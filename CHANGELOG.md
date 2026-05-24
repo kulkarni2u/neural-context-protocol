@@ -2,9 +2,10 @@
 
 All notable changes to Neural Context Protocol will be documented in this file.
 
-## 0.1.0a0 - 2026-05-23
+## 0.1.0a0 - 2026-05-24
 
-Initial alpha release candidate for the SQLite-first, stdio-MCP-first NCP V1 spine.
+Initial alpha release candidate for the SQLite-first NCP V1 spine with HTTP/SSE
+MCP as the public transport.
 
 ### Added
 
@@ -12,11 +13,12 @@ Initial alpha release candidate for the SQLite-first, stdio-MCP-first NCP V1 spi
 - pidgin encoder, chunker, assembler, and SQLite store
 - local runtime API in `ncp/api.py`
 - provider adapters for Anthropic, OpenAI, Ollama, Gemini, Mistral, and Cohere
-- stdio MCP server and CLI commands: `ncp init`, `ncp serve`, `ncp status`, `ncp emit`, `ncp dogfood`
+- HTTP/SSE MCP server and CLI commands: `ncp init`, `ncp serve`, `ncp status`, `ncp emit`, `ncp dogfood`
 - deterministic MCP dogfood harness with Claude/OpenCode/Codex continuation support
 - provider parity, benchmark, and dogfood documentation under `docs/`
 - launch-critical examples for quickstart, multi-agent handoff, Claude Code, and Codex CLI
 - wheel and sdist packaging path with installed CLI smoke proof
+- minimal GitHub Actions CI for `ruff`, `pytest`, and `build`
 
 ### Changed
 
@@ -26,9 +28,10 @@ Initial alpha release candidate for the SQLite-first, stdio-MCP-first NCP V1 spi
 
 ### Verified
 
-- full test suite: `168 passed`
+- full test suite: `176 passed`
 - package build: wheel and sdist build successfully
 - clean install smoke: installed `ncp init` and `ncp status` work from both wheel and sdist
+- live host proof: Claude and OpenCode both connect to the same HTTP MCP endpoint, write shared memory, fetch each other's writes, and deliver whispers across hosts
 
 ### Known Notes
 
