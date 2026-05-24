@@ -7,6 +7,7 @@ from .dogfood import (
     load_dogfood_adapter,
     run_adapter_continuation_dogfood_loop,
     run_canonical_dogfood_loop,
+    run_canonical_http_dogfood_loop,
     run_live_adapter_continuation_attempt,
     run_repeatability_dogfood_loop,
 )
@@ -23,6 +24,7 @@ __all__ = [
     "load_dogfood_adapter",
     "run_adapter_continuation_dogfood_loop",
     "run_canonical_dogfood_loop",
+    "run_canonical_http_dogfood_loop",
     "run_live_adapter_continuation_attempt",
     "run_repeatability_dogfood_loop",
     "run",

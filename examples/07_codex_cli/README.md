@@ -4,7 +4,7 @@ This folder shows the minimum V1 setup for running NCP inside Codex CLI.
 
 ## Files
 
-- `mcp_servers.json` registers the NCP stdio server with Codex CLI.
+- `mcp_servers.json` points Codex CLI at the HTTP MCP endpoint.
 
 ## Setup
 
@@ -13,12 +13,12 @@ project that already has `ncp init` applied.
 
 ```bash
 ncp init
-ncp serve --cwd /path/to/your/project
+ncp serve --host 127.0.0.1 --port 4242 --cwd /path/to/your/project
 ```
 
-Use the explicit `--cwd` form in MCP configs. Some hosts spawn the server from
-outside the repo root, and NCP needs the project path to resolve the right
-store and config reliably.
+Then point Codex CLI at:
+
+- `http://127.0.0.1:4242/mcp`
 
 ## Session reminder
 

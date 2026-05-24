@@ -44,8 +44,8 @@ def test_claude_code_example_files_exist() -> None:
 
     assert (example_dir / "CLAUDE.md").exists()
     config = json.loads((example_dir / "mcp_servers.json").read_text())
-    assert config["ncp"]["command"] == "ncp"
-    assert config["ncp"]["args"] == ["serve", "--cwd", "/path/to/your/project"]
+    assert config["mcpServers"]["ncp"]["type"] == "http"
+    assert config["mcpServers"]["ncp"]["url"] == "http://127.0.0.1:4242/mcp"
     assert "ncp_get_context" in (example_dir / "README.md").read_text()
 
 
@@ -53,6 +53,6 @@ def test_codex_cli_example_files_exist() -> None:
     example_dir = REPO_ROOT / "examples" / "07_codex_cli"
 
     config = json.loads((example_dir / "mcp_servers.json").read_text())
-    assert config["mcpServers"]["ncp"]["command"] == "ncp"
-    assert config["mcpServers"]["ncp"]["args"] == ["serve", "--cwd", "/path/to/your/project"]
+    assert config["mcpServers"]["ncp"]["type"] == "http"
+    assert config["mcpServers"]["ncp"]["url"] == "http://127.0.0.1:4242/mcp"
     assert "ncp_write_memory" in (example_dir / "README.md").read_text()

@@ -77,10 +77,31 @@ def status_command(cwd: Path) -> None:
               help="Project root used to resolve .ncp/config.toml when the MCP host launches from another directory.")
 @click.option("--store-path", type=click.Path(path_type=Path), default=None,
               help="Path to the NCP store. Defaults to .ncp/store.db from config.")
-def serve_command(cwd: Path | None, store_path: Path | None) -> None:
-    """Start the MCP stdio server for Claude Code integration."""
+@click.option("--host", default="127.0.0.1", show_default=True,
+              help="Host interface for HTTP/SSE mode.")
+@click.option("--port", default=4242, show_default=True, type=int,
+              help="Port for HTTP/SSE mode.")
+def serve_command(
+    cwd: Path | None,
+    store_path: Path | None,
+    host: str,
+    port: int,
+) -> None:
+    """Start the MCP server over HTTP POST plus SSE discovery."""
+
+    from ncp.mcp.server import serve_http
+
+    serve_http(host=host, port=port, store_path=store_path, cwd=cwd)
+
+
+@main.command("serve-stdio", hidden=True)
+@click.option("--cwd", type=click.Path(path_type=Path), default=None)
+@click.option("--store-path", type=click.Path(path_type=Path), default=None)
+def serve_stdio_command(cwd: Path | None, store_path: Path | None) -> None:
+    """Internal compatibility transport used by tests and dogfood."""
 
     from ncp.mcp.server import serve as mcp_serve
+
     mcp_serve(store_path=store_path, cwd=cwd)
 
 
@@ -97,6 +118,7 @@ def serve_command(cwd: Path | None, store_path: Path | None) -> None:
               help="Repeat the continuation adapter run N times and print a compact summary artifact.")
 @click.option("--adapter-timeout-seconds", default=None, type=float,
               help="Override the per-call timeout for CLI-backed continuation adapters.")
+@click.option("--transport", type=click.Choice(["http", "stdio"]), default="http", hidden=True)
 def dogfood_command(
     *,
     cwd: Path,
@@ -108,6 +130,7 @@ def dogfood_command(
     continuation_adapter: str | None,
     attempts: int,
     adapter_timeout_seconds: float | None,
+    transport: str,
 ) -> None:
     """Run the canonical MCP dogfood loop or a continuation repeatability pass."""
 
@@ -115,6 +138,7 @@ def dogfood_command(
         load_dogfood_adapter,
         run_adapter_continuation_dogfood_loop,
         run_canonical_dogfood_loop,
+        run_canonical_http_dogfood_loop,
         run_live_adapter_continuation_attempt,
         run_repeatability_dogfood_loop,
     )
@@ -139,6 +163,7 @@ def dogfood_command(
                 normalized_adapter,
                 attempts=attempts,
                 adapter_timeout_seconds=adapter_timeout_seconds,
+                transport=transport,
                 **common_kwargs,
             )
         elif normalized_adapter == "local":
@@ -147,16 +172,21 @@ def dogfood_command(
                     normalized_adapter,
                     timeout_seconds=adapter_timeout_seconds,
                 ),
+                transport=transport,
                 **common_kwargs,
             )
         else:
             artifact = run_live_adapter_continuation_attempt(
                 normalized_adapter,
                 adapter_timeout_seconds=adapter_timeout_seconds,
+                transport=transport,
                 **common_kwargs,
             )
     else:
-        artifact = run_canonical_dogfood_loop(**common_kwargs)
+        if transport == "http":
+            artifact = run_canonical_http_dogfood_loop(**common_kwargs)
+        else:
+            artifact = run_canonical_dogfood_loop(**common_kwargs)
     console.print_json(data=artifact)
 
 

@@ -9,7 +9,7 @@ It is the current engineering truth for the live CLI-backed continuation path.
 
 ## Harness version
 
-- transport: real stdio MCP via `ncp serve`
+- transport: internal stdio compatibility path via `ncp serve-stdio`
 - scenario: continuation adapter repeatability mode
 - attempts per provider: `5`
 - per-call timeout: provider-specific, recorded below

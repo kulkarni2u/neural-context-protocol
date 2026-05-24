@@ -1,10 +1,22 @@
 from __future__ import annotations
 
+from contextlib import closing
 import io
 import json
+import socket
+import threading
 from pathlib import Path
 
-from ncp.mcp.server import MCP_TOOLS, _handle_request, _read_message, make_handlers, serve_streams
+import httpx
+
+from ncp.mcp.server import (
+    MCP_TOOLS,
+    _handle_request,
+    _read_message,
+    create_http_server,
+    make_handlers,
+    serve_streams,
+)
 from ncp.stores.sqlite import SQLiteStore
 from ncp.types import SubconsciousChunk
 
@@ -41,6 +53,12 @@ def _frame(message: dict) -> bytes:
     return f"Content-Length: {len(payload)}\r\n\r\n".encode("ascii") + payload
 
 
+def _free_port() -> int:
+    with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
 class TestInitialize:
     def test_initialize(self) -> None:
         resp = _handle_request(_req("initialize", {"protocolVersion": "2024-11-05"}), {})
@@ -48,6 +66,11 @@ class TestInitialize:
         assert result["protocolVersion"] == "2024-11-05"
         assert result["serverInfo"]["name"] == "ncp"
         assert result["capabilities"]["tools"] == {"listChanged": False}
+
+    def test_initialize_accepts_latest_claude_protocol(self) -> None:
+        resp = _handle_request(_req("initialize", {"protocolVersion": "2025-11-25"}), {})
+        result = json.loads(resp)["result"]
+        assert result["protocolVersion"] == "2025-11-25"
 
     def test_stdio_framing_round_trip(self, tmp_path: Path) -> None:
         project = tmp_path / "repo"
@@ -60,6 +83,42 @@ class TestInitialize:
         framed_response = _read_message(io.BytesIO(output_stream.getvalue()))
         assert framed_response is not None
         assert framed_response["result"]["tools"] == MCP_TOOLS
+
+    def test_http_transport_handles_initialize_and_tools_list(self, tmp_path: Path) -> None:
+        port = _free_port()
+        server = create_http_server(host="127.0.0.1", port=port, cwd=tmp_path)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with httpx.Client(base_url=f"http://127.0.0.1:{port}", timeout=5.0) as client:
+                health = client.get("/healthz")
+                assert health.status_code == 200
+                assert health.json()["transport"] == "http_sse"
+
+                sse = client.build_request("GET", "/sse")
+                response = client.send(sse, stream=True)
+                try:
+                    assert response.status_code == 200
+                    first_text = next(response.iter_text())
+                    assert "event: endpoint" in first_text
+                    assert "/mcp" in first_text
+                finally:
+                    response.close()
+
+                initialize = client.post(
+                    "/mcp",
+                    json=_req("initialize", {"protocolVersion": "2025-11-25"}),
+                )
+                assert initialize.status_code == 200
+                assert initialize.json()["result"]["protocolVersion"] == "2025-11-25"
+
+                tools = client.post("/mcp", json=_req("tools/list"))
+                assert tools.status_code == 200
+                assert tools.json()["result"]["tools"] == MCP_TOOLS
+        finally:
+            server._shutdown_event.set()
+            server.shutdown()
+            thread.join(timeout=5)
 
 
 class TestToolsList:

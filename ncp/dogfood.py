@@ -7,10 +7,14 @@ import json
 import os
 from pathlib import Path
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import time
 from typing import BinaryIO
+
+import httpx
 
 from ncp.adapters.base import BaseAdapter
 from ncp.adapters.local import LocalAdapter
@@ -52,6 +56,12 @@ class MCPToolResult:
     raw: dict[str, object]
     text: str
     data: dict[str, object]
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
 
 
 @dataclass
@@ -255,7 +265,7 @@ _PROVIDER_ENV_VARS: dict[str, str | tuple[str, ...]] = {
 
 
 class MCPStdioClient:
-    """Small stdio JSON-RPC client for talking to ``ncp serve``."""
+    """Small stdio JSON-RPC client for talking to the internal compatibility server."""
 
     def __init__(
         self,
@@ -270,7 +280,7 @@ class MCPStdioClient:
             sys.executable,
             "-m",
             "ncp.cli",
-            "serve",
+            "serve-stdio",
             "--store-path",
             str(self.store_path),
         ]
@@ -359,6 +369,160 @@ class MCPStdioClient:
         return response
 
 
+class MCPHTTPClient:
+    """Small HTTP/SSE JSON-RPC client for talking to the public ``ncp serve`` transport."""
+
+    def __init__(
+        self,
+        *,
+        store_path: str | Path,
+        cwd: str | Path,
+        server_cmd: list[str] | None = None,
+        host: str = "127.0.0.1",
+        port: int | None = None,
+    ) -> None:
+        self.store_path = Path(store_path)
+        self.cwd = Path(cwd)
+        self.host = host
+        self.port = port or _free_port()
+        self.server_cmd = server_cmd or [
+            sys.executable,
+            "-m",
+            "ncp.cli",
+            "serve",
+            "--host",
+            self.host,
+            "--port",
+            str(self.port),
+            "--store-path",
+            str(self.store_path),
+        ]
+        self._process: subprocess.Popen[bytes] | None = None
+        self._next_id = 1
+        self._client: httpx.Client | None = None
+
+    @property
+    def base_url(self) -> str:
+        return f"http://{self.host}:{self.port}"
+
+    def __enter__(self) -> MCPHTTPClient:
+        self.start()
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        self.close()
+
+    def start(self) -> None:
+        if self._process is not None:
+            return
+        self._process = subprocess.Popen(
+            self.server_cmd,
+            cwd=self.cwd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self._client = httpx.Client(base_url=self.base_url, timeout=5.0)
+        self._wait_until_ready()
+
+    def close(self) -> None:
+        client = self._client
+        self._client = None
+        if client is not None:
+            client.close()
+        if self._process is None:
+            return
+        process = self._process
+        self._process = None
+        for pipe in (process.stdout, process.stderr):
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except OSError:
+                    pass
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+
+    def _wait_until_ready(self, timeout_seconds: float = 5.0) -> None:
+        if self._client is None:
+            raise RuntimeError("HTTP client not initialized")
+        deadline = time.monotonic() + timeout_seconds
+        last_error: Exception | None = None
+        while time.monotonic() < deadline:
+            if self._process is not None and self._process.poll() is not None:
+                stderr_text = ""
+                if self._process.stderr is not None:
+                    stderr_text = self._process.stderr.read().decode("utf-8", "replace").strip()
+                raise RuntimeError(stderr_text or "HTTP MCP server exited before readiness")
+            try:
+                response = self._client.get("/healthz")
+                if response.status_code == 200:
+                    return
+            except Exception as exc:  # pragma: no cover - timing dependent
+                last_error = exc
+            time.sleep(0.1)
+        raise RuntimeError(f"HTTP MCP server did not become ready in {timeout_seconds}s") from last_error
+
+    def initialize(self) -> dict[str, object]:
+        return self.request("initialize", {"protocolVersion": "2025-11-25"})
+
+    def list_tools(self) -> list[dict[str, object]]:
+        response = self.request("tools/list")
+        tools = response["result"]["tools"]
+        if not isinstance(tools, list):
+            raise RuntimeError("tools/list did not return a tools array")
+        return tools
+
+    def sse_handshake(self) -> str:
+        if self._client is None:
+            raise RuntimeError("HTTP client is not started")
+        with self._client.stream("GET", "/sse") as response:
+            response.raise_for_status()
+            for chunk in response.iter_text():
+                if chunk:
+                    return chunk
+        raise RuntimeError("SSE stream returned no data")
+
+    def call_tool(self, name: str, arguments: dict[str, object] | None = None) -> MCPToolResult:
+        response = self.request(
+            "tools/call",
+            {"name": name, "arguments": arguments or {}},
+        )
+        result = response.get("result", {})
+        if not isinstance(result, dict):
+            raise RuntimeError(f"tools/call returned invalid result for {name}")
+        content = result.get("content", [])
+        if not isinstance(content, list) or not content:
+            raise RuntimeError(f"tools/call returned no content for {name}")
+        text = str(content[0]["text"])
+        data = json.loads(text)
+        if not isinstance(data, dict):
+            raise RuntimeError(f"Tool payload for {name} must be a JSON object")
+        return MCPToolResult(raw=response, text=text, data=data)
+
+    def request(self, method: str, params: dict[str, object] | None = None) -> dict[str, object]:
+        if self._client is None:
+            raise RuntimeError("HTTP client is not started")
+        req_id = self._next_id
+        self._next_id += 1
+        payload: dict[str, object] = {"jsonrpc": "2.0", "id": req_id, "method": method}
+        if params is not None:
+            payload["params"] = params
+        response = self._client.post("/mcp", json=payload)
+        response.raise_for_status()
+        data = response.json()
+        if not isinstance(data, dict):
+            raise RuntimeError("HTTP MCP response must be a JSON object")
+        if "error" in data:
+            raise RuntimeError(f"MCP {method} failed: {data['error']}")
+        return data
+
+
 def run_canonical_dogfood_loop(
     *,
     store_path: str | Path,
@@ -367,7 +531,7 @@ def run_canonical_dogfood_loop(
     pipeline_id: str = "pipe_dogfood_mcp",
     provider_roles: dict[str, str] | None = None,
 ) -> dict[str, object]:
-    """Run one deterministic dogfood loop against a real ``ncp serve`` process."""
+    """Run one deterministic dogfood loop against the internal stdio compatibility process."""
 
     resolved_roles = provider_roles or {
         "planner": "claude",
@@ -491,6 +655,154 @@ def run_canonical_dogfood_loop(
     return artifact
 
 
+def run_canonical_http_dogfood_loop(
+    *,
+    store_path: str | Path,
+    cwd: str | Path | None = None,
+    server_cmd: list[str] | None = None,
+    pipeline_id: str = "pipe_dogfood_http",
+    provider_roles: dict[str, str] | None = None,
+    host: str = "127.0.0.1",
+    port: int | None = None,
+) -> dict[str, object]:
+    """Run one deterministic dogfood loop against the public HTTP/SSE transport."""
+
+    resolved_roles = provider_roles or {
+        "planner": "claude",
+        "executor": "opencode",
+        "critic": "codex",
+    }
+    store_path = Path(store_path)
+    cwd = Path(cwd) if cwd is not None else Path(__file__).resolve().parents[1]
+
+    artifact: dict[str, object] = {
+        "transport": "http_sse_mcp",
+        "pipeline_id": pipeline_id,
+        "provider_roles": resolved_roles,
+    }
+
+    seeded_content = "dogfood contract persists across restart"
+    summary_content = "dogfood loop verified over public HTTP/SSE MCP"
+    turn = "Need the stored dogfood contract before finalizing the answer."
+
+    with MCPHTTPClient(
+        store_path=store_path,
+        cwd=cwd,
+        server_cmd=server_cmd,
+        host=host,
+        port=port,
+    ) as client:
+        artifact["health"] = client.request("ping")["result"]
+        artifact["sse_handshake"] = client.sse_handshake()
+        artifact["initialize"] = client.initialize()["result"]
+        tools = client.list_tools()
+        artifact["tools"] = [tool["name"] for tool in tools]
+
+        seed_write = client.call_tool(
+            "ncp_write_memory",
+            {
+                "content": seeded_content,
+                "layer": "semantic",
+                "src": "tool_result",
+                "written_by": resolved_roles["executor"],
+                "pipeline_id": pipeline_id,
+            },
+        )
+        context = client.call_tool(
+            "ncp_get_context",
+            {
+                "agent_id": "planner",
+                "role": "plan",
+                "owns": ["planning"],
+                "must_not": ["shipping"],
+                "task": "prove_http_mcp_dogfood",
+                "slot": "bounded_context",
+                "intent": "verify_protocol_runtime",
+                "pipeline_id": pipeline_id,
+            },
+        )
+        directive = _scripted_fetch_decision(
+            context=str(context.data["context"]),
+            turn=turn,
+        )
+        fetch = _execute_fetch(
+            client,
+            directive=directive,
+            session_id=str(context.data["session_id"]),
+            pipeline_id=pipeline_id,
+            agent_id="planner",
+        )
+        continued_response = _scripted_continue_after_fetch(
+            turn=turn,
+            fetch_result=str(fetch.data["result"]),
+        )
+        client.call_tool(
+            "ncp_write_memory",
+            {
+                "content": summary_content,
+                "layer": "episodic",
+                "src": "synthesis",
+                "written_by": resolved_roles["critic"],
+                "pipeline_id": pipeline_id,
+            },
+        )
+
+        artifact["first_pass"] = {
+            "seed_chunk_id": seed_write.data["chunk_id"],
+            "session_id": context.data["session_id"],
+            "context_has_conscious": "[NCP:CONSCIOUS]" in str(context.data["context"]),
+            "fetch_result": fetch.data["result"],
+            "continued_response": continued_response,
+        }
+
+    with MCPHTTPClient(
+        store_path=store_path,
+        cwd=cwd,
+        server_cmd=server_cmd,
+        host=host,
+        port=port,
+    ) as restarted:
+        restarted.initialize()
+        restart_context = restarted.call_tool(
+            "ncp_get_context",
+            {
+                "agent_id": "critic",
+                "role": "review",
+                "owns": ["review"],
+                "must_not": ["implementation"],
+                "task": "prove_restart_persistence",
+                "slot": "memory_recall",
+                "intent": "verify_restart_path",
+                "pipeline_id": pipeline_id,
+            },
+        )
+        restart_fetch = restarted.call_tool(
+            "ncp_fetch",
+            {
+                "query": "dogfood restart contract",
+                "session_id": restart_context.data["session_id"],
+                "pipeline_id": pipeline_id,
+                "agent_id": "critic",
+            },
+        )
+        artifact["restart_pass"] = {
+            "session_id": restart_context.data["session_id"],
+            "fetch_result": restart_fetch.data["result"],
+        }
+
+    status = SQLiteStore(store_path).status()
+    artifact["store_status"] = status
+    artifact["restart_persistence_ok"] = seeded_content in str(artifact["restart_pass"]["fetch_result"])
+    artifact["summary"] = {
+        "first_fetch_ok": seeded_content in str(artifact["first_pass"]["fetch_result"]),
+        "restart_fetch_ok": artifact["restart_persistence_ok"],
+        "continuation_ok": seeded_content in str(artifact["first_pass"]["continued_response"]),
+        "turn_record_count": status["turn_record_count"],
+        "chunk_count": status["chunk_count"],
+    }
+    return artifact
+
+
 def run_adapter_continuation_dogfood_loop(
     *,
     adapter: BaseAdapter,
@@ -499,6 +811,7 @@ def run_adapter_continuation_dogfood_loop(
     server_cmd: list[str] | None = None,
     pipeline_id: str = "pipe_dogfood_adapter",
     provider_roles: dict[str, str] | None = None,
+    transport: str = "stdio",
 ) -> dict[str, object]:
     """Run one two-call adapter continuation loop over the real MCP transport."""
 
@@ -512,15 +825,17 @@ def run_adapter_continuation_dogfood_loop(
     seeded_content = "dogfood contract persists across restart"
     turn = "Need the stored dogfood contract before finalizing the answer."
 
+    client_cls = MCPStdioClient if transport == "stdio" else MCPHTTPClient
+
     artifact: dict[str, object] = {
-        "transport": "stdio_mcp",
+        "transport": "stdio_mcp" if transport == "stdio" else "http_sse_mcp",
         "mode": "adapter_continuation",
         "pipeline_id": pipeline_id,
         "provider_roles": resolved_roles,
         "adapter": type(adapter).__name__,
     }
 
-    with MCPStdioClient(store_path=store_path, cwd=cwd, server_cmd=server_cmd) as client:
+    with client_cls(store_path=store_path, cwd=cwd, server_cmd=server_cmd) as client:
         artifact["initialize"] = client.initialize()["result"]
         artifact["tools"] = [tool["name"] for tool in client.list_tools()]
         client.call_tool(
@@ -589,6 +904,7 @@ def run_live_adapter_continuation_attempt(
     pipeline_id: str = "pipe_dogfood_live",
     provider_roles: dict[str, str] | None = None,
     adapter_timeout_seconds: float | None = None,
+    transport: str = "stdio",
 ) -> dict[str, object]:
     """Capture a truthful artifact for one external-provider continuation attempt."""
 
@@ -613,6 +929,7 @@ def run_live_adapter_continuation_attempt(
             server_cmd=server_cmd,
             pipeline_id=pipeline_id,
             provider_roles=provider_roles,
+            transport=transport,
         )
     except Exception as exc:
         artifact["attempted"] = True
@@ -638,6 +955,7 @@ def run_repeatability_dogfood_loop(
     pipeline_id: str = "pipe_dogfood_repeatability",
     provider_roles: dict[str, str] | None = None,
     adapter_timeout_seconds: float | None = None,
+    transport: str = "stdio",
 ) -> dict[str, object]:
     """Run repeated continuation attempts and return a compact summary artifact."""
 
@@ -670,6 +988,7 @@ def run_repeatability_dogfood_loop(
                 server_cmd=server_cmd,
                 pipeline_id=attempt_pipeline_id,
                 provider_roles=provider_roles,
+                transport=transport,
             )
             attempt_artifact: dict[str, object] = {
                 "mode": "live_adapter_attempt",
@@ -687,6 +1006,7 @@ def run_repeatability_dogfood_loop(
                 pipeline_id=attempt_pipeline_id,
                 provider_roles=provider_roles,
                 adapter_timeout_seconds=adapter_timeout_seconds,
+                transport=transport,
             )
 
         status = str(attempt_artifact.get("status", "unknown"))
@@ -747,7 +1067,7 @@ def _scripted_fetch_decision(*, context: str, turn: str) -> FetchDirective:
 
 
 def _execute_fetch(
-    client: MCPStdioClient,
+    client: MCPStdioClient | MCPHTTPClient,
     *,
     directive: FetchDirective,
     session_id: str,

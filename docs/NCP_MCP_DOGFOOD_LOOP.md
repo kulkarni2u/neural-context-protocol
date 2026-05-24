@@ -1,7 +1,7 @@
 # NCP MCP Dogfood Loop
-## The first real stdio host proof for NCP V1
+## Deterministic MCP proof for NCP V1
 
-This document describes the deterministic dogfood loop that now ships inside
+This document describes the deterministic dogfood loops that now ship inside
 the package.
 
 It is intentionally narrower than the full multi-provider Sarathi run.
@@ -12,14 +12,20 @@ claiming real provider parity.
 
 The package now includes:
 
+- `ncp.dogfood.MCPHTTPClient`
 - `ncp.dogfood.MCPStdioClient`
+- `ncp.run_canonical_http_dogfood_loop(...)`
 - `ncp.run_canonical_dogfood_loop(...)`
 - `ncp.run_adapter_continuation_dogfood_loop(...)`
 - `ncp.run_repeatability_dogfood_loop(...)`
 - `ncp dogfood`
 
-These loops talk to a real `ncp serve` subprocess over framed stdio JSON-RPC.
-They are not in-process shortcuts.
+There are now two validation paths:
+
+- public HTTP/SSE validation against `ncp serve`
+- internal stdio compatibility validation against `ncp serve-stdio`
+
+Neither path is an in-process shortcut.
 
 ## Default role map
 
@@ -35,16 +41,19 @@ real provider turn loop is already complete.
 
 ## What the loop proves
 
-The deterministic loop proves these things end to end:
+The default `ncp dogfood` path proves these things end to end:
 
-1. `initialize` and `tools/list` work over stdio framing.
+1. `initialize` and `tools/list` work over the public HTTP/SSE transport.
 2. `ncp_write_memory` writes durable chunks into the SQLite store.
 3. `ncp_get_context` returns assembled context and a fetch session token.
 4. the host triggers one `ncp_fetch` and reinjects the result into the same turn.
 5. `ncp_fetch` works in the same host session and returns the persisted chunk.
 6. Restarting the MCP server does not lose the stored memory.
 
-That is enough to validate the first real host path for V1.
+That is enough to validate the public transport path used by hosts.
+
+The hidden `serve-stdio` compatibility path still exists for internal tests and
+lower-level dogfood coverage.
 
 ## Adapter continuation mode
 
@@ -156,9 +165,9 @@ Or directly through Python:
 
 ```python
 from pathlib import Path
-from ncp.dogfood import run_canonical_dogfood_loop
+from ncp.dogfood import run_canonical_http_dogfood_loop
 
-artifact = run_canonical_dogfood_loop(
+artifact = run_canonical_http_dogfood_loop(
     store_path=Path(".ncp/store.db"),
 )
 ```

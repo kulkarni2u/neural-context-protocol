@@ -6,7 +6,7 @@ Neural Context Protocol (NCP): bounded, persistent context for multi-agent pipel
 
 - `docs/NCP_SETUP.md` - install and first-run setup
 - `docs/NCP_PROTOCOL_SPEC.md` - normative protocol reference
-- `docs/NCP_MCP_DOGFOOD_LOOP.md` - deterministic stdio MCP dogfood proof
+- `docs/NCP_MCP_DOGFOOD_LOOP.md` - deterministic MCP dogfood proof
 - `docs/NCP_PROVIDER_PARITY_BASELINE.md` - current live parity snapshot
 - `docs/NCP_BENCHMARK_CODING_PIPELINE.md` - first bounded-context benchmark result
 - `docs/NCP_BENCHMARK_RESEARCH_PIPELINE.md` - research-style benchmark result
@@ -19,7 +19,7 @@ Neural Context Protocol (NCP): bounded, persistent context for multi-agent pipel
 ## Status
 
 This repository is now in a release-prepared alpha-candidate state for the
-SQLite-first, stdio-MCP-first V1 spine.
+SQLite-first V1 spine, with HTTP/SSE MCP as the single public transport.
 
 Current completed slice:
 
@@ -32,7 +32,8 @@ Current completed slice:
 - pricing and cost calculation in `ncp/costs.py`
 - first public API slice in `ncp/api.py`
 - first local adapter and CLI slice in `ncp/adapters/local.py` and `ncp/cli.py`
-- canonical stdio MCP dogfood harness in `ncp/dogfood.py`
+- canonical MCP dogfood harness in `ncp/dogfood.py`
+- HTTP/SSE MCP transport in `ncp/mcp/server.py`
 - focused validation coverage in `tests/test_types.py`
 - golden-format encoder coverage in `tests/test_encoder.py`
 - chunking coverage in `tests/test_chunker.py`
@@ -40,7 +41,7 @@ Current completed slice:
 - assembler/config/cost coverage in `tests/test_assembler.py`, `tests/test_config.py`, and `tests/test_costs.py`
 - public API coverage in `tests/test_api.py`
 - CLI coverage in `tests/test_cli.py`
-- end-to-end stdio MCP dogfood coverage in `tests/test_dogfood.py`
+- end-to-end MCP dogfood coverage in `tests/test_dogfood.py`
 - trust-boundary hardening coverage in `tests/test_mcp_server.py`, `tests/test_sqlite_store.py`, `tests/test_assembler_phase3.py`, and `tests/test_types.py`
 - pre-MCP dogfood and provider parity docs in `docs/`
 - deterministic MCP dogfood runbook in `docs/NCP_MCP_DOGFOOD_LOOP.md`
@@ -50,6 +51,7 @@ Current completed slice:
 - launch-critical examples in `examples/01_quickstart.py`, `examples/02_multi_agent.py`, `examples/06_claude_code/`, and `examples/07_codex_cli/`
 - wheel and sdist install smoke verified through the installed `ncp` CLI
 - adapter and store degradation paths now return explicit NCP-owned errors with focused CLI coverage
+- minimal GitHub Actions CI runs `ruff`, `pytest`, and `build` on push and pull request
 
 Next release step: publish the first alpha release.
 
@@ -69,21 +71,38 @@ ncp status
 
 For a guided setup path, see [docs/NCP_SETUP.md](./docs/NCP_SETUP.md).
 
-## Multi-tool sharing
+## HTTP/SSE MCP
 
-Each coding tool (Claude Code, Codex, OpenCode) spawns its own `ncp serve`
-process via stdio. They do not share a process, but they all read and write to
-the same `.ncp/store.db` SQLite file — so memory written by one agent is
-immediately visible to any other agent pointing at the same store.
+NCP’s public transport is HTTP/SSE MCP:
 
-```
-Claude Code  →  ncp serve (process A)  ─┐
-Codex        →  ncp serve (process B)  ─┤─  .ncp/store.db
-OpenCode     →  ncp serve (process C)  ─┘
+```bash
+ncp serve --host 127.0.0.1 --port 4242 --cwd /path/to/project
 ```
 
-The store is the shared memory substrate. Each tool manages its own server
-lifecycle; you do not need to coordinate processes.
+Endpoints:
+
+- `GET /healthz` - transport readiness
+- `GET /sse` - SSE discovery stream
+- `POST /mcp` - streamable HTTP / JSON-RPC request endpoint
+
+Each coding tool connects to the same long-lived NCP server over HTTP/SSE while
+sharing the same `.ncp/store.db` SQLite file.
+
+```
+Claude Code  ─┐
+Codex        ─┼→  ncp serve (HTTP/SSE)  →  .ncp/store.db
+OpenCode     ─┘
+```
+
+That keeps transport, process lifetime, and shared memory behavior simple and
+observable.
+
+The public HTTP/SSE path is validated end to end by the dogfood harness, not
+just by unit tests.
+
+For MCP host configuration, prefer the HTTP endpoint:
+
+- `http://127.0.0.1:4242/mcp`
 
 ## Provider Notes
 

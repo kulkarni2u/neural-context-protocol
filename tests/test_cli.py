@@ -31,6 +31,65 @@ def test_cli_status_renders_table(tmp_path: Path) -> None:
 def test_cli_serve_passes_explicit_cwd(monkeypatch: object, tmp_path: Path) -> None:
     called: dict[str, object] = {}
 
+    def fake_serve_http(
+        *,
+        host: str,
+        port: int,
+        store_path: Path | None = None,
+        cwd: Path | None = None,
+    ) -> None:
+        called["host"] = host
+        called["port"] = port
+        called["store_path"] = store_path
+        called["cwd"] = cwd
+
+    monkeypatch.setattr("ncp.mcp.server.serve_http", fake_serve_http)
+    runner = CliRunner()
+
+    result = runner.invoke(main, ["serve", "--cwd", str(tmp_path)])
+
+    assert result.exit_code == 0
+    assert called["host"] == "127.0.0.1"
+    assert called["port"] == 4242
+    assert called["cwd"] == tmp_path
+    assert called["store_path"] is None
+
+
+def test_cli_serve_passes_network_options(monkeypatch: object, tmp_path: Path) -> None:
+    called: dict[str, object] = {}
+
+    def fake_serve_http(
+        *,
+        host: str,
+        port: int,
+        store_path: Path | None = None,
+        cwd: Path | None = None,
+    ) -> None:
+        called["host"] = host
+        called["port"] = port
+        called["store_path"] = store_path
+        called["cwd"] = cwd
+
+    monkeypatch.setattr("ncp.mcp.server.serve_http", fake_serve_http)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        main,
+        ["serve", "--host", "0.0.0.0", "--port", "4545", "--cwd", str(tmp_path)],
+    )
+
+    assert result.exit_code == 0
+    assert called == {
+        "host": "0.0.0.0",
+        "port": 4545,
+        "store_path": None,
+        "cwd": tmp_path,
+    }
+
+
+def test_cli_serve_stdio_hidden_command(monkeypatch: object, tmp_path: Path) -> None:
+    called: dict[str, object] = {}
+
     def fake_serve(*, store_path: Path | None = None, cwd: Path | None = None) -> None:
         called["store_path"] = store_path
         called["cwd"] = cwd
@@ -38,11 +97,10 @@ def test_cli_serve_passes_explicit_cwd(monkeypatch: object, tmp_path: Path) -> N
     monkeypatch.setattr("ncp.mcp.server.serve", fake_serve)
     runner = CliRunner()
 
-    result = runner.invoke(main, ["serve", "--cwd", str(tmp_path)])
+    result = runner.invoke(main, ["serve-stdio", "--cwd", str(tmp_path)])
 
     assert result.exit_code == 0
-    assert called["cwd"] == tmp_path
-    assert called["store_path"] is None
+    assert called == {"store_path": None, "cwd": tmp_path}
 
 
 def test_cli_status_reports_store_unavailable_cleanly(tmp_path: Path) -> None:
@@ -133,6 +191,7 @@ def test_cli_dogfood_prints_restart_proof(tmp_path: Path) -> None:
 
     assert result.exit_code == 0
     payload = json.loads(result.output)
+    assert payload["transport"] == "http_sse_mcp"
     assert payload["restart_persistence_ok"] is True
     assert payload["provider_roles"]["planner"] == "claude"
     assert payload["summary"]["continuation_ok"] is True
@@ -157,9 +216,37 @@ def test_cli_dogfood_adapter_mode_prints_continuation_artifact(tmp_path: Path) -
 
     assert result.exit_code == 0
     payload = json.loads(result.output)
+    assert payload["transport"] == "http_sse_mcp"
     assert payload["mode"] == "adapter_continuation"
     assert payload["adapter"] == "DogfoodLocalAdapter"
     assert payload["continuation_ok"] is True
+
+
+def test_cli_dogfood_hidden_stdio_transport_still_available(
+    tmp_path: Path,
+    monkeypatch: object,
+) -> None:
+    monkeypatch.setattr(
+        "ncp.dogfood.run_canonical_dogfood_loop",
+        lambda **kwargs: {"transport": "stdio_mcp", "restart_persistence_ok": True},
+    )
+    runner = CliRunner()
+    runner.invoke(main, ["init", "--cwd", str(tmp_path)])
+
+    result = runner.invoke(
+        main,
+        [
+            "dogfood",
+            "--cwd",
+            str(tmp_path),
+            "--transport",
+            "stdio",
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["transport"] == "stdio_mcp"
 
 
 def test_cli_dogfood_external_adapter_reports_missing_credentials(

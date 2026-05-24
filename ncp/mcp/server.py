@@ -1,17 +1,21 @@
-"""MCP stdio server — JSON-RPC 2.0 transport over stdin/stdout."""
+"""MCP transports for stdio and HTTP/SSE JSON-RPC 2.0 endpoints."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import sys
+import threading
+import time
 import traceback
 from collections.abc import Callable
 from pathlib import Path
 from typing import BinaryIO
 
 from ncp.assembler import Assembler
-from ncp.config import NCPConfig, load_config
+from ncp.config import load_config
 from ncp.stores.sqlite import SQLiteStore
 from ncp.types import BudgetContext, ConsciousBlock, SubconsciousChunk, Whisper
 
@@ -26,6 +30,10 @@ def _ok(id: int | str | None, result: object) -> str:
 
 def _err_response(id: int | str | None, code: int, message: str) -> str:
     return json.dumps({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
+
+
+def _json_bytes(payload: object) -> bytes:
+    return json.dumps(payload).encode("utf-8")
 
 
 ToolHandler = Callable[..., object]
@@ -220,8 +228,8 @@ def make_handlers(store: SQLiteStore) -> dict[str, ToolHandler]:
     }
 
 
-_SUPPORTED_VERSIONS = {"2024-11-05", "2025-03-26", "2025-06-18"}
-_LATEST_VERSION = "2025-03-26"
+_SUPPORTED_VERSIONS = {"2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"}
+_LATEST_VERSION = "2025-11-25"
 
 
 def _negotiate_version(client_version: str) -> str:
@@ -320,6 +328,19 @@ def _write_message(output_stream: BinaryIO, payload: str) -> None:
     output_stream.flush()
 
 
+def _create_handlers(
+    *,
+    store_path: str | Path | None = None,
+    cwd: Path | None = None,
+) -> dict[str, ToolHandler]:
+    if store_path:
+        config = load_config(env={"NCP_STORE_PATH": str(store_path)})
+    else:
+        config = load_config(cwd=cwd or Path.cwd())
+    store = SQLiteStore(config.store_path)
+    return make_handlers(store)
+
+
 def serve_streams(
     input_stream: BinaryIO,
     output_stream: BinaryIO,
@@ -329,15 +350,10 @@ def serve_streams(
 ) -> None:
     """Run the MCP server against arbitrary binary streams."""
     try:
-        if store_path:
-            config = load_config(env={"NCP_STORE_PATH": str(store_path)})
-        else:
-            config = load_config(cwd=cwd or Path.cwd())
-        store = SQLiteStore(config.store_path)
+        handlers = _create_handlers(store_path=store_path, cwd=cwd)
     except Exception as exc:
         _err(f"NCP server failed to start: {exc}\n{traceback.format_exc()}")
         sys.exit(1)
-    handlers = make_handlers(store)
 
     while True:
         try:
@@ -361,3 +377,161 @@ def serve_streams(
 def serve(store_path: str | Path | None = None, *, cwd: Path | None = None) -> None:
     """Run the MCP stdio server loop."""
     serve_streams(sys.stdin.buffer, sys.stdout.buffer, store_path=store_path, cwd=cwd)
+
+
+class _MCPHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(
+        self,
+        server_address: tuple[str, int],
+        *,
+        handlers: dict[str, ToolHandler],
+        sse_path: str,
+        rpc_path: str,
+        keepalive_seconds: float,
+    ) -> None:
+        self.handlers = handlers
+        self.sse_path = sse_path
+        self.rpc_path = rpc_path
+        self.keepalive_seconds = keepalive_seconds
+        self._shutdown_event = threading.Event()
+        super().__init__(server_address, _MCPHTTPHandler)
+
+
+class _MCPHTTPHandler(BaseHTTPRequestHandler):
+    server: _MCPHTTPServer
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, format: str, *args: object) -> None:
+        return
+
+    def _send_json(self, status: HTTPStatus, payload: object) -> None:
+        body = _json_bytes(payload)
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+        self.wfile.flush()
+
+    def _send_empty(self, status: HTTPStatus) -> None:
+        self.send_response(status)
+        self.send_header("Content-Length", "0")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
+    def do_OPTIONS(self) -> None:
+        self.send_response(HTTPStatus.NO_CONTENT)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_GET(self) -> None:
+        if self.path == "/healthz":
+            self._send_json(
+                HTTPStatus.OK,
+                {"ok": True, "transport": "http_sse", "rpc_path": self.server.rpc_path, "sse_path": self.server.sse_path},
+            )
+            return
+        if self.path != self.server.sse_path:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+            return
+
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        try:
+            endpoint_event = f"event: endpoint\ndata: {self.server.rpc_path}\n\n".encode("utf-8")
+            self.wfile.write(endpoint_event)
+            self.wfile.flush()
+            while not self.server._shutdown_event.is_set():
+                self.wfile.write(b": keepalive\n\n")
+                self.wfile.flush()
+                time.sleep(self.server.keepalive_seconds)
+        except (BrokenPipeError, ConnectionResetError):
+            return
+
+    def do_POST(self) -> None:
+        if self.path not in (self.server.rpc_path, "/message"):
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+            return
+
+        try:
+            content_length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_content_length"})
+            return
+        try:
+            payload = json.loads(self.rfile.read(content_length).decode("utf-8"))
+        except json.JSONDecodeError as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_json", "detail": str(exc)})
+            return
+        if not isinstance(payload, dict):
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_payload"})
+            return
+
+        response = _handle_request(payload, self.server.handlers)
+        if not response:
+            self._send_empty(HTTPStatus.ACCEPTED)
+            return
+        self._send_json(HTTPStatus.OK, json.loads(response))
+
+
+def create_http_server(
+    *,
+    host: str = "127.0.0.1",
+    port: int = 4242,
+    store_path: str | Path | None = None,
+    cwd: Path | None = None,
+    sse_path: str = "/sse",
+    rpc_path: str = "/mcp",
+    keepalive_seconds: float = 15.0,
+) -> _MCPHTTPServer:
+    handlers = _create_handlers(store_path=store_path, cwd=cwd)
+    return _MCPHTTPServer(
+        (host, port),
+        handlers=handlers,
+        sse_path=sse_path,
+        rpc_path=rpc_path,
+        keepalive_seconds=keepalive_seconds,
+    )
+
+
+def serve_http(
+    *,
+    host: str = "127.0.0.1",
+    port: int = 4242,
+    store_path: str | Path | None = None,
+    cwd: Path | None = None,
+    sse_path: str = "/sse",
+    rpc_path: str = "/mcp",
+    keepalive_seconds: float = 15.0,
+) -> None:
+    """Run the MCP server over HTTP POST plus an SSE discovery stream."""
+    try:
+        server = create_http_server(
+            host=host,
+            port=port,
+            store_path=store_path,
+            cwd=cwd,
+            sse_path=sse_path,
+            rpc_path=rpc_path,
+            keepalive_seconds=keepalive_seconds,
+        )
+    except Exception as exc:
+        _err(f"NCP HTTP server failed to start: {exc}\n{traceback.format_exc()}")
+        sys.exit(1)
+
+    try:
+        server.serve_forever()
+    finally:
+        server._shutdown_event.set()
+        server.server_close()

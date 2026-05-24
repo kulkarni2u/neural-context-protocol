@@ -14,6 +14,7 @@ from ncp.dogfood import (
     load_dogfood_adapter,
     run_adapter_continuation_dogfood_loop,
     run_canonical_dogfood_loop,
+    run_canonical_http_dogfood_loop,
     run_live_adapter_continuation_attempt,
     run_repeatability_dogfood_loop,
 )
@@ -48,6 +49,30 @@ def test_canonical_dogfood_loop_runs_against_real_stdio_server(tmp_path: Path) -
 
 def test_public_package_exports_dogfood_runner() -> None:
     assert callable(ncp.run_canonical_dogfood_loop)
+    assert callable(ncp.run_canonical_http_dogfood_loop)
+
+
+def test_canonical_http_dogfood_loop_runs_against_real_http_server(tmp_path: Path) -> None:
+    project = tmp_path / "repo"
+    (project / ".git").mkdir(parents=True)
+
+    artifact = run_canonical_http_dogfood_loop(
+        store_path=project / ".ncp" / "store.db",
+        cwd=REPO_ROOT,
+        pipeline_id="pipe_test_http_dogfood",
+    )
+
+    assert artifact["transport"] == "http_sse_mcp"
+    assert artifact["provider_roles"] == {
+        "planner": "claude",
+        "executor": "opencode",
+        "critic": "codex",
+    }
+    assert artifact["restart_persistence_ok"] is True
+    assert "event: endpoint" in str(artifact["sse_handshake"])
+    assert "/mcp" in str(artifact["sse_handshake"])
+    assert "ncp_fetch:results" in str(artifact["first_pass"]["fetch_result"])
+    assert artifact["summary"]["continuation_ok"] is True
 
 
 def test_adapter_continuation_loop_runs_with_local_contract_adapter(tmp_path: Path) -> None:
@@ -65,6 +90,24 @@ def test_adapter_continuation_loop_runs_with_local_contract_adapter(tmp_path: Pa
     assert artifact["adapter"] == "DogfoodLocalAdapter"
     assert "NCP_FETCH_REQUEST" in str(artifact["first_pass"]["first_provider_response"])
     assert "NCP_FINAL" in str(artifact["first_pass"]["second_provider_response"])
+    assert artifact["continuation_ok"] is True
+
+
+def test_http_adapter_continuation_loop_runs_with_local_contract_adapter(tmp_path: Path) -> None:
+    project = tmp_path / "repo"
+    (project / ".git").mkdir(parents=True)
+
+    artifact = run_adapter_continuation_dogfood_loop(
+        adapter=load_dogfood_adapter("local"),
+        store_path=project / ".ncp" / "store.db",
+        cwd=REPO_ROOT,
+        pipeline_id="pipe_test_http_adapter_dogfood",
+        transport="http",
+    )
+
+    assert artifact["transport"] == "http_sse_mcp"
+    assert artifact["mode"] == "adapter_continuation"
+    assert artifact["adapter"] == "DogfoodLocalAdapter"
     assert artifact["continuation_ok"] is True
 
 

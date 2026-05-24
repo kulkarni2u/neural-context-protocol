@@ -10,7 +10,8 @@ build/
 *.egg-info/
 .mcp.json
 CLAUDE.md
-.ncp/store.db
+.ncp/*.db
+.ncp/*.db-*
 .ncp/config.toml
 .ncp/run.py
 .sarathi

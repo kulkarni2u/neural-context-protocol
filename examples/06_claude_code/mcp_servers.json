@@ -1,6 +1,8 @@
 {
-  "ncp": {
-    "command": "ncp",
-    "args": ["serve", "--cwd", "/path/to/your/project"]
+  "mcpServers": {
+    "ncp": {
+      "type": "http",
+      "url": "http://127.0.0.1:4242/mcp"
+    }
   }
 }
