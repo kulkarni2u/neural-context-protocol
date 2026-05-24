@@ -10,6 +10,17 @@ readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "kulkarni2u" }]
 license = "MIT"
+keywords = ["mcp", "agents", "multi-agent", "context", "memory", "sqlite", "llm", "protocol"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
   "pydantic>=2.7",
   "rank-bm25>=0.2.2",
@@ -20,6 +31,11 @@ dependencies = [
   "orjson>=3.10",
   "structlog>=24.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/kulkarni2u/neural-context-protocol"
+Repository = "https://github.com/kulkarni2u/neural-context-protocol"
+Issues = "https://github.com/kulkarni2u/neural-context-protocol/issues"
 
 [project.optional-dependencies]
 providers = [

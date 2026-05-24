@@ -1,77 +1,109 @@
 # Neural Context Protocol
 
-Neural Context Protocol (NCP): bounded, persistent context for multi-agent pipelines.
+[![CI](https://github.com/kulkarni2u/neural-context-protocol/actions/workflows/ci.yml/badge.svg)](https://github.com/kulkarni2u/neural-context-protocol/actions/workflows/ci.yml)
+![Python](https://img.shields.io/badge/python-3.10%2B-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
 
-## Repo layout
+Neural Context Protocol (NCP) is a local-first context runtime for multi-agent
+systems. It keeps context bounded, persists useful memory across turns and
+restarts, and exposes that shared context over MCP so multiple tools can work
+from the same state instead of replaying full history.
 
-- `docs/NCP_SETUP.md` - install and first-run setup
-- `docs/NCP_PROTOCOL_SPEC.md` - normative protocol reference
-- `docs/NCP_MCP_DOGFOOD_LOOP.md` - deterministic MCP dogfood proof
-- `docs/NCP_PROVIDER_PARITY_BASELINE.md` - current live parity snapshot
-- `docs/NCP_BENCHMARK_CODING_PIPELINE.md` - first bounded-context benchmark result
-- `docs/NCP_BENCHMARK_RESEARCH_PIPELINE.md` - research-style benchmark result
-- `CHANGELOG.md` - release-facing change summary
-- `benchmarks/coding_pipeline/` - runnable benchmark artifact
-- `benchmarks/research_pipeline/` - second runnable benchmark artifact
-- `ncp/` - Python package
-- `tests/` - test suite
+In the included benchmarks, NCP reduced peak prompt size by `17.52x` on a
+coding pipeline and `16.35x` on a research pipeline versus naive history replay.
 
-## Status
+## Why NCP
 
-This repository is now in a release-prepared alpha-candidate state for the
-SQLite-first V1 spine, with HTTP/SSE MCP as the single public transport.
+Multi-agent workflows usually break down in three predictable ways:
 
-Current completed slice:
+- prompt history keeps growing until token cost and latency get ugly
+- agents lose useful state between turns or after a restart
+- each tool has its own silo, so context does not move cleanly across workers
 
-- launch-critical core types in `ncp/types.py`
-- pidgin encoder in `ncp/encoder.py`
-- type-aware chunker in `ncp/chunker.py`
-- SQLite-first persistence slice in `ncp/stores/sqlite.py`
-- first local assembler slice in `ncp/assembler.py`
-- config loading in `ncp/config.py`
-- pricing and cost calculation in `ncp/costs.py`
-- first public API slice in `ncp/api.py`
-- first local adapter and CLI slice in `ncp/adapters/local.py` and `ncp/cli.py`
-- canonical MCP dogfood harness in `ncp/dogfood.py`
-- HTTP/SSE MCP transport in `ncp/mcp/server.py`
-- focused validation coverage in `tests/test_types.py`
-- golden-format encoder coverage in `tests/test_encoder.py`
-- chunking coverage in `tests/test_chunker.py`
-- persistence coverage in `tests/test_sqlite_store.py`
-- assembler/config/cost coverage in `tests/test_assembler.py`, `tests/test_config.py`, and `tests/test_costs.py`
-- public API coverage in `tests/test_api.py`
-- CLI coverage in `tests/test_cli.py`
-- end-to-end MCP dogfood coverage in `tests/test_dogfood.py`
-- trust-boundary hardening coverage in `tests/test_mcp_server.py`, `tests/test_sqlite_store.py`, `tests/test_assembler_phase3.py`, and `tests/test_types.py`
-- pre-MCP dogfood and provider parity docs in `docs/`
-- deterministic MCP dogfood runbook in `docs/NCP_MCP_DOGFOOD_LOOP.md`
-- repeatability runner for CLI-backed provider stabilization in `ncp/dogfood.py`
-- first coding-pipeline benchmark with real token numbers in `benchmarks/coding_pipeline/`
-- second research-pipeline benchmark with real token numbers in `benchmarks/research_pipeline/`
-- launch-critical examples in `examples/01_quickstart.py`, `examples/02_multi_agent.py`, `examples/06_claude_code/`, and `examples/07_codex_cli/`
-- wheel and sdist install smoke verified through the installed `ncp` CLI
-- adapter and store degradation paths now return explicit NCP-owned errors with focused CLI coverage
-- minimal GitHub Actions CI runs `ruff`, `pytest`, and `build` on push and pull request
+NCP addresses that with:
 
-Next release step: publish the first alpha release.
+- bounded context assembly for the current turn
+- durable shared memory in a project-local SQLite store
+- targeted mid-turn retrieval with `ncp_fetch`
+- cross-agent signaling with whispers
+- one MCP surface that multiple coding tools can share
 
-That means:
+## What Is Proven Today
 
-- confirm the final version/tag
-- upload the built artifacts
-- cut the first GitHub release
+This repo is in an early alpha V1 state with a SQLite-first runtime and
+HTTP/SSE MCP as the public transport.
 
-## Quick start
+What is already proven in this repository:
+
+- Claude and OpenCode both connect to the same NCP MCP server over HTTP
+- both hosts can write shared memory through MCP
+- both hosts can retrieve memory written by the other host
+- both hosts can deliver and receive whispers through the shared MCP runtime
+- restart persistence is validated by the dogfood harness
+- bounded-context benchmarks are reproducible and show large prompt reduction
+
+Current benchmark snapshot:
+
+- coding pipeline: peak `174` NCP tokens vs `1927` naive replay, `17.52x` reduction
+- research pipeline: peak `156` NCP tokens vs `1700` naive replay, `16.35x` reduction
+
+## Quick Start
+
+```bash
+pip install -e .
+ncp init
+ncp serve --host 127.0.0.1 --port 4242 --cwd /path/to/project
+ncp status --cwd /path/to/project
+```
+
+Expected success signals:
+
+- `ncp init` creates `.ncp/config.toml` and `CLAUDE.md`
+- `ncp serve` starts the local HTTP MCP server on `127.0.0.1:4242`
+- `ncp status` prints store metrics such as chunk count and whisper count
+
+Once the first alpha is published, the install path becomes:
 
 ```bash
 pip install ncp-sdk
-ncp init
-ncp status
 ```
 
-For a guided setup path, see [docs/NCP_SETUP.md](./docs/NCP_SETUP.md).
+For a deeper setup path, see [docs/NCP_SETUP.md](./docs/NCP_SETUP.md).
 
-## HTTP/SSE MCP
+## How It Works
+
+NCP keeps one shared SQLite store per project and serves it over MCP:
+
+```text
+Claude Code  ─┐
+Codex        ─┼→  ncp serve (HTTP/SSE MCP)  →  .ncp/store.db
+OpenCode     ─┘
+```
+
+Each agent turn works roughly like this:
+
+1. call `ncp_get_context`
+2. get a bounded, assembled context block for the current role and task
+3. optionally call `ncp_fetch` for targeted retrieval mid-turn
+4. persist useful results with `ncp_write_memory`
+5. send light-weight cross-agent signals with `ncp_emit_whisper`
+
+Example assembled context:
+
+```text
+[NCP:CONSCIOUS]
+agent:planner role:plan task:verify_shared_memory slot:bounded_context
+
+[NCP:SUBCON]
+chunk:sub_2267717ed22a layer:semantic
+  opencode_http_probe_20260524T230734Z
+
+[NCP:WHISPERS]
+wsp from:opencode to:claude t:nudge c:0.96 age:1s
+  whisper_probe_opencode_to_claude_20260524T232132Z
+```
+
+## MCP Transport
 
 NCP’s public transport is HTTP/SSE MCP:
 
@@ -81,33 +113,16 @@ ncp serve --host 127.0.0.1 --port 4242 --cwd /path/to/project
 
 Endpoints:
 
-- `GET /healthz` - transport readiness
-- `GET /sse` - SSE discovery stream
-- `POST /mcp` - streamable HTTP / JSON-RPC request endpoint
+- `GET /healthz`
+- `GET /sse`
+- `POST /mcp`
 
-Each coding tool connects to the same long-lived NCP server over HTTP/SSE while
-sharing the same `.ncp/store.db` SQLite file.
-
-```
-Claude Code  ─┐
-Codex        ─┼→  ncp serve (HTTP/SSE)  →  .ncp/store.db
-OpenCode     ─┘
-```
-
-That keeps transport, process lifetime, and shared memory behavior simple and
-observable.
-
-The public HTTP/SSE path is validated end to end by the dogfood harness, not
-just by unit tests.
-
-For MCP host configuration, prefer the HTTP endpoint:
+Use this endpoint in MCP host configs:
 
 - `http://127.0.0.1:4242/mcp`
 
-## Provider Notes
-
-- `GeminiAdapter` is currently implemented against `google.generativeai`, which is deprecated upstream. The adapter is functionally green in tests, but a future follow-up should migrate it to `google.genai` once that dependency path is available in the supported environment.
-- `CohereAdapter` is functionally green, but the current upstream SDK emits Python deprecation warnings during tests. Treat that as an upstream runtime note, not a protocol/runtime correctness failure.
+The public HTTP path is validated end to end by the dogfood harness, not just
+by unit tests.
 
 ## Benchmarks
 
@@ -118,16 +133,10 @@ python3 benchmarks/coding_pipeline/run.py --turns 40
 python3 benchmarks/research_pipeline/run.py --turns 36
 ```
 
-Current benchmark snapshot:
+Benchmark write-ups:
 
-- coding pipeline: peak `174` NCP tokens vs `1927` naive replay, `17.52x` final-turn reduction
-- research pipeline: peak `156` NCP tokens vs `1700` naive replay, `16.35x` final-turn reduction
-
-Release preflight:
-
-```bash
-bash scripts/release_preflight.sh
-```
+- [docs/NCP_BENCHMARK_CODING_PIPELINE.md](./docs/NCP_BENCHMARK_CODING_PIPELINE.md)
+- [docs/NCP_BENCHMARK_RESEARCH_PIPELINE.md](./docs/NCP_BENCHMARK_RESEARCH_PIPELINE.md)
 
 ## Examples
 
@@ -138,7 +147,46 @@ python3 examples/01_quickstart.py
 python3 examples/02_multi_agent.py
 ```
 
-Integration setup examples:
+Integration examples:
 
-- `examples/06_claude_code/` - `CLAUDE.md`, MCP config, and a minimal setup README
-- `examples/07_codex_cli/` - Codex CLI MCP config and session loop README
+- `examples/06_claude_code/` - Claude Code setup and MCP config
+- `examples/07_codex_cli/` - Codex CLI MCP config and session loop
+
+## Current Scope
+
+This repository currently ships:
+
+- core NCP types and encoder
+- chunking and bounded assembly
+- SQLite-backed persistence
+- HTTP/SSE MCP server
+- dogfood validation harness
+- local adapter plus provider adapter surface
+- release preflight script
+- minimal CI for `ruff`, `pytest`, and `build`
+
+Next release step:
+
+- publish the first alpha release
+
+## Documentation
+
+- [docs/NCP_SETUP.md](./docs/NCP_SETUP.md) - install and first-run setup
+- [docs/NCP_PROTOCOL_SPEC.md](./docs/NCP_PROTOCOL_SPEC.md) - normative protocol reference
+- [docs/NCP_MCP_DOGFOOD_LOOP.md](./docs/NCP_MCP_DOGFOOD_LOOP.md) - deterministic MCP proof path
+- [docs/NCP_PROVIDER_PARITY_BASELINE.md](./docs/NCP_PROVIDER_PARITY_BASELINE.md) - current live host parity snapshot
+- [CHANGELOG.md](./CHANGELOG.md) - release-facing change summary
+
+## Release Preflight
+
+```bash
+bash scripts/release_preflight.sh
+```
+
+<details>
+<summary>Provider notes</summary>
+
+- `GeminiAdapter` currently uses `google.generativeai`, which is deprecated upstream. The adapter is functionally green in tests, but should migrate to `google.genai` in a future pass.
+- `CohereAdapter` is functionally green, but the current upstream SDK emits Python deprecation warnings during tests.
+
+</details>
