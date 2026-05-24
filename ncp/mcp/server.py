@@ -220,6 +220,16 @@ def make_handlers(store: SQLiteStore) -> dict[str, ToolHandler]:
     }
 
 
+_SUPPORTED_VERSIONS = {"2024-11-05", "2025-03-26", "2025-06-18"}
+_LATEST_VERSION = "2025-03-26"
+
+
+def _negotiate_version(client_version: str) -> str:
+    if client_version in _SUPPORTED_VERSIONS:
+        return client_version
+    return _LATEST_VERSION
+
+
 def _handle_request(req: dict[str, object], handlers: dict[str, ToolHandler]) -> str:
     req_id = req.get("id")
     method = str(req.get("method", ""))
@@ -227,18 +237,23 @@ def _handle_request(req: dict[str, object], handlers: dict[str, ToolHandler]) ->
     if not isinstance(params, dict):
         params = {}
 
+    # Notifications have no id and require no response
+    if req_id is None and method.startswith("notifications/"):
+        return ""
+
     if method == "initialize":
+        client_version = str(params.get("protocolVersion", "2024-11-05"))
         return _ok(
             req_id,
             {
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": _negotiate_version(client_version),
                 "serverInfo": {"name": "ncp", "version": "0.1.0a0"},
-                "capabilities": {"tools": {}},
+                "capabilities": {"tools": {"listChanged": False}},
             },
         )
 
-    if method == "notifications/initialized":
-        return ""
+    if method == "ping":
+        return _ok(req_id, {})
 
     if method == "tools/list":
         return _ok(req_id, {"tools": MCP_TOOLS})
@@ -258,6 +273,9 @@ def _handle_request(req: dict[str, object], handlers: dict[str, ToolHandler]) ->
             _err(f"Tool {tool_name} error: {traceback.format_exc()}")
             return _err_response(req_id, -32603, f"Tool error: {exc}")
 
+    # Respond with method-not-found only for requests (have an id); silently drop unknown notifications
+    if req_id is None:
+        return ""
     return _err_response(req_id, -32601, f"Method not found: {method}")
 
 
@@ -310,20 +328,28 @@ def serve_streams(
     cwd: Path | None = None,
 ) -> None:
     """Run the MCP server against arbitrary binary streams."""
-    config: NCPConfig
-    if store_path:
-        config = load_config(env={"NCP_STORE_PATH": str(store_path)})
-    else:
-        config = load_config(cwd=cwd or Path.cwd())
-    store = SQLiteStore(config.store_path)
+    try:
+        if store_path:
+            config = load_config(env={"NCP_STORE_PATH": str(store_path)})
+        else:
+            config = load_config(cwd=cwd or Path.cwd())
+        store = SQLiteStore(config.store_path)
+    except Exception as exc:
+        _err(f"NCP server failed to start: {exc}\n{traceback.format_exc()}")
+        sys.exit(1)
     handlers = make_handlers(store)
 
     while True:
         try:
             req = _read_message(input_stream)
-        except (json.JSONDecodeError, ValueError) as exc:
-            _err(f"Invalid MCP message: {exc}")
+        except json.JSONDecodeError as exc:
+            # Body was fully consumed but JSON was invalid — stream still in sync
+            _err(f"Invalid MCP JSON: {exc}")
             continue
+        except ValueError as exc:
+            # Header/framing error — stream position is unknown, must stop
+            _err(f"Invalid MCP framing: {exc}")
+            break
         if req is None:
             break
 
@@ -332,6 +358,6 @@ def serve_streams(
             _write_message(output_stream, response)
 
 
-def serve(store_path: str | Path | None = None) -> None:
+def serve(store_path: str | Path | None = None, *, cwd: Path | None = None) -> None:
     """Run the MCP stdio server loop."""
-    serve_streams(sys.stdin.buffer, sys.stdout.buffer, store_path=store_path)
+    serve_streams(sys.stdin.buffer, sys.stdout.buffer, store_path=store_path, cwd=cwd)

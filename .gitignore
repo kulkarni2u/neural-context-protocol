@@ -8,7 +8,11 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+.mcp.json
+CLAUDE.md
 .ncp/store.db
+.ncp/config.toml
+.ncp/run.py
 .sarathi
 .gstack/
 .claude/

@@ -1,6 +1,6 @@
 {
   "ncp": {
     "command": "ncp",
-    "args": ["serve"]
+    "args": ["serve", "--cwd", "/path/to/your/project"]
   }
 }

@@ -69,6 +69,22 @@ ncp status
 
 For a guided setup path, see [docs/NCP_SETUP.md](./docs/NCP_SETUP.md).
 
+## Multi-tool sharing
+
+Each coding tool (Claude Code, Codex, OpenCode) spawns its own `ncp serve`
+process via stdio. They do not share a process, but they all read and write to
+the same `.ncp/store.db` SQLite file — so memory written by one agent is
+immediately visible to any other agent pointing at the same store.
+
+```
+Claude Code  →  ncp serve (process A)  ─┐
+Codex        →  ncp serve (process B)  ─┤─  .ncp/store.db
+OpenCode     →  ncp serve (process C)  ─┘
+```
+
+The store is the shared memory substrate. Each tool manages its own server
+lifecycle; you do not need to coordinate processes.
+
 ## Provider Notes
 
 - `GeminiAdapter` is currently implemented against `google.generativeai`, which is deprecated upstream. The adapter is functionally green in tests, but a future follow-up should migrate it to `google.genai` once that dependency path is available in the supported environment.

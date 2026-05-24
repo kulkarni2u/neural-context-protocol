@@ -73,13 +73,15 @@ def status_command(cwd: Path) -> None:
 
 
 @main.command("serve")
+@click.option("--cwd", type=click.Path(path_type=Path), default=None,
+              help="Project root used to resolve .ncp/config.toml when the MCP host launches from another directory.")
 @click.option("--store-path", type=click.Path(path_type=Path), default=None,
               help="Path to the NCP store. Defaults to .ncp/store.db from config.")
-def serve_command(store_path: Path | None) -> None:
+def serve_command(cwd: Path | None, store_path: Path | None) -> None:
     """Start the MCP stdio server for Claude Code integration."""
 
     from ncp.mcp.server import serve as mcp_serve
-    mcp_serve(store_path=store_path)
+    mcp_serve(store_path=store_path, cwd=cwd)
 
 
 @main.command("dogfood")

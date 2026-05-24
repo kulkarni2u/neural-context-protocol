@@ -47,7 +47,7 @@ class TestInitialize:
         result = json.loads(resp)["result"]
         assert result["protocolVersion"] == "2024-11-05"
         assert result["serverInfo"]["name"] == "ncp"
-        assert result["capabilities"]["tools"] == {}
+        assert result["capabilities"]["tools"] == {"listChanged": False}
 
     def test_stdio_framing_round_trip(self, tmp_path: Path) -> None:
         project = tmp_path / "repo"

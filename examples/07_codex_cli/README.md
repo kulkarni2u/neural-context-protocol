@@ -13,8 +13,12 @@ project that already has `ncp init` applied.
 
 ```bash
 ncp init
-ncp serve
+ncp serve --cwd /path/to/your/project
 ```
+
+Use the explicit `--cwd` form in MCP configs. Some hosts spawn the server from
+outside the repo root, and NCP needs the project path to resolve the right
+store and config reliably.
 
 ## Session reminder
 

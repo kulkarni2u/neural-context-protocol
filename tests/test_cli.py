@@ -28,6 +28,23 @@ def test_cli_status_renders_table(tmp_path: Path) -> None:
     assert "Chunks" in result.output
 
 
+def test_cli_serve_passes_explicit_cwd(monkeypatch: object, tmp_path: Path) -> None:
+    called: dict[str, object] = {}
+
+    def fake_serve(*, store_path: Path | None = None, cwd: Path | None = None) -> None:
+        called["store_path"] = store_path
+        called["cwd"] = cwd
+
+    monkeypatch.setattr("ncp.mcp.server.serve", fake_serve)
+    runner = CliRunner()
+
+    result = runner.invoke(main, ["serve", "--cwd", str(tmp_path)])
+
+    assert result.exit_code == 0
+    assert called["cwd"] == tmp_path
+    assert called["store_path"] is None
+
+
 def test_cli_status_reports_store_unavailable_cleanly(tmp_path: Path) -> None:
     runner = CliRunner()
     runner.invoke(main, ["init", "--cwd", str(tmp_path)])

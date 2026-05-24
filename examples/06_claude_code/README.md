@@ -12,8 +12,12 @@ This folder shows the minimum V1 setup for running NCP inside Claude Code.
 ```bash
 ncp init
 cp examples/06_claude_code/mcp_servers.json ~/.claude/mcp_servers.json
-ncp serve
+ncp serve --cwd /path/to/your/project
 ```
+
+The explicit `--cwd` matters. Some MCP hosts launch the server from a session
+directory that is not your project root. Without that flag, `ncp serve` can
+resolve the wrong `.ncp/config.toml` and the tools may fail to register.
 
 ## Expected tools
 
