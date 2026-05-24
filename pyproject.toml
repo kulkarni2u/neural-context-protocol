@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ncp-sdk"
+version = "0.1.0a0"
+description = "Neural Context Protocol (NCP): bounded, persistent context for multi-agent pipelines."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "kulkarni2u" }]
+license = "MIT"
+dependencies = [
+  "pydantic>=2.7",
+  "rank-bm25>=0.2.2",
+  "click>=8.1",
+  "rich>=13.0",
+  "httpx>=0.27",
+  "anyio>=4.3",
+  "orjson>=3.10",
+  "structlog>=24.0",
+]
+
+[project.optional-dependencies]
+providers = [
+  "anthropic",
+  "openai",
+  "google-generativeai",
+  "mistralai",
+  "cohere",
+]
+http = ["aiohttp"]
+redis = ["redis"]
+pgvector = ["psycopg2-binary", "pgvector"]
+dev = [
+  "pytest",
+  "pytest-asyncio",
+  "pytest-httpx",
+  "pytest-cov",
+  "ruff",
+  "mypy",
+]
+
+[project.scripts]
+ncp = "ncp.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "."}
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ncp*"]
+
+[tool.setuptools.package-data]
+ncp = ["templates/*.example"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

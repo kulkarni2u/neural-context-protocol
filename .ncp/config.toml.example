@@ -1,0 +1,28 @@
+[store]
+type = "sqlite"
+path = ".ncp/store.db"
+
+[pipeline]
+default_ttl_hours = 24
+max_working_chunks = 500
+gc_threshold = 400
+cold_start_retry = 2
+
+[budget]
+max_tokens_per_call = 4000
+warn_at_ratio = 0.70
+critical_at_ratio = 0.85
+
+[chunking]
+max_chunk_tokens = 200
+default_type = "auto"
+
+[whispers]
+default_ttl_seconds = 60
+max_per_drain = 3
+min_confidence = 0.60
+
+[observability]
+log_level = "info"
+log_format = "pretty"
+cost_tracking = true

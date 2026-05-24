@@ -1,0 +1,6 @@
+{
+  "ncp": {
+    "command": "ncp",
+    "args": ["serve"]
+  }
+}

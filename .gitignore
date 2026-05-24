@@ -1,0 +1,25 @@
+.DS_Store
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+__pycache__/
+*.pyc
+dist/
+build/
+*.egg-info/
+.ncp/store.db
+.sarathi
+.gstack/
+.claude/
+policy-pack/
+SARATHI.md
+
+# Internal working docs
+docs/CLAUDE_STABILIZATION.md
+docs/OPENCODE_STABILIZATION.md
+docs/NCP_PRE_MCP_DOGFOOD_PATH.md
+docs/NCP_PROVIDER_PARITY_HARNESS.md
+docs/NCP_V1_BUILD_PLAN.md
+docs/NCP_V1_README_POSITIONING.md
+docs/NCP_V1_RELEASE_CHECKLIST.md
