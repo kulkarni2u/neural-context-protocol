@@ -332,30 +332,13 @@ class SQLiteStore(BaseStore):
         now = time.time()
         with self._connect() as connection:
             connection.execute("DELETE FROM whispers WHERE expires_at <= ?", (now,))
-            clauses = ["expires_at > ?", "target IN (?, '*')"]
-            params: list[object] = [now, agent_id]
-            if pipeline_id is None:
-                clauses.append("pipeline_id IS NULL")
-            else:
-                clauses.append("pipeline_id = ?")
-                params.append(pipeline_id)
-            rows = connection.execute(
-                f"""
-                SELECT * FROM whispers
-                WHERE {' AND '.join(clauses)}
-                ORDER BY CASE WHEN whisper_type = 'alert' THEN 0 ELSE 1 END, created_at ASC
-                """,
-                params,
-            ).fetchall()
-
-            drained: list[Whisper] = []
-            for row in rows:
-                whisper = self._row_to_whisper(row)
-                if whisper.whisper_type not in {"alert", "world_check"} and whisper.confidence < min_confidence:
-                    continue
-                drained.append(whisper)
-                if len(drained) >= max_items:
-                    break
+            drained = self._select_whispers(
+                connection,
+                agent_id=agent_id,
+                pipeline_id=pipeline_id,
+                max_items=max_items,
+                min_confidence=min_confidence,
+            )
 
             if drained:
                 connection.executemany(
@@ -363,6 +346,39 @@ class SQLiteStore(BaseStore):
                     [(whisper.whisper_id,) for whisper in drained],
                 )
             return drained
+
+    def peek_whispers(
+        self,
+        *,
+        agent_id: str,
+        pipeline_id: str | None = None,
+        max_items: int = 3,
+        min_confidence: float = 0.60,
+    ) -> list[Whisper]:
+        """Return eligible whispers without consuming them."""
+
+        now = time.time()
+        with self._connect() as connection:
+            connection.execute("DELETE FROM whispers WHERE expires_at <= ?", (now,))
+            return self._select_whispers(
+                connection,
+                agent_id=agent_id,
+                pipeline_id=pipeline_id,
+                max_items=max_items,
+                min_confidence=min_confidence,
+            )
+
+    def acknowledge_whispers(self, whisper_ids: Sequence[str]) -> int:
+        """Delete already-processed whispers by id."""
+
+        if not whisper_ids:
+            return 0
+        with self._connect() as connection:
+            cursor = connection.executemany(
+                "DELETE FROM whispers WHERE whisper_id = ?",
+                [(whisper_id,) for whisper_id in whisper_ids],
+            )
+            return int(cursor.rowcount)
 
     def log_turn_record(self, record: TurnRecord) -> None:
         with self._connect() as connection:
@@ -849,6 +865,41 @@ class SQLiteStore(BaseStore):
             ttl_seconds=ttl_seconds,
             pipeline_id=row["pipeline_id"],
         )
+
+    def _select_whispers(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        agent_id: str,
+        pipeline_id: str | None,
+        max_items: int,
+        min_confidence: float,
+    ) -> list[Whisper]:
+        clauses = ["expires_at > ?", "target IN (?, '*')"]
+        params: list[object] = [time.time(), agent_id]
+        if pipeline_id is None:
+            clauses.append("pipeline_id IS NULL")
+        else:
+            clauses.append("pipeline_id = ?")
+            params.append(pipeline_id)
+        rows = connection.execute(
+            f"""
+            SELECT * FROM whispers
+            WHERE {' AND '.join(clauses)}
+            ORDER BY CASE WHEN whisper_type = 'alert' THEN 0 ELSE 1 END, created_at ASC
+            """,
+            params,
+        ).fetchall()
+
+        selected: list[Whisper] = []
+        for row in rows:
+            whisper = self._row_to_whisper(row)
+            if whisper.whisper_type not in {"alert", "world_check"} and whisper.confidence < min_confidence:
+                continue
+            selected.append(whisper)
+            if len(selected) >= max_items:
+                break
+        return selected
 
     def _with_runtime_age(self, chunk: SubconsciousChunk) -> SubconsciousChunk:
         return chunk.model_copy(update={"age_seconds": max(0.0, chunk.age_seconds)})

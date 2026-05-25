@@ -73,6 +73,7 @@ def main() -> int:
         cmd.append("--bare")
     if args.json_schema:
         cmd.extend(["--json-schema", args.json_schema])
+    cmd.append("--")
     cmd.append(prompt)
 
     started_at = time.monotonic()

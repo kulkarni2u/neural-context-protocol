@@ -296,6 +296,8 @@ def test_claude_cli_adapter_default_command_adds_repo_dir(
     assert isinstance(command, list)
     assert "--add-dir" in command
     assert command[command.index("--add-dir") + 1] == str(tmp_path)
+    assert "--" in command
+    assert command[-1] == "turn"
     assert captured["cwd"] == tmp_path
 
 

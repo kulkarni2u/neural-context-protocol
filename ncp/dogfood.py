@@ -126,6 +126,7 @@ class ClaudeCLIDogfoodAdapter(BaseAdapter):
             "--dangerously-skip-permissions",
             "--add-dir",
             str(self._cwd),
+            "--",
         ]
 
     def call(self, ncp_context: str, user_turn: str) -> str:
