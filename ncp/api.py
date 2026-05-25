@@ -1,4 +1,4 @@
-"""Public API helpers for the SQLite-first NCP runtime."""
+"""Public API helpers for the NCP runtime."""
 
 from __future__ import annotations
 
@@ -9,7 +9,8 @@ from ncp.adapters.base import BaseAdapter
 from ncp.adapters.local import LocalAdapter
 from ncp.assembler import Assembler
 from ncp.config import NCPConfig, load_config
-from ncp.stores.sqlite import SQLiteStore
+from ncp.stores.base import BaseStore
+from ncp.stores.factory import create_store
 from ncp.types import BudgetContext, ConsciousBlock, NCPResponse, SubconsciousChunk, Whisper
 
 _CONFIG: NCPConfig | None = None
@@ -59,13 +60,13 @@ def get_context(
     agent: ConsciousBlock,
     budget: BudgetContext | None = None,
     query_text: str | None = None,
-    store: SQLiteStore | None = None,
+    store: BaseStore | None = None,
     config: NCPConfig | None = None,
 ) -> str:
     """Assemble raw pidgin context for one agent turn."""
 
     resolved_config = config or _CONFIG or configure(cwd=Path.cwd())
-    resolved_store = store or SQLiteStore(resolved_config.store_path)
+    resolved_store = store or create_store(resolved_config)
     assembler = Assembler(store=resolved_store)
     return assembler.assemble(
         conscious=agent,
@@ -77,26 +78,26 @@ def get_context(
 def write_memory(
     chunk: SubconsciousChunk,
     *,
-    store: SQLiteStore | None = None,
+    store: BaseStore | None = None,
     config: NCPConfig | None = None,
 ) -> bool:
     """Persist one chunk through the public API."""
 
     resolved_config = config or _CONFIG or configure(cwd=Path.cwd())
-    resolved_store = store or SQLiteStore(resolved_config.store_path)
+    resolved_store = store or create_store(resolved_config)
     return resolved_store.write(chunk)
 
 
 def emit(
     whisper: Whisper,
     *,
-    store: SQLiteStore | None = None,
+    store: BaseStore | None = None,
     config: NCPConfig | None = None,
 ) -> None:
     """Persist one whisper through the public API."""
 
     resolved_config = config or _CONFIG or configure(cwd=Path.cwd())
-    resolved_store = store or SQLiteStore(resolved_config.store_path)
+    resolved_store = store or create_store(resolved_config)
     resolved_store.emit_whisper(whisper)
 
 
@@ -107,13 +108,13 @@ def run(
     adapter: BaseAdapter | None = None,
     budget: BudgetContext | None = None,
     query_text: str | None = None,
-    store: SQLiteStore | None = None,
+    store: BaseStore | None = None,
     config: NCPConfig | None = None,
 ) -> NCPResponse:
     """Run one blocking local-runtime call through an adapter."""
 
     resolved_config = config or _CONFIG or configure(cwd=Path.cwd())
-    resolved_store = store or SQLiteStore(resolved_config.store_path)
+    resolved_store = store or create_store(resolved_config)
     resolved_budget = budget or BudgetContext()
     resolved_adapter = adapter or LocalAdapter()
     assembler = Assembler(store=resolved_store)
@@ -150,13 +151,13 @@ def stream(
     adapter: BaseAdapter | None = None,
     budget: BudgetContext | None = None,
     query_text: str | None = None,
-    store: SQLiteStore | None = None,
+    store: BaseStore | None = None,
     config: NCPConfig | None = None,
 ):
     """Yield a streamed response through the adapter."""
 
     resolved_config = config or _CONFIG or configure(cwd=Path.cwd())
-    resolved_store = store or SQLiteStore(resolved_config.store_path)
+    resolved_store = store or create_store(resolved_config)
     resolved_budget = budget or BudgetContext()
     resolved_adapter = adapter or LocalAdapter()
     assembler = Assembler(store=resolved_store)

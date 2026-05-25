@@ -58,12 +58,29 @@ def test_load_config_exposes_redis_and_pgvector_settings(tmp_path: Path) -> None
     assert config.pgvector_table_prefix == "demo_"
 
 
-def test_load_config_rejects_forward_compatible_store_types(tmp_path: Path) -> None:
+def test_load_config_allows_pgvector_store_type(tmp_path: Path) -> None:
+    project = tmp_path / "repo"
+    (project / ".git").mkdir(parents=True)
+
+    config = load_config(cwd=project, env={"NCP_STORE_TYPE": "pgvector"})
+
+    assert config.store_type == "pgvector"
+
+
+def test_load_config_rejects_redis_store_type(tmp_path: Path) -> None:
     project = tmp_path / "repo"
     (project / ".git").mkdir(parents=True)
 
     with pytest.raises(NotImplementedError, match="forward compatibility"):
         load_config(cwd=project, env={"NCP_STORE_TYPE": "redis"})
+
+
+def test_load_config_rejects_unknown_store_type(tmp_path: Path) -> None:
+    project = tmp_path / "repo"
+    (project / ".git").mkdir(parents=True)
+
+    with pytest.raises(ValueError, match="Unsupported store type"):
+        load_config(cwd=project, env={"NCP_STORE_TYPE": "mystery"})
 
 
 def test_find_project_root_walks_up_tree(tmp_path: Path) -> None:

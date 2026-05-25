@@ -212,6 +212,20 @@ def test_cli_status_reports_store_unavailable_cleanly(tmp_path: Path) -> None:
     assert "SQLite store unavailable" in result.output
 
 
+def test_cli_status_reports_pgvector_rollout_boundary(tmp_path: Path) -> None:
+    runner = CliRunner()
+    runner.invoke(main, ["init", "--cwd", str(tmp_path)])
+
+    result = runner.invoke(
+        main,
+        ["status", "--cwd", str(tmp_path)],
+        env={"NCP_STORE_TYPE": "pgvector"},
+    )
+
+    assert result.exit_code != 0
+    assert "currently supports sqlite only" in result.output
+
+
 def test_cli_emit_writes_whisper(tmp_path: Path) -> None:
     runner = CliRunner()
     runner.invoke(main, ["init", "--cwd", str(tmp_path)])

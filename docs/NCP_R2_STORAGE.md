@@ -18,8 +18,9 @@ shell out to Docker or Podman.
 
 Today:
 
-- SQLite remains the only implemented store
-- `redis` and `pgvector` remain forward-compatible config values
+- SQLite remains the default and only fully implemented store
+- `store.type = "pgvector"` now boots a real schema-initializing durable-store skeleton
+- `store.type = "redis"` remains explicitly deferred
 - local infra is now scaffolded with `compose.yaml`
 - helper scripts exist:
   - `scripts/infra_up.sh`
@@ -72,9 +73,9 @@ Defaults:
 
 The next real `0.2.0` code slice should be:
 
-1. pgvector backend skeleton with real schema creation
-2. backend selection helper from config
-3. Redis-backed ephemeral coordination helper for whispers and fetch sessions
-4. integration tests against the local infra path
+1. durable chunk/query/write paths on pgvector
+2. Redis-backed ephemeral coordination helper for whispers and fetch sessions
+3. integration tests against the local infra path
+4. reporting parity beyond the current SQLite-only `status`, `cost`, and `explain` commands
 
 Do not start both deep backends at once before pgvector proves the durable path.

@@ -16,7 +16,8 @@ from typing import BinaryIO
 
 from ncp.assembler import Assembler
 from ncp.config import load_config
-from ncp.stores.sqlite import SQLiteStore
+from ncp.stores.base import BaseStore
+from ncp.stores.factory import create_store
 from ncp.types import BudgetContext, ConsciousBlock, SubconsciousChunk, Whisper
 
 
@@ -140,7 +141,7 @@ def _session_id_from_args(args: dict[str, object]) -> str:
     return DEFAULT_FETCH_SESSION_ID
 
 
-def make_handlers(store: SQLiteStore) -> dict[str, ToolHandler]:
+def make_handlers(store: BaseStore) -> dict[str, ToolHandler]:
     sessions: dict[str, FetchSession] = {}
     last_session_id = DEFAULT_FETCH_SESSION_ID
 
@@ -337,7 +338,7 @@ def _create_handlers(
         config = load_config(env={"NCP_STORE_PATH": str(store_path)})
     else:
         config = load_config(cwd=cwd or Path.cwd())
-    store = SQLiteStore(config.store_path)
+    store = create_store(config)
     return make_handlers(store)
 
 

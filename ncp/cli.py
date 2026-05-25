@@ -12,7 +12,10 @@ from rich.console import Console
 from rich.table import Table
 
 import ncp
+from ncp.config import NCPConfig
+from ncp.stores.base import BaseStore
 from ncp.stores.base import NCPStoreUnavailableError
+from ncp.stores.factory import create_store
 from ncp.stores.sqlite import SQLiteStore
 from ncp.types import Whisper
 
@@ -29,6 +32,24 @@ CLAUDE_MD_TEMPLATE = """# NCP Conventions
 
 def _load_config_template() -> str:
     return resources.files("ncp").joinpath("templates/config.toml.example").read_text()
+
+
+def _require_sqlite_reporting(config: NCPConfig, command_name: str) -> SQLiteStore:
+    if config.store_type != "sqlite":
+        raise click.ClickException(
+            f"`ncp {command_name}` currently supports sqlite only. "
+            f"The {config.store_type} backend is still in the 0.2.0 rollout."
+        )
+    return SQLiteStore(config.store_path)
+
+
+def _resolve_runtime_store(config: NCPConfig) -> BaseStore:
+    try:
+        return create_store(config)
+    except NCPStoreUnavailableError as exc:
+        raise click.ClickException(str(exc)) from exc
+    except NotImplementedError as exc:
+        raise click.ClickException(str(exc)) from exc
 
 
 def _format_ts(value: float | None) -> str:
@@ -133,7 +154,7 @@ def status_command(cwd: Path, pipeline_id: str | None, json_output: bool) -> Non
 
     try:
         config = ncp.configure(cwd=cwd)
-        store = SQLiteStore(config.store_path)
+        store = _require_sqlite_reporting(config, "status")
         detail = store.status_detail(pipeline_id=pipeline_id)
     except NCPStoreUnavailableError as exc:
         raise click.ClickException(str(exc)) from exc
@@ -197,7 +218,7 @@ def cost_command(cwd: Path, pipeline_id: str | None, limit: int, json_output: bo
 
     try:
         config = ncp.configure(cwd=cwd)
-        store = SQLiteStore(config.store_path)
+        store = _require_sqlite_reporting(config, "cost")
         detail = store.cost_summary(pipeline_id=pipeline_id, limit=limit)
     except NCPStoreUnavailableError as exc:
         raise click.ClickException(str(exc)) from exc
@@ -285,7 +306,7 @@ def explain_command(cwd: Path, pipeline_id: str | None, limit: int, json_output:
 
     try:
         config = ncp.configure(cwd=cwd)
-        store = SQLiteStore(config.store_path)
+        store = _require_sqlite_reporting(config, "explain")
         status_detail = store.status_detail(pipeline_id=pipeline_id)
         cost_detail = store.cost_summary(pipeline_id=pipeline_id, limit=limit)
     except NCPStoreUnavailableError as exc:
@@ -475,7 +496,7 @@ def emit_command(
 
     try:
         config = ncp.configure(cwd=cwd)
-        store = SQLiteStore(config.store_path)
+        store = _resolve_runtime_store(config)
         ncp.emit(
             Whisper(
                 from_agent=from_agent,

@@ -68,7 +68,8 @@ Postgres/pgvector and Redis:
 ```
 
 This does not change the current default store. SQLite remains the active
-implementation until the R2 backends land.
+implementation by default. `store.type = "pgvector"` now boots the durable
+schema skeleton, while Redis-backed coordination is still pending.
 
 ## Run the examples
 

@@ -127,10 +127,12 @@ def load_config(
 
     _apply_env_overrides(values, runtime_env)
     store_type = str(values["store"]["type"])
-    if store_type in {"redis", "pgvector"}:
+    if store_type == "redis":
         raise NotImplementedError(
             f"Store type '{store_type}' is accepted for forward compatibility but not implemented in V1."
         )
+    if store_type not in {"sqlite", "pgvector"}:
+        raise ValueError(f"Unsupported store type: {store_type}")
 
     if not Path(str(values["store"]["path"])).is_absolute():
         values["store"]["path"] = str(project_root / str(values["store"]["path"]))
