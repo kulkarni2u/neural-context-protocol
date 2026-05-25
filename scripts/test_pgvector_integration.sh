@@ -35,6 +35,18 @@ if [[ -z "$COMPOSE_CMD" ]]; then
   exit 1
 fi
 
+STARTED_POSTGRES=0
+
+cleanup() {
+  local status=$?
+  if [[ "$STARTED_POSTGRES" -eq 1 && "${NCP_KEEP_INFRA:-0}" != "1" ]]; then
+    $COMPOSE_CMD -f "$COMPOSE_FILE" down >/dev/null 2>&1 || true
+  fi
+  exit "$status"
+}
+
+trap cleanup EXIT
+
 python3 - <<'PY'
 import importlib.util
 import sys
@@ -46,6 +58,7 @@ PY
 
 echo "Using: $COMPOSE_CMD"
 $COMPOSE_CMD -f "$COMPOSE_FILE" up -d postgres
+STARTED_POSTGRES=1
 
 python3 - <<'PY'
 import os
