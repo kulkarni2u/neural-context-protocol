@@ -5,6 +5,7 @@ from click.testing import CliRunner
 
 from ncp.cli import main
 from ncp.stores.sqlite import SQLiteStore
+from ncp.types import SubconsciousChunk
 
 
 def test_cli_init_creates_config_and_claude_md(tmp_path: Path) -> None:
@@ -26,6 +27,52 @@ def test_cli_status_renders_table(tmp_path: Path) -> None:
     assert result.exit_code == 0
     assert "NCP Status" in result.output
     assert "Chunks" in result.output
+
+
+def test_cli_status_json_and_cost_command(tmp_path: Path) -> None:
+    runner = CliRunner()
+    runner.invoke(main, ["init", "--cwd", str(tmp_path)])
+    store = SQLiteStore(tmp_path / ".ncp" / "store.db")
+    store.write(
+        SubconsciousChunk(
+            chunk_id="sub_status",
+            layer="semantic",
+            content="status example chunk",
+            src="tool_result",
+            pipeline_id="pipe_cli",
+        )
+    )
+    store.log_cost_raw(
+        agent_id="planner",
+        model="claude-sonnet",
+        input_tokens=120,
+        output_tokens=18,
+        cost_usd=0.021,
+        pipeline_id="pipe_cli",
+        turn_id="turn_cost_cli",
+        latency_ms=180,
+    )
+
+    status_result = runner.invoke(
+        main,
+        ["status", "--cwd", str(tmp_path), "--pipeline-id", "pipe_cli", "--json-output"],
+    )
+    cost_result = runner.invoke(
+        main,
+        ["cost", "--cwd", str(tmp_path), "--pipeline-id", "pipe_cli", "--json-output"],
+    )
+
+    assert status_result.exit_code == 0
+    status_payload = json.loads(status_result.output)
+    assert status_payload["pipeline_id"] == "pipe_cli"
+    assert status_payload["overview"]["chunk_count"] == 1
+    assert status_payload["layer_counts"]["semantic"] == 1
+
+    assert cost_result.exit_code == 0
+    cost_payload = json.loads(cost_result.output)
+    assert cost_payload["pipeline_id"] == "pipe_cli"
+    assert cost_payload["summary"]["cost_usd_total"] == 0.021
+    assert cost_payload["recent_entries"][0]["turn_id"] == "turn_cost_cli"
 
 
 def test_cli_serve_passes_explicit_cwd(monkeypatch: object, tmp_path: Path) -> None:

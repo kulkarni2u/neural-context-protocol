@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from importlib import resources
 from pathlib import Path
 
 import click
+from rich import box
 from rich.console import Console
 from rich.table import Table
 
@@ -27,6 +29,12 @@ CLAUDE_MD_TEMPLATE = """# NCP Conventions
 
 def _load_config_template() -> str:
     return resources.files("ncp").joinpath("templates/config.toml.example").read_text()
+
+
+def _format_ts(value: float | None) -> str:
+    if value is None:
+        return "-"
+    return datetime.fromtimestamp(value).isoformat(timespec="seconds")
 
 
 @click.group()
@@ -52,24 +60,153 @@ def init_command(cwd: Path) -> None:
 
 @main.command("status")
 @click.option("--cwd", type=click.Path(path_type=Path), default=Path.cwd)
-def status_command(cwd: Path) -> None:
-    """Show basic SQLite-first NCP store status."""
+@click.option("--pipeline-id", default=None, help="Optional pipeline filter for richer status detail.")
+@click.option("--json-output", is_flag=True, help="Emit machine-readable JSON instead of tables.")
+def status_command(cwd: Path, pipeline_id: str | None, json_output: bool) -> None:
+    """Show rich SQLite-first NCP store status."""
 
     try:
         config = ncp.configure(cwd=cwd)
         store = SQLiteStore(config.store_path)
-        status = store.status()
+        detail = store.status_detail(pipeline_id=pipeline_id)
     except NCPStoreUnavailableError as exc:
         raise click.ClickException(str(exc)) from exc
-    table = Table(title="NCP Status")
+    payload = {
+        "store_path": str(config.store_path),
+        "pipeline_id": pipeline_id,
+        **detail,
+    }
+    if json_output:
+        console.print_json(data=payload)
+        return
+
+    overview = detail["overview"]
+    table = Table(title="NCP Status", box=box.SIMPLE_HEAVY)
     table.add_column("Metric")
     table.add_column("Value", justify="right")
     table.add_row("Store", str(config.store_path))
-    table.add_row("Chunks", str(status["chunk_count"]))
-    table.add_row("Whispers", str(status["whisper_count"]))
-    table.add_row("Turn records", str(status["turn_record_count"]))
-    table.add_row("Cost USD", f"{status['cost_usd_total']:.4f}")
+    table.add_row("Pipeline filter", pipeline_id or "all")
+    table.add_row("Chunks", str(overview["chunk_count"]))
+    table.add_row("Tombstones", str(overview["tombstone_count"]))
+    table.add_row("Whispers", str(overview["whisper_count"]))
+    table.add_row("Turn records", str(overview["turn_record_count"]))
+    table.add_row("Conscious snapshots", str(overview["conscious_snapshot_count"]))
+    table.add_row("Cost entries", str(overview["cost_entry_count"]))
+    table.add_row("Pipelines", str(overview["pipeline_count"]))
+    table.add_row("Cost USD", f"{float(overview['cost_usd_total']):.4f}")
+    table.add_row("Last activity", _format_ts(overview["last_activity_at"]))  # type: ignore[arg-type]
     console.print(table)
+
+    layer_counts = detail["layer_counts"]
+    if layer_counts:
+        layer_table = Table(title="Chunk Layers", box=box.MINIMAL_DOUBLE_HEAD)
+        layer_table.add_column("Layer")
+        layer_table.add_column("Chunks", justify="right")
+        for layer, count in layer_counts.items():
+            layer_table.add_row(str(layer), str(count))
+        console.print(layer_table)
+
+    recent_pipelines = detail["recent_pipelines"]
+    if recent_pipelines and pipeline_id is None:
+        pipeline_table = Table(title="Recent Pipelines", box=box.MINIMAL_DOUBLE_HEAD)
+        pipeline_table.add_column("Pipeline")
+        pipeline_table.add_column("Chunks", justify="right")
+        pipeline_table.add_column("Last chunk")
+        for row in recent_pipelines:
+            pipeline_table.add_row(
+                str(row["pipeline_id"]),
+                str(row["chunk_count"]),
+                _format_ts(float(row["last_chunk_at"])),
+            )
+        console.print(pipeline_table)
+
+
+@main.command("cost")
+@click.option("--cwd", type=click.Path(path_type=Path), default=Path.cwd)
+@click.option("--pipeline-id", default=None, help="Optional pipeline filter.")
+@click.option("--limit", default=10, show_default=True, type=click.IntRange(1, 50))
+@click.option("--json-output", is_flag=True, help="Emit machine-readable JSON instead of tables.")
+def cost_command(cwd: Path, pipeline_id: str | None, limit: int, json_output: bool) -> None:
+    """Show cost totals, rollups, and recent turn cost entries."""
+
+    try:
+        config = ncp.configure(cwd=cwd)
+        store = SQLiteStore(config.store_path)
+        detail = store.cost_summary(pipeline_id=pipeline_id, limit=limit)
+    except NCPStoreUnavailableError as exc:
+        raise click.ClickException(str(exc)) from exc
+    payload = {
+        "store_path": str(config.store_path),
+        "pipeline_id": pipeline_id,
+        **detail,
+    }
+    if json_output:
+        console.print_json(data=payload)
+        return
+
+    summary = detail["summary"]
+    summary_table = Table(title="NCP Cost", box=box.SIMPLE_HEAVY)
+    summary_table.add_column("Metric")
+    summary_table.add_column("Value", justify="right")
+    summary_table.add_row("Store", str(config.store_path))
+    summary_table.add_row("Pipeline filter", pipeline_id or "all")
+    summary_table.add_row("Cost USD", f"{float(summary['cost_usd_total']):.4f}")
+    summary_table.add_row("Entries", str(summary["entry_count"]))
+    summary_table.add_row("Input tokens", str(summary["input_tokens_total"]))
+    summary_table.add_row("Output tokens", str(summary["output_tokens_total"]))
+    summary_table.add_row("Cache read tokens", str(summary["cache_read_tokens_total"]))
+    summary_table.add_row("Avg latency ms", f"{float(summary['avg_latency_ms']):.1f}")
+    console.print(summary_table)
+
+    by_agent = detail["by_agent"]
+    if by_agent:
+        agent_table = Table(title="Cost by Agent", box=box.MINIMAL_DOUBLE_HEAD)
+        agent_table.add_column("Agent")
+        agent_table.add_column("Turns", justify="right")
+        agent_table.add_column("Cost USD", justify="right")
+        for row in by_agent:
+            agent_table.add_row(
+                str(row["agent_id"]),
+                str(row["turns"]),
+                f"{float(row['cost_usd_total']):.4f}",
+            )
+        console.print(agent_table)
+
+    by_model = detail["by_model"]
+    if by_model:
+        model_table = Table(title="Cost by Model", box=box.MINIMAL_DOUBLE_HEAD)
+        model_table.add_column("Model")
+        model_table.add_column("Turns", justify="right")
+        model_table.add_column("Cost USD", justify="right")
+        for row in by_model:
+            model_table.add_row(
+                str(row["model"]),
+                str(row["turns"]),
+                f"{float(row['cost_usd_total']):.4f}",
+            )
+        console.print(model_table)
+
+    recent_entries = detail["recent_entries"]
+    if recent_entries:
+        recent_table = Table(title="Recent Cost Entries", box=box.MINIMAL_DOUBLE_HEAD)
+        recent_table.add_column("Turn")
+        recent_table.add_column("Agent")
+        recent_table.add_column("Model")
+        recent_table.add_column("In", justify="right")
+        recent_table.add_column("Out", justify="right")
+        recent_table.add_column("USD", justify="right")
+        recent_table.add_column("Logged")
+        for row in recent_entries:
+            recent_table.add_row(
+                str(row["turn_id"]),
+                str(row["agent_id"]),
+                str(row["model"]),
+                str(row["input_tokens"]),
+                str(row["output_tokens"]),
+                f"{float(row['cost_usd']):.4f}",
+                _format_ts(float(row["logged_at"])),
+            )
+        console.print(recent_table)
 
 
 @main.command("serve")

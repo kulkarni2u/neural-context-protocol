@@ -33,10 +33,12 @@ This creates:
 
 ```bash
 ncp status
+ncp cost
 ```
 
 This verifies that the local SQLite-backed store can be opened and that the CLI
-is wired correctly.
+is wired correctly. `ncp status` surfaces store and activity rollups; `ncp cost`
+surfaces token and USD rollups from `cost_log`.
 
 ## Start the MCP server
 

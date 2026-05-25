@@ -229,3 +229,83 @@ def test_sqlite_store_logs_conscious_and_cost(tmp_path: Path) -> None:
     status = store.status()
 
     assert status["cost_usd_total"] == 0.05
+
+
+def test_sqlite_store_status_detail_and_cost_summary(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "store.db")
+    store.write(
+        SubconsciousChunk(
+            chunk_id="sub_semantic",
+            layer="semantic",
+            content="semantic chunk",
+            src="tool_result",
+            pipeline_id="pipe_alpha",
+        )
+    )
+    store.write(
+        SubconsciousChunk(
+            chunk_id="sub_procedural",
+            layer="procedural",
+            content="procedural chunk",
+            src="synthesis",
+            pipeline_id="pipe_alpha",
+        )
+    )
+    store.emit_whisper(
+        Whisper(
+            from_agent="planner",
+            target="executor",
+            whisper_type="nudge",
+            payload="check_alpha",
+            confidence=0.9,
+            pipeline_id="pipe_alpha",
+        )
+    )
+    store.log_turn_record(
+        TurnRecord(
+            turn_id="turn_alpha",
+            agent_id="planner",
+            pipeline_id="pipe_alpha",
+            task="status_slice",
+            slot="inspect",
+            result="summary",
+            result_full="summary full",
+        )
+    )
+    conscious = ConsciousBlock(
+        agent_id="planner",
+        role="decompose",
+        owns=["planning"],
+        must_not=["shipping"],
+        task="status_slice",
+        slot="inspect",
+        intent="show_rollup",
+        pipeline_id="pipe_alpha",
+    )
+    response = NCPResponse(
+        content="done",
+        input_tokens=150,
+        output_tokens=30,
+        cost_usd=0.0125,
+        model="claude_sonnet",
+        pipeline_id="pipe_alpha",
+        turn_id="turn_cost_alpha",
+        latency_ms=250,
+    )
+    store.log_conscious(conscious, snapshot_hash="hash_alpha")
+    store.log_cost(agent_id="planner", response=response)
+
+    detail = store.status_detail()
+    filtered = store.status_detail(pipeline_id="pipe_alpha")
+    costs = store.cost_summary(pipeline_id="pipe_alpha", limit=5)
+
+    assert detail["overview"]["chunk_count"] == 2
+    assert detail["overview"]["pipeline_count"] == 1
+    assert detail["layer_counts"] == {"procedural": 1, "semantic": 1}
+    assert detail["recent_pipelines"][0]["pipeline_id"] == "pipe_alpha"
+    assert filtered["overview"]["whisper_count"] == 1
+    assert costs["summary"]["cost_usd_total"] == 0.0125
+    assert costs["summary"]["input_tokens_total"] == 150
+    assert costs["by_agent"][0]["agent_id"] == "planner"
+    assert costs["by_model"][0]["model"] == "claude_sonnet"
+    assert costs["recent_entries"][0]["turn_id"] == "turn_cost_alpha"

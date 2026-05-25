@@ -2,6 +2,13 @@
 
 All notable changes to Neural Context Protocol will be documented in this file.
 
+## Unreleased
+
+### Added
+
+- richer `ncp status` output with chunk, tombstone, layer, pipeline, and last-activity visibility
+- new `ncp cost` command with total, per-agent, per-model, and recent-entry rollups
+
 ## 0.1.0a1 - 2026-05-24
 
 Follow-up alpha release to publish under the PyPI-owned project name

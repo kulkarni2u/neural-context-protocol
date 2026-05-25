@@ -54,13 +54,15 @@ pip install -e .
 ncp init
 ncp serve --host 127.0.0.1 --port 4242 --cwd /path/to/project
 ncp status --cwd /path/to/project
+ncp cost --cwd /path/to/project
 ```
 
 Expected success signals:
 
 - `ncp init` creates `.ncp/config.toml` and `CLAUDE.md`
 - `ncp serve` starts the local HTTP MCP server on `127.0.0.1:4242`
-- `ncp status` prints store metrics such as chunk count and whisper count
+- `ncp status` prints store, chunk, layer, pipeline, and activity metrics
+- `ncp cost` prints cost totals plus per-agent/per-model rollups
 
 Published alpha install path:
 

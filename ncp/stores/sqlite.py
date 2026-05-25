@@ -511,6 +511,273 @@ class SQLiteStore(BaseStore):
             "cost_usd_total": float(costs),
         }
 
+    def status_detail(self, *, pipeline_id: str | None = None) -> dict[str, object]:
+        with self._connect() as connection:
+            overview = {
+                "chunk_count": int(
+                    connection.execute(
+                        "SELECT COUNT(*) AS count FROM chunks WHERE pipeline_id = ?"
+                        if pipeline_id is not None
+                        else "SELECT COUNT(*) AS count FROM chunks",
+                        [] if pipeline_id is None else [pipeline_id],
+                    ).fetchone()["count"]
+                ),
+                "tombstone_count": int(
+                    connection.execute("SELECT COUNT(*) AS count FROM tombstones").fetchone()["count"]
+                ),
+                "whisper_count": int(
+                    connection.execute(
+                        "SELECT COUNT(*) AS count FROM whispers WHERE pipeline_id = ?"
+                        if pipeline_id is not None
+                        else "SELECT COUNT(*) AS count FROM whispers",
+                        [] if pipeline_id is None else [pipeline_id],
+                    ).fetchone()["count"]
+                ),
+                "turn_record_count": int(
+                    connection.execute(
+                        "SELECT COUNT(*) AS count FROM turn_records WHERE pipeline_id = ?"
+                        if pipeline_id is not None
+                        else "SELECT COUNT(*) AS count FROM turn_records",
+                        [] if pipeline_id is None else [pipeline_id],
+                    ).fetchone()["count"]
+                ),
+                "conscious_snapshot_count": int(
+                    connection.execute(
+                        "SELECT COUNT(*) AS count FROM conscious_log WHERE pipeline_id = ?"
+                        if pipeline_id is not None
+                        else "SELECT COUNT(*) AS count FROM conscious_log",
+                        [] if pipeline_id is None else [pipeline_id],
+                    ).fetchone()["count"]
+                ),
+                "cost_entry_count": int(
+                    connection.execute(
+                        "SELECT COUNT(*) AS count FROM cost_log WHERE pipeline_id = ?"
+                        if pipeline_id is not None
+                        else "SELECT COUNT(*) AS count FROM cost_log",
+                        [] if pipeline_id is None else [pipeline_id],
+                    ).fetchone()["count"]
+                ),
+            }
+            overview["pipeline_count"] = int(
+                connection.execute(
+                    "SELECT COUNT(DISTINCT pipeline_id) AS count FROM chunks",
+                ).fetchone()["count"]
+            )
+            overview["cost_usd_total"] = float(
+                connection.execute(
+                    "SELECT COALESCE(SUM(cost_usd), 0.0) AS total FROM cost_log WHERE pipeline_id = ?"
+                    if pipeline_id is not None
+                    else "SELECT COALESCE(SUM(cost_usd), 0.0) AS total FROM cost_log",
+                    [] if pipeline_id is None else [pipeline_id],
+                ).fetchone()["total"]
+            )
+            latest_chunk = connection.execute(
+                "SELECT MAX(created_at) AS latest FROM chunks WHERE pipeline_id = ?"
+                if pipeline_id is not None
+                else "SELECT MAX(created_at) AS latest FROM chunks",
+                [] if pipeline_id is None else [pipeline_id],
+            ).fetchone()["latest"]
+            latest_whisper = connection.execute(
+                "SELECT MAX(created_at) AS latest FROM whispers WHERE pipeline_id = ?"
+                if pipeline_id is not None
+                else "SELECT MAX(created_at) AS latest FROM whispers",
+                [] if pipeline_id is None else [pipeline_id],
+            ).fetchone()["latest"]
+            latest_turn = connection.execute(
+                "SELECT MAX(created_at) AS latest FROM turn_records WHERE pipeline_id = ?"
+                if pipeline_id is not None
+                else "SELECT MAX(created_at) AS latest FROM turn_records",
+                [] if pipeline_id is None else [pipeline_id],
+            ).fetchone()["latest"]
+            latest_cost = connection.execute(
+                "SELECT MAX(logged_at) AS latest FROM cost_log WHERE pipeline_id = ?"
+                if pipeline_id is not None
+                else "SELECT MAX(logged_at) AS latest FROM cost_log",
+                [] if pipeline_id is None else [pipeline_id],
+            ).fetchone()["latest"]
+            activity_candidates = [
+                value for value in (latest_chunk, latest_whisper, latest_turn, latest_cost) if value is not None
+            ]
+            overview["last_activity_at"] = max(activity_candidates) if activity_candidates else None
+
+            layer_rows = connection.execute(
+                """
+                SELECT layer, COUNT(*) AS count
+                FROM chunks
+                WHERE pipeline_id = ?
+                GROUP BY layer
+                ORDER BY count DESC, layer ASC
+                """,
+                [pipeline_id],
+            ).fetchall() if pipeline_id is not None else connection.execute(
+                """
+                SELECT layer, COUNT(*) AS count
+                FROM chunks
+                GROUP BY layer
+                ORDER BY count DESC, layer ASC
+                """
+            ).fetchall()
+            layer_counts = {str(row["layer"]): int(row["count"]) for row in layer_rows}
+
+            pipeline_rows = connection.execute(
+                """
+                SELECT
+                    pipeline_id,
+                    COUNT(*) AS chunk_count,
+                    MAX(created_at) AS last_chunk_at
+                FROM chunks
+                WHERE pipeline_id IS NOT NULL
+                GROUP BY pipeline_id
+                ORDER BY last_chunk_at DESC
+                LIMIT 5
+                """
+                if pipeline_id is None
+                else """
+                SELECT
+                    pipeline_id,
+                    COUNT(*) AS chunk_count,
+                    MAX(created_at) AS last_chunk_at
+                FROM chunks
+                WHERE pipeline_id = ?
+                GROUP BY pipeline_id
+                ORDER BY last_chunk_at DESC
+                LIMIT 5
+                """,
+                [] if pipeline_id is None else [pipeline_id],
+            ).fetchall()
+            recent_pipelines = [
+                {
+                    "pipeline_id": str(row["pipeline_id"]),
+                    "chunk_count": int(row["chunk_count"]),
+                    "last_chunk_at": float(row["last_chunk_at"]),
+                }
+                for row in pipeline_rows
+                if row["pipeline_id"] is not None
+            ]
+
+        return {
+            "overview": overview,
+            "layer_counts": layer_counts,
+            "recent_pipelines": recent_pipelines,
+        }
+
+    def cost_summary(
+        self,
+        *,
+        pipeline_id: str | None = None,
+        limit: int = 10,
+    ) -> dict[str, object]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if pipeline_id is not None:
+            clauses.append("pipeline_id = ?")
+            params.append(pipeline_id)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+
+        with self._connect() as connection:
+            total_row = connection.execute(
+                f"""
+                SELECT
+                    COALESCE(SUM(cost_usd), 0.0) AS cost_usd_total,
+                    COALESCE(SUM(input_tokens), 0) AS input_tokens_total,
+                    COALESCE(SUM(output_tokens), 0) AS output_tokens_total,
+                    COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens_total,
+                    COUNT(*) AS entry_count,
+                    COALESCE(AVG(latency_ms), 0.0) AS avg_latency_ms
+                FROM cost_log
+                {where}
+                """,
+                params,
+            ).fetchone()
+            by_agent_rows = connection.execute(
+                f"""
+                SELECT
+                    agent_id,
+                    COUNT(*) AS turns,
+                    COALESCE(SUM(cost_usd), 0.0) AS cost_usd_total
+                FROM cost_log
+                {where}
+                GROUP BY agent_id
+                ORDER BY cost_usd_total DESC, agent_id ASC
+                """,
+                params,
+            ).fetchall()
+            by_model_rows = connection.execute(
+                f"""
+                SELECT
+                    model,
+                    COUNT(*) AS turns,
+                    COALESCE(SUM(cost_usd), 0.0) AS cost_usd_total
+                FROM cost_log
+                {where}
+                GROUP BY model
+                ORDER BY cost_usd_total DESC, model ASC
+                """,
+                params,
+            ).fetchall()
+            recent_rows = connection.execute(
+                f"""
+                SELECT
+                    turn_id,
+                    pipeline_id,
+                    agent_id,
+                    model,
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    cost_usd,
+                    latency_ms,
+                    logged_at
+                FROM cost_log
+                {where}
+                ORDER BY logged_at DESC
+                LIMIT ?
+                """,
+                [*params, max(1, limit)],
+            ).fetchall()
+
+        return {
+            "summary": {
+                "cost_usd_total": float(total_row["cost_usd_total"]),
+                "input_tokens_total": int(total_row["input_tokens_total"]),
+                "output_tokens_total": int(total_row["output_tokens_total"]),
+                "cache_read_tokens_total": int(total_row["cache_read_tokens_total"]),
+                "entry_count": int(total_row["entry_count"]),
+                "avg_latency_ms": float(total_row["avg_latency_ms"]),
+            },
+            "by_agent": [
+                {
+                    "agent_id": str(row["agent_id"]),
+                    "turns": int(row["turns"]),
+                    "cost_usd_total": float(row["cost_usd_total"]),
+                }
+                for row in by_agent_rows
+            ],
+            "by_model": [
+                {
+                    "model": str(row["model"]),
+                    "turns": int(row["turns"]),
+                    "cost_usd_total": float(row["cost_usd_total"]),
+                }
+                for row in by_model_rows
+            ],
+            "recent_entries": [
+                {
+                    "turn_id": str(row["turn_id"]),
+                    "pipeline_id": row["pipeline_id"],
+                    "agent_id": str(row["agent_id"]),
+                    "model": str(row["model"]),
+                    "input_tokens": int(row["input_tokens"]),
+                    "output_tokens": int(row["output_tokens"]),
+                    "cache_read_tokens": int(row["cache_read_tokens"]),
+                    "cost_usd": float(row["cost_usd"]),
+                    "latency_ms": int(row["latency_ms"] or 0),
+                    "logged_at": float(row["logged_at"]),
+                }
+                for row in recent_rows
+            ],
+        }
+
     def _load_query_rows(
         self,
         connection: sqlite3.Connection,
