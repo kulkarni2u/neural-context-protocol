@@ -2,6 +2,16 @@
 
 All notable changes to Neural Context Protocol will be documented in this file.
 
+## 0.1.0a1 - 2026-05-24
+
+Follow-up alpha release to publish under the PyPI-owned project name
+`neural-context-protocol`.
+
+### Changed
+
+- PyPI package name changed from `ncp-sdk` to `neural-context-protocol`
+- install documentation updated to reflect the published package name
+
 ## 0.1.0a0 - 2026-05-24
 
 Initial alpha release candidate for the SQLite-first NCP V1 spine with HTTP/SSE

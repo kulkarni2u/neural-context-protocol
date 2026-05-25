@@ -62,10 +62,10 @@ Expected success signals:
 - `ncp serve` starts the local HTTP MCP server on `127.0.0.1:4242`
 - `ncp status` prints store metrics such as chunk count and whisper count
 
-Once the first alpha is published, the install path becomes:
+Published alpha install path:
 
 ```bash
-pip install ncp-sdk
+pip install neural-context-protocol
 ```
 
 For a deeper setup path, see [docs/NCP_SETUP.md](./docs/NCP_SETUP.md).

@@ -3,8 +3,8 @@ requires = ["setuptools>=69", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ncp-sdk"
-version = "0.1.0a0"
+name = "neural-context-protocol"
+version = "0.1.0a1"
 description = "Neural Context Protocol (NCP): bounded, persistent context for multi-agent pipelines."
 readme = "README.md"
 requires-python = ">=3.10"

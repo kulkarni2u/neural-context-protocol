@@ -7,13 +7,13 @@ This guide covers the public first-run setup for Neural Context Protocol.
 Base package:
 
 ```bash
-pip install ncp-sdk
+pip install neural-context-protocol
 ```
 
 With a provider SDK:
 
 ```bash
-pip install 'ncp-sdk[providers]'
+pip install 'neural-context-protocol[providers]'
 ```
 
 ## Initialize a project
