@@ -49,6 +49,7 @@ http = ["aiohttp"]
 redis = ["redis"]
 pgvector = ["psycopg2-binary", "pgvector"]
 dev = [
+  "build",
   "pytest",
   "pytest-asyncio",
   "pytest-httpx",
