@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from pathlib import Path
+import subprocess
 
 import ncp
+import pytest
 from ncp.dogfood import (
     ClaudeCLIDogfoodAdapter,
     CodexCLIDogfoodAdapter,
@@ -273,6 +275,30 @@ def test_claude_cli_adapter_returns_stdout_text(tmp_path: Path) -> None:
     assert result == "NCP_FINAL\ncontent:done"
 
 
+def test_claude_cli_adapter_default_command_adds_repo_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def _fake_run(command, **kwargs):
+        captured["command"] = command
+        captured["cwd"] = kwargs.get("cwd")
+        return subprocess.CompletedProcess(command, 0, stdout="NCP_FINAL\ncontent:done", stderr="")
+
+    monkeypatch.setattr("ncp.dogfood.subprocess.run", _fake_run)
+    adapter = ClaudeCLIDogfoodAdapter(cwd=tmp_path)
+
+    result = adapter.call("ctx", "turn")
+
+    assert result == "NCP_FINAL\ncontent:done"
+    command = captured["command"]
+    assert isinstance(command, list)
+    assert "--add-dir" in command
+    assert command[command.index("--add-dir") + 1] == str(tmp_path)
+    assert captured["cwd"] == tmp_path
+
+
 def test_codex_cli_adapter_reads_output_last_message_file(tmp_path: Path) -> None:
     script = (
         "import pathlib, sys; "
@@ -297,6 +323,31 @@ def test_opencode_cli_adapter_parses_json_events(tmp_path: Path) -> None:
     )
     result = adapter.call("ctx", "turn")
     assert result == "NCP_FINAL\ncontent:done"
+
+
+def test_opencode_cli_adapter_default_command_sets_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = json_line({"type": "text", "part": {"text": "NCP_FINAL\ncontent:done"}})
+    captured: dict[str, object] = {}
+
+    def _fake_run(command, **kwargs):
+        captured["command"] = command
+        captured["cwd"] = kwargs.get("cwd")
+        return subprocess.CompletedProcess(command, 0, stdout=payload, stderr="")
+
+    monkeypatch.setattr("ncp.dogfood.subprocess.run", _fake_run)
+    adapter = OpenCodeCLIDogfoodAdapter(cwd=tmp_path)
+
+    result = adapter.call("ctx", "turn")
+
+    assert result == "NCP_FINAL\ncontent:done"
+    command = captured["command"]
+    assert isinstance(command, list)
+    assert "--dir" in command
+    assert command[command.index("--dir") + 1] == str(tmp_path)
+    assert captured["cwd"] == tmp_path
 
 
 def test_claude_provider_prompt_is_tightened() -> None:

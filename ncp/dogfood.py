@@ -124,6 +124,8 @@ class ClaudeCLIDogfoodAdapter(BaseAdapter):
             "--model",
             model,
             "--dangerously-skip-permissions",
+            "--add-dir",
+            str(self._cwd),
         ]
 
     def call(self, ncp_context: str, user_turn: str) -> str:
@@ -166,6 +168,8 @@ class OpenCodeCLIDogfoodAdapter(BaseAdapter):
             model,
             "--format",
             "json",
+            "--dir",
+            str(self._cwd),
         ]
 
     def call(self, ncp_context: str, user_turn: str) -> str:

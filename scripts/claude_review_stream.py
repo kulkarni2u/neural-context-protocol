@@ -42,6 +42,11 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Optional JSON schema string for Claude structured output validation.",
     )
+    parser.add_argument(
+        "--disable-tools",
+        action="store_true",
+        help="Disable all Claude tools for the review run.",
+    )
     return parser.parse_args()
 
 
@@ -55,13 +60,15 @@ def main() -> int:
         "stream-json",
         "--verbose",
         "--dangerously-skip-permissions",
-        "--tools",
-        "",
+        "--add-dir",
+        str(args.cwd),
         "--model",
         args.model,
         "--max-budget-usd",
         str(args.max_budget_usd),
     ]
+    if args.disable_tools:
+        cmd.extend(["--tools", ""])
     if args.bare:
         cmd.append("--bare")
     if args.json_schema:
