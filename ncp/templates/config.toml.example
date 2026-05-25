@@ -2,6 +2,15 @@
 type = "sqlite"
 path = ".ncp/store.db"
 
+[redis]
+url = "redis://127.0.0.1:6379/0"
+stream = "ncp:whispers"
+
+[pgvector]
+dsn = "postgresql://postgres:postgres@127.0.0.1:5432/ncp"
+schema = "ncp"
+table_prefix = "ncp_"
+
 [pipeline]
 default_ttl_hours = 24
 max_working_chunks = 500

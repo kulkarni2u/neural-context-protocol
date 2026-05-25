@@ -18,6 +18,15 @@ DEFAULT_CONFIG = {
         "type": "sqlite",
         "path": ".ncp/store.db",
     },
+    "redis": {
+        "url": "redis://127.0.0.1:6379/0",
+        "stream": "ncp:whispers",
+    },
+    "pgvector": {
+        "dsn": "postgresql://postgres:postgres@127.0.0.1:5432/ncp",
+        "schema": "ncp",
+        "table_prefix": "ncp_",
+    },
     "pipeline": {
         "default_ttl_hours": 24,
         "max_working_chunks": 500,
@@ -76,6 +85,26 @@ class NCPConfig:
     def pricing(self) -> dict[str, dict[str, float]]:
         return dict(self.values.get("providers", {}).get("pricing", {}))
 
+    @property
+    def redis_url(self) -> str:
+        return str(self.values.get("redis", {}).get("url", ""))
+
+    @property
+    def redis_stream(self) -> str:
+        return str(self.values.get("redis", {}).get("stream", "ncp:whispers"))
+
+    @property
+    def pgvector_dsn(self) -> str:
+        return str(self.values.get("pgvector", {}).get("dsn", ""))
+
+    @property
+    def pgvector_schema(self) -> str:
+        return str(self.values.get("pgvector", {}).get("schema", "ncp"))
+
+    @property
+    def pgvector_table_prefix(self) -> str:
+        return str(self.values.get("pgvector", {}).get("table_prefix", "ncp_"))
+
 
 def load_config(
     path: str | Path | None = None,
@@ -126,6 +155,14 @@ def _apply_env_overrides(values: dict[str, Any], env: dict[str, str]) -> None:
         values["observability"]["log_level"] = env["NCP_LOG_LEVEL"]
     if "NCP_STORE_TYPE" in env:
         values["store"]["type"] = env["NCP_STORE_TYPE"]
+    if "NCP_REDIS_URL" in env:
+        values["redis"]["url"] = env["NCP_REDIS_URL"]
+    if "NCP_REDIS_STREAM" in env:
+        values["redis"]["stream"] = env["NCP_REDIS_STREAM"]
+    if "NCP_PGVECTOR_DSN" in env:
+        values["pgvector"]["dsn"] = env["NCP_PGVECTOR_DSN"]
+    if "NCP_PGVECTOR_SCHEMA" in env:
+        values["pgvector"]["schema"] = env["NCP_PGVECTOR_SCHEMA"]
 
 
 def _deep_merge(target: dict[str, Any], updates: dict[str, Any]) -> None:

@@ -184,6 +184,7 @@ Next focus:
 - [docs/NCP_MCP_DOGFOOD_LOOP.md](./docs/NCP_MCP_DOGFOOD_LOOP.md) - deterministic MCP proof path
 - [docs/NCP_PROVIDER_PARITY_BASELINE.md](./docs/NCP_PROVIDER_PARITY_BASELINE.md) - current live host parity snapshot
 - [docs/NCP_POST_V1_ROADMAP.md](./docs/NCP_POST_V1_ROADMAP.md) - recommended path after the first alpha
+- [docs/NCP_R2_STORAGE.md](./docs/NCP_R2_STORAGE.md) - pgvector/Redis storage kickoff and local infra direction
 - [CHANGELOG.md](./CHANGELOG.md) - release-facing change summary
 
 ## Release Preflight

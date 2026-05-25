@@ -15,6 +15,10 @@ All notable changes to Neural Context Protocol will be documented in this file.
 - provider install guidance now points at `neural-context-protocol[providers]`
 - known upstream Cohere warning noise is suppressed at the adapter boundary for the current alpha line
 
+### Planned next layer
+
+- containerized local infra scaffolding for Postgres/pgvector and Redis is now in place for the `0.2.0` storage kickoff
+
 ## 0.1.0a1 - 2026-05-24
 
 Follow-up alpha release to publish under the PyPI-owned project name

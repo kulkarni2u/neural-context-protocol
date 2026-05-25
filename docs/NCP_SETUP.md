@@ -58,6 +58,18 @@ HTTP endpoints:
 
 For host configs, prefer `http://127.0.0.1:4242/mcp`.
 
+## R2 local infra preview
+
+The first `0.2.0` storage kickoff uses local containerized infrastructure for
+Postgres/pgvector and Redis:
+
+```bash
+./scripts/infra_up.sh
+```
+
+This does not change the current default store. SQLite remains the active
+implementation until the R2 backends land.
+
 ## Run the examples
 
 ```bash
