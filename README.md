@@ -156,6 +156,22 @@ Integration examples:
 - `examples/06_claude_code/` - Claude Code setup and MCP config
 - `examples/07_codex_cli/` - Codex CLI MCP config and session loop
 
+## Agent Handoffs
+
+NCP can also drive a small partner-review loop over its own whisper queue:
+
+```bash
+ncp emit --from-agent codex --to claude --type share --pipeline-id pipe_demo --payload "slice=pgvector files=ncp/stores/pgvector.py ask=implement_and_handoff"
+ncp handoff claude --cwd /path/to/project --pipeline-id pipe_demo --emit-to opencode
+ncp handoff opencode --cwd /path/to/project --pipeline-id pipe_demo --emit-to claude
+```
+
+This keeps the handoff bounded:
+
+- Claude consumes pending whispers for `claude`, works in the bound repo root, and can emit one bounded follow-up whisper.
+- OpenCode consumes pending whispers for `opencode`, returns a JSON review payload, and can emit one bounded follow-up whisper.
+- Whisper queue reads are non-destructive until the consumer run succeeds, so a failed provider call does not lose the handoff.
+
 ## Current Scope
 
 This repository currently ships:

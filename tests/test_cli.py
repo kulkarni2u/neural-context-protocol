@@ -5,7 +5,7 @@ from click.testing import CliRunner
 
 from ncp.cli import main
 from ncp.stores.sqlite import SQLiteStore
-from ncp.types import SubconsciousChunk
+from ncp.types import SubconsciousChunk, Whisper
 
 
 def test_cli_init_creates_config_and_claude_md(tmp_path: Path) -> None:
@@ -251,6 +251,110 @@ def test_cli_emit_writes_whisper(tmp_path: Path) -> None:
     store = SQLiteStore(tmp_path / ".ncp" / "store.db")
     whispers = store.drain_whispers(agent_id="executor")
     assert [whisper.payload for whisper in whispers] == ["check_tests"]
+
+
+def test_cli_handoff_claude_consumes_and_emits_follow_up(
+    tmp_path: Path,
+    monkeypatch: object,
+) -> None:
+    runner = CliRunner()
+    runner.invoke(main, ["init", "--cwd", str(tmp_path)])
+    store = SQLiteStore(tmp_path / ".ncp" / "store.db")
+    store.emit_whisper(
+        Whisper(
+            from_agent="codex",
+            target="claude",
+            whisper_type="share",
+            payload="implement wrapper review flow",
+            confidence=0.95,
+            pipeline_id="pipe_handoff_cli",
+        )
+    )
+
+    monkeypatch.setattr(
+        "ncp.agent_handoff.run_claude_partner",
+        lambda **_: "claude finished the slice and handed it off",
+    )
+
+    result = runner.invoke(
+        main,
+        [
+            "handoff",
+            "claude",
+            "--cwd",
+            str(tmp_path),
+            "--pipeline-id",
+            "pipe_handoff_cli",
+            "--emit-to",
+            "opencode",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "claude finished the slice and handed it off" in result.output
+    assert store.peek_whispers(agent_id="claude", pipeline_id="pipe_handoff_cli") == []
+    follow_up = store.drain_whispers(agent_id="opencode", pipeline_id="pipe_handoff_cli")
+    assert [whisper.payload for whisper in follow_up] == ["claude finished the slice and handed it off"]
+
+
+def test_cli_handoff_opencode_requires_json_and_emits_follow_up(
+    tmp_path: Path,
+    monkeypatch: object,
+) -> None:
+    runner = CliRunner()
+    runner.invoke(main, ["init", "--cwd", str(tmp_path)])
+    store = SQLiteStore(tmp_path / ".ncp" / "store.db")
+    store.emit_whisper(
+        Whisper(
+            from_agent="claude",
+            target="opencode",
+            whisper_type="share",
+            payload="review wrapper repo binding",
+            confidence=0.95,
+            pipeline_id="pipe_handoff_cli",
+        )
+    )
+
+    monkeypatch.setattr(
+        "ncp.agent_handoff.run_opencode_reviewer",
+        lambda **_: """```json
+{"verdict":"pass","findings":[],"recommended_next_steps":[],"summary":"clean"}
+```""",
+    )
+
+    result = runner.invoke(
+        main,
+        [
+            "handoff",
+            "opencode",
+            "--cwd",
+            str(tmp_path),
+            "--pipeline-id",
+            "pipe_handoff_cli",
+            "--emit-to",
+            "claude",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert '"verdict":"pass"' in result.output
+    assert store.peek_whispers(agent_id="opencode", pipeline_id="pipe_handoff_cli") == []
+    follow_up = store.drain_whispers(agent_id="claude", pipeline_id="pipe_handoff_cli")
+    assert len(follow_up) == 1
+    assert '"summary":"clean"' in follow_up[0].payload
+
+
+def test_cli_handoff_reports_missing_queue_cleanly(tmp_path: Path) -> None:
+    runner = CliRunner()
+    runner.invoke(main, ["init", "--cwd", str(tmp_path)])
+
+    result = runner.invoke(
+        main,
+        ["handoff", "claude", "--cwd", str(tmp_path), "--pipeline-id", "pipe_empty"],
+    )
+
+    assert result.exit_code != 0
+    assert "No pending NCP handoffs for claude." in result.output
 
 
 def test_cli_emit_reports_store_unavailable_cleanly(tmp_path: Path) -> None:

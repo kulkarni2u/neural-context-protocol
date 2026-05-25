@@ -52,6 +52,79 @@ def _resolve_runtime_store(config: NCPConfig) -> BaseStore:
         raise click.ClickException(str(exc)) from exc
 
 
+def _run_handoff_command(
+    *,
+    cwd: Path,
+    agent_id: str,
+    pipeline_id: str | None,
+    max_items: int,
+    min_confidence: float,
+    instruction: str | None,
+    emit_to: str | None,
+    emit_type: str,
+    emit_confidence: float,
+    max_payload_chars: int,
+    timeout_seconds: float,
+    runner: str,
+) -> str:
+    from ncp.agent_handoff import (
+        acknowledge_handoffs,
+        emit_follow_up_whisper,
+        load_sqlite_handoffs,
+        parse_json_review,
+        run_claude_partner,
+        run_opencode_reviewer,
+        truncate_whisper_payload,
+    )
+
+    try:
+        store, handoffs = load_sqlite_handoffs(
+            cwd=cwd,
+            agent_id=agent_id,
+            pipeline_id=pipeline_id,
+            max_items=max_items,
+            min_confidence=min_confidence,
+        )
+    except NotImplementedError as exc:
+        raise click.ClickException(str(exc)) from exc
+    if not handoffs:
+        raise click.ClickException(f"No pending NCP handoffs for {agent_id}.")
+
+    try:
+        if runner == "claude":
+            response = run_claude_partner(
+                cwd=cwd,
+                agent_id=agent_id,
+                handoffs=handoffs,
+                instruction=instruction,
+                timeout_seconds=timeout_seconds,
+            )
+        else:
+            response = run_opencode_reviewer(
+                cwd=cwd,
+                agent_id=agent_id,
+                handoffs=handoffs,
+                instruction=instruction,
+                timeout_seconds=timeout_seconds,
+            )
+            parse_json_review(response)
+    except (RuntimeError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    if emit_to:
+        emit_follow_up_whisper(
+            cwd=cwd,
+            from_agent=agent_id,
+            target=emit_to,
+            pipeline_id=pipeline_id or handoffs[0].pipeline_id,
+            payload=truncate_whisper_payload(response, max_chars=max_payload_chars),
+            whisper_type=emit_type,
+            confidence=emit_confidence,
+        )
+    acknowledge_handoffs(store, handoffs)
+    return response
+
+
 def _format_ts(value: float | None) -> str:
     if value is None:
         return "-"
@@ -472,6 +545,95 @@ def dogfood_command(
         else:
             artifact = run_canonical_dogfood_loop(**common_kwargs)
     console.print_json(data=artifact)
+
+
+@main.group("handoff")
+def handoff_group() -> None:
+    """Run repo-bound Claude/OpenCode handoff consumers on pending whispers."""
+
+
+@handoff_group.command("claude")
+@click.option("--cwd", type=click.Path(path_type=Path), default=Path.cwd)
+@click.option("--pipeline-id", default=None)
+@click.option("--max-items", default=3, show_default=True, type=click.IntRange(1, 10))
+@click.option("--min-confidence", default=0.60, show_default=True, type=float)
+@click.option("--instruction", default=None, help="Optional extra instruction for Claude.")
+@click.option("--emit-to", default=None, help="Optional follow-up whisper target.")
+@click.option("--emit-type", default="share", show_default=True)
+@click.option("--emit-confidence", default=0.90, show_default=True, type=float)
+@click.option("--max-payload-chars", default=600, show_default=True, type=click.IntRange(1, 600))
+@click.option("--timeout-seconds", default=90.0, show_default=True, type=float)
+def handoff_claude_command(
+    cwd: Path,
+    pipeline_id: str | None,
+    max_items: int,
+    min_confidence: float,
+    instruction: str | None,
+    emit_to: str | None,
+    emit_type: str,
+    emit_confidence: float,
+    max_payload_chars: int,
+    timeout_seconds: float,
+) -> None:
+    """Consume pending whispers for Claude and optionally emit a follow-up whisper."""
+
+    response = _run_handoff_command(
+        cwd=cwd,
+        agent_id="claude",
+        pipeline_id=pipeline_id,
+        max_items=max_items,
+        min_confidence=min_confidence,
+        instruction=instruction,
+        emit_to=emit_to,
+        emit_type=emit_type,
+        emit_confidence=emit_confidence,
+        max_payload_chars=max_payload_chars,
+        timeout_seconds=timeout_seconds,
+        runner="claude",
+    )
+    console.print(response)
+
+
+@handoff_group.command("opencode")
+@click.option("--cwd", type=click.Path(path_type=Path), default=Path.cwd)
+@click.option("--pipeline-id", default=None)
+@click.option("--max-items", default=3, show_default=True, type=click.IntRange(1, 10))
+@click.option("--min-confidence", default=0.60, show_default=True, type=float)
+@click.option("--instruction", default=None, help="Optional extra instruction for OpenCode.")
+@click.option("--emit-to", default=None, help="Optional follow-up whisper target.")
+@click.option("--emit-type", default="share", show_default=True)
+@click.option("--emit-confidence", default=0.90, show_default=True, type=float)
+@click.option("--max-payload-chars", default=600, show_default=True, type=click.IntRange(1, 600))
+@click.option("--timeout-seconds", default=45.0, show_default=True, type=float)
+def handoff_opencode_command(
+    cwd: Path,
+    pipeline_id: str | None,
+    max_items: int,
+    min_confidence: float,
+    instruction: str | None,
+    emit_to: str | None,
+    emit_type: str,
+    emit_confidence: float,
+    max_payload_chars: int,
+    timeout_seconds: float,
+) -> None:
+    """Consume pending whispers for OpenCode and require a JSON review payload."""
+
+    response = _run_handoff_command(
+        cwd=cwd,
+        agent_id="opencode",
+        pipeline_id=pipeline_id,
+        max_items=max_items,
+        min_confidence=min_confidence,
+        instruction=instruction,
+        emit_to=emit_to,
+        emit_type=emit_type,
+        emit_confidence=emit_confidence,
+        max_payload_chars=max_payload_chars,
+        timeout_seconds=timeout_seconds,
+        runner="opencode",
+    )
+    console.print(response)
 
 
 @main.command("emit")
