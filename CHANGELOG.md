@@ -9,6 +9,7 @@ All notable changes to Neural Context Protocol will be documented in this file.
 - richer `ncp status` output with chunk, tombstone, layer, pipeline, and last-activity visibility
 - new `ncp cost` command with total, per-agent, per-model, and recent-entry rollups
 - new `ncp explain` command for a short human-readable store summary
+- Claude `stream-json` review helper script for bounded review/debug workflows
 
 ### Changed
 
