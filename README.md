@@ -164,6 +164,7 @@ This repository currently ships:
 - chunking and bounded assembly
 - SQLite-backed persistence
 - pgvector durable-store preview for chunk/query and core runtime telemetry
+- opt-in live pgvector integration suite for the local Postgres/pgvector path
 - HTTP/SSE MCP server
 - dogfood validation harness
 - local adapter plus provider adapter surface

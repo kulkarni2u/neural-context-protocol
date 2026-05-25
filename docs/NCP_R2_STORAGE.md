@@ -21,6 +21,9 @@ Today:
 - SQLite remains the default and only fully implemented store
 - `store.type = "pgvector"` now supports durable chunk writes, BM25-backed chunk query, working-zone reads, turn persistence, conscious snapshots, cost logging, and goal-version reads
 - pgvector still does not provide whisper delivery; that remains intentionally deferred to Redis-backed coordination
+- a live opt-in integration suite now exists at `tests/test_pgvector_integration.py`
+- a local runner now exists at `scripts/test_pgvector_integration.sh`
+- the current live runner brings up the Postgres/pgvector service only; Redis is not part of this validation slice yet
 - `store.type = "redis"` remains explicitly deferred
 - local infra is now scaffolded with `compose.yaml`
 - helper scripts exist:
@@ -74,7 +77,7 @@ Defaults:
 
 The next real `0.2.0` code slice should be:
 
-1. real integration tests against local Postgres/pgvector infra
+1. run and harden the new live integration path against local Postgres/pgvector infra
 2. Redis-backed ephemeral coordination helper for whispers and fetch sessions
 3. reporting parity beyond the current SQLite-only `status`, `cost`, and `explain` commands
 4. retrieval-hardening decisions after the durable path sees real infra usage

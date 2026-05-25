@@ -73,6 +73,16 @@ chunk/query path plus core turn/cost/conscious persistence, while Redis-backed
 coordination is still pending and the richer operator commands remain
 SQLite-only for now.
 
+To run the live pgvector integration suite against the local containerized
+stack:
+
+```bash
+./scripts/test_pgvector_integration.sh
+```
+
+This runner brings up the Postgres/pgvector service only; Redis is not required
+for the current pgvector durability suite.
+
 ## Run the examples
 
 ```bash
