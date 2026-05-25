@@ -658,11 +658,7 @@ def emit_command(
 
     try:
         config = ncp.configure(cwd=cwd)
-        if config.store_type == "pgvector":
-            raise click.ClickException(
-                "Redis-backed whisper coordination is still pending; `ncp emit` is not available on the pgvector backend yet."
-            )
-        store = _resolve_runtime_store(config)
+        store = _require_sqlite_reporting(config, "emit")
         ncp.emit(
             Whisper(
                 from_agent=from_agent,

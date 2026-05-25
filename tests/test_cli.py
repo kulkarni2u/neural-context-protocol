@@ -408,7 +408,8 @@ def test_cli_emit_reports_pgvector_boundary_cleanly(tmp_path: Path) -> None:
     )
 
     assert result.exit_code != 0
-    assert "Redis-backed whisper coordination is still pending" in result.output
+    assert "currently supports sqlite only" in result.output
+    assert "0.2.0 rollout" in result.output
 
 
 def test_cli_dogfood_prints_restart_proof(tmp_path: Path) -> None:
