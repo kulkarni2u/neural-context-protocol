@@ -165,6 +165,8 @@ def _apply_env_overrides(values: dict[str, Any], env: dict[str, str]) -> None:
         values["pgvector"]["dsn"] = env["NCP_PGVECTOR_DSN"]
     if "NCP_PGVECTOR_SCHEMA" in env:
         values["pgvector"]["schema"] = env["NCP_PGVECTOR_SCHEMA"]
+    if "NCP_PGVECTOR_TABLE_PREFIX" in env:
+        values["pgvector"]["table_prefix"] = env["NCP_PGVECTOR_TABLE_PREFIX"]
 
 
 def _deep_merge(target: dict[str, Any], updates: dict[str, Any]) -> None:

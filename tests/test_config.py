@@ -48,6 +48,7 @@ def test_load_config_exposes_redis_and_pgvector_settings(tmp_path: Path) -> None
             "NCP_REDIS_URL": "redis://127.0.0.1:6390/5",
             "NCP_PGVECTOR_DSN": "postgresql://postgres:postgres@127.0.0.1:5440/ncp_override",
             "NCP_PGVECTOR_SCHEMA": "ncp_override",
+            "NCP_PGVECTOR_TABLE_PREFIX": "override_",
         },
     )
 
@@ -55,7 +56,7 @@ def test_load_config_exposes_redis_and_pgvector_settings(tmp_path: Path) -> None
     assert config.redis_stream == "ncp:test"
     assert config.pgvector_dsn == "postgresql://postgres:postgres@127.0.0.1:5440/ncp_override"
     assert config.pgvector_schema == "ncp_override"
-    assert config.pgvector_table_prefix == "demo_"
+    assert config.pgvector_table_prefix == "override_"
 
 
 def test_load_config_allows_pgvector_store_type(tmp_path: Path) -> None:

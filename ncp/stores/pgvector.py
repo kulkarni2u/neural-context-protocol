@@ -264,5 +264,5 @@ def infra_hint(project_root: str | Path) -> str:
     root = Path(project_root)
     return (
         f"Start local Postgres/pgvector with {root / 'scripts' / 'infra_up.sh'} and set "
-        "NCP_PGVECTOR_DSN plus NCP_STORE_TYPE=pgvector when the durable backend rollout is ready."
+        "NCP_PGVECTOR_DSN plus NCP_STORE_TYPE=pgvector when you want to exercise the schema bootstrap path."
     )

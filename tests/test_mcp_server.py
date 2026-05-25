@@ -17,6 +17,7 @@ from ncp.mcp.server import (
     make_handlers,
     serve_streams,
 )
+from ncp.stores.base import BaseStore
 from ncp.stores.sqlite import SQLiteStore
 from ncp.types import SubconsciousChunk
 
@@ -495,3 +496,48 @@ class TestErrors:
         )
         result = _content(resp)
         assert "invalid_layer" in result["result"]
+
+    def test_not_implemented_backend_error_is_explicit(self) -> None:
+        class _PendingStore(BaseStore):
+            def write(self, chunk):
+                raise NotImplementedError("pending backend path")
+
+            def query(self, text, *, k=4, layer=None, pipeline_id=None, scope=None, zone="working"):
+                raise NotImplementedError("pending backend path")
+
+            def emit_whisper(self, whisper):
+                raise NotImplementedError("pending backend path")
+
+            def drain_whispers(self, *, agent_id, pipeline_id=None, max_items=3, min_confidence=0.60):
+                raise NotImplementedError("pending backend path")
+
+            def get_working_zone(self, *, pipeline_id=None, layer=None):
+                raise NotImplementedError("pending backend path")
+
+            def log_turn_record(self, record):
+                raise NotImplementedError("pending backend path")
+
+            def resolve_recent_ref(self, ref):
+                raise NotImplementedError("pending backend path")
+
+            def log_cost(self, *, agent_id, response):
+                raise NotImplementedError("pending backend path")
+
+        handlers = make_handlers(_PendingStore())
+        resp = _handle_request(
+            _call(
+                "ncp_emit_whisper",
+                {
+                    "from": "builder",
+                    "target": "executor",
+                    "type": "nudge",
+                    "payload": "check this",
+                    "confidence": 0.9,
+                },
+            ),
+            handlers,
+        )
+
+        error = _error(resp)
+        assert error["code"] == -32603
+        assert "Tool unavailable for the configured store backend" in error["message"]

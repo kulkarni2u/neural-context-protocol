@@ -278,6 +278,13 @@ def _handle_request(req: dict[str, object], handlers: dict[str, ToolHandler]) ->
         try:
             result = handler(arguments)
             return _ok(req_id, {"content": [{"type": "text", "text": json.dumps(result)}]})
+        except NotImplementedError as exc:
+            _err(f"Tool {tool_name} unavailable for current backend: {traceback.format_exc()}")
+            return _err_response(
+                req_id,
+                -32603,
+                f"Tool unavailable for the configured store backend: {exc}",
+            )
         except Exception as exc:
             _err(f"Tool {tool_name} error: {traceback.format_exc()}")
             return _err_response(req_id, -32603, f"Tool error: {exc}")

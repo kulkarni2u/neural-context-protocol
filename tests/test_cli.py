@@ -281,6 +281,32 @@ def test_cli_emit_reports_store_unavailable_cleanly(tmp_path: Path) -> None:
     assert "SQLite store unavailable" in result.output
 
 
+def test_cli_emit_reports_pgvector_boundary_cleanly(tmp_path: Path) -> None:
+    runner = CliRunner()
+    runner.invoke(main, ["init", "--cwd", str(tmp_path)])
+
+    result = runner.invoke(
+        main,
+        [
+            "emit",
+            "--cwd",
+            str(tmp_path),
+            "--from-agent",
+            "planner",
+            "--to",
+            "executor",
+            "--type",
+            "nudge",
+            "--payload",
+            "check_tests",
+        ],
+        env={"NCP_STORE_TYPE": "pgvector"},
+    )
+
+    assert result.exit_code != 0
+    assert "Redis-backed whisper coordination is still pending" in result.output
+
+
 def test_cli_dogfood_prints_restart_proof(tmp_path: Path) -> None:
     runner = CliRunner()
     runner.invoke(main, ["init", "--cwd", str(tmp_path)])
