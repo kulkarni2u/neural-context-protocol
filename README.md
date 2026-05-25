@@ -165,9 +165,14 @@ This repository currently ships:
 - release preflight script
 - minimal CI for `ruff`, `pytest`, and `build`
 
-Next release step:
+Current published alpha:
 
-- publish the first alpha release
+- `neural-context-protocol==0.1.0a1`
+
+Next focus:
+
+- V1.1 ergonomics: richer `ncp status`, `ncp explain`, and `ncp cost`
+- production-facing storage and retrieval in the next major phase
 
 ## Documentation
 
@@ -175,6 +180,7 @@ Next release step:
 - [docs/NCP_PROTOCOL_SPEC.md](./docs/NCP_PROTOCOL_SPEC.md) - normative protocol reference
 - [docs/NCP_MCP_DOGFOOD_LOOP.md](./docs/NCP_MCP_DOGFOOD_LOOP.md) - deterministic MCP proof path
 - [docs/NCP_PROVIDER_PARITY_BASELINE.md](./docs/NCP_PROVIDER_PARITY_BASELINE.md) - current live host parity snapshot
+- [docs/NCP_POST_V1_ROADMAP.md](./docs/NCP_POST_V1_ROADMAP.md) - recommended path after the first alpha
 - [CHANGELOG.md](./CHANGELOG.md) - release-facing change summary
 
 ## Release Preflight
