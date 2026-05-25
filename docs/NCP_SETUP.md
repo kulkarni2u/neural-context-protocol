@@ -163,6 +163,27 @@ Run the deterministic MCP proof:
 ncp dogfood
 ```
 
+## Whisper handoff loop
+
+NCP can also drive a bounded partner/reviewer loop over its own whisper queue:
+
+```bash
+ncp emit --cwd /path/to/your/project --from-agent codex --to claude --type share --pipeline-id pipe_demo --payload "slice=pgvector files=ncp/stores/pgvector.py ask=implement_and_handoff"
+ncp handoff claude --cwd /path/to/your/project --pipeline-id pipe_demo --emit-to opencode
+ncp handoff opencode --cwd /path/to/your/project --pipeline-id pipe_demo --emit-to claude
+```
+
+Operational notes:
+
+- handoff queue reads are non-destructive until the provider run succeeds
+- Claude works best as the bounded implementation/planning partner in this loop
+- OpenCode works well as the bounded reviewer
+- the public value of the loop is not only coordination correctness, but prompt-size reduction from whisper-based task deltas instead of replaying the full task prompt
+
+In the current live Sarathi-managed proof for the `pgvector` storage slice, the
+compact handoff route reduced one Claude planning dispatch from `677`
+estimated bridge-prompt tokens to `265` estimated handoff tokens.
+
 Run the release preflight:
 
 ```bash

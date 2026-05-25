@@ -10,11 +10,13 @@ All notable changes to Neural Context Protocol will be documented in this file.
 - new `ncp cost` command with total, per-agent, per-model, and recent-entry rollups
 - new `ncp explain` command for a short human-readable store summary
 - Claude `stream-json` review helper script for bounded review/debug workflows
+- public `ncp handoff claude` and `ncp handoff opencode` commands for whisper-driven partner/reviewer loops
 
 ### Changed
 
 - provider install guidance now points at `neural-context-protocol[providers]`
 - known upstream Cohere warning noise is suppressed at the adapter boundary for the current alpha line
+- public docs now reflect the live Sarathi-managed handoff proof and its measured prompt reduction on the `pgvector` storage slice
 
 ### Planned next layer
 
@@ -22,6 +24,7 @@ All notable changes to Neural Context Protocol will be documented in this file.
 - pgvector now supports durable chunk writes/query, working-zone reads, recent-ref turn logging, conscious snapshots, cost logging, and pipeline goal-version reads
 - a live opt-in pgvector integration suite and runner script now exist for the local Postgres/pgvector path
 - Redis remains a deferred ephemeral backend for whisper delivery and short-lived coordination
+- the next live storage step is to complete the paired OpenCode review lane on the current `pgvector` task, then continue with Redis-backed ephemeral coordination
 
 ## 0.1.0a1 - 2026-05-24
 

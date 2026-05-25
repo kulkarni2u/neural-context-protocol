@@ -39,6 +39,7 @@ What is already proven in this repository:
 - both hosts can write shared memory through MCP
 - both hosts can retrieve memory written by the other host
 - both hosts can deliver and receive whispers through the shared MCP runtime
+- Sarathi can route Claude and OpenCode child-task dispatches through NCP handoffs
 - restart persistence is validated by the dogfood harness
 - bounded-context benchmarks are reproducible and show large prompt reduction
 
@@ -46,6 +47,7 @@ Current benchmark snapshot:
 
 - coding pipeline: peak `174` NCP tokens vs `1927` naive replay, `17.52x` reduction
 - research pipeline: peak `156` NCP tokens vs `1700` naive replay, `16.35x` reduction
+- live Sarathi handoff route: one real Claude planning subtask dropped from `677` estimated bridge-prompt tokens to `265` estimated handoff tokens, a `60.9%` reduction
 
 ## Quick Start
 
@@ -172,6 +174,12 @@ This keeps the handoff bounded:
 - OpenCode consumes pending whispers for `opencode`, returns a JSON review payload, and can emit one bounded follow-up whisper.
 - Whisper queue reads are non-destructive until the consumer run succeeds, so a failed provider call does not lose the handoff.
 
+When Sarathi routes a child task through this handoff path, it no longer needs
+to send the full provider bridge prompt as the primary instruction. The current
+live proof on the `pgvector` storage slice reduced one Claude planning handoff
+from `677` estimated prompt tokens to `265` estimated handoff tokens by using a
+compact instruction plus bounded whisper payload.
+
 ## Current Scope
 
 This repository currently ships:
@@ -194,6 +202,7 @@ Current published alpha:
 Next focus:
 
 - Next major focus: production-facing storage and retrieval
+- Immediate next step: complete the same NCP handoff route for the paired OpenCode review lane on the live `pgvector` slice, then carry the partner/reviewer loop into the next real `0.2.0` implementation task
 
 ## Documentation
 

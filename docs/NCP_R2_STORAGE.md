@@ -29,6 +29,7 @@ Today:
 - helper scripts exist:
   - `scripts/infra_up.sh`
   - `scripts/infra_down.sh`
+- Sarathi can now route Claude and OpenCode task lanes through NCP handoffs for NCP-enabled workspaces, and one live Claude planning subtask on this storage track recorded a `60.9%` estimated prompt reduction versus the older full bridge prompt
 
 ## Intended Role Split
 
@@ -77,9 +78,10 @@ Defaults:
 
 The next real `0.2.0` code slice should be:
 
-1. run and harden the new live integration path against local Postgres/pgvector infra
-2. Redis-backed ephemeral coordination helper for whispers and fetch sessions
-3. reporting parity beyond the current SQLite-only `status`, `cost`, and `explain` commands
-4. retrieval-hardening decisions after the durable path sees real infra usage
+1. complete the paired OpenCode review lane on the live `pgvector` storage task through the same NCP handoff route
+2. run and harden the new live integration path against local Postgres/pgvector infra
+3. Redis-backed ephemeral coordination helper for whispers and fetch sessions
+4. reporting parity beyond the current SQLite-only `status`, `cost`, and `explain` commands
+5. retrieval-hardening decisions after the durable path sees real infra usage
 
 Do not start both deep backends at once before pgvector proves the durable path.
