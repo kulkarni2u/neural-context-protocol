@@ -19,7 +19,8 @@ shell out to Docker or Podman.
 Today:
 
 - SQLite remains the default and only fully implemented store
-- `store.type = "pgvector"` now boots a real schema-initializing durable-store skeleton
+- `store.type = "pgvector"` now supports durable chunk writes, BM25-backed chunk query, working-zone reads, turn persistence, conscious snapshots, cost logging, and goal-version reads
+- pgvector still does not provide whisper delivery; that remains intentionally deferred to Redis-backed coordination
 - `store.type = "redis"` remains explicitly deferred
 - local infra is now scaffolded with `compose.yaml`
 - helper scripts exist:
@@ -73,9 +74,9 @@ Defaults:
 
 The next real `0.2.0` code slice should be:
 
-1. durable chunk/query/write paths on pgvector
+1. real integration tests against local Postgres/pgvector infra
 2. Redis-backed ephemeral coordination helper for whispers and fetch sessions
-3. integration tests against the local infra path
-4. reporting parity beyond the current SQLite-only `status`, `cost`, and `explain` commands
+3. reporting parity beyond the current SQLite-only `status`, `cost`, and `explain` commands
+4. retrieval-hardening decisions after the durable path sees real infra usage
 
 Do not start both deep backends at once before pgvector proves the durable path.

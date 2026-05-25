@@ -19,7 +19,8 @@ All notable changes to Neural Context Protocol will be documented in this file.
 ### Planned next layer
 
 - containerized local infra scaffolding for Postgres/pgvector and Redis is now in place for the `0.2.0` storage kickoff
-- pgvector is now selectable enough to initialize the durable schema path, while Redis remains a deferred ephemeral backend
+- pgvector now supports durable chunk writes/query, working-zone reads, recent-ref turn logging, conscious snapshots, cost logging, and pipeline goal-version reads
+- Redis remains a deferred ephemeral backend for whisper delivery and short-lived coordination
 
 ## 0.1.0a1 - 2026-05-24
 

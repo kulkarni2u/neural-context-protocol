@@ -163,6 +163,7 @@ This repository currently ships:
 - core NCP types and encoder
 - chunking and bounded assembly
 - SQLite-backed persistence
+- pgvector durable-store preview for chunk/query and core runtime telemetry
 - HTTP/SSE MCP server
 - dogfood validation harness
 - local adapter plus provider adapter surface
