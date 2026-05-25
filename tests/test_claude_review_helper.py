@@ -63,3 +63,22 @@ def test_extract_assistant_event_payload_reads_message_text() -> None:
     assert extract_assistant_event_payload(line) == (
         '{"verdict":"approve","findings":[],"recommended_next_steps":[],"summary":"ok"}'
     )
+
+
+def test_extract_assistant_event_payload_reads_structured_output_tool_use() -> None:
+    line = json.dumps(
+        {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": "StructuredOutput",
+                        "input": {"ok": True},
+                    }
+                ]
+            },
+        }
+    )
+
+    assert extract_assistant_event_payload(line) == '{"ok": true}'

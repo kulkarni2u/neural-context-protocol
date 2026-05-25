@@ -63,11 +63,16 @@ def extract_assistant_event_payload(line: str) -> str | None:
     for item in content:
         if not isinstance(item, dict):
             continue
-        if item.get("type") != "text":
+        item_type = item.get("type")
+        if item_type == "text":
+            text = item.get("text")
+            if isinstance(text, str):
+                parts.append(text)
             continue
-        text = item.get("text")
-        if isinstance(text, str):
-            parts.append(text)
+        if item_type == "tool_use" and item.get("name") == "StructuredOutput":
+            tool_input = item.get("input")
+            if isinstance(tool_input, dict):
+                parts.append(json.dumps(tool_input))
     if not parts:
         return None
     return "\n".join(parts)
