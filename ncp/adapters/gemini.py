@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from os import environ
+import warnings
 
 from ncp.adapters.base import BaseAdapter
 
@@ -17,10 +18,12 @@ class GeminiAdapter(BaseAdapter):
         timeout: float = 120.0,
     ) -> None:
         try:
-            import google.generativeai as genai
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", FutureWarning)
+                import google.generativeai as genai
         except ImportError as err:
             raise ImportError(
-                "google-generativeai is required. Install it with: pip install 'ncp-sdk[providers]'"
+                "google-generativeai is required. Install it with: pip install 'neural-context-protocol[providers]'"
             ) from err
         resolved_key = api_key or environ.get("GOOGLE_API_KEY", "")
         genai.configure(api_key=self._require_api_key(resolved_key, env_var="GOOGLE_API_KEY"))

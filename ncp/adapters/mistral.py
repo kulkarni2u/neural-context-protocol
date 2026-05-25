@@ -21,7 +21,7 @@ class MistralAdapter(BaseAdapter):
             from mistralai.client import Mistral
         except ImportError as err:
             raise ImportError(
-                "mistralai is required. Install it with: pip install 'ncp-sdk[providers]'"
+                "mistralai is required. Install it with: pip install 'neural-context-protocol[providers]'"
             ) from err
         resolved_key = api_key or environ.get("MISTRAL_API_KEY", "")
         self._client = Mistral(

@@ -24,7 +24,7 @@ class OllamaAdapter(BaseAdapter):
             import openai
         except ImportError as err:
             raise ImportError(
-                "openai is required. Install it with: pip install 'ncp-sdk[providers]'"
+                "openai is required. Install it with: pip install 'neural-context-protocol[providers]'"
             ) from err
         self._openai = openai
         resolved_base_url = base_url or environ.get("OLLAMA_BASE_URL", _DEFAULT_OLLAMA_BASE_URL)

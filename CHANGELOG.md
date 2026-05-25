@@ -8,6 +8,12 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 - richer `ncp status` output with chunk, tombstone, layer, pipeline, and last-activity visibility
 - new `ncp cost` command with total, per-agent, per-model, and recent-entry rollups
+- new `ncp explain` command for a short human-readable store summary
+
+### Changed
+
+- provider install guidance now points at `neural-context-protocol[providers]`
+- known upstream Cohere warning noise is suppressed at the adapter boundary for the current alpha line
 
 ## 0.1.0a1 - 2026-05-24
 

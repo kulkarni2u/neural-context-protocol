@@ -22,7 +22,7 @@ class AnthropicAdapter(BaseAdapter):
             import anthropic
         except ImportError as err:
             raise ImportError(
-                "anthropic is required. Install it with: pip install 'ncp-sdk[providers]'"
+                "anthropic is required. Install it with: pip install 'neural-context-protocol[providers]'"
             ) from err
         self._anthropic = anthropic
         resolved_key = api_key or environ.get("ANTHROPIC_API_KEY", "")

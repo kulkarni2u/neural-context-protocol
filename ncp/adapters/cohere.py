@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from os import environ
+import warnings
 
 from ncp.adapters.base import BaseAdapter
 
@@ -18,16 +19,28 @@ class CohereAdapter(BaseAdapter):
         timeout: float = 120.0,
     ) -> None:
         try:
-            import cohere
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message=".*iscoroutinefunction.*",
+                    category=DeprecationWarning,
+                )
+                import cohere
         except ImportError as err:
             raise ImportError(
-                "cohere is required. Install it with: pip install 'ncp-sdk[providers]'"
+                "cohere is required. Install it with: pip install 'neural-context-protocol[providers]'"
             ) from err
         resolved_key = api_key or environ.get("COHERE_API_KEY", "")
-        self._client = cohere.Client(
-            api_key=self._require_api_key(resolved_key, env_var="COHERE_API_KEY"),
-            timeout=timeout,
-        )
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=".*iscoroutinefunction.*",
+                category=DeprecationWarning,
+            )
+            self._client = cohere.Client(
+                api_key=self._require_api_key(resolved_key, env_var="COHERE_API_KEY"),
+                timeout=timeout,
+            )
         self._model = model
         self._max_tokens = max_tokens
 

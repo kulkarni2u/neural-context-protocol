@@ -55,6 +55,7 @@ ncp init
 ncp serve --host 127.0.0.1 --port 4242 --cwd /path/to/project
 ncp status --cwd /path/to/project
 ncp cost --cwd /path/to/project
+ncp explain --cwd /path/to/project
 ```
 
 Expected success signals:
@@ -63,6 +64,7 @@ Expected success signals:
 - `ncp serve` starts the local HTTP MCP server on `127.0.0.1:4242`
 - `ncp status` prints store, chunk, layer, pipeline, and activity metrics
 - `ncp cost` prints cost totals plus per-agent/per-model rollups
+- `ncp explain` turns the current store state into a short human-readable operator summary
 
 Published alpha install path:
 
@@ -173,8 +175,7 @@ Current published alpha:
 
 Next focus:
 
-- V1.1 ergonomics: richer `ncp status`, `ncp explain`, and `ncp cost`
-- production-facing storage and retrieval in the next major phase
+- Next major focus: production-facing storage and retrieval
 
 ## Documentation
 
@@ -195,6 +196,6 @@ bash scripts/release_preflight.sh
 <summary>Provider notes</summary>
 
 - `GeminiAdapter` currently uses `google.generativeai`, which is deprecated upstream. The adapter is functionally green in tests, but should migrate to `google.genai` in a future pass.
-- `CohereAdapter` is functionally green, but the current upstream SDK emits Python deprecation warnings during tests.
+- `CohereAdapter` is functionally green. Known upstream warning noise is suppressed at the adapter boundary for the current alpha line.
 
 </details>

@@ -37,6 +37,72 @@ def _format_ts(value: float | None) -> str:
     return datetime.fromtimestamp(value).isoformat(timespec="seconds")
 
 
+def _build_explain_payload(
+    *,
+    store_path: str,
+    pipeline_id: str | None,
+    status_detail: dict[str, object],
+    cost_detail: dict[str, object],
+) -> dict[str, object]:
+    overview = status_detail["overview"]
+    layer_counts = status_detail["layer_counts"]
+    recent_pipelines = status_detail["recent_pipelines"]
+    summary = cost_detail["summary"]
+    by_agent = cost_detail["by_agent"]
+    by_model = cost_detail["by_model"]
+
+    warnings: list[str] = []
+    if int(overview["chunk_count"]) == 0:
+        warnings.append("No persisted chunks yet; the store is initialized but has not captured durable memory.")
+    if int(overview["whisper_count"]) > 10:
+        warnings.append("Whisper backlog is high; agents may not be draining transient signals quickly enough.")
+    if int(summary["entry_count"]) == 0:
+        warnings.append("No cost telemetry recorded yet; ncp cost will stay empty until provider turns are logged.")
+    if len(layer_counts) == 1 and int(overview["chunk_count"]) >= 5:
+        dominant_layer = next(iter(layer_counts))
+        warnings.append(
+            f"Memory is concentrated in the {dominant_layer} layer; consider whether other chunk types are being under-used."
+        )
+    if pipeline_id is None and not recent_pipelines:
+        warnings.append("No named pipelines found yet; cross-host sharing may still be happening on the global/default path.")
+
+    if int(overview["chunk_count"]) == 0:
+        headline = "NCP is initialized but still cold."
+    elif int(overview["turn_record_count"]) == 0:
+        headline = "Memory exists, but turn records have not been built up yet."
+    else:
+        headline = "NCP is actively recording bounded context and recent turn state."
+
+    if int(summary["entry_count"]) > 0:
+        headline += (
+            f" Cost telemetry covers {summary['entry_count']} turns for "
+            f"{float(summary['cost_usd_total']):.4f} USD total."
+        )
+
+    top_agent = by_agent[0]["agent_id"] if by_agent else None
+    top_model = by_model[0]["model"] if by_model else None
+
+    return {
+        "store_path": store_path,
+        "pipeline_id": pipeline_id,
+        "headline": headline,
+        "warnings": warnings,
+        "facts": {
+            "chunk_count": overview["chunk_count"],
+            "whisper_count": overview["whisper_count"],
+            "turn_record_count": overview["turn_record_count"],
+            "pipeline_count": overview["pipeline_count"],
+            "last_activity_at": overview["last_activity_at"],
+            "dominant_layers": layer_counts,
+            "top_agent": top_agent,
+            "top_model": top_model,
+            "cost_usd_total": summary["cost_usd_total"],
+        },
+        "status": status_detail,
+        "cost": cost_detail,
+    }
+
+
 @click.group()
 def main() -> None:
     """Neural Context Protocol CLI."""
@@ -207,6 +273,66 @@ def cost_command(cwd: Path, pipeline_id: str | None, limit: int, json_output: bo
                 _format_ts(float(row["logged_at"])),
             )
         console.print(recent_table)
+
+
+@main.command("explain")
+@click.option("--cwd", type=click.Path(path_type=Path), default=Path.cwd)
+@click.option("--pipeline-id", default=None, help="Optional pipeline filter.")
+@click.option("--limit", default=5, show_default=True, type=click.IntRange(1, 20))
+@click.option("--json-output", is_flag=True, help="Emit machine-readable JSON instead of a narrative summary.")
+def explain_command(cwd: Path, pipeline_id: str | None, limit: int, json_output: bool) -> None:
+    """Explain the current NCP store state in a human-readable way."""
+
+    try:
+        config = ncp.configure(cwd=cwd)
+        store = SQLiteStore(config.store_path)
+        status_detail = store.status_detail(pipeline_id=pipeline_id)
+        cost_detail = store.cost_summary(pipeline_id=pipeline_id, limit=limit)
+    except NCPStoreUnavailableError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    payload = _build_explain_payload(
+        store_path=str(config.store_path),
+        pipeline_id=pipeline_id,
+        status_detail=status_detail,
+        cost_detail=cost_detail,
+    )
+    if json_output:
+        console.print_json(data=payload)
+        return
+
+    console.print(f"[bold]NCP Explain[/bold]  store={config.store_path}")
+    if pipeline_id:
+        console.print(f"Pipeline filter: [bold]{pipeline_id}[/bold]")
+    console.print(payload["headline"])
+
+    facts = payload["facts"]
+    console.print(
+        f"- chunks={facts['chunk_count']} whispers={facts['whisper_count']} "
+        f"turn_records={facts['turn_record_count']} pipelines={facts['pipeline_count']}"
+    )
+    console.print(
+        f"- total_cost_usd={float(facts['cost_usd_total']):.4f} "
+        f"last_activity={_format_ts(facts['last_activity_at'])}"
+    )
+    if facts["top_agent"] is not None:
+        console.print(f"- highest-cost agent so far: {facts['top_agent']}")
+    if facts["top_model"] is not None:
+        console.print(f"- highest-cost model so far: {facts['top_model']}")
+    if facts["dominant_layers"]:
+        layer_line = ", ".join(
+            f"{layer}={count}" for layer, count in list(facts["dominant_layers"].items())[:5]
+        )
+        console.print(f"- layer distribution: {layer_line}")
+
+    warnings = payload["warnings"]
+    if warnings:
+        console.print("[bold]Warnings[/bold]")
+        for warning in warnings:
+            console.print(f"- {warning}")
+    else:
+        console.print("[bold]Warnings[/bold]")
+        console.print("- none")
 
 
 @main.command("serve")

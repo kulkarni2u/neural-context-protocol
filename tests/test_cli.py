@@ -75,6 +75,52 @@ def test_cli_status_json_and_cost_command(tmp_path: Path) -> None:
     assert cost_payload["recent_entries"][0]["turn_id"] == "turn_cost_cli"
 
 
+def test_cli_explain_renders_narrative_and_json(tmp_path: Path) -> None:
+    runner = CliRunner()
+    runner.invoke(main, ["init", "--cwd", str(tmp_path)])
+    store = SQLiteStore(tmp_path / ".ncp" / "store.db")
+    store.write(
+        SubconsciousChunk(
+            chunk_id="sub_explain",
+            layer="semantic",
+            content="explain example chunk",
+            src="tool_result",
+            pipeline_id="pipe_explain",
+        )
+    )
+    store.log_cost_raw(
+        agent_id="planner",
+        model="claude-sonnet",
+        input_tokens=90,
+        output_tokens=12,
+        cost_usd=0.015,
+        pipeline_id="pipe_explain",
+        turn_id="turn_explain",
+        latency_ms=120,
+    )
+
+    text_result = runner.invoke(
+        main,
+        ["explain", "--cwd", str(tmp_path), "--pipeline-id", "pipe_explain"],
+    )
+    json_result = runner.invoke(
+        main,
+        ["explain", "--cwd", str(tmp_path), "--pipeline-id", "pipe_explain", "--json-output"],
+    )
+
+    assert text_result.exit_code == 0
+    assert "NCP Explain" in text_result.output
+    assert "highest-cost agent so far: planner" in text_result.output
+    assert "layer distribution:" in text_result.output
+
+    assert json_result.exit_code == 0
+    payload = json.loads(json_result.output)
+    assert payload["pipeline_id"] == "pipe_explain"
+    assert payload["facts"]["chunk_count"] == 1
+    assert payload["facts"]["top_agent"] == "planner"
+    assert payload["cost"]["summary"]["cost_usd_total"] == 0.015
+
+
 def test_cli_serve_passes_explicit_cwd(monkeypatch: object, tmp_path: Path) -> None:
     called: dict[str, object] = {}
 
