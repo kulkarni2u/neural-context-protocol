@@ -5,6 +5,7 @@ Implements the normative 7-step assembly sequence from NCP spec §6.1.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 from hashlib import sha256
 from typing import Protocol
@@ -101,6 +102,32 @@ class Assembler:
     # Step 0-5: assemble
     # ------------------------------------------------------------------
 
+    def _prepare_assembly(
+        self,
+        *,
+        conscious: ConsciousBlock,
+        budget: BudgetContext,
+        query_text: str | None = None,
+        ctx_window: int | None = None,
+    ) -> tuple[ConsciousBlock, BudgetContext, list[SubconsciousChunk], list[Whisper]]:
+        conscious, budget = self.middleware.pre_assemble(conscious, budget)
+        coherence_report = self.coherence.check(conscious)
+        coherence_alerts = coherence_report.alerts
+        hydrated = conscious if ctx_window is None else conscious.model_copy(update={"ctx_window": ctx_window})
+        recent_chunks = self._resolve_recent_refs(hydrated)
+        subconscious = self._retrieve_chunks(hydrated, query_text=query_text, budget=budget)
+        subconscious = self._cold_start_bootstrap(hydrated, subconscious)
+        combined_chunks = self._dedupe_chunks([*recent_chunks, *subconscious])
+        drained_whispers = self._drain_whispers(hydrated)
+        combined_whispers: list[Whisper] = [*coherence_alerts, *drained_whispers]
+        if budget.pressure == "critical":
+            combined_chunks = combined_chunks[:2]
+            combined_whispers = combined_whispers[:1]
+        else:
+            combined_chunks = combined_chunks[:4]
+            combined_whispers = combined_whispers[:3]
+        return hydrated, budget, combined_chunks, combined_whispers
+
     def assemble(
         self,
         *,
@@ -109,46 +136,76 @@ class Assembler:
         query_text: str | None = None,
         ctx_window: int | None = None,
     ) -> AssemblyResult:
-        conscious, budget = self.middleware.pre_assemble(conscious, budget)
-
-        coherence_report = self.coherence.check(conscious)
-        coherence_alerts = coherence_report.alerts
-
-        hydrated = conscious if ctx_window is None else conscious.model_copy(update={"ctx_window": ctx_window})
-
-        recent_chunks = self._resolve_recent_refs(hydrated)
-
-        subconscious = self._retrieve_chunks(hydrated, query_text=query_text, budget=budget)
-
-        subconscious = self._cold_start_bootstrap(hydrated, subconscious)
-
-        combined_chunks = self._dedupe_chunks([*recent_chunks, *subconscious])
-
-        drained_whispers = self._drain_whispers(hydrated)
-        combined_whispers = [*coherence_alerts, *drained_whispers]
-
-        if budget.pressure == "critical":
-            combined_chunks = combined_chunks[:2]
-            combined_whispers = combined_whispers[:1]
-        else:
-            combined_chunks = combined_chunks[:4]
-            combined_whispers = combined_whispers[:3]
-
+        hydrated, budget, combined_chunks, combined_whispers = self._prepare_assembly(
+            conscious=conscious,
+            budget=budget,
+            query_text=query_text,
+            ctx_window=ctx_window,
+        )
         context = self.encoder.assemble(
             conscious=hydrated,
             chunks=combined_chunks,
             whispers=combined_whispers,
             budget=budget,
         )
-
         context = self.middleware.post_assemble(context)
-
         return AssemblyResult(
             context=context,
             conscious=hydrated,
             chunks=combined_chunks,
             whispers=combined_whispers,
         )
+
+    def assemble_incremental(
+        self,
+        *,
+        conscious: ConsciousBlock,
+        budget: BudgetContext,
+        query_text: str | None = None,
+        ctx_window: int | None = None,
+        max_tokens: int | None = None,
+    ) -> Iterator[tuple[str, str]]:
+        """Yield (label, section_text) in priority order, enforcing max_tokens.
+
+        Labels in order: ``budget_header``, ``conscious``, ``subconscious`` (one
+        per chunk), ``whispers``. Budget and conscious sections are always emitted.
+        Subconscious chunks stop yielding once max_tokens would be exceeded.
+        Token count is estimated via word-split proxy (len(text.split())).
+
+        Note: ``middleware.post_assemble`` is NOT called on yielded sections.
+        Callers that use post_assemble middleware should apply it to the
+        concatenated result: ``mw.post_assemble("\\n\\n".join(t for _, t in sections))``.
+        """
+        hydrated, budget, combined_chunks, combined_whispers = self._prepare_assembly(
+            conscious=conscious,
+            budget=budget,
+            query_text=query_text,
+            ctx_window=ctx_window,
+        )
+
+        tokens_used = 0
+
+        budget_text = self.encoder._encode_budget(budget)
+        tokens_used += len(budget_text.split())
+        yield "budget_header", budget_text
+
+        conscious_text = self.encoder._encode_conscious(hydrated)
+        tokens_used += len(conscious_text.split())
+        yield "conscious", conscious_text
+
+        fitting_chunks: list[SubconsciousChunk] = []
+        for chunk in combined_chunks:
+            chunk_tokens = len(self.encoder._encode_subconscious([chunk]).split())
+            if max_tokens is not None and tokens_used + chunk_tokens > max_tokens:
+                break
+            tokens_used += chunk_tokens
+            fitting_chunks.append(chunk)
+
+        if fitting_chunks:
+            yield "subconscious", self.encoder._encode_subconscious(fitting_chunks)
+
+        if combined_whispers:
+            yield "whispers", self.encoder._encode_whispers(combined_whispers, now=None)
 
     # ------------------------------------------------------------------
     # Step 7: post-turn
