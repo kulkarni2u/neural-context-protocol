@@ -584,8 +584,64 @@ class PgvectorStore(BaseStore):
                 continue
         return versions
 
+    def status_detail(self, *, pipeline_id: str | None = None) -> dict[str, object]:
+        with self._connect() as connection:
+            overview = {
+                "chunk_count": self._count_rows(connection, "chunks", pipeline_id=pipeline_id),
+                "tombstone_count": self._count_rows(connection, "tombstones"),
+                "turn_record_count": self._count_rows(connection, "turn_records", pipeline_id=pipeline_id),
+                "conscious_snapshot_count": self._count_rows(connection, "conscious_log", pipeline_id=pipeline_id),
+                "cost_entry_count": self._count_rows(connection, "cost_log", pipeline_id=pipeline_id),
+            }
+            overview["pipeline_count"] = self._count_distinct_pipelines(connection)
+            overview["cost_usd_total"] = self._sum_cost(connection, pipeline_id=pipeline_id)
+            latest_chunk = self._max_column(connection, "chunks", "created_at", pipeline_id=pipeline_id)
+            latest_turn = self._max_column(connection, "turn_records", "created_at", pipeline_id=pipeline_id)
+            latest_cost = self._max_column(connection, "cost_log", "logged_at", pipeline_id=pipeline_id)
+            layer_counts = self._layer_counts(connection, pipeline_id=pipeline_id)
+            recent_pipelines = self._recent_pipelines(connection, pipeline_id=pipeline_id)
+
+        whisper_stats = (
+            self.coordination.whisper_stats(pipeline_id=pipeline_id)
+            if self.coordination is not None
+            else {"count": 0, "last_activity_at": None}
+        )
+        overview["whisper_count"] = int(whisper_stats["count"] or 0)
+        activity_candidates = [
+            value
+            for value in (latest_chunk, latest_turn, latest_cost, whisper_stats["last_activity_at"])
+            if value is not None
+        ]
+        overview["last_activity_at"] = max(activity_candidates) if activity_candidates else None
+        return {
+            "overview": overview,
+            "layer_counts": layer_counts,
+            "recent_pipelines": recent_pipelines,
+        }
+
+    def cost_summary(
+        self,
+        *,
+        pipeline_id: str | None = None,
+        limit: int = 10,
+    ) -> dict[str, object]:
+        with self._connect() as connection:
+            summary = self._cost_summary_row(connection, pipeline_id=pipeline_id)
+            by_agent = self._cost_group_rows(connection, group_by="agent_id", pipeline_id=pipeline_id)
+            by_model = self._cost_group_rows(connection, group_by="model", pipeline_id=pipeline_id)
+            recent_entries = self._recent_cost_rows(connection, pipeline_id=pipeline_id, limit=limit)
+        return {
+            "summary": summary,
+            "by_agent": by_agent,
+            "by_model": by_model,
+            "recent_entries": recent_entries,
+        }
+
     def _sql(self, statement: str) -> str:
         return statement.format(schema=self.schema, prefix=self.table_prefix)
+
+    def _table_name(self, logical_name: str) -> str:
+        return f"{self.schema}.{self.table_prefix}{logical_name}"
 
     def _fetchall(self, cursor: Any) -> list[dict[str, Any]]:
         rows = cursor.fetchall()
@@ -645,6 +701,209 @@ class PgvectorStore(BaseStore):
             return self._fetchall(cursor)
         finally:
             self._close_cursor(cursor)
+
+    def _count_rows(self, connection: Any, table: str, *, pipeline_id: str | None = None) -> int:
+        cursor = connection.cursor()
+        try:
+            statement = f"SELECT COUNT(*) AS count FROM {self._table_name(table)}"
+            params: tuple[object, ...] = ()
+            if pipeline_id is not None and table in {"chunks", "turn_records", "conscious_log", "cost_log"}:
+                statement += " WHERE pipeline_id = %s"
+                params = (pipeline_id,)
+            cursor.execute(statement, params)
+            row = self._fetchone(cursor)
+        finally:
+            self._close_cursor(cursor)
+        return int(row["count"] if row is not None else 0)
+
+    def _count_distinct_pipelines(self, connection: Any) -> int:
+        cursor = connection.cursor()
+        try:
+            cursor.execute(f"SELECT COUNT(DISTINCT pipeline_id) AS count FROM {self._table_name('chunks')}")
+            row = self._fetchone(cursor)
+        finally:
+            self._close_cursor(cursor)
+        return int(row["count"] if row is not None else 0)
+
+    def _sum_cost(self, connection: Any, *, pipeline_id: str | None = None) -> float:
+        cursor = connection.cursor()
+        try:
+            statement = f"SELECT COALESCE(SUM(cost_usd), 0.0) AS total FROM {self._table_name('cost_log')}"
+            params: tuple[object, ...] = ()
+            if pipeline_id is not None:
+                statement += " WHERE pipeline_id = %s"
+                params = (pipeline_id,)
+            cursor.execute(statement, params)
+            row = self._fetchone(cursor)
+        finally:
+            self._close_cursor(cursor)
+        return float(row["total"] if row is not None else 0.0)
+
+    def _max_column(
+        self,
+        connection: Any,
+        table: str,
+        column: str,
+        *,
+        pipeline_id: str | None = None,
+    ) -> float | None:
+        cursor = connection.cursor()
+        try:
+            statement = f"SELECT MAX({column}) AS latest FROM {self._table_name(table)}"
+            params: tuple[object, ...] = ()
+            if pipeline_id is not None and table in {"chunks", "turn_records", "conscious_log", "cost_log"}:
+                statement += " WHERE pipeline_id = %s"
+                params = (pipeline_id,)
+            cursor.execute(statement, params)
+            row = self._fetchone(cursor)
+        finally:
+            self._close_cursor(cursor)
+        if row is None or row["latest"] is None:
+            return None
+        return float(row["latest"])
+
+    def _layer_counts(self, connection: Any, *, pipeline_id: str | None = None) -> dict[str, int]:
+        cursor = connection.cursor()
+        try:
+            statement = (
+                f"SELECT layer, COUNT(*) AS count FROM {self._table_name('chunks')}"
+                + (" WHERE pipeline_id = %s" if pipeline_id is not None else "")
+                + " GROUP BY layer ORDER BY count DESC, layer ASC"
+            )
+            cursor.execute(statement, () if pipeline_id is None else (pipeline_id,))
+            rows = self._fetchall(cursor)
+        finally:
+            self._close_cursor(cursor)
+        return {str(row["layer"]): int(row["count"]) for row in rows}
+
+    def _recent_pipelines(self, connection: Any, *, pipeline_id: str | None = None) -> list[dict[str, object]]:
+        cursor = connection.cursor()
+        try:
+            statement = (
+                "SELECT pipeline_id, COUNT(*) AS chunk_count, MAX(created_at) AS last_chunk_at "
+                f"FROM {self._table_name('chunks')} "
+            )
+            params: tuple[object, ...] = ()
+            if pipeline_id is None:
+                statement += "WHERE pipeline_id IS NOT NULL "
+            else:
+                statement += "WHERE pipeline_id = %s "
+                params = (pipeline_id,)
+            statement += "GROUP BY pipeline_id ORDER BY last_chunk_at DESC LIMIT 5"
+            cursor.execute(statement, params)
+            rows = self._fetchall(cursor)
+        finally:
+            self._close_cursor(cursor)
+        return [
+            {
+                "pipeline_id": str(row["pipeline_id"]),
+                "chunk_count": int(row["chunk_count"]),
+                "last_chunk_at": float(row["last_chunk_at"]),
+            }
+            for row in rows
+            if row["pipeline_id"] is not None
+        ]
+
+    def _cost_summary_row(self, connection: Any, *, pipeline_id: str | None = None) -> dict[str, object]:
+        cursor = connection.cursor()
+        try:
+            statement = (
+                "SELECT "
+                "COALESCE(SUM(cost_usd), 0.0) AS cost_usd_total, "
+                "COALESCE(SUM(input_tokens), 0) AS input_tokens_total, "
+                "COALESCE(SUM(output_tokens), 0) AS output_tokens_total, "
+                "COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens_total, "
+                "COUNT(*) AS entry_count, "
+                "COALESCE(AVG(latency_ms), 0.0) AS avg_latency_ms "
+                f"FROM {self._table_name('cost_log')}"
+            )
+            params: tuple[object, ...] = ()
+            if pipeline_id is not None:
+                statement += " WHERE pipeline_id = %s"
+                params = (pipeline_id,)
+            cursor.execute(statement, params)
+            row = self._fetchone(cursor)
+        finally:
+            self._close_cursor(cursor)
+        return {
+            "cost_usd_total": float(row["cost_usd_total"]),
+            "input_tokens_total": int(row["input_tokens_total"]),
+            "output_tokens_total": int(row["output_tokens_total"]),
+            "cache_read_tokens_total": int(row["cache_read_tokens_total"]),
+            "entry_count": int(row["entry_count"]),
+            "avg_latency_ms": float(row["avg_latency_ms"]),
+        }
+
+    def _cost_group_rows(
+        self,
+        connection: Any,
+        *,
+        group_by: str,
+        pipeline_id: str | None = None,
+    ) -> list[dict[str, object]]:
+        cursor = connection.cursor()
+        try:
+            statement = (
+                f"SELECT {group_by}, COUNT(*) AS turns, COALESCE(SUM(cost_usd), 0.0) AS cost_usd_total "
+                f"FROM {self._table_name('cost_log')}"
+            )
+            params: tuple[object, ...] = ()
+            if pipeline_id is not None:
+                statement += " WHERE pipeline_id = %s"
+                params = (pipeline_id,)
+            statement += f" GROUP BY {group_by} ORDER BY cost_usd_total DESC, {group_by} ASC"
+            cursor.execute(statement, params)
+            rows = self._fetchall(cursor)
+        finally:
+            self._close_cursor(cursor)
+        return [
+            {
+                group_by: str(row[group_by]),
+                "turns": int(row["turns"]),
+                "cost_usd_total": float(row["cost_usd_total"]),
+            }
+            for row in rows
+        ]
+
+    def _recent_cost_rows(
+        self,
+        connection: Any,
+        *,
+        pipeline_id: str | None = None,
+        limit: int,
+    ) -> list[dict[str, object]]:
+        cursor = connection.cursor()
+        try:
+            statement = (
+                "SELECT turn_id, pipeline_id, agent_id, model, input_tokens, output_tokens, "
+                "cache_read_tokens, cost_usd, latency_ms, logged_at "
+                f"FROM {self._table_name('cost_log')}"
+            )
+            params: list[object] = []
+            if pipeline_id is not None:
+                statement += " WHERE pipeline_id = %s"
+                params.append(pipeline_id)
+            statement += " ORDER BY logged_at DESC LIMIT %s"
+            params.append(max(1, limit))
+            cursor.execute(statement, tuple(params))
+            rows = self._fetchall(cursor)
+        finally:
+            self._close_cursor(cursor)
+        return [
+            {
+                "turn_id": str(row["turn_id"]),
+                "pipeline_id": row["pipeline_id"],
+                "agent_id": str(row["agent_id"]),
+                "model": str(row["model"]),
+                "input_tokens": int(row["input_tokens"]),
+                "output_tokens": int(row["output_tokens"]),
+                "cache_read_tokens": int(row["cache_read_tokens"]),
+                "cost_usd": float(row["cost_usd"]),
+                "latency_ms": int(row["latency_ms"] or 0),
+                "logged_at": float(row["logged_at"]),
+            }
+            for row in rows
+        ]
 
     def _row_to_chunk(self, row: dict[str, Any]) -> SubconsciousChunk:
         created_at = float(row["created_at"])

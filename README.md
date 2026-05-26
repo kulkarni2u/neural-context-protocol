@@ -49,7 +49,7 @@ Current benchmark snapshot:
 - coding pipeline: peak `174` NCP tokens vs `1927` naive replay, `17.52x` reduction
 - research pipeline: peak `156` NCP tokens vs `1700` naive replay, `16.35x` reduction
 - live Sarathi handoff route: one real Claude planning subtask dropped from `677` estimated bridge-prompt tokens to `265` estimated handoff tokens, a `60.9%` reduction
-- live pgvector + Redis coordination path: `4/4` integration tests green on the local compose stack
+- live pgvector + Redis coordination path: `5/5` integration tests green on the local compose stack
 
 ## Quick Start
 
@@ -80,11 +80,13 @@ For a deeper setup path, see [docs/NCP_SETUP.md](./docs/NCP_SETUP.md).
 
 ## How It Works
 
-NCP keeps one shared SQLite store per project and serves it over MCP:
+NCP serves one shared project runtime over MCP. By default that runtime is the
+project-local SQLite store; in the `0.2.0` storage line it can also be backed
+by pgvector for durable memory plus Redis for ephemeral coordination:
 
 ```text
 Claude Code  ─┐
-Codex        ─┼→  ncp serve (HTTP/SSE MCP)  →  .ncp/store.db
+Codex        ─┼→  ncp serve (HTTP/SSE MCP)  →  shared NCP store/runtime
 OpenCode     ─┘
 ```
 
@@ -197,7 +199,7 @@ This repository currently ships:
 - core NCP types and encoder
 - chunking and bounded assembly
 - SQLite-backed persistence
-- pgvector durable-store preview for chunk/query and core runtime telemetry
+- pgvector durable-store preview for chunk/query, runtime telemetry, and operator reporting
 - Redis-backed coordination for pgvector whisper delivery and fetch-session limits
 - opt-in live pgvector integration suite for the local Postgres/pgvector path
 - HTTP/SSE MCP server
@@ -213,7 +215,7 @@ Current published alpha:
 Next focus:
 
 - Next major focus: production-facing storage and retrieval
-- Immediate next step: add reporting parity (`ncp status`, `ncp cost`, `ncp explain`) for the pgvector runtime, then carry the partner/reviewer loop into the next real `0.2.0` implementation task
+- Immediate next step: complete the paired OpenCode review lane on the current pgvector storage task, then move into retrieval hardening beyond the current BM25-only query path
 
 ## Documentation
 

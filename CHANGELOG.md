@@ -19,15 +19,17 @@ All notable changes to Neural Context Protocol will be documented in this file.
 - provider install guidance now points at `neural-context-protocol[providers]`
 - known upstream Cohere warning noise is suppressed at the adapter boundary for the current alpha line
 - public docs now reflect the live Sarathi-managed handoff proof and its measured prompt reduction on the `pgvector` storage slice
-- `store.type = "pgvector"` can now power `ncp emit`, `ncp handoff`, and MCP whisper/fetch coordination when Redis is configured
+- `store.type = "pgvector"` can now power `ncp emit`, `ncp handoff`, and MCP whisper/fetch coordination when Redis is configured, with Redis remaining the transient coordination layer behind that path
+- `store.type = "pgvector"` now powers `ncp status`, `ncp cost`, and `ncp explain`, with the CLI reporting the active backend instead of assuming SQLite
 - local infra scripts now prefer a running container engine instead of blindly picking Podman first
 
 ### Planned next layer
 
 - containerized local infra scaffolding for Postgres/pgvector and Redis is now in place for the `0.2.0` storage kickoff
-- pgvector now supports durable chunk writes/query, working-zone reads, recent-ref turn logging, conscious snapshots, cost logging, and pipeline goal-version reads
+- pgvector now supports durable chunk writes/query, working-zone reads, recent-ref turn logging, conscious snapshots, cost logging, pipeline goal-version reads, and operator reporting
 - a live opt-in pgvector integration suite and runner script now exist for the local Postgres/pgvector path
-- the next live storage step is reporting parity for the pgvector runtime, then the paired OpenCode review lane on the current `pgvector` task
+- the current live storage proof covers `5/5` pgvector+Redis integration checks
+- the next live storage step is the paired OpenCode review lane on the current `pgvector` task, then retrieval hardening beyond the current BM25-only query path
 
 ## 0.1.0a1 - 2026-05-24
 

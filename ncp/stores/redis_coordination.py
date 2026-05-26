@@ -119,6 +119,20 @@ class RedisCoordination:
             deleted += int(bool(client.delete(self._payload_key(whisper_id))))
         return deleted
 
+    def whisper_stats(self, *, pipeline_id: str | None = None) -> dict[str, float | int | None]:
+        client = self._client_or_raise()
+        count = 0
+        latest: float | None = None
+        for whisper_id in self._iter_whisper_ids(client):
+            whisper = self._load_whisper(client, whisper_id)
+            if whisper is None:
+                continue
+            if pipeline_id is not None and whisper.pipeline_id != pipeline_id:
+                continue
+            count += 1
+            latest = whisper.created_at if latest is None else max(latest, whisper.created_at)
+        return {"count": count, "last_activity_at": latest}
+
     def drain_whispers(
         self,
         *,
@@ -197,6 +211,21 @@ class RedisCoordination:
             dissent_target=str(payload.get("dissent_target") or "") or None,
         )
         return whisper
+
+    def _iter_whisper_ids(self, client: Any) -> list[str]:
+        pattern = f"{self.whisper_payload_prefix}:*"
+        if hasattr(client, "scan_iter"):
+            return [str(key).split(":")[-1] for key in client.scan_iter(match=pattern)]
+        if hasattr(client, "keys"):
+            return [str(key).split(":")[-1] for key in client.keys(pattern)]
+        hashes = getattr(client, "hashes", None)
+        if isinstance(hashes, dict):
+            return [
+                str(key).split(":")[-1]
+                for key in hashes
+                if str(key).startswith(f"{self.whisper_payload_prefix}:")
+            ]
+        return []
 
     def _client_or_raise(self) -> Any:
         if self._client is None:

@@ -37,8 +37,8 @@ ncp cost
 ncp explain
 ```
 
-This verifies that the local SQLite-backed store can be opened and that the CLI
-is wired correctly. `ncp status` surfaces store and activity rollups; `ncp cost`
+This verifies that the active NCP store can be opened and that the CLI is wired
+correctly. `ncp status` surfaces store and activity rollups; `ncp cost`
 surfaces token and USD rollups from `cost_log`; `ncp explain` summarizes the
 same state in a short human-readable operator view.
 
@@ -69,9 +69,9 @@ Postgres/pgvector and Redis:
 
 This does not change the current default store. SQLite remains the active
 implementation by default. `store.type = "pgvector"` now supports the durable
-chunk/query path plus core turn/cost/conscious persistence, and Redis-backed
-coordination now covers whispers plus fetch-session limits. The richer operator
-commands remain SQLite-only for now.
+chunk/query path, core turn/cost/conscious persistence, Redis-backed
+coordination for whispers plus fetch-session limits, and operator reporting via
+`ncp status`, `ncp cost`, and `ncp explain`.
 
 To run the live pgvector integration suite against the local containerized
 stack:
@@ -81,7 +81,8 @@ stack:
 ```
 
 This runner brings up both Postgres/pgvector and Redis, then validates durable
-pgvector behavior plus Redis-backed coordination on the same local stack.
+pgvector behavior, reporting parity, and Redis-backed coordination on the same
+local stack.
 
 ## Run the examples
 

@@ -148,6 +148,85 @@ def test_pgvector_live_conscious_cost_and_goal_versions() -> None:
     assert versions == {"planner": 3}
 
 
+def test_pgvector_live_status_and_cost_reporting() -> None:
+    store = _pgvector_store()
+    store.write(
+        SubconsciousChunk(
+            chunk_id="sub_live_status",
+            layer="semantic",
+            content="live reporting chunk",
+            src="tool_result",
+            pipeline_id="pipe_live_report",
+        )
+    )
+    store.log_turn_record(
+        TurnRecord(
+            turn_id="turn_live_report",
+            agent_id="planner",
+            pipeline_id="pipe_live_report",
+            task="reporting",
+            slot="status",
+            result="summary",
+            result_full="full summary",
+            created_at=100.0,
+            expires_at=200.0,
+        )
+    )
+    store.log_conscious(
+        ConsciousBlock(
+            agent_id="planner",
+            role="decompose",
+            owns=["planning"],
+            must_not=["shipping"],
+            task="reporting",
+            slot="status",
+            intent="verify_live_reporting",
+            pipeline_id="pipe_live_report",
+            goal_version=2,
+        ),
+        snapshot_hash="hash_live_report",
+    )
+    store.log_cost(
+        agent_id="planner",
+        response=NCPResponse(
+            content="done",
+            input_tokens=90,
+            output_tokens=11,
+            cost_usd=0.02,
+            model="claude-sonnet",
+            pipeline_id="pipe_live_report",
+            turn_id="turn_live_cost",
+            latency_ms=140,
+        ),
+    )
+    store.emit_whisper(
+        Whisper(
+            whisper_id=f"wsp_live_report_{uuid4().hex[:8]}",
+            from_agent="claude",
+            target="opencode",
+            whisper_type="share",
+            payload="check live reporting path",
+            confidence=0.95,
+            pipeline_id="pipe_live_report",
+        )
+    )
+
+    detail = store.status_detail(pipeline_id="pipe_live_report")
+    costs = store.cost_summary(pipeline_id="pipe_live_report", limit=5)
+
+    assert detail["overview"]["chunk_count"] == 1
+    assert detail["overview"]["whisper_count"] == 1
+    assert detail["overview"]["turn_record_count"] == 1
+    assert detail["overview"]["conscious_snapshot_count"] == 1
+    assert detail["layer_counts"] == {"semantic": 1}
+    assert detail["recent_pipelines"][0]["pipeline_id"] == "pipe_live_report"
+    assert costs["summary"]["cost_usd_total"] == 0.02
+    assert costs["summary"]["entry_count"] == 1
+    assert costs["by_agent"][0]["agent_id"] == "planner"
+    assert costs["by_model"][0]["model"] == "claude-sonnet"
+    assert costs["recent_entries"][0]["turn_id"] == "turn_live_cost"
+
+
 def test_pgvector_live_redis_coordination_for_whispers_and_fetch_sessions() -> None:
     if importlib.util.find_spec("redis") is None:
         pytest.skip("redis client is not installed; install neural-context-protocol[redis] first")

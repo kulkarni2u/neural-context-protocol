@@ -8,7 +8,7 @@ from click.testing import CliRunner
 from ncp.agent_handoff import (
     acknowledge_handoffs,
     emit_follow_up_whisper,
-    load_sqlite_handoffs,
+    load_handoffs,
     parse_json_review,
     run_claude_partner,
     run_opencode_reviewer,
@@ -44,7 +44,7 @@ def test_load_handoffs_peeks_without_consuming(tmp_path: Path) -> None:
     store = SQLiteStore(tmp_path / ".ncp" / "store.db")
     _seed_whisper(store, target="claude", payload="implement pgvector integration")
 
-    resolved_store, handoffs = load_sqlite_handoffs(cwd=tmp_path, agent_id="claude", pipeline_id="pipe_handoff")
+    resolved_store, handoffs = load_handoffs(cwd=tmp_path, agent_id="claude", pipeline_id="pipe_handoff")
 
     assert resolved_store.path == store.path
     assert [whisper.payload for whisper in handoffs] == ["implement pgvector integration"]
@@ -59,7 +59,7 @@ def test_claude_partner_acknowledges_after_success_and_can_emit_follow_up(tmp_pa
     store = SQLiteStore(tmp_path / ".ncp" / "store.db")
     _seed_whisper(store, target="claude", payload="tighten the pgvector rollout boundary")
 
-    resolved_store, handoffs = load_sqlite_handoffs(cwd=tmp_path, agent_id="claude", pipeline_id="pipe_handoff")
+    resolved_store, handoffs = load_handoffs(cwd=tmp_path, agent_id="claude", pipeline_id="pipe_handoff")
     response = run_claude_partner(
         cwd=tmp_path,
         agent_id="claude",
@@ -88,7 +88,7 @@ def test_opencode_failure_does_not_consume_handoff(tmp_path: Path) -> None:
     store = SQLiteStore(tmp_path / ".ncp" / "store.db")
     _seed_whisper(store, target="opencode", payload="review pgvector cleanup patch")
 
-    _, handoffs = load_sqlite_handoffs(cwd=tmp_path, agent_id="opencode", pipeline_id="pipe_handoff")
+    _, handoffs = load_handoffs(cwd=tmp_path, agent_id="opencode", pipeline_id="pipe_handoff")
 
     with pytest.raises(RuntimeError, match="boom"):
         run_opencode_reviewer(
@@ -108,7 +108,7 @@ def test_opencode_review_parses_json_text_payload(tmp_path: Path) -> None:
     store = SQLiteStore(tmp_path / ".ncp" / "store.db")
     _seed_whisper(store, target="opencode", payload="review the handoff")
 
-    _, handoffs = load_sqlite_handoffs(cwd=tmp_path, agent_id="opencode", pipeline_id="pipe_handoff")
+    _, handoffs = load_handoffs(cwd=tmp_path, agent_id="opencode", pipeline_id="pipe_handoff")
     review_text = json.dumps(
         {
             "type": "text",
@@ -166,7 +166,7 @@ def test_load_handoffs_can_use_non_sqlite_store(monkeypatch: pytest.MonkeyPatch,
 
     monkeypatch.setattr("ncp.agent_handoff.create_store", lambda _config: _PgvectorLikeStore())
 
-    resolved_store, handoffs = load_sqlite_handoffs(cwd=tmp_path, agent_id="claude", pipeline_id="pipe_handoff")
+    resolved_store, handoffs = load_handoffs(cwd=tmp_path, agent_id="claude", pipeline_id="pipe_handoff")
 
     assert handoffs[0].payload == "delegate via pgvector"
     assert acknowledge_handoffs(resolved_store, handoffs) == 1

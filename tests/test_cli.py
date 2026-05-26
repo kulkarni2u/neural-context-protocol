@@ -212,9 +212,90 @@ def test_cli_status_reports_store_unavailable_cleanly(tmp_path: Path) -> None:
     assert "SQLite store unavailable" in result.output
 
 
-def test_cli_status_reports_pgvector_rollout_boundary(tmp_path: Path) -> None:
+def test_cli_reporting_supports_non_sqlite_runtime_store(tmp_path: Path, monkeypatch: object) -> None:
     runner = CliRunner()
     runner.invoke(main, ["init", "--cwd", str(tmp_path)])
+
+    class _FakeReportingStore:
+        def status_detail(self, *, pipeline_id: str | None = None) -> dict[str, object]:
+            return {
+                "overview": {
+                    "chunk_count": 2,
+                    "tombstone_count": 0,
+                    "whisper_count": 1,
+                    "turn_record_count": 1,
+                    "conscious_snapshot_count": 1,
+                    "cost_entry_count": 1,
+                    "pipeline_count": 1,
+                    "cost_usd_total": 0.015,
+                    "last_activity_at": 123.0,
+                },
+                "layer_counts": {"semantic": 2},
+                "recent_pipelines": [
+                    {"pipeline_id": pipeline_id or "pipe_pg", "chunk_count": 2, "last_chunk_at": 123.0}
+                ],
+            }
+
+        def cost_summary(self, *, pipeline_id: str | None = None, limit: int = 10) -> dict[str, object]:
+            return {
+                "summary": {
+                    "cost_usd_total": 0.015,
+                    "input_tokens_total": 90,
+                    "output_tokens_total": 12,
+                    "cache_read_tokens_total": 0,
+                    "entry_count": 1,
+                    "avg_latency_ms": 120.0,
+                },
+                "by_agent": [{"agent_id": "planner", "turns": 1, "cost_usd_total": 0.015}],
+                "by_model": [{"model": "claude-sonnet", "turns": 1, "cost_usd_total": 0.015}],
+                "recent_entries": [
+                    {
+                        "turn_id": "turn_pg",
+                        "pipeline_id": pipeline_id,
+                        "agent_id": "planner",
+                        "model": "claude-sonnet",
+                        "input_tokens": 90,
+                        "output_tokens": 12,
+                        "cache_read_tokens": 0,
+                        "cost_usd": 0.015,
+                        "latency_ms": 120,
+                        "logged_at": 123.0,
+                    }
+                ],
+            }
+
+    monkeypatch.setattr("ncp.cli._resolve_runtime_store", lambda _config: _FakeReportingStore())
+
+    status_result = runner.invoke(
+        main,
+        ["status", "--cwd", str(tmp_path), "--pipeline-id", "pipe_pg", "--json-output"],
+        env={"NCP_STORE_TYPE": "pgvector"},
+    )
+    cost_result = runner.invoke(
+        main,
+        ["cost", "--cwd", str(tmp_path), "--pipeline-id", "pipe_pg", "--json-output"],
+        env={"NCP_STORE_TYPE": "pgvector"},
+    )
+    explain_result = runner.invoke(
+        main,
+        ["explain", "--cwd", str(tmp_path), "--pipeline-id", "pipe_pg", "--json-output"],
+        env={"NCP_STORE_TYPE": "pgvector"},
+    )
+
+    assert status_result.exit_code == 0
+    assert json.loads(status_result.output)["overview"]["chunk_count"] == 2
+    assert cost_result.exit_code == 0
+    assert json.loads(cost_result.output)["summary"]["cost_usd_total"] == 0.015
+    assert explain_result.exit_code == 0
+    explain_payload = json.loads(explain_result.output)
+    assert explain_payload["facts"]["top_agent"] == "planner"
+    assert explain_payload["facts"]["top_model"] == "claude-sonnet"
+
+
+def test_cli_reporting_rejects_store_without_reporting_capability(tmp_path: Path, monkeypatch: object) -> None:
+    runner = CliRunner()
+    runner.invoke(main, ["init", "--cwd", str(tmp_path)])
+    monkeypatch.setattr("ncp.cli._resolve_runtime_store", lambda _config: object())
 
     result = runner.invoke(
         main,
@@ -223,7 +304,7 @@ def test_cli_status_reports_pgvector_rollout_boundary(tmp_path: Path) -> None:
     )
 
     assert result.exit_code != 0
-    assert "currently supports sqlite only" in result.output
+    assert "not supported by the configured pgvector backend yet" in result.output
 
 
 def test_cli_emit_writes_whisper(tmp_path: Path) -> None:

@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from importlib import resources
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 import click
 from rich import box
@@ -16,7 +17,6 @@ from ncp.config import NCPConfig
 from ncp.stores.base import BaseStore
 from ncp.stores.base import NCPStoreUnavailableError
 from ncp.stores.factory import create_store
-from ncp.stores.sqlite import SQLiteStore
 from ncp.types import Whisper
 
 console = Console()
@@ -34,15 +34,6 @@ def _load_config_template() -> str:
     return resources.files("ncp").joinpath("templates/config.toml.example").read_text()
 
 
-def _require_sqlite_reporting(config: NCPConfig, command_name: str) -> SQLiteStore:
-    if config.store_type != "sqlite":
-        raise click.ClickException(
-            f"`ncp {command_name}` currently supports sqlite only. "
-            f"The {config.store_type} backend is still in the 0.2.0 rollout."
-        )
-    return SQLiteStore(config.store_path)
-
-
 def _resolve_runtime_store(config: NCPConfig) -> BaseStore:
     try:
         return create_store(config)
@@ -50,6 +41,30 @@ def _resolve_runtime_store(config: NCPConfig) -> BaseStore:
         raise click.ClickException(str(exc)) from exc
     except NotImplementedError as exc:
         raise click.ClickException(str(exc)) from exc
+
+
+def _resolve_reporting_store(config: NCPConfig, command_name: str, capability: str) -> BaseStore:
+    store = _resolve_runtime_store(config)
+    if not callable(getattr(store, capability, None)):
+        raise click.ClickException(
+            f"`ncp {command_name}` is not supported by the configured {config.store_type} backend yet."
+        )
+    return store
+
+
+def _store_display(config: NCPConfig) -> str:
+    if config.store_type == "sqlite":
+        return str(config.store_path)
+    dsn = config.pgvector_dsn
+    split = urlsplit(dsn)
+    if split.password is None:
+        return dsn
+    username = split.username or ""
+    host = split.hostname or ""
+    if split.port is not None:
+        host = f"{host}:{split.port}"
+    auth = f"{username}:***@{host}" if username else host
+    return urlunsplit((split.scheme, auth, split.path, split.query, split.fragment))
 
 
 def _run_handoff_command(
@@ -70,7 +85,7 @@ def _run_handoff_command(
     from ncp.agent_handoff import (
         acknowledge_handoffs,
         emit_follow_up_whisper,
-        load_sqlite_handoffs,
+        load_handoffs,
         parse_json_review,
         run_claude_partner,
         run_opencode_reviewer,
@@ -78,7 +93,7 @@ def _run_handoff_command(
     )
 
     try:
-        store, handoffs = load_sqlite_handoffs(
+        store, handoffs = load_handoffs(
             cwd=cwd,
             agent_id=agent_id,
             pipeline_id=pipeline_id,
@@ -223,16 +238,16 @@ def init_command(cwd: Path) -> None:
 @click.option("--pipeline-id", default=None, help="Optional pipeline filter for richer status detail.")
 @click.option("--json-output", is_flag=True, help="Emit machine-readable JSON instead of tables.")
 def status_command(cwd: Path, pipeline_id: str | None, json_output: bool) -> None:
-    """Show rich SQLite-first NCP store status."""
+    """Show rich NCP store status."""
 
     try:
         config = ncp.configure(cwd=cwd)
-        store = _require_sqlite_reporting(config, "status")
+        store = _resolve_reporting_store(config, "status", "status_detail")
         detail = store.status_detail(pipeline_id=pipeline_id)
     except NCPStoreUnavailableError as exc:
         raise click.ClickException(str(exc)) from exc
     payload = {
-        "store_path": str(config.store_path),
+        "store_path": _store_display(config),
         "pipeline_id": pipeline_id,
         **detail,
     }
@@ -244,7 +259,7 @@ def status_command(cwd: Path, pipeline_id: str | None, json_output: bool) -> Non
     table = Table(title="NCP Status", box=box.SIMPLE_HEAVY)
     table.add_column("Metric")
     table.add_column("Value", justify="right")
-    table.add_row("Store", str(config.store_path))
+    table.add_row("Store", _store_display(config))
     table.add_row("Pipeline filter", pipeline_id or "all")
     table.add_row("Chunks", str(overview["chunk_count"]))
     table.add_row("Tombstones", str(overview["tombstone_count"]))
@@ -291,12 +306,12 @@ def cost_command(cwd: Path, pipeline_id: str | None, limit: int, json_output: bo
 
     try:
         config = ncp.configure(cwd=cwd)
-        store = _require_sqlite_reporting(config, "cost")
+        store = _resolve_reporting_store(config, "cost", "cost_summary")
         detail = store.cost_summary(pipeline_id=pipeline_id, limit=limit)
     except NCPStoreUnavailableError as exc:
         raise click.ClickException(str(exc)) from exc
     payload = {
-        "store_path": str(config.store_path),
+        "store_path": _store_display(config),
         "pipeline_id": pipeline_id,
         **detail,
     }
@@ -308,7 +323,7 @@ def cost_command(cwd: Path, pipeline_id: str | None, limit: int, json_output: bo
     summary_table = Table(title="NCP Cost", box=box.SIMPLE_HEAVY)
     summary_table.add_column("Metric")
     summary_table.add_column("Value", justify="right")
-    summary_table.add_row("Store", str(config.store_path))
+    summary_table.add_row("Store", _store_display(config))
     summary_table.add_row("Pipeline filter", pipeline_id or "all")
     summary_table.add_row("Cost USD", f"{float(summary['cost_usd_total']):.4f}")
     summary_table.add_row("Entries", str(summary["entry_count"]))
@@ -379,14 +394,18 @@ def explain_command(cwd: Path, pipeline_id: str | None, limit: int, json_output:
 
     try:
         config = ncp.configure(cwd=cwd)
-        store = _require_sqlite_reporting(config, "explain")
+        store = _resolve_reporting_store(config, "explain", "status_detail")
+        if not callable(getattr(store, "cost_summary", None)):
+            raise click.ClickException(
+                f"`ncp explain` is not supported by the configured {config.store_type} backend yet."
+            )
         status_detail = store.status_detail(pipeline_id=pipeline_id)
         cost_detail = store.cost_summary(pipeline_id=pipeline_id, limit=limit)
     except NCPStoreUnavailableError as exc:
         raise click.ClickException(str(exc)) from exc
 
     payload = _build_explain_payload(
-        store_path=str(config.store_path),
+        store_path=_store_display(config),
         pipeline_id=pipeline_id,
         status_detail=status_detail,
         cost_detail=cost_detail,
@@ -395,7 +414,7 @@ def explain_command(cwd: Path, pipeline_id: str | None, limit: int, json_output:
         console.print_json(data=payload)
         return
 
-    console.print(f"[bold]NCP Explain[/bold]  store={config.store_path}")
+    console.print(f"[bold]NCP Explain[/bold]  store={_store_display(config)}")
     if pipeline_id:
         console.print(f"Pipeline filter: [bold]{pipeline_id}[/bold]")
     console.print(payload["headline"])

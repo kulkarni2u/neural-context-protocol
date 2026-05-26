@@ -45,7 +45,7 @@ def _require_handoff_store(store: Any) -> HandoffStore:
     return store
 
 
-def load_sqlite_handoffs(
+def load_handoffs(
     *,
     cwd: Path,
     agent_id: str,

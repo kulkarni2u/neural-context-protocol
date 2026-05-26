@@ -59,7 +59,7 @@ class _FakeCursor:
         if "SELECT * FROM" in normalized and "chunks WHERE" in normalized and "ORDER BY created_at DESC" in normalized:
             self._rows = self._select_chunks(normalized, params, desc=True)
             return
-        if "SELECT COUNT(*) AS count FROM" in normalized and "chunks WHERE" in normalized:
+        if "SELECT COUNT(*) AS count FROM" in normalized and "chunks WHERE" in normalized and "zone" in normalized:
             self._rows = [{"count": len(self._select_chunks(normalized, params, desc=False))}]
             return
         if "SELECT chunk_id FROM" in normalized and "chunks WHERE" in normalized and "ORDER BY created_at ASC" in normalized:
@@ -124,6 +124,36 @@ class _FakeCursor:
                 "latency_ms": params[8],
                 "logged_at": params[9],
             }
+            return
+        if "SELECT COUNT(*) AS count FROM" in normalized:
+            self._rows = [{"count": self._count_table_rows(normalized, params)}]
+            return
+        if "SELECT COUNT(DISTINCT pipeline_id) AS count FROM" in normalized:
+            self._rows = [{"count": self._count_distinct_pipelines()}]
+            return
+        if "SELECT COALESCE(SUM(cost_usd), 0.0) AS total FROM" in normalized:
+            self._rows = [{"total": self._sum_cost(params)}]
+            return
+        if "SELECT MAX(" in normalized and " AS latest FROM " in normalized:
+            self._rows = [{"latest": self._max_latest(normalized, params)}]
+            return
+        if "SELECT layer, COUNT(*) AS count FROM" in normalized and "GROUP BY layer" in normalized:
+            self._rows = self._layer_counts(params)
+            return
+        if "SELECT pipeline_id, COUNT(*) AS chunk_count, MAX(created_at) AS last_chunk_at FROM" in normalized:
+            self._rows = self._recent_pipelines(params)
+            return
+        if "COALESCE(SUM(cost_usd), 0.0) AS cost_usd_total" in normalized and "AVG(latency_ms)" in normalized:
+            self._rows = [self._cost_summary_row(params)]
+            return
+        if "SELECT agent_id, COUNT(*) AS turns, COALESCE(SUM(cost_usd), 0.0) AS cost_usd_total FROM" in normalized:
+            self._rows = self._cost_group_rows("agent_id", params)
+            return
+        if "SELECT model, COUNT(*) AS turns, COALESCE(SUM(cost_usd), 0.0) AS cost_usd_total FROM" in normalized:
+            self._rows = self._cost_group_rows("model", params)
+            return
+        if "SELECT turn_id, pipeline_id, agent_id, model, input_tokens, output_tokens," in normalized:
+            self._rows = self._recent_cost_rows(params)
             return
 
         raise AssertionError(f"Unhandled fake pgvector SQL: {normalized}")
@@ -220,6 +250,136 @@ class _FakeCursor:
         for key, row in list(table.items()):
             if float(row["expires_at"]) <= expires_at:
                 del table[key]
+
+    def _count_table_rows(self, normalized: str, params: tuple[object, ...]) -> int:
+        table = self._table_from_sql(normalized)
+        rows = self._rows_for_table(table)
+        if " WHERE pipeline_id = %s" in normalized:
+            pipeline_id = params[0] if params else None
+            rows = [row for row in rows if row.get("pipeline_id") == pipeline_id]
+        return len(rows)
+
+    def _count_distinct_pipelines(self) -> int:
+        return len({row["pipeline_id"] for row in self._db.chunks.values() if row.get("pipeline_id") is not None})
+
+    def _sum_cost(self, params: tuple[object, ...]) -> float:
+        rows = list(self._db.cost_log.values())
+        if params:
+            pipeline_id = params[0]
+            rows = [row for row in rows if row["pipeline_id"] == pipeline_id]
+        return float(sum(float(row["cost_usd"]) for row in rows))
+
+    def _max_latest(self, normalized: str, params: tuple[object, ...]) -> float | None:
+        table = self._table_from_sql(normalized)
+        column = normalized.split("SELECT MAX(", 1)[1].split(")", 1)[0]
+        rows = self._rows_for_table(table)
+        if params and table in {"chunks", "turn_records", "cost_log", "conscious_log"}:
+            pipeline_id = params[0]
+            rows = [row for row in rows if row.get("pipeline_id") == pipeline_id]
+        values = [float(row[column]) for row in rows if row.get(column) is not None]
+        return max(values) if values else None
+
+    def _layer_counts(self, params: tuple[object, ...]) -> list[dict[str, object]]:
+        rows = list(self._db.chunks.values())
+        if params:
+            pipeline_id = params[0]
+            rows = [row for row in rows if row["pipeline_id"] == pipeline_id]
+        counts: dict[str, int] = {}
+        for row in rows:
+            counts[str(row["layer"])] = counts.get(str(row["layer"]), 0) + 1
+        return [
+            {"layer": layer, "count": count}
+            for layer, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+        ]
+
+    def _recent_pipelines(self, params: tuple[object, ...]) -> list[dict[str, object]]:
+        rows = [row for row in self._db.chunks.values() if row["pipeline_id"] is not None]
+        if params:
+            pipeline_id = params[0]
+            rows = [row for row in rows if row["pipeline_id"] == pipeline_id]
+        grouped: dict[str, list[dict[str, object]]] = {}
+        for row in rows:
+            grouped.setdefault(str(row["pipeline_id"]), []).append(row)
+        payload = [
+            {
+                "pipeline_id": pipeline_id,
+                "chunk_count": len(group_rows),
+                "last_chunk_at": max(float(row["created_at"]) for row in group_rows),
+            }
+            for pipeline_id, group_rows in grouped.items()
+        ]
+        return sorted(payload, key=lambda row: float(row["last_chunk_at"]), reverse=True)[:5]
+
+    def _cost_summary_row(self, params: tuple[object, ...]) -> dict[str, object]:
+        rows = list(self._db.cost_log.values())
+        if params:
+            pipeline_id = params[0]
+            rows = [row for row in rows if row["pipeline_id"] == pipeline_id]
+        entry_count = len(rows)
+        avg_latency = (
+            sum(float(row["latency_ms"] or 0) for row in rows) / entry_count if entry_count else 0.0
+        )
+        return {
+            "cost_usd_total": float(sum(float(row["cost_usd"]) for row in rows)),
+            "input_tokens_total": int(sum(int(row["input_tokens"]) for row in rows)),
+            "output_tokens_total": int(sum(int(row["output_tokens"]) for row in rows)),
+            "cache_read_tokens_total": int(sum(int(row["cache_read_tokens"]) for row in rows)),
+            "entry_count": entry_count,
+            "avg_latency_ms": float(avg_latency),
+        }
+
+    def _cost_group_rows(self, group_by: str, params: tuple[object, ...]) -> list[dict[str, object]]:
+        rows = list(self._db.cost_log.values())
+        if params:
+            pipeline_id = params[0]
+            rows = [row for row in rows if row["pipeline_id"] == pipeline_id]
+        grouped: dict[str, dict[str, object]] = {}
+        for row in rows:
+            key = str(row[group_by])
+            bucket = grouped.setdefault(key, {group_by: key, "turns": 0, "cost_usd_total": 0.0})
+            bucket["turns"] = int(bucket["turns"]) + 1
+            bucket["cost_usd_total"] = float(bucket["cost_usd_total"]) + float(row["cost_usd"])
+        return sorted(grouped.values(), key=lambda row: (-float(row["cost_usd_total"]), str(row[group_by])))
+
+    def _recent_cost_rows(self, params: tuple[object, ...]) -> list[dict[str, object]]:
+        rows = list(self._db.cost_log.values())
+        if len(params) > 1:
+            pipeline_id = params[0]
+            limit = int(params[1])
+            rows = [row for row in rows if row["pipeline_id"] == pipeline_id]
+        else:
+            limit = int(params[0])
+        ordered = sorted(rows, key=lambda row: float(row["logged_at"]), reverse=True)
+        return ordered[:limit]
+
+    def _table_from_sql(self, normalized: str) -> str:
+        if " FROM " not in normalized:
+            raise AssertionError(f"Unable to determine table for SQL: {normalized}")
+        table_name = normalized.split(" FROM ", 1)[1].split()[0].split(".")[-1]
+        if table_name.endswith("chunks"):
+            return "chunks"
+        if table_name.endswith("tombstones"):
+            return "tombstones"
+        if table_name.endswith("turn_records"):
+            return "turn_records"
+        if table_name.endswith("conscious_log"):
+            return "conscious_log"
+        if table_name.endswith("cost_log"):
+            return "cost_log"
+        raise AssertionError(f"Unknown fake pgvector table for SQL: {normalized}")
+
+    def _rows_for_table(self, table: str) -> list[dict[str, object]]:
+        if table == "chunks":
+            return list(self._db.chunks.values())
+        if table == "tombstones":
+            return list(self._db.tombstones.values())
+        if table == "turn_records":
+            return list(self._db.turn_records.values())
+        if table == "conscious_log":
+            return list(self._db.conscious_log)
+        if table == "cost_log":
+            return list(self._db.cost_log.values())
+        raise AssertionError(f"Unsupported fake pgvector table: {table}")
 
 
 class _FakeConnection:
@@ -445,6 +605,113 @@ def test_pgvector_store_working_zone_turns_and_goal_versions() -> None:
     assert db.cost_log["turn_cost"]["cost_usd"] == 0.05
 
 
+def test_pgvector_store_status_detail_and_cost_summary_with_coordination() -> None:
+    db = _MemoryPgDB()
+    redis_client = _FakeRedisClient()
+    coordination = RedisCoordination(
+        "redis://127.0.0.1:6379/0",
+        client_factory=lambda _url: redis_client,
+    )
+    store = PgvectorStore(
+        "postgresql://postgres:postgres@127.0.0.1:5432/ncp",
+        connect_factory=_pg_connect_factory(db),
+        coordination=coordination,
+    )
+    store.write(
+        SubconsciousChunk(
+            chunk_id="sub_alpha",
+            layer="semantic",
+            content="alpha semantic chunk",
+            src="tool_result",
+            pipeline_id="pipe_alpha",
+        )
+    )
+    store.write(
+        SubconsciousChunk(
+            chunk_id="sub_beta",
+            layer="procedural",
+            content="beta procedural chunk",
+            src="tool_result",
+            pipeline_id="pipe_beta",
+        )
+    )
+    store.log_turn_record(
+        TurnRecord(
+            turn_id="turn_alpha",
+            agent_id="planner",
+            pipeline_id="pipe_alpha",
+            task="reporting",
+            slot="status",
+            result="summary",
+            result_full="full summary",
+            created_at=100.0,
+            expires_at=200.0,
+        )
+    )
+    store.log_conscious(
+        ConsciousBlock(
+            agent_id="planner",
+            role="decompose",
+            owns=["planning"],
+            must_not=["shipping"],
+            task="reporting",
+            slot="status",
+            intent="explain_store",
+            pipeline_id="pipe_alpha",
+            goal_version=2,
+        ),
+        snapshot_hash="hash_alpha",
+    )
+    store.log_cost(
+        agent_id="planner",
+        response=NCPResponse(
+            content="done",
+            input_tokens=80,
+            output_tokens=10,
+            cost_usd=0.02,
+            model="claude-sonnet",
+            pipeline_id="pipe_alpha",
+            turn_id="turn_cost_alpha",
+            latency_ms=150,
+        ),
+    )
+    coordination.emit_whisper(
+        Whisper(
+            whisper_id="wsp_alpha",
+            from_agent="claude",
+            target="opencode",
+            whisper_type="share",
+            payload="review pgvector reporting",
+            confidence=0.95,
+            pipeline_id="pipe_alpha",
+            created_at=250.0,
+        )
+    )
+
+    detail = store.status_detail()
+    filtered = store.status_detail(pipeline_id="pipe_alpha")
+    costs = store.cost_summary(pipeline_id="pipe_alpha", limit=5)
+
+    assert detail["overview"]["chunk_count"] == 2
+    assert detail["overview"]["pipeline_count"] == 2
+    assert detail["overview"]["whisper_count"] == 1
+    assert filtered["overview"]["chunk_count"] == 1
+    assert filtered["overview"]["whisper_count"] == 1
+    assert filtered["overview"]["turn_record_count"] == 1
+    assert filtered["overview"]["conscious_snapshot_count"] == 1
+    assert filtered["overview"]["last_activity_at"] is not None
+    assert float(filtered["overview"]["last_activity_at"]) >= 250.0
+    assert filtered["layer_counts"] == {"semantic": 1}
+    assert filtered["recent_pipelines"] == [
+        {"pipeline_id": "pipe_alpha", "chunk_count": 1, "last_chunk_at": db.chunks["sub_alpha"]["created_at"]}
+    ]
+    assert costs["summary"]["cost_usd_total"] == 0.02
+    assert costs["summary"]["entry_count"] == 1
+    assert costs["by_agent"][0]["agent_id"] == "planner"
+    assert costs["by_model"][0]["model"] == "claude-sonnet"
+    assert costs["recent_entries"][0]["turn_id"] == "turn_cost_alpha"
+
+
 def test_pgvector_store_rejects_invalid_identifiers() -> None:
     with pytest.raises(ValueError, match="schema"):
         PgvectorStore(
@@ -489,9 +756,13 @@ def test_redis_coordination_supports_peek_ack_and_fetch_sessions() -> None:
     )
 
     peeked = coordination.peek_whispers(agent_id="executor", pipeline_id="pipe_redis")
+    all_stats = coordination.whisper_stats()
+    filtered_stats = coordination.whisper_stats(pipeline_id="pipe_redis")
     claimed, pipeline_id = coordination.claim_fetch_slot("session-1", pipeline_id="pipe_redis")
 
     assert [whisper.whisper_id for whisper in peeked] == ["wsp_broadcast", "wsp_direct"]
+    assert all_stats["count"] == 2
+    assert filtered_stats["count"] == 2
     assert coordination.acknowledge_whispers(["wsp_direct"]) == 1
     assert [whisper.whisper_id for whisper in coordination.drain_whispers(agent_id="executor", pipeline_id="pipe_redis")] == [
         "wsp_broadcast"
