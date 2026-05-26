@@ -42,6 +42,10 @@ What is already proven in this repository:
 - Sarathi can route Claude and OpenCode child-task dispatches through NCP handoffs
 - the pgvector durable path now supports Redis-backed whisper delivery and Redis-backed fetch-session limits
 - retrieval now filters lexical zero-overlap noise and reranks surviving matches with NCP's trust/age/generation weighting
+- `retrieval_mode="trust_recency"` enables pure trust+recency ranking for non-BM25 backends
+- retrieval feedback calibration: `query()` tracks `retrieval_count`; `calibrate(feedback_mode=True)` auto-boosts frequently-retrieved chunks
+- pgvector schema migrations with advisory lock, checksums, and UP/DOWN rollback via `ncp migrate`
+- incremental assembly (`assemble_incremental()`) enforces the declared `max_tokens_per_call` budget and yields sections in priority order
 - restart persistence is validated by the dogfood harness
 - bounded-context benchmarks are reproducible and show large prompt reduction
 
@@ -173,7 +177,16 @@ fusion of three signals:
 | `base_trust` (writer attestation) | 0.2 | user-verified facts outrank inferred ones |
 
 Chunks that share zero lexical overlap with the query are filtered before
-scoring, so noise never reaches the assembled context.
+scoring, so noise never reaches the assembled context. Pass
+`retrieval_mode="trust_recency"` to skip BM25 entirely — useful for backends
+that perform their own vector similarity search before handing results to NCP
+for trust/recency reranking.
+
+**Retrieval feedback calibration.** Each `query()` call increments a
+`retrieval_count` on returned chunks. `calibrate(feedback_mode=True)` then
+boosts `base_trust` for frequently-retrieved chunks (proportional to retrieval
+count, capped at 10 retrievals, +15% max), so facts that agents actually use
+accumulate higher trust over time without manual intervention.
 
 **Deduplication.** The store rejects writes with >92% content similarity in the
 same zone/layer/pipeline. The same fact is stored once and updated, not
@@ -250,9 +263,9 @@ limits can all operate on the same runtime split:
 This repository currently ships:
 
 - core NCP types and encoder
-- chunking and bounded assembly
+- chunking and bounded assembly with incremental `assemble_incremental()` generator
 - SQLite-backed persistence
-- pgvector durable-store preview for chunk/query, runtime telemetry, and operator reporting
+- pgvector durable-store with schema migrations, advisory-lock upgrade tooling, and `ncp migrate` CLI
 - Redis-backed coordination for pgvector whisper delivery and fetch-session limits
 - opt-in live pgvector integration suite for the local Postgres/pgvector path
 - HTTP/SSE MCP server
@@ -263,14 +276,7 @@ This repository currently ships:
 
 Current release:
 
-- `neural-context-protocol==0.3.0`
-
-Next focus:
-
-- pgvector schema migrations and upgrade tooling
-- streaming / incremental assembly for very long turns
-- vector-only retrieval path for non-BM25 backends
-- calibration/trust scoring driven by retrieval feedback (not just age)
+- `neural-context-protocol==0.4.0`
 
 ## Documentation
 

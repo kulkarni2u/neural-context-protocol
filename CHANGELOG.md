@@ -2,6 +2,56 @@
 
 All notable changes to Neural Context Protocol will be documented in this file.
 
+## [0.4.0] - 2026-05-26
+
+Release hardening and retrieval quality milestone. All four slices landed on
+both SQLite and pgvector; no breaking changes to existing callers.
+
+### Added
+
+- **pgvector schema migrations** (`ncp/stores/migrations.py`, `ncp/migrations/`):
+  `MigrationRunner` with advisory lock, SHA-256 checksums, UP/DOWN sections,
+  idempotent apply, version-ordered rollback, and `ncp migrate` CLI commands
+  (`check`, `apply [--dry-run]`, `rollback <version> [--dry-run]`)
+- **Migration 001**: baseline pgvector schema (chunks, whispers, turns, costs,
+  schema_versions tracking table)
+- **Migration 002**: `retrieval_count` and `last_retrieved_at` columns added to
+  the chunks table
+- **Retrieval feedback calibration** (`calibrate(feedback_mode=True)`): every
+  `query()` call increments `retrieval_count` and stamps `last_retrieved_at`; a
+  new `feedback_mode` pass in `calibrate()` boosts `base_trust` proportional to
+  retrieval count (saturates at 10 retrievals, default +15% max, `dry_run`
+  supported); `CalibrationReport` extended with `feedback_adjusted` field and
+  change-log entries with `reason="retrieval_feedback"`
+- **Incremental assembly** (`Assembler.assemble_incremental()`): generator that
+  yields `(label, section_text)` pairs in priority order
+  (`budget_header → conscious → subconscious → whispers`) with an optional
+  `max_tokens` cap enforced via word-split proxy; budget/conscious sections always
+  emitted; `assemble()` refactored to call shared `_prepare_assembly()` helper
+- **Non-BM25 retrieval mode** (`retrieval_mode` parameter on `BaseStore.query()`):
+  `"hybrid"` (default, existing BM25 + recency + trust) and `"trust_recency"`
+  (skips BM25 and term-overlap filter, scores by recency + trust with renormalized
+  weights); `RetrievalPolicy.score_no_bm25()` added; unknown mode values raise
+  `ValueError`; `SupportsAssemblyStore` Protocol updated
+
+### Changed
+
+- `BaseStore.query()` gains `retrieval_mode: str = "hybrid"` — default behavior
+  unchanged; existing callers require no modification
+- `SubconsciousChunk` gains `retrieval_count: int = 0` and
+  `last_retrieved_at: float | None = None` fields
+- `CalibrationReport` gains `feedback_adjusted: int = 0` field
+- `Assembler.assemble()` now delegates setup to `_prepare_assembly()`;
+  output is identical to the previous implementation
+
+### Verified
+
+- Full test suite: 370 passed, 8 skipped
+- Ruff: zero lint errors
+- OpenCode (deepseek-v4-flash-free) reviewed all 4 implementation slices; one
+  structural fix applied per review (Slice 3: multiple `[NCP:SUBCONSCIOUS]`
+  headers; Slice 4: unknown-mode silent fallthrough)
+
 ## [0.3.0] - 2026-05-25
 
 Operator tooling and maintenance milestone. SQLite remains the default runtime;

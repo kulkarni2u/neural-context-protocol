@@ -6,11 +6,11 @@ agent instead of replaying long chat history.
 
 ## Current State
 
-Released:
+Latest release:
 
-- PyPI: `neural-context-protocol==0.2.0` *(pending publish)*
-- GitHub tag: `v0.2.0` (commit `dff06a7`)
-- Suite: `236 passed, 6 skipped`
+- PyPI: `neural-context-protocol==0.4.0` *(pending publish)*
+- GitHub: `main` branch (commit `1a3be87`)
+- Suite: `370 passed, 8 skipped`
 - Live pgvector + Redis integration suite: `6 passed`
 
 ## What Shipped In 0.2.0
@@ -64,17 +64,36 @@ Released:
 - BaseStore ABC: consolidate, calibrate, viz_data all @abstractmethod
 - Suite: 306 passed, 6 skipped
 
-## Active Line: 0.4.x
+## What Shipped In 0.4.0
 
-The `0.3.0` consolidation and operator tooling line is closed. Work now moves
-to the `0.4.x` release hardening and streaming line.
+- **Slice 1 — pgvector schema migrations**: `MigrationRunner` with advisory lock,
+  SHA-256 checksums, UP/DOWN sections, `ncp migrate check/apply/rollback` CLI.
+  Migration 001 (baseline schema) and 002 (`retrieval_count`, `last_retrieved_at`).
+- **Slice 2 — Retrieval feedback calibration**: `query()` increments
+  `retrieval_count`/`last_retrieved_at` on every returned chunk;
+  `calibrate(feedback_mode=True)` boosts `base_trust` proportional to retrieval
+  count (max +15% at 10 retrievals, `dry_run` supported). `CalibrationReport`
+  extended with `feedback_adjusted` and change-log entries.
+- **Slice 3 — Incremental assembly**: `Assembler.assemble_incremental()` generator
+  yields `(label, text)` pairs in priority order; enforces `max_tokens_per_call`
+  budget via word-split proxy; `_prepare_assembly()` extracted so `assemble()` and
+  `assemble_incremental()` share identical setup logic.
+- **Slice 4 — Non-BM25 retrieval mode**: `retrieval_mode` parameter on
+  `BaseStore.query()` (`"hybrid"` default, `"trust_recency"` new);
+  `RetrievalPolicy.score_no_bm25()` with renormalized weights + div-by-zero guard;
+  unknown values raise `ValueError`.
+- Suite: 370 passed, 8 skipped. Ruff clean. All four slices OpenCode-reviewed.
 
-### Next focus
+## Active Line: 0.5.x (suggested)
 
-1. pgvector schema migrations and upgrade tooling
-2. Streaming / incremental assembly for very long turns
-3. Calibration driven by retrieval feedback (not just age decay)
-4. Vector-only retrieval path for non-BM25 backends
+The `0.4.x` release hardening line is closed.
+
+### Suggested next focus
+
+- Connection pooling for pgvector (production readiness)
+- Collapse `SupportsAssemblyStore` Protocol into `BaseStore` directly
+- Actual embedding storage + ANN query using the pgvector `<=>` operator
+- Streaming MCP `ncp_get_context` endpoint (SSE or NDJSON) for very long turns
 
 ## Known Architectural Gaps (carried forward)
 
@@ -104,10 +123,12 @@ to the `0.4.x` release hardening and streaming line.
 
 ## Suggested Prompt For The Next Orchestrator
 
-> Read `docs/NCP_0_2_0_HANDOFF_PACKET.md` first. The `0.2.0` line is closed
-> and tagged at `v0.2.0`. We are opening the `0.3.0` consolidation and
-> operator tooling line. Start with subconscious consolidation — a background
-> pass that merges/prunes redundant chunks and trims tombstones so long-running
-> pipelines don't accumulate noise. Keep SQLite and pgvector aligned. Use NCP
-> handoffs for bounded coordination. Prefer correctness and tests over broad
-> refactors.
+> Read `docs/NCP_0_2_0_HANDOFF_PACKET.md` first. The `0.4.x` line is closed.
+> We are opening the `0.5.x` production readiness line. Priorities in order:
+> (1) pgvector connection pooling so the production path can handle concurrent
+> agents without exhausting connections; (2) collapse `SupportsAssemblyStore`
+> into `BaseStore` so the assembler has one typed surface; (3) actual embedding
+> storage + ANN query using pgvector `<=>` so `retrieval_mode="trust_recency"`
+> has a real vector backend rather than just trust/recency fallback. Keep SQLite
+> and pgvector aligned. Use NCP handoffs for bounded coordination. Prefer
+> correctness and tests over broad refactors.
