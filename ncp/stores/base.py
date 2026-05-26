@@ -5,7 +5,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 
-from ncp.types import ConsciousBlock, NCPResponse, SubconsciousChunk, TurnRecord, Whisper
+from ncp.types import ConsolidationReport, ConsciousBlock, NCPResponse, SubconsciousChunk, TurnRecord, Whisper
 
 
 class NCPStoreError(RuntimeError):
@@ -128,3 +128,14 @@ class BaseStore(ABC):
         current_agent: str | None = None,
     ) -> dict[str, int]:
         """Return latest goal_version for each agent in a pipeline."""
+
+    @abstractmethod
+    def consolidate(
+        self,
+        *,
+        pipeline_id: str | None = None,
+        dry_run: bool = False,
+        similarity_threshold: float = 0.65,
+        trust_floor: float = 0.10,
+    ) -> ConsolidationReport:
+        """Merge redundant chunks and tombstone noise. Returns a report of what changed."""

@@ -13,8 +13,9 @@ import time
 from rank_bm25 import BM25Okapi
 
 from ncp.stores.base import BaseStore, NCPStoreUnavailableError
+from ncp.stores.consolidation import cluster_by_tags, find_merge_candidates
 from ncp.stores.retrieval import DEFAULT_RETRIEVAL_POLICY, RetrievalPolicy
-from ncp.types import ConsciousBlock, NCPResponse, SubconsciousChunk, TurnRecord, Whisper
+from ncp.types import ConsolidationReport, ConsciousBlock, NCPResponse, SubconsciousChunk, TurnRecord, Whisper
 
 
 SCHEMA = """
@@ -544,6 +545,90 @@ class SQLiteStore(BaseStore):
             except (json.JSONDecodeError, KeyError, TypeError, ValueError):
                 pass
         return versions
+
+    def consolidate(
+        self,
+        *,
+        pipeline_id: str | None = None,
+        dry_run: bool = False,
+        similarity_threshold: float = 0.65,
+        trust_floor: float = 0.10,
+    ) -> ConsolidationReport:
+        started = time.monotonic()
+        report = ConsolidationReport(dry_run=dry_run, pipeline_id=pipeline_id)
+
+        with self._connect() as connection:
+            query = "SELECT * FROM chunks WHERE chunk_id NOT IN (SELECT chunk_id FROM tombstones)"
+            params: list = []
+            if pipeline_id is not None:
+                query += " AND pipeline_id = ?"
+                params.append(pipeline_id)
+            rows = connection.execute(query, params).fetchall()
+
+        all_chunks = [self._row_to_chunk(row) for row in rows]
+        eligible = [c for c in all_chunks if c.base_trust >= trust_floor]
+        report.skipped += len(all_chunks) - len(eligible)
+        clusters = cluster_by_tags(eligible)
+        report.clusters_scanned = len(clusters)
+
+        for cluster in clusters:
+            candidates = find_merge_candidates(cluster, similarity_threshold=similarity_threshold)
+            for keeper, losers in candidates:
+                loser_ids = [c.chunk_id for c in losers]
+                report.merge_log.append({
+                    "kept": keeper.chunk_id,
+                    "merged": loser_ids,
+                    "layer": keeper.layer,
+                    "zone": keeper.zone,
+                    "pipeline_id": keeper.pipeline_id,
+                })
+                if not dry_run:
+                    supersedes_json = json.dumps(loser_ids)
+                    new_gen = keeper.generation + 1
+                    with self._connect() as connection:
+                        connection.execute("BEGIN IMMEDIATE")
+                        for loser_id in loser_ids:
+                            connection.execute("DELETE FROM chunks WHERE chunk_id = ?", (loser_id,))
+                            connection.execute(
+                                "INSERT OR REPLACE INTO tombstones (chunk_id, forward_ref, tombstoned_at, expires_at)"
+                                " VALUES (?, ?, ?, ?)",
+                                (loser_id, keeper.chunk_id, time.time(), time.time() + 86400),
+                            )
+                        connection.execute(
+                            "UPDATE chunks SET generation = ?, supersedes = ? WHERE chunk_id = ?",
+                            (new_gen, supersedes_json, keeper.chunk_id),
+                        )
+                report.merged += 1
+                report.tombstoned += len(loser_ids)
+
+            report.skipped += sum(
+                1 for c in cluster
+                if not any(
+                    c.chunk_id == k.chunk_id or c.chunk_id in [l.chunk_id for l in ls]
+                    for k, ls in candidates
+                )
+            )
+
+        if not dry_run and report.merged > 0:
+            self._emit_consolidation_whisper(pipeline_id=pipeline_id)
+
+        report.duration_seconds = time.monotonic() - started
+        return report
+
+    def _emit_consolidation_whisper(self, *, pipeline_id: str | None) -> None:
+        from ncp.types import Whisper
+        whisper = Whisper(
+            from_agent="ncp_consolidator",
+            target="*",
+            whisper_type="consolidation_ready",
+            payload=f"consolidation_complete pipeline:{pipeline_id or 'all'}",
+            confidence=1.0,
+            pipeline_id=pipeline_id,
+        )
+        try:
+            self.emit_whisper(whisper)
+        except Exception:
+            pass
 
     def status(self) -> dict[str, int | float]:
         with self._connect() as connection:

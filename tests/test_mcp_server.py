@@ -618,6 +618,9 @@ class TestErrors:
             def get_pipeline_goal_versions(self, *, pipeline_id, current_agent=None):
                 raise NotImplementedError("pending backend path")
 
+            def consolidate(self, *, pipeline_id=None, dry_run=False, similarity_threshold=0.65, trust_floor=0.10):
+                raise NotImplementedError("pending backend path")
+
         handlers = make_handlers(_PendingStore())
         resp = _handle_request(
             _call(

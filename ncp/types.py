@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import time
+from dataclasses import dataclass, field
 from typing import Literal
 from uuid import uuid4
 
@@ -421,3 +422,17 @@ class NCPResponse(NCPModel):
         if value < 0.0:
             raise ValueError("cost_usd must be >= 0.0")
         return value
+
+
+@dataclass
+class ConsolidationReport:
+    """Result of a consolidation pass over the store."""
+
+    clusters_scanned: int = 0
+    merged: int = 0
+    tombstoned: int = 0
+    skipped: int = 0
+    duration_seconds: float = 0.0
+    dry_run: bool = False
+    pipeline_id: str | None = None
+    merge_log: list[dict] = field(default_factory=list)

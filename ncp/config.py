@@ -52,6 +52,13 @@ DEFAULT_CONFIG = {
         "log_format": "pretty",
         "cost_tracking": True,
     },
+    "consolidation": {
+        "enabled": True,
+        "similarity_threshold": 0.65,
+        "trust_floor": 0.10,
+        "model_provider": None,
+        "model": None,
+    },
     "providers": {
         "pricing": {
             "claude-sonnet-4-20250514": {"input": 3.00, "output": 15.00, "cache_read": 0.30},
@@ -104,6 +111,28 @@ class NCPConfig:
     @property
     def pgvector_table_prefix(self) -> str:
         return str(self.values.get("pgvector", {}).get("table_prefix", "ncp_"))
+
+    @property
+    def consolidation_enabled(self) -> bool:
+        return bool(self.values.get("consolidation", {}).get("enabled", True))
+
+    @property
+    def consolidation_similarity_threshold(self) -> float:
+        return float(self.values.get("consolidation", {}).get("similarity_threshold", 0.65))
+
+    @property
+    def consolidation_trust_floor(self) -> float:
+        return float(self.values.get("consolidation", {}).get("trust_floor", 0.10))
+
+    @property
+    def consolidation_model_provider(self) -> str | None:
+        val = self.values.get("consolidation", {}).get("model_provider")
+        return str(val) if val else None
+
+    @property
+    def consolidation_model(self) -> str | None:
+        val = self.values.get("consolidation", {}).get("model")
+        return str(val) if val else None
 
 
 def load_config(

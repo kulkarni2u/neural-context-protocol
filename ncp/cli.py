@@ -696,5 +696,58 @@ def emit_command(
     console.print("Whisper emitted.")
 
 
+@main.command("consolidate")
+@click.option("--cwd", default=None, type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("--pipeline-id", default=None, help="Scope consolidation to one pipeline.")
+@click.option("--dry-run", is_flag=True, default=False, help="Preview merges without writing.")
+@click.option("--similarity-threshold", default=None, type=float, help="Override config similarity threshold.")
+def consolidate_command(
+    cwd: Path | None,
+    pipeline_id: str | None,
+    dry_run: bool,
+    similarity_threshold: float | None,
+) -> None:
+    """Merge redundant chunks and clean up tombstones."""
+    from ncp.config import load_config
+
+    config = load_config(cwd=cwd or Path.cwd())
+    threshold = similarity_threshold if similarity_threshold is not None else config.consolidation_similarity_threshold
+    trust_floor = config.consolidation_trust_floor
+
+    try:
+        store = create_store(config)
+    except NCPStoreUnavailableError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    try:
+        report = store.consolidate(
+            pipeline_id=pipeline_id,
+            dry_run=dry_run,
+            similarity_threshold=threshold,
+            trust_floor=trust_floor,
+        )
+    except NCPStoreUnavailableError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    table = Table(title="Consolidation Report", box=box.SIMPLE)
+    table.add_column("Metric", style="cyan")
+    table.add_column("Value", style="green")
+    table.add_row("Mode", "dry-run" if report.dry_run else "live")
+    table.add_row("Pipeline", report.pipeline_id or "all")
+    table.add_row("Clusters scanned", str(report.clusters_scanned))
+    table.add_row("Groups merged", str(report.merged))
+    table.add_row("Chunks tombstoned", str(report.tombstoned))
+    table.add_row("Chunks skipped", str(report.skipped))
+    table.add_row("Duration", f"{report.duration_seconds:.3f}s")
+    console.print(table)
+
+    if report.dry_run and report.merged > 0:
+        console.print(f"[yellow]Dry run: {report.merged} merge(s) would be committed.[/yellow]")
+    elif report.merged == 0:
+        console.print("[dim]Nothing to consolidate.[/dim]")
+    else:
+        console.print(f"[green]Consolidated {report.merged} group(s), {report.tombstoned} chunk(s) tombstoned.[/green]")
+
+
 if __name__ == "__main__":
     main()
