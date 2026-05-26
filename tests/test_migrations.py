@@ -5,11 +5,11 @@ from __future__ import annotations
 import hashlib
 import os
 from pathlib import Path
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock
 
 import pytest
 
-from ncp.stores.migrations import MigrationError, MigrationFile, MigrationRunner
+from ncp.stores.migrations import MigrationError, MigrationRunner
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -110,7 +110,7 @@ def test_discover_sorted_by_version(tmp_path: Path) -> None:
 
 def test_discover_checksum_is_sha256_of_raw_bytes(tmp_path: Path) -> None:
     content = "-- UP\nCREATE TABLE x ();"
-    p = _sql_file(tmp_path, "001_x.sql", content)
+    _sql_file(tmp_path, "001_x.sql", content)
     expected = hashlib.sha256(content.encode()).hexdigest()
 
     runner = _runner(_mock_conn(), tmp_path)
@@ -353,7 +353,7 @@ def test_migration_apply_and_rollback_live(tmp_path: Path) -> None:
         f"-- DOWN\nDROP TABLE IF EXISTS {schema}.{prefix}mig_test CASCADE;\n"
         f"DROP SCHEMA IF EXISTS {schema} CASCADE;\n"
     )
-    sql_file = _sql_file(tmp_path, "001_mig_test.sql", content)
+    _sql_file(tmp_path, "001_mig_test.sql", content)
 
     conn = psycopg2.connect(dsn)
     runner = MigrationRunner(conn, schema=schema, prefix=prefix, migrations_dir=tmp_path)

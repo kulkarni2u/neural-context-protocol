@@ -629,7 +629,7 @@ class SQLiteStore(BaseStore):
             report.skipped += sum(
                 1 for c in cluster
                 if not any(
-                    c.chunk_id == k.chunk_id or c.chunk_id in [l.chunk_id for l in ls]
+                    c.chunk_id == k.chunk_id or c.chunk_id in [m.chunk_id for m in ls]
                     for k, ls in candidates
                 )
             )

@@ -6,7 +6,7 @@ from click.testing import CliRunner
 from ncp.batch import run_batch
 from ncp.cli import main
 from ncp.stores.sqlite import SQLiteStore
-from ncp.types import SubconsciousChunk, Whisper
+from ncp.types import SubconsciousChunk
 
 
 def _store(tmp_path: Path) -> SQLiteStore:
@@ -131,8 +131,6 @@ def test_malformed_json_line_handled_in_cli(tmp_path: Path) -> None:
     runner = CliRunner()
     input_file = tmp_path / "bad.jsonl"
     input_file.write_text('{"op": "write_memory", "content": "ok", "layer": "semantic", "src": "agent_inferred", "written_by": "test"}\nnot valid json\n')
-    store = SQLiteStore(tmp_path / ".ncp" / "store.db")
-
     result = runner.invoke(
         main,
         ["batch", str(input_file), "--cwd", str(tmp_path)],

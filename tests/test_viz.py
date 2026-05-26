@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import tempfile
 import time
 from pathlib import Path
 
-import pytest
 
 from ncp.stores.sqlite import SQLiteStore
 from ncp.types import SubconsciousChunk, Whisper
@@ -215,7 +213,7 @@ class TestTopChunks:
             store.write(_chunk(
                 content=f"chunk with trust {trust} label {label} unique content abc",
                 base_trust=trust,
-                layer=f"episodic",
+                layer="episodic",
             ))
         data = store.viz_data()
         trusts = [float(r["base_trust"]) for r in data["top_chunks"]]

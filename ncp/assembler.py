@@ -15,7 +15,6 @@ import anyio
 from ncp.coherence import CoherenceChecker
 from ncp.encoder import PidginEncoder
 from ncp.middleware.base import MiddlewarePipeline
-from ncp.stores.base import BaseStore
 from ncp.types import BudgetContext, ConsciousBlock, NCPResponse, SubconsciousChunk, TurnRecord, Whisper
 
 
