@@ -41,6 +41,7 @@ What is already proven in this repository:
 - both hosts can deliver and receive whispers through the shared MCP runtime
 - Sarathi can route Claude and OpenCode child-task dispatches through NCP handoffs
 - the pgvector durable path now supports Redis-backed whisper delivery and Redis-backed fetch-session limits
+- retrieval now filters lexical zero-overlap noise and reranks surviving matches with NCP's trust/age/generation weighting
 - restart persistence is validated by the dogfood harness
 - bounded-context benchmarks are reproducible and show large prompt reduction
 
@@ -49,7 +50,7 @@ Current benchmark snapshot:
 - coding pipeline: peak `174` NCP tokens vs `1927` naive replay, `17.52x` reduction
 - research pipeline: peak `156` NCP tokens vs `1700` naive replay, `16.35x` reduction
 - live Sarathi handoff route: one real Claude planning subtask dropped from `677` estimated bridge-prompt tokens to `265` estimated handoff tokens, a `60.9%` reduction
-- live pgvector + Redis coordination path: `5/5` integration tests green on the local compose stack
+- live pgvector + Redis coordination path: `6/6` integration tests green on the local compose stack
 
 ## Quick Start
 
@@ -215,7 +216,7 @@ Current published alpha:
 Next focus:
 
 - Next major focus: production-facing storage and retrieval
-- Immediate next step: complete the paired OpenCode review lane on the current pgvector storage task, then move into retrieval hardening beyond the current BM25-only query path
+- Immediate next step: move from lexical hardening into fuller hybrid retrieval beyond the current BM25-first query path
 
 ## Documentation
 

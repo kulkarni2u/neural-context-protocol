@@ -64,7 +64,7 @@ def main() -> None:
             SubconsciousChunk(
                 chunk_id="sub_example_plan",
                 layer="semantic",
-                content="planner decided to hand the task to executor with one bounded step",
+                content="handoff_demo execute planner decided to hand the task to executor with one bounded step",
                 src="synthesis",
                 written_by="planner",
                 pipeline_id=PIPELINE_ID,

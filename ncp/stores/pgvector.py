@@ -299,6 +299,7 @@ class PgvectorStore(BaseStore):
         text: str,
         *,
         k: int = 4,
+        min_score: float = 0.01,
         layer: str | None = None,
         pipeline_id: str | None = None,
         scope: str | None = None,
@@ -315,21 +316,39 @@ class PgvectorStore(BaseStore):
         if not rows:
             return []
 
-        corpus = [str(row["content"]).split() for row in rows]
+        query_terms = {term for term in text.lower().split() if term}
+        corpus = [str(row["content"]).lower().split() for row in rows]
         bm25 = BM25Okapi(corpus)
         scores = bm25.get_scores(text.split())
-        paired = sorted(zip(scores, rows, strict=True), key=lambda item: item[0], reverse=True)
+        candidates: list[SubconsciousChunk] = []
+        for score, row, doc_tokens in zip(scores, rows, corpus, strict=True):
+            if query_terms:
+                overlap = len(query_terms.intersection(doc_tokens))
+                if overlap == 0:
+                    continue
+                lexical_floor = overlap / len(query_terms)
+                relevance = max(float(score), lexical_floor)
+            else:
+                relevance = 1.0
+            if relevance < min_score:
+                continue
+            chunk = self._row_to_chunk(row)
+            chunk.relevance = max(0.0, relevance)
+            candidates.append(chunk)
+        ranked = sorted(
+            candidates,
+            key=lambda chunk: (chunk.effective_score, chunk.relevance),
+            reverse=True,
+        )
 
         diversity_limit = 2
         author_count: dict[str, int] = {}
         results: list[SubconsciousChunk] = []
-        for score, row in paired:
-            author = str(row["written_by"])
+        for chunk in ranked:
+            author = str(chunk.written_by)
             if author_count.get(author, 0) >= diversity_limit:
                 continue
             author_count[author] = author_count.get(author, 0) + 1
-            chunk = self._row_to_chunk(row)
-            chunk.relevance = max(0.0, float(score))
             results.append(chunk)
             if len(results) >= max(1, min(k, 4)):
                 break

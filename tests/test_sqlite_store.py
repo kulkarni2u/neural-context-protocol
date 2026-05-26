@@ -46,6 +46,52 @@ def test_sqlite_store_write_query_and_restart(tmp_path: Path) -> None:
     assert results[0].pipeline_id == "pipe_1"
 
 
+def test_sqlite_store_query_filters_zero_score_noise_and_uses_effective_score(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "store.db")
+    store.write(
+        SubconsciousChunk(
+            chunk_id="sub_low_trust",
+            layer="semantic",
+            content="bearer token failure handling shared ranking content",
+            src="tool_result",
+            pipeline_id="pipe_1",
+            written_by="executor",
+            base_trust=0.4,
+        )
+    )
+    store.write(
+        SubconsciousChunk(
+            chunk_id="sub_high_trust",
+            layer="procedural",
+            content="bearer token failure handling shared ranking content",
+            src="tool_result",
+            pipeline_id="pipe_1",
+            written_by="planner",
+            base_trust=0.9,
+        )
+    )
+    store.write(
+        SubconsciousChunk(
+            chunk_id="sub_noise",
+            layer="semantic",
+            content="database schema migration notes",
+            src="tool_result",
+            pipeline_id="pipe_1",
+            written_by="critic",
+        )
+    )
+
+    results = store.query("bearer token failure", pipeline_id="pipe_1", k=4)
+    off_topic = store.query("unrelated astronomy orbit", pipeline_id="pipe_1", k=4)
+    blank_query = store.query("   ", pipeline_id="pipe_1", k=4)
+
+    assert [chunk.chunk_id for chunk in results] == ["sub_high_trust", "sub_low_trust"]
+    assert all(chunk.relevance > 0.0 for chunk in results)
+    assert off_topic == []
+    assert blank_query[0].chunk_id == "sub_high_trust"
+    assert {chunk.chunk_id for chunk in blank_query} >= {"sub_low_trust", "sub_noise"}
+
+
 def test_sqlite_store_duplicate_write_is_skipped(tmp_path: Path) -> None:
     store = SQLiteStore(tmp_path / "store.db")
     chunk = SubconsciousChunk(

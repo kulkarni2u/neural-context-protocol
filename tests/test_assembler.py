@@ -26,7 +26,7 @@ def test_assembler_builds_context_from_store_and_queue(tmp_path: Path) -> None:
         SubconsciousChunk(
             chunk_id="sub_store",
             layer="procedural",
-            content="store persists chunks and resolves whispers",
+            content="implement_store assemble_context persists chunks and resolves whispers",
             src="tool_result",
             pipeline_id="pipe_1",
         )

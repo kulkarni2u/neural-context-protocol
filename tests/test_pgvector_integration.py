@@ -71,6 +71,51 @@ def test_pgvector_live_write_query_and_restart() -> None:
     assert [result.chunk_id for result in restarted.get_working_zone(pipeline_id="pipe_live")] == ["sub_auth"]
 
 
+def test_pgvector_live_query_filters_zero_score_noise_and_uses_effective_score() -> None:
+    store = _pgvector_store()
+    store.write(
+        SubconsciousChunk(
+            chunk_id="sub_live_low_trust",
+            layer="semantic",
+            content="bearer token failure handling shared ranking content",
+            src="tool_result",
+            pipeline_id="pipe_live_rank",
+            written_by="executor",
+            base_trust=0.4,
+        )
+    )
+    store.write(
+        SubconsciousChunk(
+            chunk_id="sub_live_high_trust",
+            layer="procedural",
+            content="bearer token failure handling shared ranking content",
+            src="tool_result",
+            pipeline_id="pipe_live_rank",
+            written_by="planner",
+            base_trust=0.9,
+        )
+    )
+    store.write(
+        SubconsciousChunk(
+            chunk_id="sub_live_noise",
+            layer="semantic",
+            content="database schema migration notes",
+            src="tool_result",
+            pipeline_id="pipe_live_rank",
+            written_by="critic",
+        )
+    )
+
+    results = store.query("bearer token failure", pipeline_id="pipe_live_rank", k=4)
+    off_topic = store.query("unrelated astronomy orbit", pipeline_id="pipe_live_rank", k=4)
+    blank_query = store.query("   ", pipeline_id="pipe_live_rank", k=4)
+
+    assert [chunk.chunk_id for chunk in results] == ["sub_live_high_trust", "sub_live_low_trust"]
+    assert off_topic == []
+    assert blank_query[0].chunk_id == "sub_live_high_trust"
+    assert {chunk.chunk_id for chunk in blank_query} >= {"sub_live_low_trust", "sub_live_noise"}
+
+
 def test_pgvector_live_src_immutability_and_recent_refs() -> None:
     store = _pgvector_store()
     chunk = SubconsciousChunk(

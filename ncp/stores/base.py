@@ -29,6 +29,7 @@ class BaseStore(ABC):
         text: str,
         *,
         k: int = 4,
+        min_score: float = 0.01,
         layer: str | None = None,
         pipeline_id: str | None = None,
         scope: str | None = None,

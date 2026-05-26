@@ -32,7 +32,7 @@ def test_configure_and_get_context_use_store_runtime(tmp_path: Path) -> None:
         SubconsciousChunk(
             chunk_id="sub_api",
             layer="semantic",
-            content="api can assemble from persisted memory",
+            content="api can assemble from persisted refactor_auth memory",
             src="tool_result",
         )
     )
@@ -61,7 +61,7 @@ def test_configure_and_get_context_use_store_runtime(tmp_path: Path) -> None:
     )
 
     assert "[NCP:CONSCIOUS]" in context
-    assert "api can assemble from persisted memory" in context
+    assert "api can assemble from persisted refactor_auth memory" in context
     assert "check_context" in context
     assert isinstance(config, NCPConfig)
 
