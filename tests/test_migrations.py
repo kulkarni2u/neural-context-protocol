@@ -309,7 +309,7 @@ def test_rollback_raises_if_no_down_section(tmp_path: Path) -> None:
 def test_bundled_001_migration_has_up_and_down() -> None:
     from importlib import resources
     pkg = resources.files("ncp.migrations")
-    sql_files = [f for f in pkg.iterdir() if str(f).endswith(".sql")]
+    sql_files = sorted(f for f in pkg.iterdir() if str(f).endswith(".sql"))
     assert len(sql_files) >= 1, "ncp/migrations/ must contain at least one .sql file"
     sql = Path(str(sql_files[0])).read_text()
     up, down = MigrationRunner.parse_sections(sql)

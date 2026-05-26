@@ -373,6 +373,27 @@ class PgvectorStore(BaseStore):
             results.append(chunk)
             if len(results) >= max(1, min(k, 4)):
                 break
+
+        if results:
+            now = time.time()
+            chunk_ids = [c.chunk_id for c in results]
+            with self._connect() as connection:
+                cursor = connection.cursor()
+                try:
+                    cursor.execute(
+                        self._sql(
+                            "UPDATE {schema}.{prefix}chunks"
+                            " SET retrieval_count = retrieval_count + 1, last_retrieved_at = %s"
+                            " WHERE chunk_id = ANY(%s)"
+                        ),
+                        (now, chunk_ids),
+                    )
+                finally:
+                    self._close_cursor(cursor)
+            for chunk in results:
+                chunk.retrieval_count += 1
+                chunk.last_retrieved_at = now
+
         return results
 
     def emit_whisper(self, whisper: Whisper) -> None:
@@ -728,6 +749,8 @@ class PgvectorStore(BaseStore):
         dry_run: bool = False,
         decay_factor: float = 0.85,
         recency_half_life_seconds: float = 14400,
+        feedback_mode: bool = False,
+        feedback_weight: float = 0.15,
     ) -> CalibrationReport:
         """Re-score base_trust on live chunks.
 
@@ -793,8 +816,8 @@ class PgvectorStore(BaseStore):
                     if pipeline_id is not None:
                         cursor.execute(
                             self._sql(
-                                "SELECT chunk_id, base_trust, src, generation, created_at"
-                                " FROM {schema}.{prefix}chunks"
+                                "SELECT chunk_id, base_trust, src, generation, created_at,"
+                                " retrieval_count FROM {schema}.{prefix}chunks"
                                 " WHERE chunk_id NOT IN (SELECT chunk_id FROM {schema}.{prefix}tombstones)"
                                 " AND pipeline_id = %s"
                             ),
@@ -803,8 +826,8 @@ class PgvectorStore(BaseStore):
                     else:
                         cursor.execute(
                             self._sql(
-                                "SELECT chunk_id, base_trust, src, generation, created_at"
-                                " FROM {schema}.{prefix}chunks"
+                                "SELECT chunk_id, base_trust, src, generation, created_at,"
+                                " retrieval_count FROM {schema}.{prefix}chunks"
                                 " WHERE chunk_id NOT IN (SELECT chunk_id FROM {schema}.{prefix}tombstones)"
                             )
                         )
@@ -819,23 +842,36 @@ class PgvectorStore(BaseStore):
                     base_trust = float(row["base_trust"])
                     generation = int(row["generation"])
                     age_seconds = max(0.0, now - float(row["created_at"]))
+                    rc = int(row["retrieval_count"]) if row["retrieval_count"] is not None else 0
 
                     if src == "user_verified":
                         report.protected += 1
                         continue
 
-                    if age_seconds > cutoff_age and base_trust > 0.5 and generation == 0:
-                        new_trust = max(0.0, base_trust * decay_factor)
-                        report.change_log.append({
-                            "chunk_id": cid,
-                            "old_trust": base_trust,
-                            "new_trust": new_trust,
-                            "reason": "batch_decay",
-                        })
-                        updates.append((new_trust, cid))
-                        report.adjusted += 1
+                    if not feedback_mode:
+                        if age_seconds > cutoff_age and base_trust > 0.5 and generation == 0:
+                            new_trust = max(0.0, base_trust * decay_factor)
+                            report.change_log.append({
+                                "chunk_id": cid, "old_trust": base_trust,
+                                "new_trust": new_trust, "reason": "batch_decay",
+                            })
+                            updates.append((new_trust, cid))
+                            report.adjusted += 1
+                        else:
+                            report.skipped += 1
                     else:
-                        report.skipped += 1
+                        if rc > 0:
+                            boost = feedback_weight * min(1.0, rc / 10)
+                            new_trust = min(1.0, base_trust + boost)
+                            report.change_log.append({
+                                "chunk_id": cid, "old_trust": base_trust,
+                                "new_trust": new_trust, "reason": "retrieval_feedback",
+                                "retrieval_count": rc,
+                            })
+                            updates.append((new_trust, cid))
+                            report.feedback_adjusted += 1
+                        else:
+                            report.skipped += 1
 
                 if not dry_run and updates:
                     update_cursor = connection.cursor()

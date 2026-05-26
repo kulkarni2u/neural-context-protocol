@@ -45,7 +45,9 @@ CREATE TABLE IF NOT EXISTS chunks (
     valid_while TEXT,
     expiry REAL,
     owner TEXT,
-    meta TEXT DEFAULT '{}'
+    meta TEXT DEFAULT '{}',
+    retrieval_count INTEGER DEFAULT 0,
+    last_retrieved_at REAL
 );
 
 CREATE TABLE IF NOT EXISTS tombstones (
@@ -161,6 +163,15 @@ class SQLiteStore(BaseStore):
     def _init_db(self) -> None:
         with self._connect() as connection:
             connection.executescript(SCHEMA)
+            # Upgrade existing databases that predate retrieval tracking columns.
+            for ddl in (
+                "ALTER TABLE chunks ADD COLUMN retrieval_count INTEGER DEFAULT 0",
+                "ALTER TABLE chunks ADD COLUMN last_retrieved_at REAL",
+            ):
+                try:
+                    connection.execute(ddl)
+                except Exception:
+                    pass  # column already exists
 
     def write(self, chunk: SubconsciousChunk) -> bool:
         chunk = self._validate_chunk_for_write(chunk)
@@ -277,6 +288,20 @@ class SQLiteStore(BaseStore):
             results.append(chunk)
             if len(results) >= max(1, min(k, 4)):
                 break
+
+        if results:
+            now = time.time()
+            placeholders = ",".join("?" * len(results))
+            with self._connect() as connection:
+                connection.execute(
+                    f"UPDATE chunks SET retrieval_count = retrieval_count + 1,"
+                    f" last_retrieved_at = ? WHERE chunk_id IN ({placeholders})",
+                    [now] + [c.chunk_id for c in results],
+                )
+            for chunk in results:
+                chunk.retrieval_count += 1
+                chunk.last_retrieved_at = now
+
         return results
 
     def tombstone(self, chunk_id: str, *, forward_ref: str | None = None, ttl_seconds: int = 86400) -> None:
@@ -624,6 +649,8 @@ class SQLiteStore(BaseStore):
         dry_run: bool = False,
         decay_factor: float = 0.85,
         recency_half_life_seconds: float = 14400,
+        feedback_mode: bool = False,
+        feedback_weight: float = 0.15,
     ) -> CalibrationReport:
         """Re-score base_trust on live chunks.
 
@@ -668,7 +695,8 @@ class SQLiteStore(BaseStore):
             cutoff_age = recency_half_life_seconds
 
             query = (
-                "SELECT chunk_id, base_trust, src, generation, created_at FROM chunks"
+                "SELECT chunk_id, base_trust, src, generation, created_at,"
+                " retrieval_count FROM chunks"
                 " WHERE chunk_id NOT IN (SELECT chunk_id FROM tombstones)"
             )
             params: list = []
@@ -690,23 +718,36 @@ class SQLiteStore(BaseStore):
                     base_trust = float(row["base_trust"])
                     generation = int(row["generation"])
                     age_seconds = max(0.0, now - float(row["created_at"]))
+                    rc = int(row["retrieval_count"]) if row["retrieval_count"] is not None else 0
 
                     if src == "user_verified":
                         report.protected += 1
                         continue
 
-                    if age_seconds > cutoff_age and base_trust > 0.5 and generation == 0:
-                        new_trust = max(0.0, base_trust * decay_factor)
-                        report.change_log.append({
-                            "chunk_id": cid,
-                            "old_trust": base_trust,
-                            "new_trust": new_trust,
-                            "reason": "batch_decay",
-                        })
-                        updates.append((new_trust, cid))
-                        report.adjusted += 1
+                    if not feedback_mode:
+                        if age_seconds > cutoff_age and base_trust > 0.5 and generation == 0:
+                            new_trust = max(0.0, base_trust * decay_factor)
+                            report.change_log.append({
+                                "chunk_id": cid, "old_trust": base_trust,
+                                "new_trust": new_trust, "reason": "batch_decay",
+                            })
+                            updates.append((new_trust, cid))
+                            report.adjusted += 1
+                        else:
+                            report.skipped += 1
                     else:
-                        report.skipped += 1
+                        if rc > 0:
+                            boost = feedback_weight * min(1.0, rc / 10)
+                            new_trust = min(1.0, base_trust + boost)
+                            report.change_log.append({
+                                "chunk_id": cid, "old_trust": base_trust,
+                                "new_trust": new_trust, "reason": "retrieval_feedback",
+                                "retrieval_count": rc,
+                            })
+                            updates.append((new_trust, cid))
+                            report.feedback_adjusted += 1
+                        else:
+                            report.skipped += 1
 
                 if not dry_run and updates:
                     for new_trust, cid in updates:
@@ -1249,6 +1290,8 @@ class SQLiteStore(BaseStore):
             supersedes=row["supersedes"],
             source_refs=json.loads(row["source_refs"]),
             age_seconds=max(0.0, time.time() - created_at),
+            retrieval_count=int(row["retrieval_count"]) if row["retrieval_count"] is not None else 0,
+            last_retrieved_at=float(row["last_retrieved_at"]) if row["last_retrieved_at"] is not None else None,
         )
         return chunk
 

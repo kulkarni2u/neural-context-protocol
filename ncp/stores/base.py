@@ -150,6 +150,8 @@ class BaseStore(ABC):
         dry_run: bool = False,
         decay_factor: float = 0.85,
         recency_half_life_seconds: float = 14400,
+        feedback_mode: bool = False,
+        feedback_weight: float = 0.15,
     ) -> CalibrationReport:
         """Re-score base_trust on existing chunks.
 

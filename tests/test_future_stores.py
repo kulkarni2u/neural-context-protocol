@@ -66,6 +66,8 @@ class _FakeCursor:
             limit = int(params[-1])
             self._rows = [{"chunk_id": row["chunk_id"]} for row in self._select_chunks(normalized, params[:-1], desc=False)[:limit]]
             return
+        if "UPDATE" in normalized and "chunks SET retrieval_count = retrieval_count + 1" in normalized:
+            return  # retrieval tracking update — no-op in fake store
         if "DELETE FROM" in normalized and "chunks WHERE chunk_id = %s" in normalized:
             self._db.chunks.pop(str(params[0]), None)
             return

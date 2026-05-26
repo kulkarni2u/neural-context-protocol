@@ -201,6 +201,8 @@ class SubconsciousChunk(NCPModel):
 
     relevance: float = 0.0
     age_seconds: float = 0.0
+    retrieval_count: int = 0
+    last_retrieved_at: float | None = None
 
     @property
     def effective_score(self) -> float:
@@ -443,6 +445,7 @@ class CalibrationReport:
     """Result of a calibration pass over the store."""
 
     adjusted: int = 0
+    feedback_adjusted: int = 0
     protected: int = 0
     skipped: int = 0
     duration_seconds: float = 0.0
