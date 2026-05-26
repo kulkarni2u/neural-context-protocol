@@ -5,7 +5,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 
-from ncp.types import NCPResponse, SubconsciousChunk, TurnRecord, Whisper
+from ncp.types import ConsciousBlock, NCPResponse, SubconsciousChunk, TurnRecord, Whisper
 
 
 class NCPStoreError(RuntimeError):
@@ -17,7 +17,14 @@ class NCPStoreUnavailableError(NCPStoreError):
 
 
 class BaseStore(ABC):
-    """Abstract persistence surface for NCP runtime state."""
+    """Abstract persistence surface for NCP runtime state.
+
+    Every method listed here is implemented by both SQLiteStore and
+    PgvectorStore.  Subclasses must implement all abstract methods.
+    """
+
+    # ------------------------------------------------------------------
+    # Chunk persistence
 
     @abstractmethod
     def write(self, chunk: SubconsciousChunk) -> bool:
@@ -38,6 +45,18 @@ class BaseStore(ABC):
         """Query stored chunks by text relevance."""
 
     @abstractmethod
+    def get_working_zone(
+        self,
+        *,
+        pipeline_id: str | None = None,
+        layer: str | None = None,
+    ) -> Sequence[SubconsciousChunk]:
+        """Return working-zone chunks, optionally filtered."""
+
+    # ------------------------------------------------------------------
+    # Whisper queue
+
+    @abstractmethod
     def emit_whisper(self, whisper: Whisper) -> None:
         """Persist a whisper for later drain."""
 
@@ -53,13 +72,22 @@ class BaseStore(ABC):
         """Drain queued whispers for an agent."""
 
     @abstractmethod
-    def get_working_zone(
+    def peek_whispers(
         self,
         *,
+        agent_id: str,
         pipeline_id: str | None = None,
-        layer: str | None = None,
-    ) -> Sequence[SubconsciousChunk]:
-        """Return working-zone chunks, optionally filtered."""
+        max_items: int = 3,
+        min_confidence: float = 0.60,
+    ) -> list[Whisper]:
+        """Return eligible whispers without consuming them."""
+
+    @abstractmethod
+    def acknowledge_whispers(self, whisper_ids: Sequence[str]) -> int:
+        """Delete already-processed whispers by id. Returns count deleted."""
+
+    # ------------------------------------------------------------------
+    # Turn / cost / conscious logging
 
     @abstractmethod
     def log_turn_record(self, record: TurnRecord) -> None:
@@ -70,9 +98,14 @@ class BaseStore(ABC):
         """Resolve a recent ref like ``r:sub/<turn_id>``."""
 
     @abstractmethod
+    def log_conscious(self, conscious: ConsciousBlock, *, snapshot_hash: str) -> None:
+        """Persist a conscious-block snapshot for audit and goal-version tracking."""
+
+    @abstractmethod
     def log_cost(self, *, agent_id: str, response: NCPResponse) -> None:
         """Persist cost telemetry for one turn."""
 
+    @abstractmethod
     def log_cost_raw(
         self,
         *,
@@ -87,6 +120,7 @@ class BaseStore(ABC):
     ) -> None:
         """Persist raw cost telemetry without a full NCPResponse."""
 
+    @abstractmethod
     def get_pipeline_goal_versions(
         self,
         *,
@@ -94,4 +128,3 @@ class BaseStore(ABC):
         current_agent: str | None = None,
     ) -> dict[str, int]:
         """Return latest goal_version for each agent in a pipeline."""
-        return {}

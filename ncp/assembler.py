@@ -14,11 +14,12 @@ import anyio
 from ncp.coherence import CoherenceChecker
 from ncp.encoder import PidginEncoder
 from ncp.middleware.base import MiddlewarePipeline
+from ncp.stores.base import BaseStore
 from ncp.types import BudgetContext, ConsciousBlock, NCPResponse, SubconsciousChunk, TurnRecord, Whisper
 
 
 class SupportsAssemblyStore(Protocol):
-    """Minimal store surface required by the assembler."""
+    """Kept for backward compatibility — new code should use BaseStore directly."""
 
     def query(
         self,

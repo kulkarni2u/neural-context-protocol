@@ -582,13 +582,19 @@ class TestErrors:
             def write(self, chunk):
                 raise NotImplementedError("pending backend path")
 
-            def query(self, text, *, k=4, layer=None, pipeline_id=None, scope=None, zone="working"):
+            def query(self, text, *, k=4, min_score=0.01, layer=None, pipeline_id=None, scope=None, zone="working"):
                 raise NotImplementedError("pending backend path")
 
             def emit_whisper(self, whisper):
                 raise NotImplementedError("pending backend path")
 
             def drain_whispers(self, *, agent_id, pipeline_id=None, max_items=3, min_confidence=0.60):
+                raise NotImplementedError("pending backend path")
+
+            def peek_whispers(self, *, agent_id, pipeline_id=None, max_items=3, min_confidence=0.60):
+                raise NotImplementedError("pending backend path")
+
+            def acknowledge_whispers(self, whisper_ids):
                 raise NotImplementedError("pending backend path")
 
             def get_working_zone(self, *, pipeline_id=None, layer=None):
@@ -600,7 +606,16 @@ class TestErrors:
             def resolve_recent_ref(self, ref):
                 raise NotImplementedError("pending backend path")
 
+            def log_conscious(self, conscious, *, snapshot_hash):
+                raise NotImplementedError("pending backend path")
+
             def log_cost(self, *, agent_id, response):
+                raise NotImplementedError("pending backend path")
+
+            def log_cost_raw(self, *, agent_id, model, input_tokens, output_tokens, cost_usd, pipeline_id=None, turn_id, latency_ms=0):
+                raise NotImplementedError("pending backend path")
+
+            def get_pipeline_goal_versions(self, *, pipeline_id, current_agent=None):
                 raise NotImplementedError("pending backend path")
 
         handlers = make_handlers(_PendingStore())
