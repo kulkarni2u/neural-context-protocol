@@ -55,24 +55,26 @@ Released:
 - CHANGELOG updated with full 0.2.0 entry
 - README updated: version, next-focus, "How NCP Reduces Token Cost" section
 
-## Active Line: 0.3.0
+## What Shipped In 0.3.0
 
-The `0.2.0` storage/retrieval line is closed. Work now moves to the `0.3.0`
-consolidation and operator tooling line.
+- `ncp consolidate` — tag pre-cluster + BM25 merge, dry_run, consolidation_ready whisper
+- `ncp calibrate` — batch trust decay + manual override, user_verified protection
+- `ncp viz` — 5-panel operator view (distribution, age, top chunks, pipelines, whispers)
+- `ncp batch` — JSONL batch processor, no MCP server required
+- BaseStore ABC: consolidate, calibrate, viz_data all @abstractmethod
+- Suite: 306 passed, 6 skipped
 
-### Roadmap (priority order)
+## Active Line: 0.4.x
 
-1. **Subconscious consolidation** — background pass that merges/prunes
-   redundant chunks, trims tombstoned content, and shapes the store so
-   long-running pipelines don't accumulate noise
-2. **Calibration / trust tooling** — review and adjust `base_trust` scores
-   post-write; currently set at write time and never re-evaluated
-3. **`ncp viz`** — operator view: chunk age/layer distribution, whisper queue
-   state, pipeline activity timeline
-4. **Batch / non-interactive workflows** — NCP-driven pipelines without a live
-   MCP server (file-in / file-out for CI and offline use)
-5. **Release hardening** — pgvector schema migrations, upgrade tooling, broader
-   package maturity
+The `0.3.0` consolidation and operator tooling line is closed. Work now moves
+to the `0.4.x` release hardening and streaming line.
+
+### Next focus
+
+1. pgvector schema migrations and upgrade tooling
+2. Streaming / incremental assembly for very long turns
+3. Calibration driven by retrieval feedback (not just age decay)
+4. Vector-only retrieval path for non-BM25 backends
 
 ## Known Architectural Gaps (carried forward)
 

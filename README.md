@@ -263,13 +263,14 @@ This repository currently ships:
 
 Current release:
 
-- `neural-context-protocol==0.2.0`
+- `neural-context-protocol==0.3.0`
 
 Next focus:
 
+- pgvector schema migrations and upgrade tooling
 - streaming / incremental assembly for very long turns
 - vector-only retrieval path for non-BM25 backends
-- pgvector schema migrations and upgrade tooling
+- calibration/trust scoring driven by retrieval feedback (not just age)
 
 ## Documentation
 

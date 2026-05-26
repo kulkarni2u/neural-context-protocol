@@ -2,6 +2,33 @@
 
 All notable changes to Neural Context Protocol will be documented in this file.
 
+## [0.3.0] - 2026-05-25
+
+Operator tooling and maintenance milestone. SQLite remains the default runtime;
+all new commands work on both SQLite and pgvector.
+
+### Added
+
+- `ncp consolidate` command: tag pre-clustering + BM25/SequenceMatcher similarity
+  merge, trust_floor pre-filter, dry_run flag, `consolidation_ready` whisper on
+  completion; `ConsolidationReport` dataclass
+- `ncp calibrate` command: batch trust decay (protects `user_verified` chunks)
+  and manual pinpoint override; `CalibrationReport` dataclass
+- `ncp viz` command: 5-panel operator view — chunk distribution by layer/zone,
+  age brackets, top chunks by trust, pipeline summary, whisper queue breakdown
+- `ncp batch` command: JSONL file-in / results-out batch processor; runs against
+  the local store without a live MCP server; supports write_memory, emit_whisper,
+  query, consolidate, calibrate ops; `--dry-run` and `--stop-on-error` flags
+- `BaseStore` ABC extended: `consolidate()`, `calibrate()`, `viz_data()` are now
+  `@abstractmethod` — both SQLiteStore and PgvectorStore implement all three
+- `[consolidation]` config section: `similarity_threshold`, `trust_floor`,
+  opt-in `model_provider`/`model`
+
+### Verified
+
+- Full test suite: 306 passed, 6 skipped
+- OpenCode (deepseek-v4-flash-free) reviewed all 4 implementation slices
+
 ## [0.2.0] - 2026-05-25
 
 Storage and retrieval milestone. SQLite remains the default runtime;
