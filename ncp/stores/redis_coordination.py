@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import time
 from typing import Any
 
 from ncp.stores.base import NCPStoreUnavailableError
@@ -227,14 +228,20 @@ class RedisCoordination:
             ]
         return []
 
-    def _client_or_raise(self) -> Any:
-        if self._client is None:
+    def _client_or_raise(self, *, attempts: int = 2, delay_seconds: float = 0.1) -> Any:
+        if self._client is not None:
+            return self._client
+        last_exc: Exception | None = None
+        for attempt in range(attempts):
             try:
                 self._client = self._client_factory(self.url)
+                return self._client
             except NCPStoreUnavailableError:
                 raise
             except Exception as exc:  # pragma: no cover - depends on runtime client
-                raise NCPStoreUnavailableError(
-                    f"Redis coordination unavailable at {self.url}: {exc}"
-                ) from exc
-        return self._client
+                last_exc = exc
+                if attempt < attempts - 1:
+                    time.sleep(delay_seconds)
+        raise NCPStoreUnavailableError(
+            f"Redis coordination unavailable at {self.url} after {attempts} attempts: {last_exc}"
+        ) from last_exc

@@ -175,14 +175,7 @@ class PgvectorStore(BaseStore):
 
     @contextmanager
     def _connect(self) -> Iterator[Any]:
-        try:
-            connection = self._connect_factory(self.dsn)
-        except NCPStoreUnavailableError:
-            raise
-        except Exception as exc:  # pragma: no cover - depends on runtime driver
-            raise NCPStoreUnavailableError(
-                f"pgvector store unavailable at {self.dsn}: {exc}"
-            ) from exc
+        connection = self._connect_with_retry()
         try:
             yield connection
             connection.commit()
@@ -201,6 +194,21 @@ class PgvectorStore(BaseStore):
                 connection.close()
             except Exception:
                 pass
+
+    def _connect_with_retry(self, *, attempts: int = 2, delay_seconds: float = 0.1) -> Any:
+        last_exc: Exception | None = None
+        for attempt in range(attempts):
+            try:
+                return self._connect_factory(self.dsn)
+            except NCPStoreUnavailableError:
+                raise
+            except Exception as exc:
+                last_exc = exc
+                if attempt < attempts - 1:
+                    time.sleep(delay_seconds)
+        raise NCPStoreUnavailableError(
+            f"pgvector store unavailable at {self.dsn} after {attempts} attempts: {last_exc}"
+        ) from last_exc
 
     def _init_db(self) -> None:
         schema_sql = PGVECTOR_SCHEMA_TEMPLATE.format(
