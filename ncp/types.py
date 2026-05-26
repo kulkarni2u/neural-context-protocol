@@ -206,8 +206,14 @@ class SubconsciousChunk(NCPModel):
 
     @property
     def effective_score(self) -> float:
-        """Derived retrieval score used by the assembler."""
+        """Presentation-layer score written into the pidgin wire format.
 
+        ``relevance`` is already a fused retrieval score from RetrievalPolicy
+        (BM25 + recency + trust). This property applies a second recency decay
+        and trust weight so the encoded score reflects the chunk's freshness and
+        credibility at display time, which may differ from when it was retrieved.
+        Retrieval ranking uses ``relevance``; the pidgin encoder uses this value.
+        """
         decay = math.exp(-0.693 * self.age_seconds / 14400)
         generation_penalty = 0.9 ** self.generation
         return self.relevance * decay * self.base_trust * generation_penalty
