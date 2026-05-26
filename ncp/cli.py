@@ -7,6 +7,8 @@ from importlib import resources
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
+import json
+
 import click
 from rich import box
 from rich.console import Console
@@ -899,6 +901,59 @@ def calibrate_command(
         console.print("[dim]Nothing to calibrate.[/dim]")
     else:
         console.print(f"[green]Calibrated {report.adjusted} chunk(s).[/green]")
+
+
+@main.command("batch")
+@click.argument("input_file", type=click.Path(path_type=Path), required=False)
+@click.option("--output", type=click.Path(path_type=Path), default=None, help="Write results to file instead of stdout.")
+@click.option("--cwd", type=click.Path(path_type=Path, exists=True, file_okay=False), default=Path.cwd)
+@click.option("--dry-run", is_flag=True, default=False, help="Pass dry_run=True to all ops that support it, skip writes.")
+@click.option("--stop-on-error", is_flag=True, default=False, help="Halt on first failed op.")
+def batch_command(
+    input_file: Path | None,
+    output: Path | None,
+    cwd: Path,
+    dry_run: bool,
+    stop_on_error: bool,
+) -> None:
+    """Process a JSONL file of NCP operations against the local store.
+
+    Positional INPUT can be a path or omit/use `-` to read from stdin.
+    """
+
+    from ncp.batch import run_batch
+    from ncp.config import load_config
+    from ncp.stores.factory import create_store
+
+    config = load_config(cwd=cwd)
+    store = create_store(config)
+
+    if input_file is None:
+        raw = __import__("sys").stdin.read()
+    else:
+        raw = input_file.read_text()
+
+    lines = raw.strip().splitlines()
+    operations: list[dict[str, object]] = []
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            operations.append(json.loads(line))
+        except json.JSONDecodeError as exc:
+            err = {"op": "unknown", "ok": False, "error": str(exc)}
+            if stop_on_error:
+                __import__("sys").stdout.write(json.dumps(err) + "\n")
+                return
+            operations.append(err)
+
+    results = run_batch(operations, store, dry_run=dry_run, stop_on_error=stop_on_error)
+    output_lines = "\n".join(json.dumps(r) for r in results) + "\n"
+
+    if output:
+        output.write_text(output_lines)
+    else:
+        __import__("sys").stdout.write(output_lines)
 
 
 if __name__ == "__main__":
