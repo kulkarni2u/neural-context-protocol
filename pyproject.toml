@@ -69,7 +69,7 @@ where = ["."]
 include = ["ncp*"]
 
 [tool.setuptools.package-data]
-ncp = ["templates/*.example"]
+ncp = ["templates/*.example", "migrations/*.sql"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

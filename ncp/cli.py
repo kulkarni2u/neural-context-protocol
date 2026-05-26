@@ -956,5 +956,128 @@ def batch_command(
         __import__("sys").stdout.write(output_lines)
 
 
+# ── migrate ───────────────────────────────────────────────────────────────────
+
+@main.group("migrate")
+def migrate_group() -> None:
+    """pgvector schema migration commands."""
+
+
+def _migration_runner(cwd: Path, migrations_dir: Path | None) -> tuple:
+    from ncp.config import load_config
+    from ncp.stores.migrations import MigrationRunner
+
+    try:
+        import psycopg2
+    except ImportError:
+        console.print("[red]psycopg2 not installed — pip install neural-context-protocol[pgvector][/red]")
+        raise SystemExit(1)
+
+    config = load_config(cwd=cwd)
+    if config.store_type != "pgvector":
+        console.print("[red]migrate commands require store.type = pgvector in .ncp/config.toml[/red]")
+        raise SystemExit(1)
+
+    conn = psycopg2.connect(config.pgvector_dsn)
+    runner = MigrationRunner(
+        conn,
+        schema=config.pgvector_schema,
+        prefix=config.pgvector_table_prefix,
+        migrations_dir=migrations_dir,
+    )
+    runner.bootstrap()
+    return conn, runner
+
+
+@migrate_group.command("check")
+@click.option("--cwd", type=click.Path(path_type=Path, exists=True, file_okay=False), default=Path.cwd)
+@click.option("--migrations-dir", type=click.Path(path_type=Path, exists=True, file_okay=False), default=None, help="Custom migrations directory.")
+def migrate_check(cwd: Path, migrations_dir: Path | None) -> None:
+    """Show applied, pending, and checksum-mismatched migrations."""
+    from ncp.stores.migrations import MigrationStatus
+
+    conn, runner = _migration_runner(cwd, migrations_dir)
+    try:
+        status: MigrationStatus = runner.check()
+    finally:
+        conn.close()
+
+    t_applied = Table("Version", "Name", "Applied At", title="Applied", box=box.SIMPLE)
+    for row in status.applied:
+        ts = datetime.fromtimestamp(row["applied_at"]).strftime("%Y-%m-%d %H:%M:%S")
+        t_applied.add_row(str(row["version"]), row["name"], ts)
+    console.print(t_applied)
+
+    if status.pending:
+        t_pending = Table("Version", "Name", title="Pending", box=box.SIMPLE)
+        for mf in status.pending:
+            t_pending.add_row(str(mf.version), mf.name)
+        console.print(t_pending)
+    else:
+        console.print("[green]No pending migrations.[/green]")
+
+    if status.mismatches:
+        console.print("[red bold]Checksum mismatches detected:[/red bold]")
+        for m in status.mismatches:
+            console.print(f"  v{m['version']} {m['name']}: stored={m['stored_checksum'][:12]}… file={m['file_checksum'][:12]}…")
+        raise SystemExit(1)
+
+
+@migrate_group.command("apply")
+@click.option("--cwd", type=click.Path(path_type=Path, exists=True, file_okay=False), default=Path.cwd)
+@click.option("--dry-run", is_flag=True, default=False, help="Print SQL without executing.")
+@click.option("--migrations-dir", type=click.Path(path_type=Path, exists=True, file_okay=False), default=None)
+def migrate_apply(cwd: Path, dry_run: bool, migrations_dir: Path | None) -> None:
+    """Apply all pending migrations."""
+    from ncp.stores.migrations import MigrationError
+
+    conn, runner = _migration_runner(cwd, migrations_dir)
+    try:
+        applied = runner.apply_all(dry_run=dry_run)
+    except MigrationError as exc:
+        console.print(f"[red]{exc}[/red]")
+        conn.close()
+        raise SystemExit(1)
+    finally:
+        conn.close()
+
+    if not applied:
+        console.print("[dim]Nothing to apply.[/dim]")
+        return
+    if dry_run:
+        for item in applied:
+            console.print(f"[yellow]-- v{item['version']} {item['name']} (dry run)[/yellow]")
+            console.print(item["sql"])
+    else:
+        for item in applied:
+            console.print(f"[green]Applied v{item['version']} {item['name']}[/green]")
+
+
+@migrate_group.command("rollback")
+@click.argument("version", type=int)
+@click.option("--cwd", type=click.Path(path_type=Path, exists=True, file_okay=False), default=Path.cwd)
+@click.option("--dry-run", is_flag=True, default=False, help="Print DOWN SQL without executing.")
+@click.option("--migrations-dir", type=click.Path(path_type=Path, exists=True, file_okay=False), default=None)
+def migrate_rollback(version: int, cwd: Path, dry_run: bool, migrations_dir: Path | None) -> None:
+    """Roll back a specific migration version (must be the highest applied)."""
+    from ncp.stores.migrations import MigrationError
+
+    conn, runner = _migration_runner(cwd, migrations_dir)
+    try:
+        result = runner.rollback(version, dry_run=dry_run)
+    except MigrationError as exc:
+        console.print(f"[red]{exc}[/red]")
+        conn.close()
+        raise SystemExit(1)
+    finally:
+        conn.close()
+
+    if dry_run:
+        console.print(f"[yellow]-- v{result['version']} {result['name']} rollback (dry run)[/yellow]")
+        console.print(result["sql"])
+    else:
+        console.print(f"[green]Rolled back v{result['version']} {result['name']}[/green]")
+
+
 if __name__ == "__main__":
     main()
