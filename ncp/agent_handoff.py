@@ -5,11 +5,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import subprocess
-from typing import Any, Protocol
+from typing import Protocol
 
 from ncp.api import configure, emit
 from ncp.claude_review_helper import extract_json_object
 from ncp.dogfood import _extract_opencode_text
+from ncp.stores.base import BaseStore
 from ncp.stores.factory import create_store
 from ncp.types import Whisper
 
@@ -25,6 +26,8 @@ DEFAULT_OPENCODE_REVIEW_INSTRUCTION = (
 
 
 class HandoffStore(Protocol):
+    """Kept for backward compatibility — BaseStore now declares both methods."""
+
     def peek_whispers(
         self,
         *,
@@ -37,14 +40,6 @@ class HandoffStore(Protocol):
     def acknowledge_whispers(self, whisper_ids: list[str]) -> int: ...
 
 
-def _require_handoff_store(store: Any) -> HandoffStore:
-    if not hasattr(store, "peek_whispers") or not hasattr(store, "acknowledge_whispers"):
-        raise NotImplementedError(
-            "The configured store does not support NCP handoff queue operations yet."
-        )
-    return store
-
-
 def load_handoffs(
     *,
     cwd: Path,
@@ -52,11 +47,11 @@ def load_handoffs(
     pipeline_id: str | None = None,
     max_items: int = 3,
     min_confidence: float = 0.60,
-) -> tuple[HandoffStore, list[Whisper]]:
+) -> tuple[BaseStore, list[Whisper]]:
     """Load pending whisper handoffs without consuming them."""
 
     config = configure(cwd=cwd)
-    store = _require_handoff_store(create_store(config))
+    store = create_store(config)
     handoffs = store.peek_whispers(
         agent_id=agent_id,
         pipeline_id=pipeline_id,
@@ -239,7 +234,7 @@ def run_opencode_reviewer(
     return _extract_opencode_text(completed.stdout)
 
 
-def acknowledge_handoffs(store: HandoffStore, handoffs: list[Whisper]) -> int:
+def acknowledge_handoffs(store: BaseStore, handoffs: list[Whisper]) -> int:
     """Delete handoffs after a successful consumer run."""
 
     return store.acknowledge_whispers([whisper.whisper_id for whisper in handoffs])
