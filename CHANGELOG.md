@@ -2,35 +2,49 @@
 
 All notable changes to Neural Context Protocol will be documented in this file.
 
-## Unreleased
+## [0.2.0] - 2026-05-25
+
+Storage and retrieval milestone. SQLite remains the default runtime;
+pgvector + Redis is the production-oriented durable path.
 
 ### Added
 
-- richer `ncp status` output with chunk, tombstone, layer, pipeline, and last-activity visibility
-- new `ncp cost` command with total, per-agent, per-model, and recent-entry rollups
-- new `ncp explain` command for a short human-readable store summary
+- `store.type = "pgvector"` durable store: chunk writes/query, working-zone reads,
+  recent-ref turn logging, conscious snapshots, cost logging, goal-version reads,
+  `ncp status`, `ncp cost`, `ncp explain`
+- Redis-backed coordination for the pgvector path: whispers, fetch-session state,
+  handoff queue
+- `ncp handoff claude` and `ncp handoff opencode` commands for whisper-driven
+  partner/reviewer orchestration loops
+- Hybrid retrieval via `RetrievalPolicy`: fuses BM25 (lexical), recency decay, and
+  `base_trust` into a normalized `[0, 1]` score; both SQLiteStore and PgvectorStore
+  use the same policy, keeping behavior aligned across backends
+- `richer ncp status` output with chunk, tombstone, layer, pipeline, and last-activity
+  visibility
+- `ncp cost` command with total, per-agent, per-model, and recent-entry rollups
+- `ncp explain` command for a short human-readable store summary
 - Claude `stream-json` review helper script for bounded review/debug workflows
-- public `ncp handoff claude` and `ncp handoff opencode` commands for whisper-driven partner/reviewer loops
-- Redis-backed coordination helper for whispers and fetch-session state in the `0.2.0` pgvector path
-- live pgvector integration now covers Redis-backed coordination in addition to durable chunk/query behavior
+- 2-attempt connection retry with 100 ms backoff on pgvector and Redis paths
 
 ### Changed
 
-- provider install guidance now points at `neural-context-protocol[providers]`
-- known upstream Cohere warning noise is suppressed at the adapter boundary for the current alpha line
-- public docs now reflect the live Sarathi-managed handoff proof and its measured prompt reduction on the `pgvector` storage slice
-- `store.type = "pgvector"` can now power `ncp emit`, `ncp handoff`, and MCP whisper/fetch coordination when Redis is configured, with Redis remaining the transient coordination layer behind that path
-- `store.type = "pgvector"` now powers `ncp status`, `ncp cost`, and `ncp explain`, with the CLI reporting the active backend instead of assuming SQLite
-- retrieval now filters lexical zero-overlap chunks and reranks surviving lexical matches with NCP's trust/age/generation weighting
-- local infra scripts now prefer a running container engine instead of blindly picking Podman first
+- `BaseStore` ABC now declares all methods that both concrete stores implement:
+  `log_conscious`, `peek_whispers`, `acknowledge_whispers`, `log_cost_raw`, and
+  `get_pipeline_goal_versions` are now `@abstractmethod`
+- `HandoffStore` Protocol in `agent_handoff.py` replaced by direct `BaseStore`
+  typing; duck-type `hasattr` guard removed
+- Retrieval ranking changed from BM25-first + `effective_score` post-sort to explicit
+  multi-signal hybrid fusion; zero-overlap guard preserved
+- Provider install guidance now points at `neural-context-protocol[providers]`
+- Known upstream Cohere warning noise suppressed at the adapter boundary
 
-### Planned next layer
+### Verified
 
-- containerized local infra scaffolding for Postgres/pgvector and Redis is now in place for the `0.2.0` storage kickoff
-- pgvector now supports durable chunk writes/query, working-zone reads, recent-ref turn logging, conscious snapshots, cost logging, pipeline goal-version reads, and operator reporting
-- a live opt-in pgvector integration suite and runner script now exist for the local Postgres/pgvector path
-- the current live storage proof covers `6/6` pgvector+Redis integration checks
-- the next live storage step is fuller hybrid retrieval beyond the current BM25-first query path
+- Full test suite: `236 passed, 6 skipped`
+- Live pgvector + Redis integration suite: `6 passed`
+- OpenCode review: all 4 implementation slices passed code review
+
+## [0.1.0a1] - 2026-05-24
 
 ## 0.1.0a1 - 2026-05-24
 
