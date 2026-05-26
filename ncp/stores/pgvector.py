@@ -155,6 +155,8 @@ class PgvectorStore(BaseStore):
         schema: str = "ncp",
         table_prefix: str = "ncp_",
         connect_factory: Callable[[str], Any] | None = None,
+        min_pool_connections: int = 2,
+        max_pool_connections: int = 10,
         redis_url: str | None = None,
         redis_stream: str = "ncp:whispers",
         coordination: RedisCoordination | None = None,
@@ -165,7 +167,19 @@ class PgvectorStore(BaseStore):
         self.dsn = dsn
         self.schema = _validate_identifier(schema, field="schema")
         self.table_prefix = _validate_identifier(table_prefix, field="table_prefix")
-        self._connect_factory = connect_factory or _default_pgvector_connect
+        if connect_factory is not None:
+            self._connect_factory = connect_factory
+            self._pool: Any = None
+        else:
+            try:
+                from psycopg2 import pool as _pg_pool  # type: ignore[import]
+                self._pool = _pg_pool.ThreadedConnectionPool(
+                    min_pool_connections, max_pool_connections, dsn
+                )
+                self._connect_factory = lambda _dsn: self._pool.getconn()
+            except ImportError:  # pragma: no cover - psycopg2 not installed
+                self._pool = None
+                self._connect_factory = _default_pgvector_connect
         self.coordination = coordination or (
             RedisCoordination(redis_url, stream=redis_stream) if redis_url else None
         )
@@ -191,10 +205,28 @@ class PgvectorStore(BaseStore):
                 f"pgvector store operation failed at {self.dsn}: {exc}"
             ) from exc
         finally:
+            if self._pool is not None:
+                try:
+                    self._pool.putconn(connection)
+                except Exception:
+                    try:
+                        connection.close()
+                    except Exception:
+                        pass
+            else:
+                try:
+                    connection.close()
+                except Exception:
+                    pass
+
+    def close(self) -> None:
+        """Close all pooled connections. Call when the store is no longer needed."""
+        if self._pool is not None:
             try:
-                connection.close()
+                self._pool.closeall()
             except Exception:
                 pass
+            self._pool = None
 
     def _connect_with_retry(self, *, attempts: int = 2, delay_seconds: float = 0.1) -> Any:
         last_exc: Exception | None = None
@@ -232,6 +264,11 @@ class PgvectorStore(BaseStore):
                 return False
             cursor = connection.cursor()
             try:
+                embedding_val = (
+                    "[" + ",".join(str(f) for f in chunk.embedding) + "]"
+                    if chunk.embedding is not None
+                    else None
+                )
                 cursor.execute(
                     self._sql(
                         """
@@ -239,10 +276,11 @@ class PgvectorStore(BaseStore):
                             chunk_id, pipeline_id, scope, zone, layer, chunk_type, content, src,
                             written_by, caused_by, conscious_hash, evidence_id, version, supersedes,
                             source_refs, schema_version, created_at, base_trust, generation,
-                            result_confidence, result_attempts, conditions, valid_while, expiry, owner, meta
+                            result_confidence, result_attempts, conditions, valid_while, expiry, owner, meta,
+                            embedding
                         ) VALUES (
                             %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                            %s, %s, %s, %s, %s, %s, %s, %s, %s
+                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                         )
                         ON CONFLICT (chunk_id) DO UPDATE SET
                             pipeline_id = EXCLUDED.pipeline_id,
@@ -269,7 +307,8 @@ class PgvectorStore(BaseStore):
                             valid_while = EXCLUDED.valid_while,
                             expiry = EXCLUDED.expiry,
                             owner = EXCLUDED.owner,
-                            meta = EXCLUDED.meta
+                            meta = EXCLUDED.meta,
+                            embedding = EXCLUDED.embedding
                         """
                     ),
                     (
@@ -299,6 +338,7 @@ class PgvectorStore(BaseStore):
                         chunk.expiry,
                         chunk.owner,
                         json.dumps({}),
+                        embedding_val,
                     ),
                 )
             finally:
@@ -317,7 +357,20 @@ class PgvectorStore(BaseStore):
         scope: str | None = None,
         zone: str = "working",
         retrieval_mode: str = "hybrid",
+        embedding: list[float] | None = None,
     ) -> list[SubconsciousChunk]:
+        _VALID_RETRIEVAL_MODES = ("hybrid", "trust_recency", "vector")
+        if retrieval_mode not in _VALID_RETRIEVAL_MODES:
+            raise ValueError(
+                f"Unknown retrieval_mode {retrieval_mode!r}; expected one of {_VALID_RETRIEVAL_MODES}"
+            )
+
+        if retrieval_mode == "vector":
+            return self._query_vector(
+                embedding=embedding, k=k, min_score=min_score,
+                layer=layer, pipeline_id=pipeline_id, scope=scope, zone=zone,
+            )
+
         with self._connect() as connection:
             rows = self._load_query_rows(
                 connection,
@@ -328,12 +381,6 @@ class PgvectorStore(BaseStore):
             )
         if not rows:
             return []
-
-        _VALID_RETRIEVAL_MODES = ("hybrid", "trust_recency")
-        if retrieval_mode not in _VALID_RETRIEVAL_MODES:
-            raise ValueError(
-                f"Unknown retrieval_mode {retrieval_mode!r}; expected one of {_VALID_RETRIEVAL_MODES}"
-            )
 
         policy = self.retrieval_policy
         now = time.time()
@@ -395,6 +442,90 @@ class PgvectorStore(BaseStore):
             results.append(chunk)
             if len(results) >= max(1, min(k, 4)):
                 break
+
+        if results:
+            now = time.time()
+            chunk_ids = [c.chunk_id for c in results]
+            with self._connect() as connection:
+                cursor = connection.cursor()
+                try:
+                    cursor.execute(
+                        self._sql(
+                            "UPDATE {schema}.{prefix}chunks"
+                            " SET retrieval_count = retrieval_count + 1, last_retrieved_at = %s"
+                            " WHERE chunk_id = ANY(%s)"
+                        ),
+                        (now, chunk_ids),
+                    )
+                finally:
+                    self._close_cursor(cursor)
+            for chunk in results:
+                chunk.retrieval_count += 1
+                chunk.last_retrieved_at = now
+
+        return results
+
+    def _query_vector(
+        self,
+        *,
+        embedding: list[float] | None,
+        k: int,
+        min_score: float,
+        layer: str | None,
+        pipeline_id: str | None,
+        scope: str | None,
+        zone: str,
+    ) -> list[SubconsciousChunk]:
+        if embedding is None:
+            raise ValueError("retrieval_mode='vector' requires an embedding to be provided")
+        if len(embedding) != 1536:
+            raise ValueError(f"embedding must have 1536 dimensions, got {len(embedding)}")
+        embedding_str = "[" + ",".join(str(f) for f in embedding) + "]"
+
+        # Build WHERE clause (same filter logic as _load_query_rows)
+        where_clauses = ["zone = %s", "embedding IS NOT NULL"]
+        where_params: list[object] = [zone]
+        if layer is not None:
+            where_clauses.append("layer = %s")
+            where_params.append(layer)
+        if pipeline_id is None:
+            where_clauses.append("(pipeline_id IS NULL OR scope = 'global')")
+        else:
+            where_clauses.append("(pipeline_id = %s OR scope = 'global')")
+            where_params.append(pipeline_id)
+        if scope is not None:
+            where_clauses.append("scope = %s")
+            where_params.append(scope)
+
+        limit = max(1, min(k, 4))
+        # Params order: embedding (SELECT), WHERE params, embedding (ORDER BY), LIMIT
+        all_params = tuple([embedding_str] + where_params + [embedding_str, limit])
+
+        with self._connect() as connection:
+            cursor = connection.cursor()
+            try:
+                cursor.execute(
+                    self._sql(
+                        "SELECT *, (embedding <=> %s::vector) AS vec_distance"
+                        f" FROM {{schema}}.{{prefix}}chunks"
+                        f" WHERE {' AND '.join(where_clauses)}"
+                        " ORDER BY embedding <=> %s::vector LIMIT %s"
+                    ),
+                    all_params,
+                )
+                rows = self._fetchall(cursor)
+            finally:
+                self._close_cursor(cursor)
+
+        results: list[SubconsciousChunk] = []
+        for row in rows:
+            distance = float(row.get("vec_distance") or 1.0)
+            score = 1.0 / (1.0 + distance)
+            if score < min_score:
+                continue
+            chunk = self._row_to_chunk(row)
+            chunk.relevance = max(0.0, min(1.0, score))
+            results.append(chunk)
 
         if results:
             now = time.time()

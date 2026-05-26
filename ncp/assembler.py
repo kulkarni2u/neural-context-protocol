@@ -8,57 +8,14 @@ from __future__ import annotations
 from collections.abc import Iterator
 from dataclasses import dataclass
 from hashlib import sha256
-from typing import Protocol
 
 import anyio
 
 from ncp.coherence import CoherenceChecker
 from ncp.encoder import PidginEncoder
 from ncp.middleware.base import MiddlewarePipeline
+from ncp.stores.base import BaseStore
 from ncp.types import BudgetContext, ConsciousBlock, NCPResponse, SubconsciousChunk, TurnRecord, Whisper
-
-
-class SupportsAssemblyStore(Protocol):
-    """Kept for backward compatibility — new code should use BaseStore directly."""
-
-    def query(
-        self,
-        text: str,
-        *,
-        k: int = 4,
-        min_score: float = 0.01,
-        layer: str | None = None,
-        pipeline_id: str | None = None,
-        scope: str | None = None,
-        zone: str = "working",
-        retrieval_mode: str = "hybrid",
-    ) -> list[SubconsciousChunk]: ...
-
-    def drain_whispers(
-        self,
-        *,
-        agent_id: str,
-        pipeline_id: str | None = None,
-        max_items: int = 3,
-        min_confidence: float = 0.60,
-    ) -> list[Whisper]: ...
-
-    def resolve_recent_ref(self, ref: str) -> TurnRecord | None: ...
-
-    def log_turn_record(self, record: TurnRecord) -> None: ...
-
-    def log_conscious(self, conscious: ConsciousBlock, *, snapshot_hash: str) -> None: ...
-
-    def log_cost(self, *, agent_id: str, response: NCPResponse) -> None: ...
-
-    def write(self, chunk: SubconsciousChunk) -> bool: ...
-
-    def get_pipeline_goal_versions(
-        self,
-        *,
-        pipeline_id: str,
-        current_agent: str | None = None,
-    ) -> dict[str, int]: ...
 
 
 @dataclass(slots=True)
@@ -89,7 +46,7 @@ class Assembler:
     def __init__(
         self,
         *,
-        store: SupportsAssemblyStore,
+        store: BaseStore,
         encoder: PidginEncoder | None = None,
         middleware: MiddlewarePipeline | None = None,
     ) -> None:

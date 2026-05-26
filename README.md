@@ -43,7 +43,10 @@ What is already proven in this repository:
 - the pgvector durable path now supports Redis-backed whisper delivery and Redis-backed fetch-session limits
 - retrieval now filters lexical zero-overlap noise and reranks surviving matches with NCP's trust/age/generation weighting
 - `retrieval_mode="trust_recency"` enables pure trust+recency ranking for non-BM25 backends
+- `retrieval_mode="vector"` uses pgvector `<=>` cosine ANN search on stored embeddings (pgvector only)
+- optional embedding storage: `SubconsciousChunk.embedding` (1536 dims) persisted via migration 003
 - retrieval feedback calibration: `query()` tracks `retrieval_count`; `calibrate(feedback_mode=True)` auto-boosts frequently-retrieved chunks
+- pgvector connection pooling: `ThreadedConnectionPool` used by default; `close()` drains the pool
 - pgvector schema migrations with advisory lock, checksums, and UP/DOWN rollback via `ncp migrate`
 - incremental assembly (`assemble_incremental()`) enforces the declared `max_tokens_per_call` budget and yields sections in priority order
 - restart persistence is validated by the dogfood harness
@@ -265,7 +268,8 @@ This repository currently ships:
 - core NCP types and encoder
 - chunking and bounded assembly with incremental `assemble_incremental()` generator
 - SQLite-backed persistence
-- pgvector durable-store with schema migrations, advisory-lock upgrade tooling, and `ncp migrate` CLI
+- pgvector durable-store with schema migrations, advisory-lock upgrade tooling, `ncp migrate` CLI, and `ThreadedConnectionPool` by default
+- optional embedding storage on pgvector chunks with `retrieval_mode="vector"` ANN query via `<=>` operator
 - Redis-backed coordination for pgvector whisper delivery and fetch-session limits
 - opt-in live pgvector integration suite for the local Postgres/pgvector path
 - HTTP/SSE MCP server
@@ -276,7 +280,7 @@ This repository currently ships:
 
 Current release:
 
-- `neural-context-protocol==0.4.0`
+- `neural-context-protocol==0.5.0`
 
 ## Documentation
 

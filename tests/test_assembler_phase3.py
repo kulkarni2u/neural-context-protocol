@@ -231,7 +231,7 @@ def test_assembler_read_after_write_retry(tmp_path: Path) -> None:
         def get_pipeline_goal_versions(self, *args: object, **kwargs: object) -> dict: ...
 
     store = _FlakyStore()
-    assembler = Assembler(store=store)
+    assembler = Assembler(store=store)  # type: ignore[arg-type]
 
     response = NCPResponse(
         content="ok",
@@ -271,7 +271,7 @@ def test_assembler_surfaces_write_failure_after_retries() -> None:
         def query(self, *args: object, **kwargs: object) -> list: ...
         def get_pipeline_goal_versions(self, *args: object, **kwargs: object) -> dict: ...
 
-    assembler = Assembler(store=_FailingStore())
+    assembler = Assembler(store=_FailingStore())  # type: ignore[arg-type]
     response = NCPResponse(
         content="ok",
         input_tokens=10,

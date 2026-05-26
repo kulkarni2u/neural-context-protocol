@@ -2,6 +2,47 @@
 
 All notable changes to Neural Context Protocol will be documented in this file.
 
+## [0.5.0] - 2026-05-26
+
+Production readiness and embedding milestone. Three slices across pgvector and
+both stores; no breaking changes to existing callers.
+
+### Added
+
+- **pgvector connection pooling** (`PgvectorStore`): `ThreadedConnectionPool` is
+  created by default when no `connect_factory` is injected; `_connect()` checks
+  out and returns connections via `getconn()`/`putconn()` instead of
+  opening/closing a TCP connection per call; `min_pool_connections=2` and
+  `max_pool_connections=10` are configurable constructor params; `close()` method
+  drains the pool; passing an explicit `connect_factory` disables pooling (unit
+  test path unchanged)
+- **Embedding storage + ANN retrieval** (`SubconsciousChunk`, `PgvectorStore`,
+  migration 003): `SubconsciousChunk` gains optional `embedding: list[float] |
+  None = None` field validated to 1536 dimensions; `PgvectorStore.write()` stores
+  the embedding when provided; migration 003 adds nullable `vector(1536)` column;
+  `retrieval_mode="vector"` on `PgvectorStore.query()` issues `ORDER BY embedding
+  <=> %s::vector LIMIT k` and converts cosine distance to score via
+  `1/(1+distance)`; SQLite raises `ValueError` for `"vector"` mode with a clear
+  message pointing to pgvector
+- `BaseStore.query()`, `SQLiteStore.query()`, and `PgvectorStore.query()` gain
+  `embedding: list[float] | None = None` parameter (default `None`; backward
+  compatible); `"vector"` added to `_VALID_RETRIEVAL_MODES` in both stores
+
+### Changed
+
+- `SupportsAssemblyStore` Protocol removed from `ncp/assembler.py`;
+  `Assembler.__init__` now types `store: BaseStore` directly; existing
+  structural-duck-type test stubs in `test_assembler_phase3.py` are annotated
+  with `# type: ignore[arg-type]` to document the intentional deviation
+
+### Verified
+
+- Full test suite: 388 passed, 8 skipped
+- Ruff: zero lint errors
+- All three slices implemented with dedicated test files:
+  `tests/test_pgvector_pool.py` (7 tests), `tests/test_embedding_ann.py`
+  (11 tests)
+
 ## [0.4.0] - 2026-05-26
 
 Release hardening and retrieval quality milestone. All four slices landed on

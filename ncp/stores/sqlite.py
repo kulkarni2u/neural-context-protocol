@@ -232,7 +232,18 @@ class SQLiteStore(BaseStore):
         scope: str | None = None,
         zone: str = "working",
         retrieval_mode: str = "hybrid",
+        embedding: list[float] | None = None,
     ) -> list[SubconsciousChunk]:
+        _VALID_RETRIEVAL_MODES = ("hybrid", "trust_recency", "vector")
+        if retrieval_mode not in _VALID_RETRIEVAL_MODES:
+            raise ValueError(
+                f"Unknown retrieval_mode {retrieval_mode!r}; expected one of {_VALID_RETRIEVAL_MODES}"
+            )
+        if retrieval_mode == "vector":
+            raise ValueError(
+                "retrieval_mode='vector' requires pgvector; SQLite does not support ANN search"
+            )
+
         with self._connect() as connection:
             rows = self._load_query_rows(
                 connection,
@@ -243,12 +254,6 @@ class SQLiteStore(BaseStore):
             )
         if not rows:
             return []
-
-        _VALID_RETRIEVAL_MODES = ("hybrid", "trust_recency")
-        if retrieval_mode not in _VALID_RETRIEVAL_MODES:
-            raise ValueError(
-                f"Unknown retrieval_mode {retrieval_mode!r}; expected one of {_VALID_RETRIEVAL_MODES}"
-            )
 
         policy = self.retrieval_policy
         now = time.time()

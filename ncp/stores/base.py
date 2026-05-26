@@ -42,6 +42,7 @@ class BaseStore(ABC):
         scope: str | None = None,
         zone: str = "working",
         retrieval_mode: str = "hybrid",
+        embedding: list[float] | None = None,
     ) -> list[SubconsciousChunk]:
         """Query stored chunks by text relevance.
 
@@ -50,6 +51,9 @@ class BaseStore(ABC):
         - ``"trust_recency"``: recency + trust only; BM25 and the
           term-overlap filter are skipped.  Use this for non-BM25
           backends that perform their own similarity search.
+        - ``"vector"``: cosine ANN search using stored embeddings.
+          Requires ``embedding`` to be provided.  Only supported on
+          the pgvector backend; raises ``ValueError`` on SQLite.
         """
 
     @abstractmethod

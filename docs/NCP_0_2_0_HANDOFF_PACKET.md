@@ -8,9 +8,9 @@ agent instead of replaying long chat history.
 
 Latest release:
 
-- PyPI: `neural-context-protocol==0.4.0` *(pending publish)*
-- GitHub: `main` branch (commit `1a3be87`)
-- Suite: `370 passed, 8 skipped`
+- PyPI: `neural-context-protocol==0.5.0` *(pending publish)*
+- GitHub: `main` branch
+- Suite: `388 passed, 8 skipped`
 - Live pgvector + Redis integration suite: `6 passed`
 
 ## What Shipped In 0.2.0
@@ -84,16 +84,33 @@ Latest release:
   unknown values raise `ValueError`.
 - Suite: 370 passed, 8 skipped. Ruff clean. All four slices OpenCode-reviewed.
 
-## Active Line: 0.5.x (suggested)
+## What Shipped In 0.5.0
 
-The `0.4.x` release hardening line is closed.
+- **Slice 1 — pgvector connection pooling**: `ThreadedConnectionPool` wired in by
+  default; `_connect()` uses `getconn()`/`putconn()` instead of open/close per
+  call; `min_pool_connections=2`, `max_pool_connections=10` configurable;
+  `close()` drains pool; factory injection still bypasses pooling for tests.
+- **Slice 2 — SupportsAssemblyStore collapsed**: Protocol removed from
+  `ncp/assembler.py`; `Assembler.__init__` now typed `store: BaseStore`; test
+  stubs in `test_assembler_phase3.py` annotated `# type: ignore[arg-type]`.
+- **Slice 3 — Embedding storage + ANN retrieval**: `SubconsciousChunk` gains
+  `embedding: list[float] | None = None` (validated to 1536 dims); migration 003
+  adds nullable `vector(1536)` column; `PgvectorStore.write()` stores embeddings;
+  `retrieval_mode="vector"` queries via `<=>` cosine operator; SQLite raises
+  `ValueError` for vector mode; all three stores gain `embedding` param on
+  `query()`.
+- Suite: `388 passed, 8 skipped`
+
+## Active Line: 0.6.x (suggested)
+
+The `0.5.x` production readiness line is closed.
 
 ### Suggested next focus
 
-- Connection pooling for pgvector (production readiness)
-- Collapse `SupportsAssemblyStore` Protocol into `BaseStore` directly
-- Actual embedding storage + ANN query using the pgvector `<=>` operator
 - Streaming MCP `ncp_get_context` endpoint (SSE or NDJSON) for very long turns
+- IVF-FLAT index migration (migration 004) for production-scale ANN performance
+- Embedding provider integration: allow NCP to auto-embed chunks on write via
+  a configured embedding adapter (Anthropic, OpenAI, or local)
 
 ## Known Architectural Gaps (carried forward)
 
@@ -123,12 +140,13 @@ The `0.4.x` release hardening line is closed.
 
 ## Suggested Prompt For The Next Orchestrator
 
-> Read `docs/NCP_0_2_0_HANDOFF_PACKET.md` first. The `0.4.x` line is closed.
-> We are opening the `0.5.x` production readiness line. Priorities in order:
-> (1) pgvector connection pooling so the production path can handle concurrent
-> agents without exhausting connections; (2) collapse `SupportsAssemblyStore`
-> into `BaseStore` so the assembler has one typed surface; (3) actual embedding
-> storage + ANN query using pgvector `<=>` so `retrieval_mode="trust_recency"`
-> has a real vector backend rather than just trust/recency fallback. Keep SQLite
-> and pgvector aligned. Use NCP handoffs for bounded coordination. Prefer
-> correctness and tests over broad refactors.
+> Read `docs/NCP_0_2_0_HANDOFF_PACKET.md` first. The `0.5.x` line is closed.
+> We are opening the `0.6.x` streaming and embedding-provider line. Priorities
+> in order: (1) streaming MCP `ncp_get_context` endpoint (SSE or NDJSON) so
+> very long turns can yield context incrementally without buffering the full
+> assembly; (2) IVF-FLAT index migration (migration 004) for production-scale
+> ANN performance on the embedding column; (3) embedding provider integration
+> — allow NCP to auto-embed chunks on write via a configured adapter so callers
+> don't have to embed externally. Keep SQLite and pgvector aligned. Use NCP
+> handoffs for bounded coordination. Prefer correctness and tests over broad
+> refactors.
