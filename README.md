@@ -149,6 +149,58 @@ Benchmark write-ups:
 - [docs/NCP_BENCHMARK_CODING_PIPELINE.md](./docs/NCP_BENCHMARK_CODING_PIPELINE.md)
 - [docs/NCP_BENCHMARK_RESEARCH_PIPELINE.md](./docs/NCP_BENCHMARK_RESEARCH_PIPELINE.md)
 
+## How NCP Reduces Token Cost
+
+Multi-agent workflows that replay full history accumulate tokens quadratically.
+NCP replaces "replay everything" with "retrieve what is relevant," keeping each
+agent turn's context window small and signal-dense regardless of how long the
+overall session runs.
+
+### Mechanisms
+
+**Bounded context assembly.** `ncp_get_context` returns a scored, deduplicated
+window of the top-k most relevant chunks for the current role and task — not a
+raw append of every prior turn. Context size stays roughly constant as the
+session grows.
+
+**Hybrid retrieval scoring.** Every candidate chunk is ranked by a weighted
+fusion of three signals:
+
+| Signal | Default weight | Effect |
+|---|---|---|
+| BM25 lexical overlap | 0.5 | surfaces on-topic chunks |
+| Recency decay (4h half-life) | 0.3 | older facts rank lower automatically |
+| `base_trust` (writer attestation) | 0.2 | user-verified facts outrank inferred ones |
+
+Chunks that share zero lexical overlap with the query are filtered before
+scoring, so noise never reaches the assembled context.
+
+**Deduplication.** The store rejects writes with >92% content similarity in the
+same zone/layer/pipeline. The same fact is stored once and updated, not
+accumulated.
+
+**Bounded handoff payloads.** When agents hand off work via whispers, the
+payload is a compact instruction pointing at relevant chunk IDs. The receiving
+agent fetches only the chunks it needs (`ncp_fetch k=2`) rather than receiving
+a full transcript of the sender's session.
+
+**Durable cross-turn memory.** Useful decisions are persisted as typed memory
+chunks (episodic, procedural, semantic, social, reasoning_trace) at the end of
+each turn. The next turn fetches them by relevance query instead of replaying
+the full conversation.
+
+### Observed reductions
+
+| Scenario | Naive replay tokens | NCP tokens | Reduction |
+|---|---|---|---|
+| Coding pipeline (40 turns) | 1 927 peak | 174 peak | 17.5× |
+| Research pipeline (36 turns) | 1 700 peak | 156 peak | 16.4× |
+| Sarathi planning handoff (live) | ~677 estimated | ~265 estimated | 60.9% |
+
+See [docs/NCP_BENCHMARK_CODING_PIPELINE.md](./docs/NCP_BENCHMARK_CODING_PIPELINE.md)
+and [docs/NCP_BENCHMARK_RESEARCH_PIPELINE.md](./docs/NCP_BENCHMARK_RESEARCH_PIPELINE.md)
+for methodology and raw numbers.
+
 ## Examples
 
 Runnable examples:
@@ -209,18 +261,20 @@ This repository currently ships:
 - release preflight script
 - minimal CI for `ruff`, `pytest`, and `build`
 
-Current published alpha:
+Current release:
 
-- `neural-context-protocol==0.1.0a1`
+- `neural-context-protocol==0.2.0`
 
 Next focus:
 
-- Next major focus: production-facing storage and retrieval
-- Immediate next step: move from lexical hardening into fuller hybrid retrieval beyond the current BM25-first query path
+- streaming / incremental assembly for very long turns
+- vector-only retrieval path for non-BM25 backends
+- pgvector schema migrations and upgrade tooling
 
 ## Documentation
 
 - [docs/NCP_SETUP.md](./docs/NCP_SETUP.md) - install and first-run setup
+- [docs/NCP_0_2_0_HANDOFF_PACKET.md](./docs/NCP_0_2_0_HANDOFF_PACKET.md) - current orchestrator packet for finishing the active post-alpha roadmap
 - [docs/NCP_PROTOCOL_SPEC.md](./docs/NCP_PROTOCOL_SPEC.md) - normative protocol reference
 - [docs/NCP_MCP_DOGFOOD_LOOP.md](./docs/NCP_MCP_DOGFOOD_LOOP.md) - deterministic MCP proof path
 - [docs/NCP_PROVIDER_PARITY_BASELINE.md](./docs/NCP_PROVIDER_PARITY_BASELINE.md) - current live host parity snapshot
