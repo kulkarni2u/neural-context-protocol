@@ -14,6 +14,7 @@ from rank_bm25 import BM25Okapi
 
 from ncp.stores.base import BaseStore, NCPStoreUnavailableError
 from ncp.stores.redis_coordination import RedisCoordination
+from ncp.stores.retrieval import DEFAULT_RETRIEVAL_POLICY, RetrievalPolicy
 from ncp.types import ConsciousBlock, NCPResponse, SubconsciousChunk, TurnRecord, Whisper
 
 
@@ -158,6 +159,7 @@ class PgvectorStore(BaseStore):
         coordination: RedisCoordination | None = None,
         max_working_chunks: int = 500,
         gc_threshold: int = 400,
+        retrieval_policy: RetrievalPolicy | None = None,
     ) -> None:
         self.dsn = dsn
         self.schema = _validate_identifier(schema, field="schema")
@@ -168,6 +170,7 @@ class PgvectorStore(BaseStore):
         )
         self.max_working_chunks = max_working_chunks
         self.gc_threshold = gc_threshold
+        self.retrieval_policy = retrieval_policy or DEFAULT_RETRIEVAL_POLICY
         self._init_db()
 
     @contextmanager
@@ -319,27 +322,36 @@ class PgvectorStore(BaseStore):
         query_terms = {term for term in text.lower().split() if term}
         corpus = [str(row["content"]).lower().split() for row in rows]
         bm25 = BM25Okapi(corpus)
-        scores = bm25.get_scores(text.split())
+        raw_scores = bm25.get_scores(text.split())
+
+        max_bm25 = max(raw_scores) if len(raw_scores) > 0 else 0.0
+        norm_scores = [s / max_bm25 for s in raw_scores] if max_bm25 > 0 else [0.0] * len(raw_scores)
+
+        policy = self.retrieval_policy
+        now = time.time()
         candidates: list[SubconsciousChunk] = []
-        for score, row, doc_tokens in zip(scores, rows, corpus, strict=True):
+        for norm_score, row, doc_tokens in zip(norm_scores, rows, corpus, strict=True):
             if query_terms:
-                overlap = len(query_terms.intersection(doc_tokens))
-                if overlap == 0:
+                if len(query_terms.intersection(set(doc_tokens))) == 0:
                     continue
-                lexical_floor = overlap / len(query_terms)
-                relevance = max(float(score), lexical_floor)
+                bm25_for_policy = norm_score
             else:
-                relevance = 1.0
-            if relevance < min_score:
+                bm25_for_policy = 1.0
+
+            age_seconds = max(0.0, now - float(row["created_at"]))
+            hybrid_score = policy.score(
+                bm25_normalized=bm25_for_policy,
+                age_seconds=age_seconds,
+                base_trust=float(row["base_trust"]),
+                generation=int(row["generation"]),
+            )
+            if hybrid_score < min_score:
                 continue
             chunk = self._row_to_chunk(row)
-            chunk.relevance = max(0.0, relevance)
+            chunk.relevance = max(0.0, min(1.0, hybrid_score))
             candidates.append(chunk)
-        ranked = sorted(
-            candidates,
-            key=lambda chunk: (chunk.effective_score, chunk.relevance),
-            reverse=True,
-        )
+
+        ranked = sorted(candidates, key=lambda c: c.relevance, reverse=True)
 
         diversity_limit = 2
         author_count: dict[str, int] = {}
