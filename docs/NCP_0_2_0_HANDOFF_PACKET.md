@@ -114,11 +114,12 @@ The `0.5.x` production readiness line is closed.
 
 ## Known Architectural Gaps (carried forward)
 
-- `SupportsAssemblyStore` Protocol still partially duplicates `BaseStore` —
-  long-term the Assembler should accept `BaseStore` directly once test stubs
-  are updated
-- query result count semantics still opinionated inside store methods
-- pgvector production posture still needs connection pooling
+- query result count semantics still opinionated inside store methods (max 4
+  returned by hybrid/trust_recency paths; vector path honours `k` up to 4)
+- no IVF-FLAT index on the `embedding` column yet — ANN performance degrades
+  at scale; migration 004 should add it
+- NCP does not embed chunks internally; callers must pre-compute and pass
+  `embedding=` to `write()` / `query(retrieval_mode="vector")` themselves
 
 ## Recommended Agent Roles
 
