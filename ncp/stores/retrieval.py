@@ -64,5 +64,29 @@ class RetrievalPolicy:
         )
         return fused * gen_penalty
 
+    def score_no_bm25(
+        self,
+        *,
+        age_seconds: float,
+        base_trust: float,
+        generation: int = 0,
+    ) -> float:
+        """Score without BM25 for non-lexical backends.
+
+        Weights are renormalized to (w_recency + w_trust) so the result
+        stays in [0, 1] even though the lexical signal is absent.
+        Generation penalty is still applied multiplicatively.
+        """
+        recency = math.exp(-0.693 * max(0.0, age_seconds) / self.recency_half_life_seconds)
+        gen_penalty = 0.9 ** max(0, generation)
+        w_sum = self.w_recency + self.w_trust
+        if w_sum == 0.0:
+            return 0.0
+        fused = (
+            self.w_recency * recency
+            + self.w_trust * max(0.0, min(1.0, base_trust))
+        ) / w_sum
+        return fused * gen_penalty
+
 
 DEFAULT_RETRIEVAL_POLICY = RetrievalPolicy()

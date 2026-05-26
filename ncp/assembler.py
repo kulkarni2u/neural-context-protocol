@@ -31,6 +31,7 @@ class SupportsAssemblyStore(Protocol):
         pipeline_id: str | None = None,
         scope: str | None = None,
         zone: str = "working",
+        retrieval_mode: str = "hybrid",
     ) -> list[SubconsciousChunk]: ...
 
     def drain_whispers(

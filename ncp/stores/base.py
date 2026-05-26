@@ -41,8 +41,16 @@ class BaseStore(ABC):
         pipeline_id: str | None = None,
         scope: str | None = None,
         zone: str = "working",
+        retrieval_mode: str = "hybrid",
     ) -> list[SubconsciousChunk]:
-        """Query stored chunks by text relevance."""
+        """Query stored chunks by text relevance.
+
+        ``retrieval_mode`` controls the scoring strategy:
+        - ``"hybrid"`` (default): BM25 + recency + trust weighted sum.
+        - ``"trust_recency"``: recency + trust only; BM25 and the
+          term-overlap filter are skipped.  Use this for non-BM25
+          backends that perform their own similarity search.
+        """
 
     @abstractmethod
     def get_working_zone(

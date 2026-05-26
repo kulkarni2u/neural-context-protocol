@@ -316,6 +316,7 @@ class PgvectorStore(BaseStore):
         pipeline_id: str | None = None,
         scope: str | None = None,
         zone: str = "working",
+        retrieval_mode: str = "hybrid",
     ) -> list[SubconsciousChunk]:
         with self._connect() as connection:
             rows = self._load_query_rows(
@@ -328,37 +329,58 @@ class PgvectorStore(BaseStore):
         if not rows:
             return []
 
-        query_terms = {term for term in text.lower().split() if term}
-        corpus = [str(row["content"]).lower().split() for row in rows]
-        bm25 = BM25Okapi(corpus)
-        raw_scores = bm25.get_scores(text.split())
-
-        max_bm25 = max(raw_scores) if len(raw_scores) > 0 else 0.0
-        norm_scores = [s / max_bm25 for s in raw_scores] if max_bm25 > 0 else [0.0] * len(raw_scores)
+        _VALID_RETRIEVAL_MODES = ("hybrid", "trust_recency")
+        if retrieval_mode not in _VALID_RETRIEVAL_MODES:
+            raise ValueError(
+                f"Unknown retrieval_mode {retrieval_mode!r}; expected one of {_VALID_RETRIEVAL_MODES}"
+            )
 
         policy = self.retrieval_policy
         now = time.time()
         candidates: list[SubconsciousChunk] = []
-        for norm_score, row, doc_tokens in zip(norm_scores, rows, corpus, strict=True):
-            if query_terms:
-                if len(query_terms.intersection(set(doc_tokens))) == 0:
-                    continue
-                bm25_for_policy = norm_score
-            else:
-                bm25_for_policy = 1.0
 
-            age_seconds = max(0.0, now - float(row["created_at"]))
-            hybrid_score = policy.score(
-                bm25_normalized=bm25_for_policy,
-                age_seconds=age_seconds,
-                base_trust=float(row["base_trust"]),
-                generation=int(row["generation"]),
-            )
-            if hybrid_score < min_score:
-                continue
-            chunk = self._row_to_chunk(row)
-            chunk.relevance = max(0.0, min(1.0, hybrid_score))
-            candidates.append(chunk)
+        if retrieval_mode == "trust_recency":
+            for row in rows:
+                age_seconds = max(0.0, now - float(row["created_at"]))
+                score = policy.score_no_bm25(
+                    age_seconds=age_seconds,
+                    base_trust=float(row["base_trust"]),
+                    generation=int(row["generation"]),
+                )
+                if score < min_score:
+                    continue
+                chunk = self._row_to_chunk(row)
+                chunk.relevance = max(0.0, min(1.0, score))
+                candidates.append(chunk)
+        else:
+            query_terms = {term for term in text.lower().split() if term}
+            corpus = [str(row["content"]).lower().split() for row in rows]
+            bm25 = BM25Okapi(corpus)
+            raw_scores = bm25.get_scores(text.split())
+
+            max_bm25 = max(raw_scores) if len(raw_scores) > 0 else 0.0
+            norm_scores = [s / max_bm25 for s in raw_scores] if max_bm25 > 0 else [0.0] * len(raw_scores)
+
+            for norm_score, row, doc_tokens in zip(norm_scores, rows, corpus, strict=True):
+                if query_terms:
+                    if len(query_terms.intersection(set(doc_tokens))) == 0:
+                        continue
+                    bm25_for_policy = norm_score
+                else:
+                    bm25_for_policy = 1.0
+
+                age_seconds = max(0.0, now - float(row["created_at"]))
+                hybrid_score = policy.score(
+                    bm25_normalized=bm25_for_policy,
+                    age_seconds=age_seconds,
+                    base_trust=float(row["base_trust"]),
+                    generation=int(row["generation"]),
+                )
+                if hybrid_score < min_score:
+                    continue
+                chunk = self._row_to_chunk(row)
+                chunk.relevance = max(0.0, min(1.0, hybrid_score))
+                candidates.append(chunk)
 
         ranked = sorted(candidates, key=lambda c: c.relevance, reverse=True)
 
