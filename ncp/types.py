@@ -436,3 +436,16 @@ class ConsolidationReport:
     dry_run: bool = False
     pipeline_id: str | None = None
     merge_log: list[dict] = field(default_factory=list)
+
+
+@dataclass
+class CalibrationReport:
+    """Result of a calibration pass over the store."""
+
+    adjusted: int = 0
+    protected: int = 0
+    skipped: int = 0
+    duration_seconds: float = 0.0
+    dry_run: bool = False
+    pipeline_id: str | None = None
+    change_log: list[dict] = field(default_factory=list)

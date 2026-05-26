@@ -5,7 +5,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 
-from ncp.types import ConsolidationReport, ConsciousBlock, NCPResponse, SubconsciousChunk, TurnRecord, Whisper
+from ncp.types import CalibrationReport, ConsolidationReport, ConsciousBlock, NCPResponse, SubconsciousChunk, TurnRecord, Whisper
 
 
 class NCPStoreError(RuntimeError):
@@ -139,3 +139,35 @@ class BaseStore(ABC):
         trust_floor: float = 0.10,
     ) -> ConsolidationReport:
         """Merge redundant chunks and tombstone noise. Returns a report of what changed."""
+
+    @abstractmethod
+    def calibrate(
+        self,
+        *,
+        pipeline_id: str | None = None,
+        chunk_id: str | None = None,
+        trust: float | None = None,
+        dry_run: bool = False,
+        decay_factor: float = 0.85,
+        recency_half_life_seconds: float = 14400,
+    ) -> CalibrationReport:
+        """Re-score base_trust on existing chunks.
+
+        Two modes:
+        - Manual override: provide chunk_id + trust to set a specific chunk's base_trust.
+        - Batch decay: provide pipeline_id to apply decay to eligible chunks (age >
+          recency_half_life_seconds, base_trust > 0.5, generation == 0). Chunks with
+          src == "user_verified" are always protected.
+        """
+
+    @abstractmethod
+    def viz_data(self, *, pipeline_id: str | None = None) -> dict[str, object]:
+        """Return structured data for the operator viz view.
+
+        Returns a dict with these exact top-level keys:
+        - chunk_distribution: list of {layer, zone, count}
+        - age_brackets: list of {bracket, count, avg_trust, top_layer}
+        - top_chunks: list of top 5 chunks by base_trust DESC
+        - pipeline_summary: list of {pipeline_id, chunk_count, last_activity}
+        - whisper_queue: {total, by_type: {type: count}}
+        """

@@ -15,7 +15,7 @@ from rank_bm25 import BM25Okapi
 from ncp.stores.base import BaseStore, NCPStoreUnavailableError
 from ncp.stores.consolidation import cluster_by_tags, find_merge_candidates
 from ncp.stores.retrieval import DEFAULT_RETRIEVAL_POLICY, RetrievalPolicy
-from ncp.types import ConsolidationReport, ConsciousBlock, NCPResponse, SubconsciousChunk, TurnRecord, Whisper
+from ncp.types import CalibrationReport, ConsolidationReport, ConsciousBlock, NCPResponse, SubconsciousChunk, TurnRecord, Whisper
 
 
 SCHEMA = """
@@ -615,6 +615,109 @@ class SQLiteStore(BaseStore):
         report.duration_seconds = time.monotonic() - started
         return report
 
+    def calibrate(
+        self,
+        *,
+        pipeline_id: str | None = None,
+        chunk_id: str | None = None,
+        trust: float | None = None,
+        dry_run: bool = False,
+        decay_factor: float = 0.85,
+        recency_half_life_seconds: float = 14400,
+    ) -> CalibrationReport:
+        """Re-score base_trust on live chunks.
+
+        Manual mode: chunk_id + trust sets a specific chunk's base_trust directly.
+        Batch mode: pipeline_id applies decay to eligible chunks.
+        """
+        started = time.monotonic()
+        report = CalibrationReport(dry_run=dry_run, pipeline_id=pipeline_id)
+
+        if chunk_id is not None:
+            # --- Manual pinpoint override ---
+            if trust is None:
+                raise ValueError("trust is required when chunk_id is provided")
+            if not 0.0 <= trust <= 1.0:
+                raise ValueError("trust must be between 0.0 and 1.0")
+            with self._connect() as connection:
+                row = connection.execute(
+                    "SELECT chunk_id, base_trust, src FROM chunks"
+                    " WHERE chunk_id = ? AND chunk_id NOT IN (SELECT chunk_id FROM tombstones)",
+                    (chunk_id,),
+                ).fetchone()
+                if row is None:
+                    report.skipped += 1
+                    report.duration_seconds = time.monotonic() - started
+                    return report
+                old_trust = float(row["base_trust"])
+                report.change_log.append({
+                    "chunk_id": chunk_id,
+                    "old_trust": old_trust,
+                    "new_trust": trust,
+                    "reason": "manual_override",
+                })
+                if not dry_run:
+                    connection.execute(
+                        "UPDATE chunks SET base_trust = ? WHERE chunk_id = ?",
+                        (trust, chunk_id),
+                    )
+                report.adjusted += 1
+        else:
+            # --- Batch decay mode ---
+            now = time.time()
+            cutoff_age = recency_half_life_seconds
+
+            query = (
+                "SELECT chunk_id, base_trust, src, generation, created_at FROM chunks"
+                " WHERE chunk_id NOT IN (SELECT chunk_id FROM tombstones)"
+            )
+            params: list = []
+            if pipeline_id is not None:
+                query += " AND pipeline_id = ?"
+                params.append(pipeline_id)
+
+            with self._connect() as connection:
+                # Acquire an immediate write lock before reading so the read and
+                # subsequent updates happen atomically — no concurrent writer can
+                # sneak in between the SELECT and the UPDATEs.
+                if not dry_run:
+                    connection.execute("BEGIN IMMEDIATE")
+                rows = connection.execute(query, params).fetchall()
+                updates: list[tuple[float, str]] = []
+                for row in rows:
+                    cid = str(row["chunk_id"])
+                    src = str(row["src"])
+                    base_trust = float(row["base_trust"])
+                    generation = int(row["generation"])
+                    age_seconds = max(0.0, now - float(row["created_at"]))
+
+                    if src == "user_verified":
+                        report.protected += 1
+                        continue
+
+                    if age_seconds > cutoff_age and base_trust > 0.5 and generation == 0:
+                        new_trust = max(0.0, base_trust * decay_factor)
+                        report.change_log.append({
+                            "chunk_id": cid,
+                            "old_trust": base_trust,
+                            "new_trust": new_trust,
+                            "reason": "batch_decay",
+                        })
+                        updates.append((new_trust, cid))
+                        report.adjusted += 1
+                    else:
+                        report.skipped += 1
+
+                if not dry_run and updates:
+                    for new_trust, cid in updates:
+                        connection.execute(
+                            "UPDATE chunks SET base_trust = ? WHERE chunk_id = ?",
+                            (new_trust, cid),
+                        )
+
+        report.duration_seconds = time.monotonic() - started
+        return report
+
     def _emit_consolidation_whisper(self, *, pipeline_id: str | None) -> None:
         from ncp.types import Whisper
         whisper = Whisper(
@@ -908,6 +1011,188 @@ class SQLiteStore(BaseStore):
                 }
                 for row in recent_rows
             ],
+        }
+
+    def viz_data(self, *, pipeline_id: str | None = None) -> dict[str, object]:
+        """Return structured data for the operator viz view."""
+        now = time.time()
+        with self._connect() as connection:
+            # 1. Chunk distribution: layer x zone counts (live chunks only)
+            live_clause = "chunk_id NOT IN (SELECT chunk_id FROM tombstones)"
+            if pipeline_id is not None:
+                dist_rows = connection.execute(
+                    f"""
+                    SELECT layer, zone, COUNT(*) AS count
+                    FROM chunks
+                    WHERE {live_clause} AND pipeline_id = ?
+                    GROUP BY layer, zone
+                    ORDER BY layer, zone
+                    """,
+                    (pipeline_id,),
+                ).fetchall()
+            else:
+                dist_rows = connection.execute(
+                    f"""
+                    SELECT layer, zone, COUNT(*) AS count
+                    FROM chunks
+                    WHERE {live_clause}
+                    GROUP BY layer, zone
+                    ORDER BY layer, zone
+                    """
+                ).fetchall()
+            chunk_distribution = [
+                {"layer": str(r["layer"]), "zone": str(r["zone"]), "count": int(r["count"])}
+                for r in dist_rows
+            ]
+
+            # 2. Age brackets
+            bracket_sql = f"""
+                SELECT
+                    CASE
+                        WHEN (? - created_at) < 3600 THEN '<1h'
+                        WHEN (? - created_at) < 14400 THEN '1-4h'
+                        WHEN (? - created_at) < 86400 THEN '4-24h'
+                        ELSE '>24h'
+                    END AS bracket,
+                    COUNT(*) AS count,
+                    AVG(base_trust) AS avg_trust
+                FROM chunks
+                WHERE {live_clause}
+                {"AND pipeline_id = ?" if pipeline_id is not None else ""}
+                GROUP BY bracket
+                ORDER BY bracket
+            """
+            bracket_params: list[object] = [now, now, now]
+            if pipeline_id is not None:
+                bracket_params.append(pipeline_id)
+            bracket_rows = connection.execute(bracket_sql, bracket_params).fetchall()
+
+            # Top layer per bracket (separate query)
+            bracket_top_layer: dict[str, str] = {}
+            for bracket_label, age_min, age_max in [
+                ("<1h", 0, 3600),
+                ("1-4h", 3600, 14400),
+                ("4-24h", 14400, 86400),
+                (">24h", 86400, None),
+            ]:
+                clause = f"(? - created_at) >= ? AND {live_clause}"
+                params_layer: list[object] = [now, age_min]
+                if age_max is not None:
+                    clause += " AND (? - created_at) < ?"
+                    params_layer.extend([now, age_max])
+                if pipeline_id is not None:
+                    clause += " AND pipeline_id = ?"
+                    params_layer.append(pipeline_id)
+                tl_row = connection.execute(
+                    f"""
+                    SELECT layer, COUNT(*) AS cnt FROM chunks
+                    WHERE {clause}
+                    GROUP BY layer ORDER BY cnt DESC LIMIT 1
+                    """,
+                    params_layer,
+                ).fetchone()
+                if tl_row is not None:
+                    bracket_top_layer[bracket_label] = str(tl_row["layer"])
+
+            age_brackets = [
+                {
+                    "bracket": str(r["bracket"]),
+                    "count": int(r["count"]),
+                    "avg_trust": round(float(r["avg_trust"]), 4) if r["avg_trust"] is not None else 0.0,
+                    "top_layer": bracket_top_layer.get(str(r["bracket"]), "-"),
+                }
+                for r in bracket_rows
+            ]
+
+            # 3. Top chunks by base_trust DESC (live only)
+            if pipeline_id is not None:
+                top_rows = connection.execute(
+                    f"""
+                    SELECT chunk_id, layer, zone, pipeline_id, base_trust, created_at
+                    FROM chunks
+                    WHERE {live_clause} AND pipeline_id = ?
+                    ORDER BY base_trust DESC, created_at DESC
+                    LIMIT 5
+                    """,
+                    (pipeline_id,),
+                ).fetchall()
+            else:
+                top_rows = connection.execute(
+                    f"""
+                    SELECT chunk_id, layer, zone, pipeline_id, base_trust, created_at
+                    FROM chunks
+                    WHERE {live_clause}
+                    ORDER BY base_trust DESC, created_at DESC
+                    LIMIT 5
+                    """
+                ).fetchall()
+            top_chunks = [
+                {
+                    "chunk_id": str(r["chunk_id"])[:16],
+                    "layer": str(r["layer"]),
+                    "zone": str(r["zone"]),
+                    "pipeline_id": r["pipeline_id"],
+                    "base_trust": float(r["base_trust"]),
+                    "age_seconds": round(now - float(r["created_at"]), 1),
+                }
+                for r in top_rows
+            ]
+
+            # 4. Pipeline summary (live chunks only)
+            if pipeline_id is not None:
+                pipe_rows = connection.execute(
+                    f"""
+                    SELECT pipeline_id, COUNT(*) AS chunk_count, MAX(created_at) AS last_activity
+                    FROM chunks
+                    WHERE {live_clause} AND pipeline_id = ?
+                    GROUP BY pipeline_id
+                    ORDER BY last_activity DESC
+                    """,
+                    (pipeline_id,),
+                ).fetchall()
+            else:
+                pipe_rows = connection.execute(
+                    f"""
+                    SELECT pipeline_id, COUNT(*) AS chunk_count, MAX(created_at) AS last_activity
+                    FROM chunks
+                    WHERE {live_clause} AND pipeline_id IS NOT NULL
+                    GROUP BY pipeline_id
+                    ORDER BY last_activity DESC
+                    LIMIT 20
+                    """
+                ).fetchall()
+            pipeline_summary = [
+                {
+                    "pipeline_id": str(r["pipeline_id"]),
+                    "chunk_count": int(r["chunk_count"]),
+                    "last_activity": float(r["last_activity"]),
+                }
+                for r in pipe_rows
+                if r["pipeline_id"] is not None
+            ]
+
+            # 5. Whisper queue
+            if pipeline_id is not None:
+                wq_rows = connection.execute(
+                    "SELECT whisper_type, COUNT(*) AS cnt FROM whispers WHERE pipeline_id = ? GROUP BY whisper_type",
+                    (pipeline_id,),
+                ).fetchall()
+            else:
+                wq_rows = connection.execute(
+                    "SELECT whisper_type, COUNT(*) AS cnt FROM whispers GROUP BY whisper_type"
+                ).fetchall()
+            by_type = {str(r["whisper_type"]): int(r["cnt"]) for r in wq_rows}
+            whisper_queue: dict[str, object] = {
+                "total": sum(by_type.values()),
+                "by_type": by_type,
+            }
+
+        return {
+            "chunk_distribution": chunk_distribution,
+            "age_brackets": age_brackets,
+            "top_chunks": top_chunks,
+            "pipeline_summary": pipeline_summary,
+            "whisper_queue": whisper_queue,
         }
 
     def _load_query_rows(

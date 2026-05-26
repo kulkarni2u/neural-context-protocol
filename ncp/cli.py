@@ -696,6 +696,100 @@ def emit_command(
     console.print("Whisper emitted.")
 
 
+@main.command("viz")
+@click.option("--cwd", type=click.Path(path_type=Path), default=Path.cwd)
+@click.option("--pipeline-id", default=None, help="Optional pipeline scope filter.")
+def viz_command(cwd: Path, pipeline_id: str | None) -> None:
+    """Show operator view: chunk distribution, age brackets, top chunks, pipelines, whispers."""
+
+    from rich.panel import Panel
+
+    try:
+        config = ncp.configure(cwd=cwd)
+        store = _resolve_reporting_store(config, "viz", "viz_data")
+        data = store.viz_data(pipeline_id=pipeline_id)
+    except NCPStoreUnavailableError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    console.print(f"[bold]NCP Viz[/bold]  store={_store_display(config)}"
+                  + (f"  pipeline={pipeline_id}" if pipeline_id else ""))
+
+    # Panel 1: Chunk distribution
+    dist_table = Table(title="Chunk Distribution", box=box.SIMPLE_HEAVY)
+    dist_table.add_column("Layer")
+    dist_table.add_column("Zone")
+    dist_table.add_column("Count", justify="right")
+    for row in data["chunk_distribution"]:
+        dist_table.add_row(str(row["layer"]), str(row["zone"]), str(row["count"]))
+    if not data["chunk_distribution"]:
+        dist_table.add_row("[dim]-[/dim]", "[dim]-[/dim]", "[dim]0[/dim]")
+    console.print(dist_table)
+
+    # Panel 2: Age brackets
+    age_table = Table(title="Age Brackets", box=box.MINIMAL_DOUBLE_HEAD)
+    age_table.add_column("Bracket")
+    age_table.add_column("Count", justify="right")
+    age_table.add_column("Avg Trust", justify="right")
+    age_table.add_column("Top Layer")
+    for row in data["age_brackets"]:
+        age_table.add_row(
+            str(row["bracket"]),
+            str(row["count"]),
+            f"{float(row['avg_trust']):.3f}",
+            str(row["top_layer"]),
+        )
+    if not data["age_brackets"]:
+        age_table.add_row("[dim]-[/dim]", "[dim]0[/dim]", "[dim]-[/dim]", "[dim]-[/dim]")
+    console.print(age_table)
+
+    # Panel 3: Top chunks
+    top_table = Table(title="Top 5 Chunks (by trust)", box=box.MINIMAL_DOUBLE_HEAD)
+    top_table.add_column("ID (16)")
+    top_table.add_column("Layer")
+    top_table.add_column("Zone")
+    top_table.add_column("Pipeline")
+    top_table.add_column("Trust", justify="right")
+    top_table.add_column("Age (s)", justify="right")
+    for row in data["top_chunks"]:
+        top_table.add_row(
+            str(row["chunk_id"]),
+            str(row["layer"]),
+            str(row["zone"]),
+            str(row["pipeline_id"]) if row["pipeline_id"] is not None else "-",
+            f"{float(row['base_trust']):.3f}",
+            str(row["age_seconds"]),
+        )
+    if not data["top_chunks"]:
+        top_table.add_row("[dim]-[/dim]", "[dim]-[/dim]", "[dim]-[/dim]", "[dim]-[/dim]", "[dim]-[/dim]", "[dim]-[/dim]")
+    console.print(top_table)
+
+    # Panel 4: Pipeline summary (only show when pipelines present)
+    pipeline_summary = data["pipeline_summary"]
+    if pipeline_summary:
+        pipe_table = Table(title="Pipeline Summary", box=box.MINIMAL_DOUBLE_HEAD)
+        pipe_table.add_column("Pipeline")
+        pipe_table.add_column("Chunks", justify="right")
+        pipe_table.add_column("Last Activity")
+        for row in pipeline_summary:
+            pipe_table.add_row(
+                str(row["pipeline_id"]),
+                str(row["chunk_count"]),
+                _format_ts(float(row["last_activity"])),
+            )
+        console.print(pipe_table)
+
+    # Panel 5: Whisper queue
+    wq = data["whisper_queue"]
+    wq_total = int(wq["total"])  # type: ignore[arg-type]
+    by_type = wq["by_type"]
+    wq_lines = [f"Total pending: {wq_total}"]
+    if isinstance(by_type, dict) and by_type:
+        wq_lines.append("By type: " + ", ".join(f"{k}={v}" for k, v in sorted(by_type.items())))  # type: ignore[union-attr]
+    else:
+        wq_lines.append("(queue empty)")
+    console.print(Panel("\n".join(wq_lines), title="Whisper Queue", expand=False))
+
+
 @main.command("consolidate")
 @click.option("--cwd", default=None, type=click.Path(exists=True, file_okay=False, path_type=Path))
 @click.option("--pipeline-id", default=None, help="Scope consolidation to one pipeline.")
@@ -747,6 +841,64 @@ def consolidate_command(
         console.print("[dim]Nothing to consolidate.[/dim]")
     else:
         console.print(f"[green]Consolidated {report.merged} group(s), {report.tombstoned} chunk(s) tombstoned.[/green]")
+
+
+@main.command("calibrate")
+@click.option("--cwd", default=None, type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("--pipeline-id", default=None, help="Scope batch decay to one pipeline.")
+@click.option("--chunk-id", default=None, help="Pinpoint chunk to override (manual mode).")
+@click.option("--trust", default=None, type=float, help="Explicit trust value for manual override (required with --chunk-id).")
+@click.option("--decay-factor", default=0.85, show_default=True, type=float, help="Multiplicative decay applied in batch mode.")
+@click.option("--dry-run", is_flag=True, default=False, help="Preview changes without writing.")
+def calibrate_command(
+    cwd: Path | None,
+    pipeline_id: str | None,
+    chunk_id: str | None,
+    trust: float | None,
+    decay_factor: float,
+    dry_run: bool,
+) -> None:
+    """Re-score base_trust on existing chunks without touching the database manually."""
+    from ncp.config import load_config
+
+    if chunk_id is not None and trust is None:
+        raise click.UsageError("--trust is required when --chunk-id is provided.")
+
+    config = load_config(cwd=cwd or Path.cwd())
+
+    try:
+        store = create_store(config)
+    except NCPStoreUnavailableError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    try:
+        report = store.calibrate(
+            pipeline_id=pipeline_id,
+            chunk_id=chunk_id,
+            trust=trust,
+            dry_run=dry_run,
+            decay_factor=decay_factor,
+        )
+    except (NCPStoreUnavailableError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    table = Table(title="Calibration Report", box=box.SIMPLE)
+    table.add_column("Metric", style="cyan")
+    table.add_column("Value", style="green")
+    table.add_row("Mode", "dry-run" if report.dry_run else "live")
+    table.add_row("Pipeline", report.pipeline_id or "all")
+    table.add_row("Adjusted", str(report.adjusted))
+    table.add_row("Protected (user_verified)", str(report.protected))
+    table.add_row("Skipped", str(report.skipped))
+    table.add_row("Duration", f"{report.duration_seconds:.3f}s")
+    console.print(table)
+
+    if report.dry_run and report.adjusted > 0:
+        console.print(f"[yellow]Dry run: {report.adjusted} chunk(s) would be adjusted.[/yellow]")
+    elif report.adjusted == 0:
+        console.print("[dim]Nothing to calibrate.[/dim]")
+    else:
+        console.print(f"[green]Calibrated {report.adjusted} chunk(s).[/green]")
 
 
 if __name__ == "__main__":

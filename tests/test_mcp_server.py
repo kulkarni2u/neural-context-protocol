@@ -621,6 +621,12 @@ class TestErrors:
             def consolidate(self, *, pipeline_id=None, dry_run=False, similarity_threshold=0.65, trust_floor=0.10):
                 raise NotImplementedError("pending backend path")
 
+            def calibrate(self, *, pipeline_id=None, chunk_id=None, trust=None, dry_run=False, decay_factor=0.85, recency_half_life_seconds=14400):
+                raise NotImplementedError("pending backend path")
+
+            def viz_data(self, *, pipeline_id=None):
+                raise NotImplementedError("pending backend path")
+
         handlers = make_handlers(_PendingStore())
         resp = _handle_request(
             _call(
