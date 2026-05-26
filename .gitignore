@@ -20,7 +20,7 @@ CLAUDE.md
 policy-pack/
 SARATHI.md
 
-# Internal working docs
+# Internal working docs (local only, not tracked)
 docs/CLAUDE_STABILIZATION.md
 docs/OPENCODE_STABILIZATION.md
 docs/NCP_PRE_MCP_DOGFOOD_PATH.md
@@ -28,3 +28,7 @@ docs/NCP_PROVIDER_PARITY_HARNESS.md
 docs/NCP_V1_BUILD_PLAN.md
 docs/NCP_V1_README_POSITIONING.md
 docs/NCP_V1_RELEASE_CHECKLIST.md
+docs/NCP_POST_V1_ROADMAP.md
+docs/NCP_R2_STORAGE.md
+docs/superpowers/
+consolidation-review-response.json
