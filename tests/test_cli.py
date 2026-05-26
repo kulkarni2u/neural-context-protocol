@@ -385,9 +385,16 @@ def test_cli_emit_reports_store_unavailable_cleanly(tmp_path: Path) -> None:
     assert "SQLite store unavailable" in result.output
 
 
-def test_cli_emit_reports_pgvector_boundary_cleanly(tmp_path: Path) -> None:
+def test_cli_emit_supports_non_sqlite_runtime_store(tmp_path: Path, monkeypatch: object) -> None:
     runner = CliRunner()
     runner.invoke(main, ["init", "--cwd", str(tmp_path)])
+    captured: list[Whisper] = []
+
+    class _FakeStore:
+        def emit_whisper(self, whisper: Whisper) -> None:
+            captured.append(whisper)
+
+    monkeypatch.setattr("ncp.cli._resolve_runtime_store", lambda _config: _FakeStore())
 
     result = runner.invoke(
         main,
@@ -407,9 +414,10 @@ def test_cli_emit_reports_pgvector_boundary_cleanly(tmp_path: Path) -> None:
         env={"NCP_STORE_TYPE": "pgvector"},
     )
 
-    assert result.exit_code != 0
-    assert "currently supports sqlite only" in result.output
-    assert "0.2.0 rollout" in result.output
+    assert result.exit_code == 0
+    assert result.output.strip() == "Whisper emitted."
+    assert captured[0].target == "executor"
+    assert captured[0].pipeline_id is None
 
 
 def test_cli_dogfood_prints_restart_proof(tmp_path: Path) -> None:

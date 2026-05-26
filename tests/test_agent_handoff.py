@@ -146,3 +146,27 @@ def test_parse_json_review_accepts_fenced_json() -> None:
 
     assert payload["verdict"] == "pass"
     assert payload["summary"] == "clean"
+
+
+def test_load_handoffs_can_use_non_sqlite_store(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    runner = CliRunner()
+    runner.invoke(main, ["init", "--cwd", str(tmp_path)])
+    store = SQLiteStore(tmp_path / ".ncp" / "store.db")
+    _seed_whisper(store, target="claude", payload="delegate via pgvector")
+
+    class _PgvectorLikeStore:
+        def peek_whispers(self, **kwargs: object) -> list[Whisper]:
+            return store.peek_whispers(**kwargs)
+
+        def acknowledge_whispers(self, whisper_ids: list[str]) -> int:
+            return store.acknowledge_whispers(whisper_ids)
+
+        def emit_whisper(self, whisper: Whisper) -> None:
+            store.emit_whisper(whisper)
+
+    monkeypatch.setattr("ncp.agent_handoff.create_store", lambda _config: _PgvectorLikeStore())
+
+    resolved_store, handoffs = load_sqlite_handoffs(cwd=tmp_path, agent_id="claude", pipeline_id="pipe_handoff")
+
+    assert handoffs[0].payload == "delegate via pgvector"
+    assert acknowledge_handoffs(resolved_store, handoffs) == 1

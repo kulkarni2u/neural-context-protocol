@@ -15,11 +15,11 @@ resolve_compose() {
     echo "podman compose"
     return
   fi
-  if command -v podman >/dev/null 2>&1; then
+  if command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1; then
     echo "podman compose"
     return
   fi
-  if command -v docker >/dev/null 2>&1; then
+  if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     echo "docker compose"
     return
   fi

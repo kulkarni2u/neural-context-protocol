@@ -144,12 +144,17 @@ def _session_id_from_args(args: dict[str, object]) -> str:
 def make_handlers(store: BaseStore) -> dict[str, ToolHandler]:
     sessions: dict[str, FetchSession] = {}
     last_session_id = DEFAULT_FETCH_SESSION_ID
+    coordination = getattr(store, "coordination", None)
 
     def _handle_get_context(args: dict[str, object]) -> object:
         nonlocal last_session_id
         session_id = _session_id_from_args(args)
         pipeline_id = args.get("pipeline_id")
-        sessions[session_id] = FetchSession(fetch_count=0, pipeline_id=None if pipeline_id is None else str(pipeline_id))
+        normalized_pipeline_id = None if pipeline_id is None else str(pipeline_id)
+        if coordination is not None and hasattr(coordination, "reset_fetch_session"):
+            coordination.reset_fetch_session(session_id, pipeline_id=normalized_pipeline_id)
+        else:
+            sessions[session_id] = FetchSession(fetch_count=0, pipeline_id=normalized_pipeline_id)
         last_session_id = session_id
         conscious = ConsciousBlock(
             agent_id=str(args["agent_id"]),
@@ -199,10 +204,6 @@ def make_handlers(store: BaseStore) -> dict[str, ToolHandler]:
         session_id = _session_id_from_args(args)
         if session_id == DEFAULT_FETCH_SESSION_ID:
             session_id = last_session_id
-        session = sessions.setdefault(session_id, FetchSession())
-        if session.fetch_count >= 3:
-            raise ValueError("ncp_fetch limit reached: max 3 per session")
-        session.fetch_count += 1
         query_str = str(args["query"])
         layer = args.get("layer")
         if layer == "any":
@@ -210,13 +211,26 @@ def make_handlers(store: BaseStore) -> dict[str, ToolHandler]:
         if layer is not None and layer not in ("episodic", "procedural", "semantic", "social"):
             return {"result": "ncp_fetch:invalid_layer valid:[episodic,procedural,semantic,social,any]"}
         pipeline_id = args.get("pipeline_id")
-        if pipeline_id is not None:
-            session.pipeline_id = str(pipeline_id)
+        effective_pipeline_id: str | None
+        if coordination is not None and hasattr(coordination, "claim_fetch_slot"):
+            _, effective_pipeline_id = coordination.claim_fetch_slot(
+                session_id,
+                pipeline_id=None if pipeline_id is None else str(pipeline_id),
+                max_fetches=3,
+            )
+        else:
+            session = sessions.setdefault(session_id, FetchSession())
+            if session.fetch_count >= 3:
+                raise ValueError("ncp_fetch limit reached: max 3 per session")
+            session.fetch_count += 1
+            if pipeline_id is not None:
+                session.pipeline_id = str(pipeline_id)
+            effective_pipeline_id = session.pipeline_id
         try:
             k = min(int(args.get("k", 2)), 4)
         except (ValueError, TypeError):
             k = 2
-        chunks = store.query(text=query_str, k=k, layer=layer, pipeline_id=session.pipeline_id)
+        chunks = store.query(text=query_str, k=k, layer=layer, pipeline_id=effective_pipeline_id)
         if not chunks:
             return {"result": "ncp_fetch:no_results query_too_specific_or_layer_empty"}
         return {"result": _encode_fetch_results(chunks)}

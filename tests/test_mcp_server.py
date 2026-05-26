@@ -465,6 +465,86 @@ class TestFetch:
         assert "limit_reached" not in result["result"]
         assert "session beta memory" in result["result"]
 
+    def test_fetch_limit_can_use_store_coordination_backend(self) -> None:
+        class _Coordination:
+            def __init__(self) -> None:
+                self.sessions: dict[str, dict[str, object]] = {}
+
+            def reset_fetch_session(self, session_id: str, *, pipeline_id: str | None = None, ttl_seconds: int = 3600) -> None:
+                self.sessions[session_id] = {"fetch_count": 0, "pipeline_id": pipeline_id}
+
+            def claim_fetch_slot(self, session_id: str, *, pipeline_id: str | None = None, max_fetches: int = 3, ttl_seconds: int = 3600) -> tuple[int, str | None]:
+                payload = self.sessions.setdefault(session_id, {"fetch_count": 0, "pipeline_id": None})
+                count = int(payload["fetch_count"])
+                if count >= max_fetches:
+                    raise ValueError("ncp_fetch limit reached: max 3 per session")
+                payload["fetch_count"] = count + 1
+                if pipeline_id is not None:
+                    payload["pipeline_id"] = pipeline_id
+                return int(payload["fetch_count"]), payload["pipeline_id"]  # type: ignore[return-value]
+
+        class _Store:
+            def __init__(self) -> None:
+                self.coordination = _Coordination()
+
+            def write(self, chunk):  # pragma: no cover - not used
+                return True
+
+            def query(self, text: str, *, k: int = 4, layer=None, pipeline_id=None, scope=None, zone: str = "working") -> list[SubconsciousChunk]:
+                return [
+                    SubconsciousChunk(
+                        chunk_id="sub_coord",
+                        content=f"{pipeline_id}:{text}",
+                        layer="semantic",
+                        src="tool_result",
+                        pipeline_id=pipeline_id,
+                    )
+                ]
+
+            def emit_whisper(self, whisper):  # pragma: no cover - not used
+                return None
+
+            def drain_whispers(self, *, agent_id, pipeline_id=None, max_items=3, min_confidence=0.60):
+                return []
+
+            def get_working_zone(self, *, pipeline_id=None, layer=None):
+                return []
+
+            def log_turn_record(self, record):  # pragma: no cover - not used
+                return None
+
+            def resolve_recent_ref(self, ref: str):
+                return None
+
+            def log_cost(self, *, agent_id, response):
+                return None
+
+        handlers = make_handlers(_Store())
+        _handle_request(
+            _call(
+                "ncp_get_context",
+                {
+                    "agent_id": "builder",
+                    "role": "build",
+                    "owns": [],
+                    "must_not": [],
+                    "task": "test",
+                    "slot": "test",
+                    "intent": "test",
+                    "pipeline_id": "pipe_coord",
+                    "session_id": "sess_coord",
+                },
+            ),
+            handlers,
+        )
+
+        for _ in range(3):
+            _handle_request(_call("ncp_fetch", {"query": "coord", "session_id": "sess_coord"}), handlers)
+
+        err = _handle_request(_call("ncp_fetch", {"query": "coord", "session_id": "sess_coord"}, req_id=99), handlers)
+
+        assert _error(err)["message"] == "Tool error: ncp_fetch limit reached: max 3 per session"
+
 
 class TestErrors:
     def test_unknown_tool(self) -> None:

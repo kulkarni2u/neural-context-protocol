@@ -5,11 +5,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import subprocess
+from typing import Any, Protocol
 
 from ncp.api import configure, emit
 from ncp.claude_review_helper import extract_json_object
 from ncp.dogfood import _extract_opencode_text
-from ncp.stores.sqlite import SQLiteStore
+from ncp.stores.factory import create_store
 from ncp.types import Whisper
 
 DEFAULT_CLAUDE_PARTNER_INSTRUCTION = (
@@ -23,6 +24,27 @@ DEFAULT_OPENCODE_REVIEW_INSTRUCTION = (
 )
 
 
+class HandoffStore(Protocol):
+    def peek_whispers(
+        self,
+        *,
+        agent_id: str,
+        pipeline_id: str | None = None,
+        max_items: int = 3,
+        min_confidence: float = 0.60,
+    ) -> list[Whisper]: ...
+
+    def acknowledge_whispers(self, whisper_ids: list[str]) -> int: ...
+
+
+def _require_handoff_store(store: Any) -> HandoffStore:
+    if not hasattr(store, "peek_whispers") or not hasattr(store, "acknowledge_whispers"):
+        raise NotImplementedError(
+            "The configured store does not support NCP handoff queue operations yet."
+        )
+    return store
+
+
 def load_sqlite_handoffs(
     *,
     cwd: Path,
@@ -30,15 +52,11 @@ def load_sqlite_handoffs(
     pipeline_id: str | None = None,
     max_items: int = 3,
     min_confidence: float = 0.60,
-) -> tuple[SQLiteStore, list[Whisper]]:
+) -> tuple[HandoffStore, list[Whisper]]:
     """Load pending whisper handoffs without consuming them."""
 
     config = configure(cwd=cwd)
-    if config.store_type != "sqlite":
-        raise NotImplementedError(
-            "NCP whisper handoffs currently require the sqlite backend."
-        )
-    store = SQLiteStore(config.store_path)
+    store = _require_handoff_store(create_store(config))
     handoffs = store.peek_whispers(
         agent_id=agent_id,
         pipeline_id=pipeline_id,
@@ -135,7 +153,7 @@ def emit_follow_up_whisper(
     """Emit one bounded follow-up whisper."""
 
     config = configure(cwd=cwd)
-    store = SQLiteStore(config.store_path)
+    store = create_store(config)
     emit(
         Whisper(
             from_agent=from_agent,
@@ -221,7 +239,7 @@ def run_opencode_reviewer(
     return _extract_opencode_text(completed.stdout)
 
 
-def acknowledge_handoffs(store: SQLiteStore, handoffs: list[Whisper]) -> int:
+def acknowledge_handoffs(store: HandoffStore, handoffs: list[Whisper]) -> int:
     """Delete handoffs after a successful consumer run."""
 
     return store.acknowledge_whispers([whisper.whisper_id for whisper in handoffs])

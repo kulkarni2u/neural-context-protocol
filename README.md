@@ -40,6 +40,7 @@ What is already proven in this repository:
 - both hosts can retrieve memory written by the other host
 - both hosts can deliver and receive whispers through the shared MCP runtime
 - Sarathi can route Claude and OpenCode child-task dispatches through NCP handoffs
+- the pgvector durable path now supports Redis-backed whisper delivery and Redis-backed fetch-session limits
 - restart persistence is validated by the dogfood harness
 - bounded-context benchmarks are reproducible and show large prompt reduction
 
@@ -48,6 +49,7 @@ Current benchmark snapshot:
 - coding pipeline: peak `174` NCP tokens vs `1927` naive replay, `17.52x` reduction
 - research pipeline: peak `156` NCP tokens vs `1700` naive replay, `16.35x` reduction
 - live Sarathi handoff route: one real Claude planning subtask dropped from `677` estimated bridge-prompt tokens to `265` estimated handoff tokens, a `60.9%` reduction
+- live pgvector + Redis coordination path: `4/4` integration tests green on the local compose stack
 
 ## Quick Start
 
@@ -180,6 +182,14 @@ live proof on the `pgvector` storage slice reduced one Claude planning handoff
 from `677` estimated prompt tokens to `265` estimated handoff tokens by using a
 compact instruction plus bounded whisper payload.
 
+When `store.type = "pgvector"` is active, the handoff and whisper path no longer
+has to fall back to SQLite. Pgvector now delegates transient coordination to
+Redis so `ncp emit`, `ncp handoff`, MCP whisper delivery, and MCP fetch-session
+limits can all operate on the same runtime split:
+
+- pgvector for durable memory and retrieval
+- Redis for whispers and fetch-session state
+
 ## Current Scope
 
 This repository currently ships:
@@ -188,6 +198,7 @@ This repository currently ships:
 - chunking and bounded assembly
 - SQLite-backed persistence
 - pgvector durable-store preview for chunk/query and core runtime telemetry
+- Redis-backed coordination for pgvector whisper delivery and fetch-session limits
 - opt-in live pgvector integration suite for the local Postgres/pgvector path
 - HTTP/SSE MCP server
 - dogfood validation harness
@@ -202,7 +213,7 @@ Current published alpha:
 Next focus:
 
 - Next major focus: production-facing storage and retrieval
-- Immediate next step: complete the same NCP handoff route for the paired OpenCode review lane on the live `pgvector` slice, then carry the partner/reviewer loop into the next real `0.2.0` implementation task
+- Immediate next step: add reporting parity (`ncp status`, `ncp cost`, `ncp explain`) for the pgvector runtime, then carry the partner/reviewer loop into the next real `0.2.0` implementation task
 
 ## Documentation
 

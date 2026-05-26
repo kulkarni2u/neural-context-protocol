@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 from uuid import uuid4
 
 import pytest
 
+from ncp.mcp.server import make_handlers, _handle_request
 from ncp.stores.pgvector import PgvectorStore
-from ncp.types import ConsciousBlock, NCPResponse, SubconsciousChunk, TurnRecord
+from ncp.types import ConsciousBlock, NCPResponse, SubconsciousChunk, TurnRecord, Whisper
 
 
 pytestmark = pytest.mark.skipif(
@@ -28,7 +30,24 @@ def _pgvector_store() -> PgvectorStore:
         os.getenv("NCP_PGVECTOR_DSN", "postgresql://postgres:postgres@127.0.0.1:5432/ncp"),
         schema=schema,
         table_prefix="it_",
+        redis_url=os.getenv("NCP_REDIS_URL", "redis://127.0.0.1:6379/0"),
     )
+
+
+def _call(name: str, arguments: dict | None = None, req_id: int = 1) -> dict:
+    params: dict = {"name": name}
+    if arguments is not None:
+        params["arguments"] = arguments
+    return {"jsonrpc": "2.0", "id": req_id, "method": "tools/call", "params": params}
+
+
+def _content(response_str: str) -> object:
+    payload = json.loads(response_str)["result"]
+    return json.loads(payload["content"][0]["text"])
+
+
+def _error(response_str: str) -> dict:
+    return json.loads(response_str).get("error", {})
 
 
 def test_pgvector_live_write_query_and_restart() -> None:
@@ -127,3 +146,61 @@ def test_pgvector_live_conscious_cost_and_goal_versions() -> None:
     versions = store.get_pipeline_goal_versions(pipeline_id="pipe_live", current_agent="executor")
 
     assert versions == {"planner": 3}
+
+
+def test_pgvector_live_redis_coordination_for_whispers_and_fetch_sessions() -> None:
+    if importlib.util.find_spec("redis") is None:
+        pytest.skip("redis client is not installed; install neural-context-protocol[redis] first")
+
+    store = _pgvector_store()
+    store.emit_whisper(
+        Whisper(
+            whisper_id=f"wsp_live_{uuid4().hex[:8]}",
+            from_agent="claude",
+            target="opencode",
+            whisper_type="share",
+            payload="handoff the live pgvector slice",
+            confidence=0.95,
+            pipeline_id="pipe_live_coord",
+        )
+    )
+
+    peeked = store.peek_whispers(agent_id="opencode", pipeline_id="pipe_live_coord")
+    drained = store.drain_whispers(agent_id="opencode", pipeline_id="pipe_live_coord")
+
+    store.write(
+        SubconsciousChunk(
+            chunk_id="sub_live_coord",
+            layer="semantic",
+            content="coordination fetch query result",
+            src="tool_result",
+            written_by="executor",
+            pipeline_id="pipe_live_coord",
+        )
+    )
+    handlers = make_handlers(store)
+    _handle_request(
+        _call(
+            "ncp_get_context",
+            {
+                "agent_id": "builder",
+                "role": "build",
+                "owns": [],
+                "must_not": [],
+                "task": "coordination",
+                "slot": "fetch",
+                "intent": "verify",
+                "pipeline_id": "pipe_live_coord",
+                "session_id": "live_coord_sess",
+            },
+        ),
+        handlers,
+    )
+    for _ in range(3):
+        _handle_request(_call("ncp_fetch", {"query": "coordination fetch", "session_id": "live_coord_sess"}), handlers)
+
+    err = _handle_request(_call("ncp_fetch", {"query": "coordination fetch", "session_id": "live_coord_sess"}, req_id=99), handlers)
+
+    assert [whisper.payload for whisper in peeked] == ["handoff the live pgvector slice"]
+    assert [whisper.payload for whisper in drained] == ["handoff the live pgvector slice"]
+    assert _error(err)["message"] == "Tool error: ncp_fetch limit reached: max 3 per session"

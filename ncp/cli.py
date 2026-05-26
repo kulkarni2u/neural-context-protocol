@@ -654,11 +654,11 @@ def emit_command(
     pipeline_id: str | None,
     cwd: Path,
 ) -> None:
-    """Emit a manual whisper into the SQLite store."""
+    """Emit a manual whisper into the configured runtime store."""
 
     try:
         config = ncp.configure(cwd=cwd)
-        store = _require_sqlite_reporting(config, "emit")
+        store = _resolve_runtime_store(config)
         ncp.emit(
             Whisper(
                 from_agent=from_agent,

@@ -18,11 +18,11 @@ resolve_compose() {
     echo "podman compose"
     return
   fi
-  if command -v podman >/dev/null 2>&1; then
+  if command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1; then
     echo "podman compose"
     return
   fi
-  if command -v docker >/dev/null 2>&1; then
+  if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     echo "docker compose"
     return
   fi
@@ -57,7 +57,7 @@ if importlib.util.find_spec("psycopg2") is None:
 PY
 
 echo "Using: $COMPOSE_CMD"
-$COMPOSE_CMD -f "$COMPOSE_FILE" up -d postgres
+$COMPOSE_CMD -f "$COMPOSE_FILE" up -d postgres redis
 STARTED_POSTGRES=1
 
 python3 - <<'PY'
@@ -66,23 +66,27 @@ import sys
 import time
 
 import psycopg2
+import redis
 
 dsn = os.environ.get("NCP_PGVECTOR_DSN", "postgresql://postgres:postgres@127.0.0.1:5432/ncp")
+redis_url = os.environ.get("NCP_REDIS_URL", "redis://127.0.0.1:6379/0")
 deadline = time.time() + 45
-last_error = None
+last_errors: list[str] = []
 while time.time() < deadline:
     try:
         conn = psycopg2.connect(dsn)
         conn.close()
-        print("pgvector integration target is ready.")
+        redis.from_url(redis_url, decode_responses=True).ping()
+        print("pgvector + redis integration targets are ready.")
         raise SystemExit(0)
     except Exception as exc:  # pragma: no cover - readiness loop only
-        last_error = exc
+        last_errors = [str(exc)]
         time.sleep(1.5)
-print(f"Timed out waiting for Postgres/pgvector: {last_error}", file=sys.stderr)
+print(f"Timed out waiting for Postgres/pgvector + Redis: {last_errors[-1] if last_errors else 'unknown'}", file=sys.stderr)
 raise SystemExit(1)
 PY
 
 export NCP_RUN_PGVECTOR_INTEGRATION=1
 export NCP_PGVECTOR_DSN="$DSN"
+export NCP_REDIS_URL="${NCP_REDIS_URL:-redis://127.0.0.1:6379/0}"
 python3 -m pytest tests/test_pgvector_integration.py "$@"

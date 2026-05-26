@@ -13,6 +13,7 @@ import time
 from rank_bm25 import BM25Okapi
 
 from ncp.stores.base import BaseStore, NCPStoreUnavailableError
+from ncp.stores.redis_coordination import RedisCoordination
 from ncp.types import ConsciousBlock, NCPResponse, SubconsciousChunk, TurnRecord, Whisper
 
 
@@ -152,6 +153,9 @@ class PgvectorStore(BaseStore):
         schema: str = "ncp",
         table_prefix: str = "ncp_",
         connect_factory: Callable[[str], Any] | None = None,
+        redis_url: str | None = None,
+        redis_stream: str = "ncp:whispers",
+        coordination: RedisCoordination | None = None,
         max_working_chunks: int = 500,
         gc_threshold: int = 400,
     ) -> None:
@@ -159,6 +163,9 @@ class PgvectorStore(BaseStore):
         self.schema = _validate_identifier(schema, field="schema")
         self.table_prefix = _validate_identifier(table_prefix, field="table_prefix")
         self._connect_factory = connect_factory or _default_pgvector_connect
+        self.coordination = coordination or (
+            RedisCoordination(redis_url, stream=redis_stream) if redis_url else None
+        )
         self.max_working_chunks = max_working_chunks
         self.gc_threshold = gc_threshold
         self._init_db()
@@ -329,9 +336,11 @@ class PgvectorStore(BaseStore):
         return results
 
     def emit_whisper(self, whisper: Whisper) -> None:
-        raise NotImplementedError(
-            "Redis-backed whisper coordination is still pending; pgvector does not own this path yet."
-        )
+        if self.coordination is None:
+            raise NCPStoreUnavailableError(
+                "pgvector whisper coordination requires Redis. Set NCP_REDIS_URL and ensure Redis is reachable."
+            )
+        self.coordination.emit_whisper(whisper)
 
     def drain_whispers(
         self,
@@ -341,9 +350,42 @@ class PgvectorStore(BaseStore):
         max_items: int = 3,
         min_confidence: float = 0.60,
     ) -> list[Whisper]:
-        raise NotImplementedError(
-            "Redis-backed whisper coordination is still pending; pgvector does not own this path yet."
+        if self.coordination is None:
+            raise NCPStoreUnavailableError(
+                "pgvector whisper coordination requires Redis. Set NCP_REDIS_URL and ensure Redis is reachable."
+            )
+        return self.coordination.drain_whispers(
+            agent_id=agent_id,
+            pipeline_id=pipeline_id,
+            max_items=max_items,
+            min_confidence=min_confidence,
         )
+
+    def peek_whispers(
+        self,
+        *,
+        agent_id: str,
+        pipeline_id: str | None = None,
+        max_items: int = 3,
+        min_confidence: float = 0.60,
+    ) -> list[Whisper]:
+        if self.coordination is None:
+            raise NCPStoreUnavailableError(
+                "pgvector whisper coordination requires Redis. Set NCP_REDIS_URL and ensure Redis is reachable."
+            )
+        return self.coordination.peek_whispers(
+            agent_id=agent_id,
+            pipeline_id=pipeline_id,
+            max_items=max_items,
+            min_confidence=min_confidence,
+        )
+
+    def acknowledge_whispers(self, whisper_ids: Sequence[str]) -> int:
+        if self.coordination is None:
+            raise NCPStoreUnavailableError(
+                "pgvector whisper coordination requires Redis. Set NCP_REDIS_URL and ensure Redis is reachable."
+            )
+        return self.coordination.acknowledge_whispers(list(whisper_ids))
 
     def get_working_zone(
         self,

@@ -20,16 +20,17 @@ Today:
 
 - SQLite remains the default and only fully implemented store
 - `store.type = "pgvector"` now supports durable chunk writes, BM25-backed chunk query, working-zone reads, turn persistence, conscious snapshots, cost logging, and goal-version reads
-- pgvector still does not provide whisper delivery; that remains intentionally deferred to Redis-backed coordination
+- pgvector now delegates whisper delivery and fetch-session limits to Redis-backed coordination
 - a live opt-in integration suite now exists at `tests/test_pgvector_integration.py`
 - a local runner now exists at `scripts/test_pgvector_integration.sh`
-- the current live runner brings up the Postgres/pgvector service only; Redis is not part of this validation slice yet
+- the current live runner brings up both Postgres/pgvector and Redis for the coordination path
 - `store.type = "redis"` remains explicitly deferred
 - local infra is now scaffolded with `compose.yaml`
 - helper scripts exist:
   - `scripts/infra_up.sh`
   - `scripts/infra_down.sh`
 - Sarathi can now route Claude and OpenCode task lanes through NCP handoffs for NCP-enabled workspaces, and one live Claude planning subtask on this storage track recorded a `60.9%` estimated prompt reduction versus the older full bridge prompt
+- the local integration runner now validates `4/4` pgvector+Redis integration checks on the compose stack
 
 ## Intended Role Split
 
@@ -78,10 +79,10 @@ Defaults:
 
 The next real `0.2.0` code slice should be:
 
-1. complete the paired OpenCode review lane on the live `pgvector` storage task through the same NCP handoff route
-2. run and harden the new live integration path against local Postgres/pgvector infra
-3. Redis-backed ephemeral coordination helper for whispers and fetch sessions
-4. reporting parity beyond the current SQLite-only `status`, `cost`, and `explain` commands
-5. retrieval-hardening decisions after the durable path sees real infra usage
+1. reporting parity beyond the current SQLite-only `status`, `cost`, and `explain` commands
+2. complete the paired OpenCode review lane on the live `pgvector` storage task through the same NCP handoff route
+3. retrieval-hardening decisions after the durable path sees real infra usage
+4. hybrid retrieval beyond the current BM25-only query path
+5. only then widen the Redis fast-path beyond whispers and fetch sessions into caches or extra coordination surfaces
 
 Do not start both deep backends at once before pgvector proves the durable path.

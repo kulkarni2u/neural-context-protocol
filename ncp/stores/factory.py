@@ -18,6 +18,8 @@ def create_store(config: NCPConfig) -> BaseStore:
             config.pgvector_dsn,
             schema=config.pgvector_schema,
             table_prefix=config.pgvector_table_prefix,
+            redis_url=config.redis_url,
+            redis_stream=config.redis_stream,
         )
     raise NotImplementedError(
         f"Store type '{config.store_type}' is not implemented yet."

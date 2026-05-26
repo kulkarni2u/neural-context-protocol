@@ -9,8 +9,9 @@ from ncp.config import NCPConfig
 from ncp.stores.factory import create_store
 from ncp.stores.pgvector import PgvectorStore, infra_hint as pgvector_hint
 from ncp.stores.redis import RedisStore, infra_hint as redis_hint
+from ncp.stores.redis_coordination import RedisCoordination
 from ncp.stores.sqlite import SQLiteStore
-from ncp.types import ConsciousBlock, NCPResponse, SubconsciousChunk, TurnRecord
+from ncp.types import ConsciousBlock, NCPResponse, SubconsciousChunk, TurnRecord, Whisper
 
 
 @dataclass
@@ -250,6 +251,45 @@ def _pg_connect_factory(db: _MemoryPgDB):
     return _connect
 
 
+class _FakeRedisClient:
+    def __init__(self) -> None:
+        self.hashes: dict[str, dict[str, str]] = {}
+        self.sorted_sets: dict[str, dict[str, float]] = {}
+        self.expirations: dict[str, int] = {}
+
+    def hset(self, key: str, mapping: dict[str, str]) -> None:
+        self.hashes[key] = dict(mapping)
+
+    def hgetall(self, key: str) -> dict[str, str]:
+        return dict(self.hashes.get(key, {}))
+
+    def expire(self, key: str, ttl_seconds: int) -> None:
+        self.expirations[key] = ttl_seconds
+
+    def zadd(self, key: str, mapping: dict[str, float]) -> None:
+        bucket = self.sorted_sets.setdefault(key, {})
+        bucket.update(mapping)
+
+    def zrange(self, key: str, start: int, end: int) -> list[str]:
+        entries = sorted(self.sorted_sets.get(key, {}).items(), key=lambda item: item[1])
+        values = [member for member, _score in entries]
+        if end == -1:
+            return values[start:]
+        return values[start : end + 1]
+
+    def zrem(self, key: str, member: str) -> int:
+        bucket = self.sorted_sets.get(key, {})
+        if member in bucket:
+            del bucket[member]
+            return 1
+        return 0
+
+    def delete(self, key: str) -> int:
+        existed = key in self.hashes
+        self.hashes.pop(key, None)
+        return int(existed)
+
+
 def test_pgvector_store_initializes_schema_with_fake_connection() -> None:
     db = _MemoryPgDB()
     connection = _FakeConnection(db)
@@ -419,6 +459,52 @@ def test_redis_store_placeholder_is_explicit() -> None:
         RedisStore("redis://127.0.0.1:6379/0")
 
 
+def test_redis_coordination_supports_peek_ack_and_fetch_sessions() -> None:
+    client = _FakeRedisClient()
+    coordination = RedisCoordination(
+        "redis://127.0.0.1:6379/0",
+        client_factory=lambda _url: client,
+    )
+    coordination.emit_whisper(
+        Whisper(
+            whisper_id="wsp_direct",
+            from_agent="planner",
+            target="executor",
+            whisper_type="share",
+            payload="review the pgvector slice",
+            confidence=0.95,
+            pipeline_id="pipe_redis",
+        )
+    )
+    coordination.emit_whisper(
+        Whisper(
+            whisper_id="wsp_broadcast",
+            from_agent="planner",
+            target="*",
+            whisper_type="alert",
+            payload="global notice",
+            confidence=0.10,
+            pipeline_id="pipe_redis",
+        )
+    )
+
+    peeked = coordination.peek_whispers(agent_id="executor", pipeline_id="pipe_redis")
+    claimed, pipeline_id = coordination.claim_fetch_slot("session-1", pipeline_id="pipe_redis")
+
+    assert [whisper.whisper_id for whisper in peeked] == ["wsp_broadcast", "wsp_direct"]
+    assert coordination.acknowledge_whispers(["wsp_direct"]) == 1
+    assert [whisper.whisper_id for whisper in coordination.drain_whispers(agent_id="executor", pipeline_id="pipe_redis")] == [
+        "wsp_broadcast"
+    ]
+    assert claimed == 1
+    assert pipeline_id == "pipe_redis"
+    coordination.reset_fetch_session("session-1", pipeline_id="pipe_redis")
+    for _ in range(3):
+        coordination.claim_fetch_slot("session-1", pipeline_id="pipe_redis")
+    with pytest.raises(ValueError, match="max 3 per session"):
+        coordination.claim_fetch_slot("session-1", pipeline_id="pipe_redis")
+
+
 def test_future_store_hints_point_to_local_scripts(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     assert "infra_up.sh" in pgvector_hint(root)
@@ -445,10 +531,12 @@ def test_create_store_selects_pgvector(monkeypatch: pytest.MonkeyPatch, tmp_path
     captured: dict[str, str] = {}
 
     class _FakePgvectorStore:
-        def __init__(self, dsn: str, *, schema: str, table_prefix: str) -> None:
+        def __init__(self, dsn: str, *, schema: str, table_prefix: str, redis_url: str, redis_stream: str) -> None:
             captured["dsn"] = dsn
             captured["schema"] = schema
             captured["table_prefix"] = table_prefix
+            captured["redis_url"] = redis_url
+            captured["redis_stream"] = redis_stream
 
     monkeypatch.setattr("ncp.stores.factory.PgvectorStore", _FakePgvectorStore)
     project = tmp_path / "repo"
@@ -461,6 +549,7 @@ def test_create_store_selects_pgvector(monkeypatch: pytest.MonkeyPatch, tmp_path
                 "schema": "ncp_test",
                 "table_prefix": "demo_",
             },
+            "redis": {"url": "redis://127.0.0.1:6379/0", "stream": "ncp:whispers"},
             "providers": {"pricing": {}},
         },
         project_root=project,
@@ -472,4 +561,32 @@ def test_create_store_selects_pgvector(monkeypatch: pytest.MonkeyPatch, tmp_path
         "dsn": "postgresql://postgres:postgres@127.0.0.1:5432/ncp",
         "schema": "ncp_test",
         "table_prefix": "demo_",
+        "redis_url": "redis://127.0.0.1:6379/0",
+        "redis_stream": "ncp:whispers",
     }
+
+
+def test_pgvector_store_delegates_whispers_to_redis_coordination() -> None:
+    db = _MemoryPgDB()
+    client = _FakeRedisClient()
+    store = PgvectorStore(
+        "postgresql://postgres:postgres@127.0.0.1:5432/ncp",
+        connect_factory=_pg_connect_factory(db),
+        coordination=RedisCoordination("redis://127.0.0.1:6379/0", client_factory=lambda _url: client),
+    )
+    whisper = Whisper(
+        whisper_id="wsp_pg",
+        from_agent="claude",
+        target="opencode",
+        whisper_type="share",
+        payload="handoff the pgvector fix",
+        confidence=0.92,
+        pipeline_id="pipe_pg",
+    )
+
+    store.emit_whisper(whisper)
+    peeked = store.peek_whispers(agent_id="opencode", pipeline_id="pipe_pg")
+
+    assert [item.whisper_id for item in peeked] == ["wsp_pg"]
+    assert store.acknowledge_whispers(["wsp_pg"]) == 1
+    assert store.drain_whispers(agent_id="opencode", pipeline_id="pipe_pg") == []

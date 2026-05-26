@@ -11,20 +11,23 @@ All notable changes to Neural Context Protocol will be documented in this file.
 - new `ncp explain` command for a short human-readable store summary
 - Claude `stream-json` review helper script for bounded review/debug workflows
 - public `ncp handoff claude` and `ncp handoff opencode` commands for whisper-driven partner/reviewer loops
+- Redis-backed coordination helper for whispers and fetch-session state in the `0.2.0` pgvector path
+- live pgvector integration now covers Redis-backed coordination in addition to durable chunk/query behavior
 
 ### Changed
 
 - provider install guidance now points at `neural-context-protocol[providers]`
 - known upstream Cohere warning noise is suppressed at the adapter boundary for the current alpha line
 - public docs now reflect the live Sarathi-managed handoff proof and its measured prompt reduction on the `pgvector` storage slice
+- `store.type = "pgvector"` can now power `ncp emit`, `ncp handoff`, and MCP whisper/fetch coordination when Redis is configured
+- local infra scripts now prefer a running container engine instead of blindly picking Podman first
 
 ### Planned next layer
 
 - containerized local infra scaffolding for Postgres/pgvector and Redis is now in place for the `0.2.0` storage kickoff
 - pgvector now supports durable chunk writes/query, working-zone reads, recent-ref turn logging, conscious snapshots, cost logging, and pipeline goal-version reads
 - a live opt-in pgvector integration suite and runner script now exist for the local Postgres/pgvector path
-- Redis remains a deferred ephemeral backend for whisper delivery and short-lived coordination
-- the next live storage step is to complete the paired OpenCode review lane on the current `pgvector` task, then continue with Redis-backed ephemeral coordination
+- the next live storage step is reporting parity for the pgvector runtime, then the paired OpenCode review lane on the current `pgvector` task
 
 ## 0.1.0a1 - 2026-05-24
 
