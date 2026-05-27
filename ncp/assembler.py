@@ -164,6 +164,9 @@ class Assembler:
         if combined_whispers:
             yield "whispers", self.encoder._encode_whispers(combined_whispers, now=None)
 
+    def apply_post_middleware(self, text: str) -> str:
+        return self.middleware.post_assemble(text)
+
     # ------------------------------------------------------------------
     # Step 7: post-turn
     # ------------------------------------------------------------------

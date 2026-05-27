@@ -146,3 +146,19 @@ def test_assembler_post_turn_logs_cost_and_memory_chunks(tmp_path: Path) -> None
     assert store.resolve_recent_ref("r:sub/turn_post") is not None
     assert any(chunk.chunk_id == "sub_memory" for chunk in store.query("remember output", pipeline_id="pipe_1"))
     assert store.status()["cost_usd_total"] == 0.02
+
+
+def test_apply_post_middleware_invokes_registered_transformations(tmp_path: Path) -> None:
+    from ncp.middleware.base import Middleware, MiddlewarePipeline
+    from ncp.types import BudgetContext, ConsciousBlock
+
+    class _TagMiddleware(Middleware):
+        def post_assemble(self, context: str) -> str:
+            return context + "[TAGGED]"
+
+    store = SQLiteStore(tmp_path / "test.db")
+    pipeline = MiddlewarePipeline()
+    pipeline.add(_TagMiddleware())
+    assembler = Assembler(store=store, middleware=pipeline)
+    result = assembler.apply_post_middleware("hello ncp world")
+    assert result == "hello ncp world[TAGGED]"
