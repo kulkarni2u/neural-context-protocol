@@ -56,6 +56,7 @@ MCP_TOOLS: list[dict[str, object]] = [
                 "intent": {"type": "string", "description": "Why this action (no spaces)"},
                 "pipeline_id": {"type": "string", "description": "Pipeline identifier"},
                 "session_id": {"type": "string", "description": "Optional fetch-session token for this turn"},
+                "stream": {"type": "boolean", "description": "If true, returns sections progressively as NDJSON (HTTP) or JSON-RPC notifications (stdio). Default false."},
             },
             "required": ["agent_id", "role", "task", "slot", "intent"],
         },
@@ -123,6 +124,13 @@ def _encode_fetch_results(chunks: list[SubconsciousChunk]) -> str:
 class FetchSession:
     fetch_count: int = 0
     pipeline_id: str | None = None
+
+
+@dataclass
+class StreamResponse:
+    sections: list[tuple[str, str]]
+    handler_result: dict[str, object]
+    request_id: int | str | None = None
 
 
 def _session_id_from_args(args: dict[str, object]) -> str:
