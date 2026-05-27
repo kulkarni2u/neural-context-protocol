@@ -730,3 +730,48 @@ class TestStreamingGetContext:
             server._shutdown_event.set()
             server.shutdown()
             thread.join(timeout=5)
+
+    def test_stdio_stream_true_emits_notifications_then_final_response(self, tmp_path: Path) -> None:
+        project = tmp_path / "repo"
+        (project / ".git").mkdir(parents=True)
+
+        req = _call("ncp_get_context", {
+            "agent_id": "stdio_streamer",
+            "role": "tester",
+            "task": "stdio_task",
+            "slot": "slot",
+            "intent": "intent",
+            "stream": True,
+        }, req_id=42)
+
+        input_stream = io.BytesIO(_frame(req))
+        output_stream = io.BytesIO()
+
+        serve_streams(input_stream, output_stream, cwd=project)
+
+        output_stream.seek(0)
+        messages = []
+        while True:
+            try:
+                msg = _read_message(output_stream)
+            except (ValueError, json.JSONDecodeError):
+                break
+            if msg is None:
+                break
+            messages.append(msg)
+
+        assert len(messages) >= 2
+        for notif in messages[:-1]:
+            assert "id" not in notif
+            assert notif["method"] == "ncp/stream_chunk"
+            params = notif["params"]
+            assert params["request_id"] == 42
+            assert "section" in params
+            assert "index" in params
+            assert "text" in params
+
+        final = messages[-1]
+        assert final["id"] == 42
+        payload = json.loads(final["result"]["content"][0]["text"])
+        assert "[NCP:BUDGET]" in payload["context"]
+        assert payload["session_id"] == "stdio_streamer"

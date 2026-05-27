@@ -150,7 +150,6 @@ def test_assembler_post_turn_logs_cost_and_memory_chunks(tmp_path: Path) -> None
 
 def test_apply_post_middleware_invokes_registered_transformations(tmp_path: Path) -> None:
     from ncp.middleware.base import Middleware, MiddlewarePipeline
-    from ncp.types import BudgetContext, ConsciousBlock
 
     class _TagMiddleware(Middleware):
         def post_assemble(self, context: str) -> str:

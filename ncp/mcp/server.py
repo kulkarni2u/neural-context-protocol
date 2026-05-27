@@ -415,7 +415,25 @@ def serve_streams(
             break
 
         response = _handle_request(req, handlers)
-        if response:
+        if isinstance(response, StreamResponse):
+            for i, (label, text) in enumerate(response.sections):
+                notif = json.dumps({
+                    "jsonrpc": "2.0",
+                    "method": "ncp/stream_chunk",
+                    "params": {
+                        "request_id": response.request_id,
+                        "section": label,
+                        "index": i,
+                        "text": text,
+                    },
+                })
+                _write_message(output_stream, notif)
+            final = _ok(
+                response.request_id,
+                {"content": [{"type": "text", "text": json.dumps(response.handler_result)}]},
+            )
+            _write_message(output_stream, final)
+        elif response:
             _write_message(output_stream, response)
 
 
