@@ -11,6 +11,7 @@ import httpx
 
 from ncp.mcp.server import (
     MCP_TOOLS,
+    StreamResponse,
     _handle_request,
     _read_message,
     create_http_server,
@@ -645,3 +646,48 @@ class TestErrors:
         error = _error(resp)
         assert error["code"] == -32603
         assert "Tool unavailable for the configured store backend" in error["message"]
+
+
+class TestStreamingGetContext:
+    def test_stream_true_returns_stream_response(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "test.db")
+        handlers = make_handlers(store)
+        result = _handle_request(
+            _call("ncp_get_context", {
+                "agent_id": "streamer",
+                "role": "tester",
+                "task": "stream_task",
+                "slot": "stream_slot",
+                "intent": "stream_intent",
+                "stream": True,
+            }),
+            handlers,
+        )
+        assert isinstance(result, StreamResponse)
+        assert len(result.sections) >= 2
+        assert result.sections[0][0] == "budget_header"
+        assert result.sections[1][0] == "conscious"
+        assert "stream_task" in result.sections[1][1]
+        assert result.handler_result["context"]
+        assert "[NCP:BUDGET]" in result.handler_result["context"]
+        assert result.handler_result["session_id"] == "streamer"
+        assert result.request_id == 1
+
+    def test_stream_false_returns_string_unchanged(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "test.db")
+        handlers = make_handlers(store)
+        result = _handle_request(
+            _call("ncp_get_context", {
+                "agent_id": "builder",
+                "role": "build",
+                "task": "task",
+                "slot": "slot",
+                "intent": "intent",
+                "stream": False,
+            }),
+            handlers,
+        )
+        assert isinstance(result, str)
+        content = json.loads(result)["result"]["content"][0]["text"]
+        parsed = json.loads(content)
+        assert "context" in parsed

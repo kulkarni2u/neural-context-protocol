@@ -175,6 +175,18 @@ def make_handlers(store: BaseStore) -> dict[str, ToolHandler]:
             pipeline_id=pipeline_id,
         )
         assembler = Assembler(store=store)
+        stream = bool(args.get("stream", False))
+        if stream:
+            sections = list(assembler.assemble_incremental(
+                conscious=conscious,
+                budget=BudgetContext(),
+                query_text=conscious.task + " " + conscious.slot,
+            ))
+            assembled = assembler.apply_post_middleware("\n\n".join(t for _, t in sections))
+            return StreamResponse(
+                sections=sections,
+                handler_result={"context": assembled, "session_id": session_id},
+            )
         result = assembler.assemble(
             conscious=conscious,
             budget=BudgetContext(),
@@ -261,7 +273,7 @@ def _negotiate_version(client_version: str) -> str:
     return _LATEST_VERSION
 
 
-def _handle_request(req: dict[str, object], handlers: dict[str, ToolHandler]) -> str:
+def _handle_request(req: dict[str, object], handlers: dict[str, ToolHandler]) -> str | StreamResponse:
     req_id = req.get("id")
     method = str(req.get("method", ""))
     params: dict[str, object] = req.get("params", {}) or {}
@@ -299,6 +311,9 @@ def _handle_request(req: dict[str, object], handlers: dict[str, ToolHandler]) ->
             return _err_response(req_id, -32601, f"Tool not found: {tool_name}")
         try:
             result = handler(arguments)
+            if isinstance(result, StreamResponse):
+                result.request_id = req_id
+                return result
             return _ok(req_id, {"content": [{"type": "text", "text": json.dumps(result)}]})
         except NotImplementedError as exc:
             _err(f"Tool {tool_name} unavailable for current backend: {traceback.format_exc()}")
