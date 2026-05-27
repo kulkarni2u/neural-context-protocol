@@ -691,3 +691,42 @@ class TestStreamingGetContext:
         content = json.loads(result)["result"]["content"][0]["text"]
         parsed = json.loads(content)
         assert "context" in parsed
+
+    def test_http_post_stream_true_returns_ndjson_lines(self, tmp_path: Path) -> None:
+        port = _free_port()
+        server = create_http_server(host="127.0.0.1", port=port, cwd=tmp_path)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with httpx.Client(base_url=f"http://127.0.0.1:{port}", timeout=5.0) as client:
+                response = client.post(
+                    "/mcp",
+                    json=_call("ncp_get_context", {
+                        "agent_id": "http_streamer",
+                        "role": "tester",
+                        "task": "http_stream_task",
+                        "slot": "slot",
+                        "intent": "intent",
+                        "stream": True,
+                    }),
+                )
+                assert response.status_code == 200
+                assert "application/x-ndjson" in response.headers["content-type"]
+                lines = [ln for ln in response.text.splitlines() if ln.strip()]
+                assert len(lines) >= 2
+                for chunk_line in lines[:-1]:
+                    obj = json.loads(chunk_line)
+                    assert obj["type"] == "ncp_chunk"
+                    assert "section" in obj
+                    assert "index" in obj
+                    assert "text" in obj
+                final = json.loads(lines[-1])
+                assert final["jsonrpc"] == "2.0"
+                assert final["id"] == 1
+                payload = json.loads(final["result"]["content"][0]["text"])
+                assert "[NCP:BUDGET]" in payload["context"]
+                assert payload["session_id"] == "http_streamer"
+        finally:
+            server._shutdown_event.set()
+            server.shutdown()
+            thread.join(timeout=5)

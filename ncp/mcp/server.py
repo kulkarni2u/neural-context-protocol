@@ -468,6 +468,24 @@ class _MCPHTTPHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
 
+    def _stream_ndjson(self, sr: StreamResponse) -> None:
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/x-ndjson")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        try:
+            for i, (label, text) in enumerate(sr.sections):
+                line = json.dumps({"type": "ncp_chunk", "section": label, "index": i, "text": text}) + "\n"
+                self.wfile.write(line.encode("utf-8"))
+                self.wfile.flush()
+            final = _ok(sr.request_id, {"content": [{"type": "text", "text": json.dumps(sr.handler_result)}]})
+            self.wfile.write((final + "\n").encode("utf-8"))
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            return
+
     def do_OPTIONS(self) -> None:
         self.send_response(HTTPStatus.NO_CONTENT)
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -524,10 +542,12 @@ class _MCPHTTPHandler(BaseHTTPRequestHandler):
             return
 
         response = _handle_request(payload, self.server.handlers)
-        if not response:
+        if isinstance(response, StreamResponse):
+            self._stream_ndjson(response)
+        elif response:
+            self._send_json(HTTPStatus.OK, json.loads(response))
+        else:
             self._send_empty(HTTPStatus.ACCEPTED)
-            return
-        self._send_json(HTTPStatus.OK, json.loads(response))
 
 
 def create_http_server(
