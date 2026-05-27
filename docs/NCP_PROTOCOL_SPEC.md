@@ -306,6 +306,39 @@ Error cases (all deterministic, all compact):
 
 ---
 
+## 4a. ncp_get_context Streaming Contract (normative)
+
+Opt-in progressive delivery via `"stream": true` in tool arguments.
+
+```
+Request schema addition:
+  "stream": boolean (default false)
+    If true, sections are delivered progressively before the final JSON-RPC response.
+
+HTTP transport (Content-Type: application/x-ndjson, Connection: close):
+  Each section emitted as one NDJSON line before the final response line.
+  Line format: {"type":"ncp_chunk","section":"<label>","index":<N>,"text":"<content>"}
+  Final line: standard JSON-RPC 2.0 response with full assembled context in result.
+
+Stdio transport (Content-Length-framed JSON-RPC notifications):
+  Each section emitted as a JSON-RPC notification (no "id" field).
+  Notification method: "ncp/stream_chunk"
+  Params: {"request_id":<id>,"section":"<label>","index":<N>,"text":"<content>"}
+  Final message: standard Content-Length-framed JSON-RPC response.
+
+Section order (matches assemble_incremental yield order):
+  budget_header → conscious → subconscious chunks (one per chunk) → whispers
+
+Non-streaming callers:
+  Omit "stream" or pass "stream": false — response is unchanged JSON-RPC.
+
+Middleware:
+  post_assemble middleware is applied to the joined full text before the final response.
+  Individual section lines carry raw section text (pre-middleware).
+```
+
+---
+
 ## 5. Trust Boundaries (normative, first-class)
 
 These rules are enforced by the assembler and store. Not optional.

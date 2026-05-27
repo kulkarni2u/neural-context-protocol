@@ -147,9 +147,11 @@ by unit tests.
 
 Runnable benchmark commands:
 
-```bash
-python3 benchmarks/coding_pipeline/run.py --turns 40
-python3 benchmarks/research_pipeline/run.py --turns 36
+```python
+from ncp.benchmarks import run_coding_pipeline_benchmark, run_research_pipeline_benchmark
+
+run_coding_pipeline_benchmark(turns=40)
+run_research_pipeline_benchmark(turns=36)
 ```
 
 Benchmark write-ups:

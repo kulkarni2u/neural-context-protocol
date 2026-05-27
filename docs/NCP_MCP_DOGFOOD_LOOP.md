@@ -110,6 +110,8 @@ The repeatability artifact includes:
 
 ## Current observed state
 
+Last verified: **0.6.0** (2026-05-27) — `restart_persistence_ok: true`, streaming path (`"stream": true`) emits NDJSON sections before final response on HTTP and JSON-RPC notifications on stdio.
+
 Observed on May 24, 2026:
 
 - `opencode-cli`
