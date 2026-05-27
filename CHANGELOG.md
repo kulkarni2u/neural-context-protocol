@@ -2,6 +2,36 @@
 
 All notable changes to Neural Context Protocol will be documented in this file.
 
+## [0.6.0] - 2026-05-27
+
+Streaming assembly milestone. `ncp_get_context` now supports opt-in NDJSON
+streaming for progressive context delivery and elimination of timeout risk on
+large assemblies.
+
+### Added
+
+- **Streaming `ncp_get_context`**: passing `"stream": true` in tool arguments
+  switches the response to progressive section delivery. HTTP transport returns
+  `Content-Type: application/x-ndjson` with one JSON line per section
+  (`{"type":"ncp_chunk","section":"...","index":N,"text":"..."}`) followed by the
+  full JSON-RPC response as the final line. Stdio transport emits one
+  Content-Length-framed `ncp/stream_chunk` JSON-RPC notification per section
+  before the final response frame. Clients that do not handle notifications
+  receive the final response unchanged.
+- `Assembler.apply_post_middleware(text: str) -> str`: public method wrapping
+  `MiddlewarePipeline.post_assemble`; used by the streaming path to apply
+  middleware to the joined section text without calling `assemble()` twice.
+- `StreamResponse` dataclass in `ncp/mcp/server.py`: sentinel return type from
+  `_handle_get_context` that carries `sections`, `handler_result`, and
+  `request_id`; detected by both transport layers to switch to streaming mode.
+
+### Verified
+
+- Full test suite: 393 passed, 8 skipped, ruff clean
+- Non-streaming callers: zero behavior change (`stream` defaults to `false`)
+- Sections emitted in order: `budget_header`, `conscious`, `subconscious` (one
+  per fitting chunk), `whispers` (if any)
+
 ## [0.5.0] - 2026-05-26
 
 Production readiness and embedding milestone. Three slices across pgvector and
