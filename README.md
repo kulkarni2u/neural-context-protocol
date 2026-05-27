@@ -48,6 +48,7 @@ What is already proven in this repository:
 - retrieval feedback calibration: `query()` tracks `retrieval_count`; `calibrate(feedback_mode=True)` auto-boosts frequently-retrieved chunks
 - pgvector connection pooling: `ThreadedConnectionPool` used by default; `close()` drains the pool
 - pgvector schema migrations with advisory lock, checksums, and UP/DOWN rollback via `ncp migrate`
+- opt-in streaming: `ncp_get_context` with `"stream": true` delivers context sections progressively as NDJSON (HTTP) or JSON-RPC notifications (stdio), eliminating timeout risk on large assemblies
 - incremental assembly (`assemble_incremental()`) enforces the declared `max_tokens_per_call` budget and yields sections in priority order
 - restart persistence is validated by the dogfood harness
 - bounded-context benchmarks are reproducible and show large prompt reduction
@@ -280,7 +281,7 @@ This repository currently ships:
 
 Current release:
 
-- `neural-context-protocol==0.5.0`
+- `neural-context-protocol==0.6.0`
 
 ## Documentation
 

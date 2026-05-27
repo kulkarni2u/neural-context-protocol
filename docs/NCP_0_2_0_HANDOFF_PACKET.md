@@ -8,7 +8,7 @@ agent instead of replaying long chat history.
 
 Latest release:
 
-- PyPI: `neural-context-protocol==0.5.0` *(pending publish)*
+- PyPI: `neural-context-protocol==0.6.0` *(pending publish)*
 - GitHub: `main` branch
 - Suite: `388 passed, 8 skipped`
 - Live pgvector + Redis integration suite: `6 passed`
@@ -101,13 +101,28 @@ Latest release:
   `query()`.
 - Suite: `388 passed, 8 skipped`
 
-## Active Line: 0.6.x (suggested)
+## What Shipped In 0.6.0
 
-The `0.5.x` production readiness line is closed.
+- **Streaming `ncp_get_context`**: `"stream": true` in tool arguments switches
+  both transports to progressive delivery. HTTP returns `Content-Type:
+  application/x-ndjson` with one `{"type":"ncp_chunk","section":"...","index":N,"text":"..."}`
+  line per section followed by the full JSON-RPC response as the final line.
+  Stdio emits one Content-Length-framed `ncp/stream_chunk` notification per
+  section before the final response. Non-streaming callers unaffected.
+- `Assembler.apply_post_middleware(text: str) -> str`: public wrapper around
+  `MiddlewarePipeline.post_assemble`; used by the streaming path to apply
+  middleware to joined sections without calling `assemble()` twice.
+- `StreamResponse` dataclass in `ncp/mcp/server.py`: sentinel return type
+  carrying `sections`, `handler_result`, `request_id`; detected by both
+  transport layers to switch modes.
+- Suite: `393 passed, 8 skipped`
 
-### Suggested next focus
+## Active Line: 0.6.x (in progress)
 
-- Streaming MCP `ncp_get_context` endpoint (SSE or NDJSON) for very long turns
+The `0.6.0` streaming slice is shipped. Two slices remain:
+
+### Remaining 0.6.x priorities
+
 - IVF-FLAT index migration (migration 004) for production-scale ANN performance
 - Embedding provider integration: allow NCP to auto-embed chunks on write via
   a configured embedding adapter (Anthropic, OpenAI, or local)
@@ -141,13 +156,12 @@ The `0.5.x` production readiness line is closed.
 
 ## Suggested Prompt For The Next Orchestrator
 
-> Read `docs/NCP_0_2_0_HANDOFF_PACKET.md` first. The `0.5.x` line is closed.
-> We are opening the `0.6.x` streaming and embedding-provider line. Priorities
-> in order: (1) streaming MCP `ncp_get_context` endpoint (SSE or NDJSON) so
-> very long turns can yield context incrementally without buffering the full
-> assembly; (2) IVF-FLAT index migration (migration 004) for production-scale
-> ANN performance on the embedding column; (3) embedding provider integration
-> — allow NCP to auto-embed chunks on write via a configured adapter so callers
-> don't have to embed externally. Keep SQLite and pgvector aligned. Use NCP
-> handoffs for bounded coordination. Prefer correctness and tests over broad
-> refactors.
+> Read `docs/NCP_0_2_0_HANDOFF_PACKET.md` first. The `0.6.0` streaming slice
+> is shipped. Two slices remain in the `0.6.x` line. Priorities in order:
+> (1) IVF-FLAT index migration (migration 004) — add a `CREATE INDEX` migration
+> for the `embedding vector(1536)` column in pgvector so ANN queries scale
+> beyond brute-force; (2) embedding provider integration — allow NCP to
+> auto-embed chunks on write via a configured adapter (Anthropic, OpenAI, or
+> local) so callers don't have to embed externally before calling `write()`.
+> Keep SQLite and pgvector aligned. Use NCP handoffs for bounded coordination.
+> Prefer correctness and tests over broad refactors.
