@@ -60,15 +60,15 @@ For host configs, prefer `http://127.0.0.1:4242/mcp`.
 
 ## R2 local infra preview
 
-The first `0.2.0` storage kickoff uses local containerized infrastructure for
-Postgres/pgvector and Redis:
+The `0.2.0` storage path (current version `0.4.0`) uses local containerized
+infrastructure for Postgres/pgvector and Redis:
 
 ```bash
 ./scripts/infra_up.sh
 ```
 
 This does not change the current default store. SQLite remains the active
-implementation by default. `store.type = "pgvector"` now supports the durable
+implementation by default. `store.type = "pgvector"` supports the durable
 chunk/query path, core turn/cost/conscious persistence, Redis-backed
 coordination for whispers plus fetch-session limits, and operator reporting via
 `ncp status`, `ncp cost`, and `ncp explain`.

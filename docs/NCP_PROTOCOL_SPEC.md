@@ -97,7 +97,7 @@ Budget (populated by assembler):
   pressure        str   = "low"    low|medium|high|critical
 
 Schema:
-  calibration_id  str?  = None    field present, logic ships R2
+  calibration_id  str?  = None    field present, logic shipped in 0.4.0
   pipeline_id     str?  = None
 ```
 
@@ -582,8 +582,8 @@ Parity check matrix (all providers run same harness):
 # .ncp/config.toml
 
 [store]
-type = "sqlite"      # V1: only "sqlite" is implemented
-                     # "redis" and "pgvector" accepted but raise NotImplementedError
+type = "sqlite"      # Default runtime; pgvector is also fully implemented
+                     # "redis" is accepted but raises NotImplementedError
 path = ".ncp/store.db"
 
 [pipeline]
@@ -622,8 +622,9 @@ cost_tracking = true
 ```
 
 Explicit note in docs and CLI:
-`redis` and `pgvector` store types are accepted for forward compatibility
-but raise `NotImplementedError` in V1 with an upgrade path message.
+`redis` store type is accepted for forward compatibility but raises
+`NotImplementedError` with an upgrade path message. `pgvector` is fully
+implemented (see `store.type = "pgvector"`).
 
 ---
 
