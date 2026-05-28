@@ -2,6 +2,27 @@
 
 All notable changes to Neural Context Protocol will be documented in this file.
 
+## [0.6.x] - 2026-05-28
+
+Three post-0.6.0 slices completing the 0.6.x line. No breaking changes.
+
+### Added
+
+- **IVF-FLAT index** (`migration 004`): `CREATE INDEX ... USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100)` on `{prefix}chunks`. Matches the `<=>` cosine operator used by `retrieval_mode="vector"`. Reversible via DOWN section.
+- **`ivfflat_probes` on `PgvectorStore`**: new constructor param `ivfflat_probes: int = 10`; `_query_vector` prepends `SET LOCAL ivfflat.probes = %s` before every ANN SELECT, scoped to the transaction so it cannot leak across pool connections.
+- **`log_cost` CLI command** in `.ncp/run.py`: exposes `log_cost_raw` to external callers (Sarathi, scripts) via `python3 .ncp/run.py log_cost '{"agent_id":...,"model":...,"input_tokens":...,"output_tokens":...}'`. Turn ID auto-generated if omitted. Output visible in `ncp cost`.
+- **Embedding provider integration** (`ncp/adapters/embedding.py`): `BaseEmbeddingAdapter` (contract + `_validate_dims`), `OpenAIEmbeddingAdapter` (`text-embedding-3-small`, 1536 dims), `LocalEmbeddingAdapter` (`sentence-transformers`, model-configurable). Both do lazy imports — zero dependency footprint unless enabled.
+- **Auto-embed on write** (`PgvectorStore`): if `embedding_adapter` is set and `chunk.embedding is None`, calls `adapter.embed(chunk.content)` and attaches the vector before the DB upsert.
+- **Auto-embed on query** (`PgvectorStore._query_vector`): if `embedding_adapter` is set and no `embedding` is passed, auto-embeds the query text instead of raising `ValueError`.
+- **Embedding config section**: `[embedding]` in `DEFAULT_CONFIG` with `enabled = false`, `provider = "local"`, `model = "sentence-transformers/all-MiniLM-L6-v2"`. Three `NCPConfig` properties (`embedding_enabled`, `embedding_provider`, `embedding_model`) and three env overrides (`NCP_EMBEDDING_ENABLED`, `NCP_EMBEDDING_PROVIDER`, `NCP_EMBEDDING_MODEL`).
+- **Factory wiring**: `ncp/stores/factory.py` builds and injects the embedding adapter from config into `PgvectorStore` when `embedding.enabled = true`.
+
+### Verified
+
+- Full test suite: 421 passed, 8 skipped, ruff clean
+- SQLite store: unchanged, still raises `ValueError` for `retrieval_mode="vector"`
+- Existing callers passing `embedding=` explicitly: unaffected (adapter skipped when embedding already present)
+
 ## [0.6.0] - 2026-05-27
 
 Streaming assembly milestone. `ncp_get_context` now supports opt-in NDJSON

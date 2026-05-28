@@ -50,6 +50,9 @@ What is already proven in this repository:
 - pgvector schema migrations with advisory lock, checksums, and UP/DOWN rollback via `ncp migrate`
 - opt-in streaming: `ncp_get_context` with `"stream": true` delivers context sections progressively as NDJSON (HTTP) or JSON-RPC notifications (stdio), eliminating timeout risk on large assemblies
 - incremental assembly (`assemble_incremental()`) enforces the declared `max_tokens_per_call` budget and yields sections in priority order
+- IVF-FLAT ANN index (migration 004): `embedding vector_cosine_ops` indexed with `lists=100`; configurable `ivfflat_probes` (default 10) scoped per transaction for recall tuning without pool leakage
+- embedding provider integration: `PgvectorStore` auto-embeds chunks on write and query text at retrieval time via a configured adapter (`openai` → `text-embedding-3-small`; `local` → `sentence-transformers`); enabled via `[embedding]` config section or `NCP_EMBEDDING_ENABLED=true`
+- `log_cost` CLI command in `.ncp/run.py`: external callers (Sarathi, scripts) can post token usage directly into `ncp cost` without going through the full MCP surface
 - restart persistence is validated by the dogfood harness
 - bounded-context benchmarks are reproducible and show large prompt reduction
 

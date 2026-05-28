@@ -117,24 +117,24 @@ Latest release:
   transport layers to switch modes.
 - Suite: `393 passed, 8 skipped`
 
-## Active Line: 0.6.x (in progress)
+## What Shipped In 0.6.x
 
-The `0.6.0` streaming slice is shipped. Two slices remain:
+- **Migration 004 — IVF-FLAT index**: `CREATE INDEX ... USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100)` on the embedding column. `PgvectorStore` gains `ivfflat_probes: int = 10`; `SET LOCAL ivfflat.probes` prepended before every ANN SELECT.
+- **`log_cost` CLI**: `.ncp/run.py log_cost` exposes `log_cost_raw` to external callers so Sarathi and scripts can post token usage into `ncp cost`.
+- **Embedding provider integration**: `ncp/adapters/embedding.py` — `BaseEmbeddingAdapter`, `OpenAIEmbeddingAdapter` (`text-embedding-3-small`), `LocalEmbeddingAdapter` (`sentence-transformers`). `PgvectorStore` auto-embeds on `write()` and `_query_vector()` when `embedding_adapter` is configured. `[embedding]` config section + env overrides. Factory wires adapter from config.
+- Suite: `421 passed, 8 skipped`
 
-### Remaining 0.6.x priorities
+## Active Line: 0.7.x (next)
 
-- IVF-FLAT index migration (migration 004) for production-scale ANN performance
-- Embedding provider integration: allow NCP to auto-embed chunks on write via
-  a configured embedding adapter (Anthropic, OpenAI, or local)
+The `0.6.x` line is complete. Suggested next priorities:
+
+- Query result count semantics: relax the max-4 cap on hybrid/trust-recency paths; let callers control `k` fully
+- Async-native pgvector path: replace `anyio.to_thread.run_sync` shim with a native async connection
 
 ## Known Architectural Gaps (carried forward)
 
 - query result count semantics still opinionated inside store methods (max 4
   returned by hybrid/trust_recency paths; vector path honours `k` up to 4)
-- no IVF-FLAT index on the `embedding` column yet — ANN performance degrades
-  at scale; migration 004 should add it
-- NCP does not embed chunks internally; callers must pre-compute and pass
-  `embedding=` to `write()` / `query(retrieval_mode="vector")` themselves
 
 ## Recommended Agent Roles
 
@@ -156,12 +156,11 @@ The `0.6.0` streaming slice is shipped. Two slices remain:
 
 ## Suggested Prompt For The Next Orchestrator
 
-> Read `docs/NCP_0_2_0_HANDOFF_PACKET.md` first. The `0.6.0` streaming slice
-> is shipped. Two slices remain in the `0.6.x` line. Priorities in order:
-> (1) IVF-FLAT index migration (migration 004) — add a `CREATE INDEX` migration
-> for the `embedding vector(1536)` column in pgvector so ANN queries scale
-> beyond brute-force; (2) embedding provider integration — allow NCP to
-> auto-embed chunks on write via a configured adapter (Anthropic, OpenAI, or
-> local) so callers don't have to embed externally before calling `write()`.
+> Read `docs/NCP_0_2_0_HANDOFF_PACKET.md` first. The `0.6.x` line is complete
+> (421 passed, 8 skipped, ruff clean). Starting `0.7.x`. Two suggested
+> priorities: (1) relax the max-4 query result cap on hybrid and trust-recency
+> retrieval paths — callers should control `k` fully; (2) async-native pgvector
+> path — replace the `anyio.to_thread.run_sync` shim in `async_write` /
+> `async_query` with a real async connection (e.g. `psycopg` v3 async).
 > Keep SQLite and pgvector aligned. Use NCP handoffs for bounded coordination.
 > Prefer correctness and tests over broad refactors.
