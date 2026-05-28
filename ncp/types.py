@@ -3,6 +3,7 @@ import math
 import time
 from dataclasses import dataclass, field
 from typing import Any, Literal
+from typing import Self
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -277,7 +278,7 @@ class SubconsciousChunk(NCPModel):
         return value
 
     @model_validator(mode="after")
-    def _validate_zone_expiry(self) -> SubconsciousChunk:
+    def _validate_zone_expiry(self) -> Self:
         if self.zone in {"proven", "global"} and self.expiry is None:
             raise ValueError("proven/global zones require expiry")
         return self
@@ -364,7 +365,7 @@ class Whisper(NCPModel):
         return value
 
     @model_validator(mode="after")
-    def _validate_whisper_and_payload(self) -> Whisper:
+    def _validate_whisper_and_payload(self) -> Self:
         if self.whisper_type == "dissent" and self.target == "*":
             raise ValueError("dissent whispers cannot target '*'")
 
@@ -460,7 +461,7 @@ class TurnRecord(NCPModel):
         return value
 
     @model_validator(mode="after")
-    def _set_default_expiry(self) -> TurnRecord:
+    def _set_default_expiry(self) -> Self:
         if self.expires_at is None:
             self.expires_at = self.created_at + 86400
         if self.expires_at < self.created_at:

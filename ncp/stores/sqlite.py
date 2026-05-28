@@ -12,6 +12,7 @@ import time
 
 from rank_bm25 import BM25Okapi
 
+from ncp.config import NCPConfig
 from ncp.stores.base import BaseStore, NCPStoreUnavailableError
 from ncp.stores.consolidation import cluster_by_tags, find_merge_candidates
 from ncp.stores.retrieval import DEFAULT_RETRIEVAL_POLICY, RetrievalPolicy
