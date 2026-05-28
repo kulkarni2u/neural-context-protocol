@@ -4,7 +4,7 @@ import ncp
 from ncp.adapters.local import LocalAdapter
 from ncp.config import NCPConfig
 from ncp.stores.sqlite import SQLiteStore
-from ncp.types import BudgetContext, SubconsciousChunk, Whisper
+from ncp.types import AlertPayload, BudgetContext, SubconsciousChunk, Whisper
 
 
 def test_agent_creates_conscious_block_template() -> None:
@@ -83,7 +83,7 @@ def test_write_memory_and_emit_helpers_use_store(tmp_path: Path) -> None:
             from_agent="planner",
             target="planner",
             whisper_type="alert",
-            payload="self_check",
+            payload=AlertPayload(alert_code="self_check", description="self_check"),
             confidence=1.0,
         ),
         store=store,
@@ -91,7 +91,7 @@ def test_write_memory_and_emit_helpers_use_store(tmp_path: Path) -> None:
 
     assert wrote is True
     assert store.query("helper", k=1)[0].chunk_id == "sub_helper"
-    assert store.drain_whispers(agent_id="planner")[0].payload == "self_check"
+    assert "self_check" in store.drain_whispers(agent_id="planner")[0].payload
 
 
 def test_run_and_stream_use_local_adapter(tmp_path: Path) -> None:

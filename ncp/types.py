@@ -1,14 +1,13 @@
-"""Core NCP data models for the first launch-critical slice."""
-
-from __future__ import annotations
-
+import json
 import math
 import time
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
+from typing import Self
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
 
 
 PressureLevel = Literal["low", "medium", "high", "critical"]
@@ -279,10 +278,39 @@ class SubconsciousChunk(NCPModel):
         return value
 
     @model_validator(mode="after")
-    def _validate_zone_expiry(self) -> SubconsciousChunk:
+    def _validate_zone_expiry(self) -> Self:
         if self.zone in {"proven", "global"} and self.expiry is None:
             raise ValueError("proven/global zones require expiry")
         return self
+
+
+class HandoffPayload(NCPModel):
+    """Structured payload for handoff/share/request whispers."""
+
+    slice: str | None = None
+    files: list[str] = Field(default_factory=list)
+    ask: str
+
+
+class DissentPayload(NCPModel):
+    """Structured payload for dissent whispers."""
+
+    issue: str
+    alternatives: list[str] = Field(default_factory=list)
+
+
+class AlertPayload(NCPModel):
+    """Structured payload for alert whispers."""
+
+    alert_code: str
+    description: str
+
+
+class WorldCheckPayload(NCPModel):
+    """Structured payload for world_check whispers."""
+
+    anchor_intent: str
+    detected_drift: float
 
 
 class Whisper(NCPModel):
@@ -291,7 +319,7 @@ class Whisper(NCPModel):
     from_agent: str
     target: str
     whisper_type: WhisperType
-    payload: str
+    payload: Any
     confidence: float
 
     whisper_id: str = Field(default_factory=lambda: f"wsp_{uuid4().hex[:12]}")
@@ -315,13 +343,6 @@ class Whisper(NCPModel):
         field_name = getattr(info, "field_name", "field")
         return _validate_no_spaces(value, field_name)
 
-    @field_validator("payload")
-    @classmethod
-    def _payload_within_limit(cls, value: str) -> str:
-        if len(value) > 600:
-            raise ValueError("payload must be <= 600 characters")
-        return value
-
     @field_validator("confidence")
     @classmethod
     def _confidence_in_range(cls, value: float) -> float:
@@ -344,10 +365,59 @@ class Whisper(NCPModel):
         return value
 
     @model_validator(mode="after")
-    def _validate_dissent_target(self) -> Whisper:
+    def _validate_whisper_and_payload(self) -> Self:
         if self.whisper_type == "dissent" and self.target == "*":
             raise ValueError("dissent whispers cannot target '*'")
+
+        raw_payload = self.payload
+        parsed = None
+
+        if isinstance(raw_payload, NCPModel):
+            parsed = raw_payload.model_dump()
+        elif isinstance(raw_payload, dict):
+            parsed = raw_payload
+        elif isinstance(raw_payload, str):
+            trimmed = raw_payload.strip()
+            if trimmed.startswith("{") and trimmed.endswith("}"):
+                try:
+                    parsed = json.loads(trimmed)
+                except (json.JSONDecodeError, ValueError):
+                    pass
+
+        schema_model = None
+        if self.whisper_type in {"share", "request"}:
+            schema_model = HandoffPayload
+        elif self.whisper_type == "dissent":
+            schema_model = DissentPayload
+        elif self.whisper_type == "alert":
+            schema_model = AlertPayload
+        elif self.whisper_type == "world_check":
+            schema_model = WorldCheckPayload
+
+        if schema_model is not None:
+            if parsed is None:
+                raise ValueError(
+                    f"payload for whisper_type '{self.whisper_type}' must be a valid JSON string, "
+                    f"dictionary, or matching Pydantic model."
+                )
+            try:
+                validated_model = schema_model.model_validate(parsed)
+                self.payload = validated_model.model_dump_json(by_alias=True)
+            except Exception as exc:
+                raise ValueError(
+                    f"payload validation failed for whisper_type '{self.whisper_type}': {exc}"
+                ) from exc
+        else:
+            if not isinstance(raw_payload, str):
+                self.payload = json.dumps(raw_payload)
+            else:
+                self.payload = raw_payload
+
+        if len(self.payload) > 600:
+            raise ValueError("payload must be <= 600 characters")
+
         return self
+
 
 
 class TurnRecord(NCPModel):
@@ -391,7 +461,7 @@ class TurnRecord(NCPModel):
         return value
 
     @model_validator(mode="after")
-    def _set_default_expiry(self) -> TurnRecord:
+    def _set_default_expiry(self) -> Self:
         if self.expires_at is None:
             self.expires_at = self.created_at + 86400
         if self.expires_at < self.created_at:

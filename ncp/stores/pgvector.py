@@ -12,6 +12,7 @@ import time
 
 from rank_bm25 import BM25Okapi
 
+from ncp.config import NCPConfig
 from ncp.stores.base import BaseStore, NCPStoreUnavailableError
 from ncp.stores.consolidation import cluster_by_tags, find_merge_candidates
 from ncp.stores.redis_coordination import RedisCoordination
@@ -163,6 +164,7 @@ class PgvectorStore(BaseStore):
         max_working_chunks: int = 500,
         gc_threshold: int = 400,
         retrieval_policy: RetrievalPolicy | None = None,
+        config: NCPConfig | None = None,
     ) -> None:
         self.dsn = dsn
         self.schema = _validate_identifier(schema, field="schema")
@@ -186,6 +188,20 @@ class PgvectorStore(BaseStore):
         self.max_working_chunks = max_working_chunks
         self.gc_threshold = gc_threshold
         self.retrieval_policy = retrieval_policy or DEFAULT_RETRIEVAL_POLICY
+
+        from ncp.stores.rerank import Reranker
+        from ncp.config import load_config
+        try:
+            cfg = config or load_config()
+            self.reranker = Reranker(cfg)
+        except Exception:
+            class DummyConfig:
+                rerank_enabled = False
+                rerank_provider = "local"
+                rerank_model = None
+                values: dict = {}
+            self.reranker = Reranker(DummyConfig())  # type: ignore[arg-type]
+
         self._init_db()
 
     @contextmanager
@@ -367,7 +383,7 @@ class PgvectorStore(BaseStore):
 
         if retrieval_mode == "vector":
             return self._query_vector(
-                embedding=embedding, k=k, min_score=min_score,
+                text=text, embedding=embedding, k=k, min_score=min_score,
                 layer=layer, pipeline_id=pipeline_id, scope=scope, zone=zone,
             )
 
@@ -431,6 +447,10 @@ class PgvectorStore(BaseStore):
 
         ranked = sorted(candidates, key=lambda c: c.relevance, reverse=True)
 
+        if self.reranker is not None and self.reranker.enabled:
+            candidates_to_rerank = ranked[:k * 4]
+            ranked = self.reranker.rerank(text, candidates_to_rerank)
+
         diversity_limit = 2
         author_count: dict[str, int] = {}
         results: list[SubconsciousChunk] = []
@@ -468,6 +488,7 @@ class PgvectorStore(BaseStore):
     def _query_vector(
         self,
         *,
+        text: str,
         embedding: list[float] | None,
         k: int,
         min_score: float,
@@ -498,6 +519,8 @@ class PgvectorStore(BaseStore):
             where_params.append(scope)
 
         limit = max(1, min(k, 4))
+        if self.reranker is not None and self.reranker.enabled:
+            limit = limit * 4
         # Params order: embedding (SELECT), WHERE params, embedding (ORDER BY), LIMIT
         all_params = tuple([embedding_str] + where_params + [embedding_str, limit])
 
@@ -526,6 +549,9 @@ class PgvectorStore(BaseStore):
             chunk = self._row_to_chunk(row)
             chunk.relevance = max(0.0, min(1.0, score))
             results.append(chunk)
+
+        if self.reranker is not None and self.reranker.enabled:
+            results = self.reranker.rerank(text, results)[:max(1, min(k, 4))]
 
         if results:
             now = time.time()

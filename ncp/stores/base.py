@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
+from functools import partial
+
+import anyio
 
 from ncp.types import CalibrationReport, ConsolidationReport, ConsciousBlock, NCPResponse, SubconsciousChunk, TurnRecord, Whisper
 
@@ -185,3 +188,78 @@ class BaseStore(ABC):
         - pipeline_summary: list of {pipeline_id, chunk_count, last_activity}
         - whisper_queue: {total, by_type: {type: count}}
         """
+
+    # ------------------------------------------------------------------
+    # Async Counterpart Surface
+
+    async def async_write(self, chunk: SubconsciousChunk) -> bool:
+        """Asynchronously persist a chunk using thread pool."""
+        return await anyio.to_thread.run_sync(self.write, chunk)
+
+    async def async_query(
+        self,
+        text: str,
+        *,
+        k: int = 4,
+        min_score: float = 0.01,
+        layer: str | None = None,
+        pipeline_id: str | None = None,
+        scope: str | None = None,
+        zone: str = "working",
+        retrieval_mode: str = "hybrid",
+        embedding: list[float] | None = None,
+    ) -> list[SubconsciousChunk]:
+        """Asynchronously query stored chunks by text relevance using thread pool."""
+        fn = partial(
+            self.query,
+            text,
+            k=k,
+            min_score=min_score,
+            layer=layer,
+            pipeline_id=pipeline_id,
+            scope=scope,
+            zone=zone,
+            retrieval_mode=retrieval_mode,
+            embedding=embedding,
+        )
+        return await anyio.to_thread.run_sync(fn)
+
+    async def async_emit_whisper(self, whisper: Whisper) -> None:
+        """Asynchronously persist a whisper using thread pool."""
+        await anyio.to_thread.run_sync(self.emit_whisper, whisper)
+
+    async def async_drain_whispers(
+        self,
+        *,
+        agent_id: str,
+        pipeline_id: str | None = None,
+        max_items: int = 3,
+        min_confidence: float = 0.60,
+    ) -> list[Whisper]:
+        """Asynchronously drain queued whispers using thread pool."""
+        fn = partial(
+            self.drain_whispers,
+            agent_id=agent_id,
+            pipeline_id=pipeline_id,
+            max_items=max_items,
+            min_confidence=min_confidence,
+        )
+        return await anyio.to_thread.run_sync(fn)
+
+    async def async_log_turn_record(self, record: TurnRecord) -> None:
+        """Asynchronously persist a turn record using thread pool."""
+        await anyio.to_thread.run_sync(self.log_turn_record, record)
+
+    async def async_resolve_recent_ref(self, ref: str) -> TurnRecord | None:
+        """Asynchronously resolve a recent ref using thread pool."""
+        return await anyio.to_thread.run_sync(self.resolve_recent_ref, ref)
+
+    async def async_log_conscious(self, conscious: ConsciousBlock, *, snapshot_hash: str) -> None:
+        """Asynchronously persist a conscious-block snapshot using thread pool."""
+        fn = partial(self.log_conscious, conscious, snapshot_hash=snapshot_hash)
+        await anyio.to_thread.run_sync(fn)
+
+    async def async_log_cost(self, *, agent_id: str, response: NCPResponse) -> None:
+        """Asynchronously persist cost telemetry using thread pool."""
+        fn = partial(self.log_cost, agent_id=agent_id, response=response)
+        await anyio.to_thread.run_sync(fn)

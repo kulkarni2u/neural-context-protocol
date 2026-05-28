@@ -4,7 +4,7 @@ import pytest
 
 from ncp.stores.base import NCPStoreUnavailableError
 from ncp.stores.sqlite import SQLiteStore
-from ncp.types import ConsciousBlock, NCPResponse, SubconsciousChunk, TurnRecord, Whisper
+from ncp.types import ConsciousBlock, DissentPayload, NCPResponse, SubconsciousChunk, TurnRecord, Whisper
 
 
 def test_sqlite_store_initializes_all_tables(tmp_path: Path) -> None:
@@ -120,7 +120,7 @@ def test_sqlite_store_whisper_drain_filters_and_deletes(tmp_path: Path) -> None:
         Whisper(
             from_agent="planner",
             target="executor",
-            whisper_type="share",
+            whisper_type="nudge",
             payload="low_conf_signal",
             confidence=0.2,
             pipeline_id="pipe_1",
@@ -230,7 +230,7 @@ def test_sqlite_store_revalidates_whisper_before_persisting(tmp_path: Path) -> N
         from_agent="critic",
         target="executor",
         whisper_type="dissent",
-        payload="safe",
+        payload=DissentPayload(issue="safe"),
         confidence=0.9,
     ).model_copy(update={"target": "*"})
 
