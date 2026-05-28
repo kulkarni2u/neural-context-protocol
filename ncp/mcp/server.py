@@ -290,7 +290,7 @@ def _handle_request(req: dict[str, object], handlers: dict[str, ToolHandler]) ->
             req_id,
             {
                 "protocolVersion": _negotiate_version(client_version),
-                "serverInfo": {"name": "ncp", "version": "0.1.0a0"},
+                "serverInfo": {"name": "ncp", "version": "0.6.0"},
                 "capabilities": {"tools": {"listChanged": False}},
             },
         )

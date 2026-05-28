@@ -60,7 +60,7 @@ For host configs, prefer `http://127.0.0.1:4242/mcp`.
 
 ## R2 local infra preview
 
-The `0.2.0` storage path (current version `0.4.0`) uses local containerized
+The `0.2.0` storage path (current version `0.6.0`) uses local containerized
 infrastructure for Postgres/pgvector and Redis:
 
 ```bash
