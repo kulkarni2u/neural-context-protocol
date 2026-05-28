@@ -132,3 +132,20 @@ def test_pgvector_unknown_mode_raises() -> None:
     store = PgvectorStore("postgresql://localhost/ncp_test", connect_factory=factory)
     with pytest.raises(ValueError, match="Unknown retrieval_mode"):
         store.query("test", retrieval_mode="bogus")
+
+
+# ---------------------------------------------------------------------------
+# Migration 004 file presence and format
+# ---------------------------------------------------------------------------
+
+
+def test_migration_004_exists() -> None:
+    from pathlib import Path
+    migration = Path(__file__).parent.parent / "ncp" / "migrations" / "004_add_ivfflat_index.sql"
+    assert migration.exists(), "Migration 004 file is missing"
+    content = migration.read_text()
+    assert "-- UP" in content
+    assert "-- DOWN" in content
+    assert "ivfflat" in content
+    assert "vector_cosine_ops" in content
+    assert "lists" in content
