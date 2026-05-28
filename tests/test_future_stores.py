@@ -854,7 +854,7 @@ def test_create_store_selects_pgvector(monkeypatch: pytest.MonkeyPatch, tmp_path
     captured: dict[str, str] = {}
 
     class _FakePgvectorStore:
-        def __init__(self, dsn: str, *, schema: str, table_prefix: str, redis_url: str, redis_stream: str, config: object = None) -> None:
+        def __init__(self, dsn: str, *, schema: str, table_prefix: str, redis_url: str, redis_stream: str, config: object = None, embedding_adapter: object = None) -> None:
             captured["dsn"] = dsn
             captured["schema"] = schema
             captured["table_prefix"] = table_prefix

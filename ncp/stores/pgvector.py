@@ -166,6 +166,7 @@ class PgvectorStore(BaseStore):
         ivfflat_probes: int = 10,
         retrieval_policy: RetrievalPolicy | None = None,
         config: NCPConfig | None = None,
+        embedding_adapter: object | None = None,
     ) -> None:
         self.dsn = dsn
         self.schema = _validate_identifier(schema, field="schema")
@@ -204,6 +205,7 @@ class PgvectorStore(BaseStore):
                 values: dict = {}
             self.reranker = Reranker(DummyConfig())  # type: ignore[arg-type]
 
+        self._embedding_adapter = embedding_adapter
         self._init_db()
 
     @contextmanager
@@ -275,6 +277,10 @@ class PgvectorStore(BaseStore):
 
     def write(self, chunk: SubconsciousChunk) -> bool:
         chunk = self._validate_chunk_for_write(chunk)
+        if self._embedding_adapter is not None and chunk.embedding is None:
+            chunk = chunk.model_copy(
+                update={"embedding": self._embedding_adapter.embed(chunk.content)}
+            )
         with self._connect() as connection:
             self._soft_gc(connection)
             self._assert_src_immutable(connection, chunk)
@@ -500,7 +506,10 @@ class PgvectorStore(BaseStore):
         zone: str,
     ) -> list[SubconsciousChunk]:
         if embedding is None:
-            raise ValueError("retrieval_mode='vector' requires an embedding to be provided")
+            if self._embedding_adapter is not None:
+                embedding = self._embedding_adapter.embed(text)
+            else:
+                raise ValueError("retrieval_mode='vector' requires an embedding to be provided")
         if len(embedding) != 1536:
             raise ValueError(f"embedding must have 1536 dimensions, got {len(embedding)}")
         embedding_str = "[" + ",".join(str(f) for f in embedding) + "]"

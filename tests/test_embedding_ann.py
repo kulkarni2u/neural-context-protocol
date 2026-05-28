@@ -196,3 +196,72 @@ def test_pgvector_query_vector_custom_probes() -> None:
     sql, params = first_call[0][0], first_call[0][1]
     assert "SET LOCAL ivfflat.probes" in sql
     assert params == (5,)
+
+
+# ---------------------------------------------------------------------------
+# PgvectorStore auto-embed via embedding_adapter
+# ---------------------------------------------------------------------------
+
+
+def _make_store_with_adapter(adapter=None):
+    from unittest.mock import MagicMock
+    from ncp.stores.pgvector import PgvectorStore
+
+    mock_conn = MagicMock()
+    mock_cursor = MagicMock()
+    mock_cursor.fetchall.return_value = []
+    mock_cursor.fetchone.return_value = None
+    mock_cursor.description = None
+    mock_conn.cursor.return_value = mock_cursor
+
+    def factory(_dsn: str) -> MagicMock:
+        return mock_conn
+
+    store = PgvectorStore(
+        "postgresql://localhost/ncp_test",
+        connect_factory=factory,
+        embedding_adapter=adapter,
+    )
+    mock_cursor.execute.reset_mock()
+    return store, mock_conn, mock_cursor
+
+
+def _mock_embedding_adapter(vector=None):
+    from unittest.mock import MagicMock
+    adapter = MagicMock()
+    adapter.embed.return_value = vector or [0.3] * 1536
+    return adapter
+
+
+def test_pgvector_write_auto_embeds_when_adapter_set() -> None:
+    from ncp.types import SubconsciousChunk
+    adapter = _mock_embedding_adapter()
+    store, _, _ = _make_store_with_adapter(adapter=adapter)
+    chunk = SubconsciousChunk(layer="semantic", content="hello", src="synthesis")
+    assert chunk.embedding is None
+    store.write(chunk)
+    adapter.embed.assert_called_once_with("hello")
+
+
+def test_pgvector_write_skips_adapter_when_embedding_present() -> None:
+    from ncp.types import SubconsciousChunk
+    adapter = _mock_embedding_adapter()
+    store, _, _ = _make_store_with_adapter(adapter=adapter)
+    chunk = SubconsciousChunk(
+        layer="semantic", content="hello", src="synthesis", embedding=[0.1] * 1536
+    )
+    store.write(chunk)
+    adapter.embed.assert_not_called()
+
+
+def test_pgvector_query_vector_auto_embeds_when_adapter_set() -> None:
+    adapter = _mock_embedding_adapter()
+    store, _, mock_cursor = _make_store_with_adapter(adapter=adapter)
+    store.query("find something", retrieval_mode="vector")
+    adapter.embed.assert_called_once_with("find something")
+
+
+def test_pgvector_query_vector_still_raises_without_adapter_and_no_embedding() -> None:
+    store, _, _ = _make_store_with_adapter(adapter=None)
+    with pytest.raises(ValueError, match="embedding"):
+        store.query("find something", retrieval_mode="vector")

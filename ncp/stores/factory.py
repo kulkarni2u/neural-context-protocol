@@ -8,6 +8,15 @@ from ncp.stores.pgvector import PgvectorStore
 from ncp.stores.sqlite import SQLiteStore
 
 
+def _build_embedding_adapter(cfg: NCPConfig) -> object | None:
+    if not cfg.embedding_enabled:
+        return None
+    from ncp.adapters.embedding import LocalEmbeddingAdapter, OpenAIEmbeddingAdapter
+    if cfg.embedding_provider == "openai":
+        return OpenAIEmbeddingAdapter(model=cfg.embedding_model)
+    return LocalEmbeddingAdapter(model=cfg.embedding_model)
+
+
 def create_store(config: NCPConfig) -> BaseStore:
     """Create the configured NCP store implementation."""
 
@@ -21,6 +30,7 @@ def create_store(config: NCPConfig) -> BaseStore:
             redis_url=config.redis_url,
             redis_stream=config.redis_stream,
             config=config,
+            embedding_adapter=_build_embedding_adapter(config),
         )
     raise NotImplementedError(
         f"Store type '{config.store_type}' is not implemented yet."
