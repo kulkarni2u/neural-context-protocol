@@ -6,6 +6,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+pytest.importorskip("psycopg2")
+
 from ncp.stores.pgvector import PgvectorStore
 
 
