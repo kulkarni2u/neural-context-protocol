@@ -142,7 +142,7 @@ def emit_follow_up_whisper(
     target: str,
     pipeline_id: str | None,
     payload: str,
-    whisper_type: str = "share",
+    whisper_type: str = "nudge",
     confidence: float = 0.9,
 ) -> None:
     """Emit one bounded follow-up whisper."""

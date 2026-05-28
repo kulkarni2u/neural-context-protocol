@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from ncp.types import ConsciousBlock, Whisper
+from ncp.types import AlertPayload, ConsciousBlock, Whisper
 
 
 @dataclass(slots=True)
@@ -56,7 +56,7 @@ class CoherenceChecker:
                     from_agent="ncp_system",
                     target=conscious.agent_id,
                     whisper_type="alert",
-                    payload="slot_confidence_low_review_slot",
+                    payload=AlertPayload(alert_code="slot_confidence_low", description="review_slot"),
                     confidence=1.0,
                     pipeline_id=conscious.pipeline_id,
                 )
@@ -67,7 +67,7 @@ class CoherenceChecker:
                     from_agent="ncp_system",
                     target=conscious.agent_id,
                     whisper_type="alert",
-                    payload="drift_score_high_review_intent_anchor",
+                    payload=AlertPayload(alert_code="drift_score_high", description="review_intent_anchor"),
                     confidence=1.0,
                     pipeline_id=conscious.pipeline_id,
                 )
@@ -85,7 +85,10 @@ class CoherenceChecker:
                         from_agent="ncp_system",
                         target=conscious.agent_id,
                         whisper_type="alert",
-                        payload=f"goal_version_mismatch agent:{agent_id} v{version} vs v{conscious.goal_version}",
+                        payload=AlertPayload(
+                            alert_code="goal_version_mismatch",
+                            description=f"agent:{agent_id} v{version} vs v{conscious.goal_version}",
+                        ),
                         confidence=1.0,
                         pipeline_id=conscious.pipeline_id,
                     )

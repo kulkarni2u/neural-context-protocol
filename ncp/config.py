@@ -52,6 +52,11 @@ DEFAULT_CONFIG = {
         "log_format": "pretty",
         "cost_tracking": True,
     },
+    "retrieval": {
+        "rerank_enabled": False,
+        "rerank_provider": "local",
+        "rerank_model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
+    },
     "consolidation": {
         "enabled": True,
         "similarity_threshold": 0.65,
@@ -134,6 +139,19 @@ class NCPConfig:
         val = self.values.get("consolidation", {}).get("model")
         return str(val) if val else None
 
+    @property
+    def rerank_enabled(self) -> bool:
+        return bool(self.values.get("retrieval", {}).get("rerank_enabled", False))
+
+    @property
+    def rerank_provider(self) -> str:
+        return str(self.values.get("retrieval", {}).get("rerank_provider", "local"))
+
+    @property
+    def rerank_model(self) -> str | None:
+        val = self.values.get("retrieval", {}).get("rerank_model")
+        return str(val) if val else None
+
 
 def load_config(
     path: str | Path | None = None,
@@ -196,6 +214,13 @@ def _apply_env_overrides(values: dict[str, Any], env: dict[str, str]) -> None:
         values["pgvector"]["schema"] = env["NCP_PGVECTOR_SCHEMA"]
     if "NCP_PGVECTOR_TABLE_PREFIX" in env:
         values["pgvector"]["table_prefix"] = env["NCP_PGVECTOR_TABLE_PREFIX"]
+    if "NCP_RERANK_ENABLED" in env:
+        val = env["NCP_RERANK_ENABLED"].lower()
+        values["retrieval"]["rerank_enabled"] = val in {"true", "1", "yes"}
+    if "NCP_RERANK_PROVIDER" in env:
+        values["retrieval"]["rerank_provider"] = env["NCP_RERANK_PROVIDER"]
+    if "NCP_RERANK_MODEL" in env:
+        values["retrieval"]["rerank_model"] = env["NCP_RERANK_MODEL"]
 
 
 def _deep_merge(target: dict[str, Any], updates: dict[str, Any]) -> None:

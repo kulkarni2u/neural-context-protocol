@@ -125,12 +125,27 @@ class SQLiteStore(BaseStore):
         max_working_chunks: int = 500,
         gc_threshold: int = 400,
         retrieval_policy: RetrievalPolicy | None = None,
+        config: NCPConfig | None = None,
     ) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.max_working_chunks = max_working_chunks
         self.gc_threshold = gc_threshold
         self.retrieval_policy = retrieval_policy or DEFAULT_RETRIEVAL_POLICY
+
+        from ncp.stores.rerank import Reranker
+        from ncp.config import load_config
+        try:
+            cfg = config or load_config()
+            self.reranker = Reranker(cfg)
+        except Exception:
+            class DummyConfig:
+                rerank_enabled = False
+                rerank_provider = "local"
+                rerank_model = None
+                values: dict = {}
+            self.reranker = Reranker(DummyConfig())  # type: ignore[arg-type]
+
         self._init_db()
 
     @contextmanager
@@ -303,6 +318,10 @@ class SQLiteStore(BaseStore):
                 candidates.append(chunk)
 
         ranked = sorted(candidates, key=lambda c: c.relevance, reverse=True)
+
+        if self.reranker is not None and self.reranker.enabled:
+            candidates_to_rerank = ranked[:k * 4]
+            ranked = self.reranker.rerank(text, candidates_to_rerank)
 
         diversity_limit = 2
         author_count: dict[str, int] = {}

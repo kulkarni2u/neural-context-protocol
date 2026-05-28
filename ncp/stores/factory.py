@@ -12,7 +12,7 @@ def create_store(config: NCPConfig) -> BaseStore:
     """Create the configured NCP store implementation."""
 
     if config.store_type == "sqlite":
-        return SQLiteStore(config.store_path)
+        return SQLiteStore(config.store_path, config=config)
     if config.store_type == "pgvector":
         return PgvectorStore(
             config.pgvector_dsn,
@@ -20,6 +20,7 @@ def create_store(config: NCPConfig) -> BaseStore:
             table_prefix=config.pgvector_table_prefix,
             redis_url=config.redis_url,
             redis_stream=config.redis_stream,
+            config=config,
         )
     raise NotImplementedError(
         f"Store type '{config.store_type}' is not implemented yet."

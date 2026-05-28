@@ -7,7 +7,7 @@ from pathlib import Path
 
 
 from ncp.stores.sqlite import SQLiteStore
-from ncp.types import SubconsciousChunk, Whisper
+from ncp.types import AlertPayload, SubconsciousChunk, Whisper
 
 
 # ---------------------------------------------------------------------------
@@ -303,7 +303,7 @@ class TestWhisperQueue:
         ))
         store.emit_whisper(Whisper(
             from_agent="a", target="b", whisper_type="alert",
-            payload="msg2 different", confidence=0.95, pipeline_id=None,
+            payload=AlertPayload(alert_code="msg2", description="different"), confidence=0.95, pipeline_id=None,
         ))
         data = store.viz_data()
         wq = data["whisper_queue"]
@@ -321,7 +321,7 @@ class TestWhisperQueue:
         ))
         store.emit_whisper(Whisper(
             from_agent="a", target="b", whisper_type="alert",
-            payload="alert msg unique", confidence=0.95, pipeline_id=None,
+            payload=AlertPayload(alert_code="alert_msg", description="unique"), confidence=0.95, pipeline_id=None,
         ))
         data = store.viz_data()
         by_type = data["whisper_queue"]["by_type"]

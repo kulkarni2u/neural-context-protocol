@@ -345,7 +345,7 @@ def test_cli_handoff_claude_consumes_and_emits_follow_up(
         Whisper(
             from_agent="codex",
             target="claude",
-            whisper_type="share",
+            whisper_type="nudge",
             payload="implement wrapper review flow",
             confidence=0.95,
             pipeline_id="pipe_handoff_cli",
@@ -389,7 +389,7 @@ def test_cli_handoff_opencode_requires_json_and_emits_follow_up(
         Whisper(
             from_agent="claude",
             target="opencode",
-            whisper_type="share",
+            whisper_type="nudge",
             payload="review wrapper repo binding",
             confidence=0.95,
             pipeline_id="pipe_handoff_cli",

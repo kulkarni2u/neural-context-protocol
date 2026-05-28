@@ -48,7 +48,7 @@ def test_query_op_returns_results(tmp_path: Path) -> None:
 def test_emit_whisper_op_enqueues_whisper(tmp_path: Path) -> None:
     store = _store(tmp_path)
     ops = [
-        {"op": "emit_whisper", "from_agent": "ci", "to": "claude", "whisper_type": "share", "payload": "run tests", "confidence": 0.9}
+        {"op": "emit_whisper", "from_agent": "ci", "to": "claude", "whisper_type": "nudge", "payload": "run tests", "confidence": 0.9}
     ]
     results = run_batch(ops, store)
     assert len(results) == 1
@@ -102,7 +102,7 @@ def test_dry_run_does_not_write(tmp_path: Path) -> None:
     store = _store(tmp_path)
     ops = [
         {"op": "write_memory", "content": "dry run test", "layer": "semantic", "src": "agent_inferred", "written_by": "batch_test"},
-        {"op": "emit_whisper", "from_agent": "ci", "to": "claude", "whisper_type": "share", "payload": "dry run whisper"},
+        {"op": "emit_whisper", "from_agent": "ci", "to": "claude", "whisper_type": "nudge", "payload": "dry run whisper"},
     ]
     results = run_batch(ops, store, dry_run=True)
     assert len(results) == 2

@@ -11,7 +11,7 @@ from ncp.stores.pgvector import PgvectorStore, infra_hint as pgvector_hint
 from ncp.stores.redis import RedisStore, infra_hint as redis_hint
 from ncp.stores.redis_coordination import RedisCoordination
 from ncp.stores.sqlite import SQLiteStore
-from ncp.types import ConsciousBlock, NCPResponse, SubconsciousChunk, TurnRecord, Whisper
+from ncp.types import AlertPayload, ConsciousBlock, HandoffPayload, NCPResponse, SubconsciousChunk, TurnRecord, Whisper
 
 
 @dataclass
@@ -732,7 +732,7 @@ def test_pgvector_store_status_detail_and_cost_summary_with_coordination() -> No
             whisper_id="wsp_alpha",
             from_agent="claude",
             target="opencode",
-            whisper_type="share",
+            whisper_type="nudge",
             payload="review pgvector reporting",
             confidence=0.95,
             pipeline_id="pipe_alpha",
@@ -790,7 +790,7 @@ def test_redis_coordination_supports_peek_ack_and_fetch_sessions() -> None:
             from_agent="planner",
             target="executor",
             whisper_type="share",
-            payload="review the pgvector slice",
+            payload=HandoffPayload(ask="review the pgvector slice"),
             confidence=0.95,
             pipeline_id="pipe_redis",
         )
@@ -801,7 +801,7 @@ def test_redis_coordination_supports_peek_ack_and_fetch_sessions() -> None:
             from_agent="planner",
             target="*",
             whisper_type="alert",
-            payload="global notice",
+            payload=AlertPayload(alert_code="global_notice", description="global notice"),
             confidence=0.10,
             pipeline_id="pipe_redis",
         )
@@ -854,7 +854,7 @@ def test_create_store_selects_pgvector(monkeypatch: pytest.MonkeyPatch, tmp_path
     captured: dict[str, str] = {}
 
     class _FakePgvectorStore:
-        def __init__(self, dsn: str, *, schema: str, table_prefix: str, redis_url: str, redis_stream: str) -> None:
+        def __init__(self, dsn: str, *, schema: str, table_prefix: str, redis_url: str, redis_stream: str, config: object = None) -> None:
             captured["dsn"] = dsn
             captured["schema"] = schema
             captured["table_prefix"] = table_prefix
@@ -901,7 +901,7 @@ def test_pgvector_store_delegates_whispers_to_redis_coordination() -> None:
         whisper_id="wsp_pg",
         from_agent="claude",
         target="opencode",
-        whisper_type="share",
+        whisper_type="nudge",
         payload="handoff the pgvector fix",
         confidence=0.92,
         pipeline_id="pipe_pg",

@@ -8,6 +8,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from dataclasses import dataclass
 from hashlib import sha256
+import time
 
 import anyio
 
@@ -323,15 +324,13 @@ class Assembler:
         return deduped
 
     def _write_with_retry(self, chunk: SubconsciousChunk, *, retries: int = 2, backoff_ms: int = 50) -> None:
-        import time as _time
-
         for attempt in range(retries + 1):
             try:
                 self.store.write(chunk)
                 return
             except Exception:
                 if attempt < retries:
-                    _time.sleep(backoff_ms / 1000)
+                    time.sleep(backoff_ms / 1000)
                     continue
                 raise RuntimeError(
                     f"Failed to persist chunk after {retries + 1} attempts: {chunk.chunk_id}"
@@ -342,24 +341,22 @@ class Assembler:
     # ------------------------------------------------------------------
 
     async def _alog_turn_record(self, record: TurnRecord) -> None:
-        self.store.log_turn_record(record)
+        await self.store.async_log_turn_record(record)
 
     async def _alog_conscious(self, conscious: ConsciousBlock, snapshot_hash: str) -> None:
-        self.store.log_conscious(conscious, snapshot_hash=snapshot_hash)
+        await self.store.async_log_conscious(conscious, snapshot_hash=snapshot_hash)
 
     async def _alog_cost(self, agent_id: str, response: NCPResponse) -> None:
-        self.store.log_cost(agent_id=agent_id, response=response)
+        await self.store.async_log_cost(agent_id=agent_id, response=response)
 
     async def _alog_write_with_retry(self, chunk: SubconsciousChunk, *, retries: int = 2, backoff_ms: int = 50) -> None:
-        import anyio as _anyio
-
         for attempt in range(retries + 1):
             try:
-                self.store.write(chunk)
+                await self.store.async_write(chunk)
                 return
             except Exception:
                 if attempt < retries:
-                    await _anyio.sleep(backoff_ms / 1000)
+                    await anyio.sleep(backoff_ms / 1000)
                     continue
                 raise RuntimeError(
                     f"Failed to persist chunk after {retries + 1} attempts: {chunk.chunk_id}"

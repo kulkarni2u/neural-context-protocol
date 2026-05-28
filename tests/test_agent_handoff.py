@@ -30,7 +30,7 @@ def _seed_whisper(
         Whisper(
             from_agent=from_agent,
             target=target,
-            whisper_type="share",
+            whisper_type="nudge",
             payload=payload,
             confidence=0.95,
             pipeline_id=pipeline_id,
