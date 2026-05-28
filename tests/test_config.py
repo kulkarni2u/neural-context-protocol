@@ -91,3 +91,41 @@ def test_find_project_root_walks_up_tree(tmp_path: Path) -> None:
     (project / ".git").mkdir()
 
     assert find_project_root(nested) == project
+
+
+def test_embedding_config_defaults(tmp_path) -> None:
+    project = tmp_path / "repo"
+    (project / ".git").mkdir(parents=True)
+    config = load_config(cwd=project)
+    assert config.embedding_enabled is False
+    assert config.embedding_provider == "local"
+    assert config.embedding_model == "sentence-transformers/all-MiniLM-L6-v2"
+
+
+def test_embedding_config_toml_override(tmp_path) -> None:
+    project = tmp_path / "repo"
+    (project / ".git").mkdir(parents=True)
+    (project / ".ncp").mkdir()
+    (project / ".ncp" / "config.toml").write_text(
+        "[embedding]\nenabled = true\nprovider = \"openai\"\nmodel = \"text-embedding-3-small\"\n"
+    )
+    config = load_config(cwd=project)
+    assert config.embedding_enabled is True
+    assert config.embedding_provider == "openai"
+    assert config.embedding_model == "text-embedding-3-small"
+
+
+def test_embedding_config_env_overrides(tmp_path) -> None:
+    project = tmp_path / "repo"
+    (project / ".git").mkdir(parents=True)
+    config = load_config(
+        cwd=project,
+        env={
+            "NCP_EMBEDDING_ENABLED": "true",
+            "NCP_EMBEDDING_PROVIDER": "openai",
+            "NCP_EMBEDDING_MODEL": "text-embedding-3-small",
+        },
+    )
+    assert config.embedding_enabled is True
+    assert config.embedding_provider == "openai"
+    assert config.embedding_model == "text-embedding-3-small"

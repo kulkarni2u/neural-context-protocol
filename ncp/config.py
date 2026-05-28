@@ -57,6 +57,11 @@ DEFAULT_CONFIG = {
         "rerank_provider": "local",
         "rerank_model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
     },
+    "embedding": {
+        "enabled": False,
+        "provider": "local",
+        "model": "sentence-transformers/all-MiniLM-L6-v2",
+    },
     "consolidation": {
         "enabled": True,
         "similarity_threshold": 0.65,
@@ -152,6 +157,17 @@ class NCPConfig:
         val = self.values.get("retrieval", {}).get("rerank_model")
         return str(val) if val else None
 
+    @property
+    def embedding_enabled(self) -> bool:
+        return bool(self.values.get("embedding", {}).get("enabled", False))
+
+    @property
+    def embedding_provider(self) -> str:
+        return str(self.values.get("embedding", {}).get("provider", "local"))
+
+    @property
+    def embedding_model(self) -> str:
+        return str(self.values.get("embedding", {}).get("model", "sentence-transformers/all-MiniLM-L6-v2"))
 
 def load_config(
     path: str | Path | None = None,
@@ -221,6 +237,13 @@ def _apply_env_overrides(values: dict[str, Any], env: dict[str, str]) -> None:
         values["retrieval"]["rerank_provider"] = env["NCP_RERANK_PROVIDER"]
     if "NCP_RERANK_MODEL" in env:
         values["retrieval"]["rerank_model"] = env["NCP_RERANK_MODEL"]
+    if "NCP_EMBEDDING_ENABLED" in env:
+        val = env["NCP_EMBEDDING_ENABLED"].lower()
+        values["embedding"]["enabled"] = val in {"true", "1", "yes"}
+    if "NCP_EMBEDDING_PROVIDER" in env:
+        values["embedding"]["provider"] = env["NCP_EMBEDDING_PROVIDER"]
+    if "NCP_EMBEDDING_MODEL" in env:
+        values["embedding"]["model"] = env["NCP_EMBEDDING_MODEL"]
 
 
 def _deep_merge(target: dict[str, Any], updates: dict[str, Any]) -> None:
