@@ -149,3 +149,50 @@ def test_migration_004_exists() -> None:
     assert "ivfflat" in content
     assert "vector_cosine_ops" in content
     assert "lists" in content
+
+
+# ---------------------------------------------------------------------------
+# ivfflat.probes wired into _query_vector
+# ---------------------------------------------------------------------------
+
+
+def _make_probes_store(probes: int = 10):
+    from unittest.mock import MagicMock
+    from ncp.stores.pgvector import PgvectorStore
+
+    mock_conn = MagicMock()
+    mock_cursor = MagicMock()
+    mock_cursor.fetchall.return_value = []
+    mock_cursor.description = None
+    mock_conn.cursor.return_value = mock_cursor
+
+    def factory(_dsn: str) -> MagicMock:
+        return mock_conn
+
+    store = PgvectorStore(
+        "postgresql://localhost/ncp_test",
+        connect_factory=factory,
+        ivfflat_probes=probes,
+    )
+    mock_cursor.execute.reset_mock()  # discard _init_db execute calls
+    return store, mock_cursor
+
+
+def test_pgvector_query_vector_sets_probes_default() -> None:
+    store, mock_cursor = _make_probes_store(probes=10)
+    store.query("test", retrieval_mode="vector", embedding=[0.1] * 1536)
+
+    first_call = mock_cursor.execute.call_args_list[0]
+    sql, params = first_call[0][0], first_call[0][1]
+    assert "SET LOCAL ivfflat.probes" in sql
+    assert params == (10,)
+
+
+def test_pgvector_query_vector_custom_probes() -> None:
+    store, mock_cursor = _make_probes_store(probes=5)
+    store.query("test", retrieval_mode="vector", embedding=[0.1] * 1536)
+
+    first_call = mock_cursor.execute.call_args_list[0]
+    sql, params = first_call[0][0], first_call[0][1]
+    assert "SET LOCAL ivfflat.probes" in sql
+    assert params == (5,)

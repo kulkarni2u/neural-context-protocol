@@ -163,6 +163,7 @@ class PgvectorStore(BaseStore):
         coordination: RedisCoordination | None = None,
         max_working_chunks: int = 500,
         gc_threshold: int = 400,
+        ivfflat_probes: int = 10,
         retrieval_policy: RetrievalPolicy | None = None,
         config: NCPConfig | None = None,
     ) -> None:
@@ -187,6 +188,7 @@ class PgvectorStore(BaseStore):
         )
         self.max_working_chunks = max_working_chunks
         self.gc_threshold = gc_threshold
+        self._ivfflat_probes = ivfflat_probes
         self.retrieval_policy = retrieval_policy or DEFAULT_RETRIEVAL_POLICY
 
         from ncp.stores.rerank import Reranker
@@ -527,6 +529,7 @@ class PgvectorStore(BaseStore):
         with self._connect() as connection:
             cursor = connection.cursor()
             try:
+                cursor.execute("SET LOCAL ivfflat.probes = %s", (self._ivfflat_probes,))
                 cursor.execute(
                     self._sql(
                         "SELECT *, (embedding <=> %s::vector) AS vec_distance"
