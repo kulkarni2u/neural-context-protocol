@@ -12,7 +12,7 @@ authors = [{ name = "kulkarni2u" }]
 license = "MIT"
 keywords = ["mcp", "agents", "multi-agent", "context", "memory", "sqlite", "llm", "protocol"]
 classifiers = [
-  "Development Status :: 3 - Alpha",
+  "Development Status :: 4 - Beta",
   "Intended Audience :: Developers",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.10",
@@ -36,18 +36,28 @@ dependencies = [
 Homepage = "https://github.com/kulkarni2u/neural-context-protocol"
 Repository = "https://github.com/kulkarni2u/neural-context-protocol"
 Issues = "https://github.com/kulkarni2u/neural-context-protocol/issues"
+Changelog = "https://github.com/kulkarni2u/neural-context-protocol/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 providers = [
   "anthropic",
   "openai",
-  "google-generativeai",
+  "google-genai",
   "mistralai",
   "cohere",
 ]
+tokens = ["tiktoken>=0.7"]
 http = ["aiohttp"]
 redis = ["redis"]
 pgvector = ["psycopg2-binary", "pgvector"]
+all = [
+  "anthropic",
+  "openai",
+  "google-genai",
+  "mistralai",
+  "cohere",
+  "tiktoken>=0.7",
+]
 dev = [
   "build",
   "pytest",

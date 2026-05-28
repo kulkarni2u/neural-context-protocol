@@ -305,7 +305,7 @@ bash scripts/release_preflight.sh
 <details>
 <summary>Provider notes</summary>
 
-- `GeminiAdapter` currently uses `google.generativeai`, which is deprecated upstream. The adapter is functionally green in tests, but should migrate to `google.genai` in a future pass.
+- `GeminiAdapter` uses `google-genai` (`google.genai`) — the current Google SDK.
 - `CohereAdapter` is functionally green. Known upstream warning noise is suppressed at the adapter boundary for the current alpha line.
 
 </details>

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -151,21 +152,28 @@ class TestOllamaAdapter:
 
 
 class TestGeminiAdapter:
+    @pytest.fixture(autouse=True)
+    def _mock_google_genai(self):
+        mock_genai = MagicMock()
+        mock_google = MagicMock()
+        mock_google.genai = mock_genai
+        with patch.dict(sys.modules, {"google": mock_google, "google.genai": mock_genai}):
+            yield mock_genai
+
     def test_call(self) -> None:
         adapter = GeminiAdapter(api_key="test-key", model="gemini-2.0-flash")
         resp = MagicMock()
         resp.text = "Paris"
 
-        with patch.object(adapter._model, "generate_content") as mock_gen:
-            mock_gen.return_value = resp
+        with patch.object(adapter._client.models, "generate_content", return_value=resp) as mock_gen:
             result = adapter.call(NCP_CTX, USER_TURN)
 
         assert result == "Paris"
         mock_gen.assert_called_once()
-        args, kwargs = mock_gen.call_args
-        assert NCP_CTX in args[0]
-        assert USER_TURN in args[0]
-        assert "timeout" in kwargs.get("request_options", {})
+        _, kwargs = mock_gen.call_args
+        assert kwargs["model"] == "gemini-2.0-flash"
+        assert NCP_CTX in kwargs["contents"]
+        assert USER_TURN in kwargs["contents"]
 
     def test_stream_raises(self) -> None:
         adapter = GeminiAdapter(api_key="test-key")
@@ -267,12 +275,15 @@ class TestGoldenContextParity:
         assert len(result) > 0
 
     def test_gemini(self) -> None:
-        adapter = GeminiAdapter(api_key="test-key")
+        mock_genai = MagicMock()
+        mock_google = MagicMock()
+        mock_google.genai = mock_genai
+        with patch.dict(sys.modules, {"google": mock_google, "google.genai": mock_genai}):
+            adapter = GeminiAdapter(api_key="test-key")
         resp = MagicMock()
         resp.text = "Paris"
 
-        with patch.object(adapter._model, "generate_content") as mock_gen:
-            mock_gen.return_value = resp
+        with patch.object(adapter._client.models, "generate_content", return_value=resp):
             result = adapter.call(self.GOLDEN_CTX, self.GOLDEN_TURN)
         assert isinstance(result, str)
         assert len(result) > 0
@@ -333,9 +344,12 @@ class TestErrorSemantics:
                 adapter.call(NCP_CTX, USER_TURN)
 
     def test_gemini_timeout_raises(self) -> None:
-        adapter = GeminiAdapter(api_key="test-key")
-        with patch.object(adapter._model, "generate_content") as mock_gen:
-            mock_gen.side_effect = TimeoutError("timed out")
+        mock_genai = MagicMock()
+        mock_google = MagicMock()
+        mock_google.genai = mock_genai
+        with patch.dict(sys.modules, {"google": mock_google, "google.genai": mock_genai}):
+            adapter = GeminiAdapter(api_key="test-key")
+        with patch.object(adapter._client.models, "generate_content", side_effect=TimeoutError("timed out")):
             with pytest.raises(NCPAdapterTimeoutError, match="Gemini timed out"):
                 adapter.call(NCP_CTX, USER_TURN)
 
