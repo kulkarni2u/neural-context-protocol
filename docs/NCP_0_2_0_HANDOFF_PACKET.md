@@ -8,9 +8,9 @@ agent instead of replaying long chat history.
 
 Latest release:
 
-- PyPI: `neural-context-protocol==0.8.0` *(pending publish)*
+- PyPI: `neural-context-protocol==0.9.0` *(pending publish)*
 - GitHub: `main` branch
-- Suite: `446 passed, 8 skipped`
+- Suite: `464 passed, 8 skipped`
 - Live pgvector + Redis integration suite: `6 passed`
 
 ## What Shipped In 0.2.0
@@ -150,31 +150,35 @@ Latest release:
   `NotImplementedError`. New: `tests/test_async_pgvector_store.py` (9 tests).
 - Suite: `446 passed, 8 skipped`
 
-## Active Line: 0.9.x (next)
+## What Shipped In 0.9.x
 
-The `0.8.x` line is complete. Suggested next priorities:
+- **`AsyncPgvectorStore` dedup/GC parity**: `async_write` now performs all 8 steps of sync
+  `write()` — `_async_soft_gc`, `_async_assert_src_immutable`, `_async_is_duplicate`,
+  INSERT/upsert with full 26-column ON CONFLICT SET, `_async_hard_gc` (using `executemany`).
+  Returns `False` when content similarity > 0.92. `max_working_chunks`/`gc_threshold`
+  configurable on `__init__`. 8 new tests.
+- **Native async Redis whispers**: `AsyncRedisCoordination` (in `redis_coordination.py`)
+  uses `redis.asyncio` — eliminates all `anyio.to_thread.run_sync` from the whisper path.
+  `AsyncPgvectorStore` accepts `redis_url=`/`coordination=`; raises `NCPStoreUnavailableError`
+  without Redis. 10 new tests.
+- Suite: `464 passed, 8 skipped`
 
-- `AsyncPgvectorStore` dedup/GC parity: `async_write` currently skips soft_gc, duplicate
-  detection, and hard_gc vs sync `write()` — add a lightweight async dedup path
-- `async_emit_whisper` / `async_drain_whispers` native async: currently still use thread shim
-  since Redis coordination is sync; migrate to an async Redis client (e.g. `redis.asyncio`)
-  for fully thread-free `post_turn_async`
+## Active Line: 0.10.x (next)
 
-The `0.7.x` line is complete. Suggested next priorities:
+The `0.9.x` line is complete. Suggested next priorities:
 
-- True async-native pgvector path: add `AsyncPgvectorStore` using `psycopg.AsyncConnection` and
-  `psycopg_pool.AsyncConnectionPool` — eliminates `anyio.to_thread.run_sync` overhead for
-  high-concurrency workloads (~400-600 lines of new code alongside existing sync store)
-- Assembler k-forwarding: expose `k` as an assembler parameter so callers can request more than 4
-  chunks without patching internals (currently `_retrieve_chunks` hardcodes `k=4`)
+- `diversity_limit=2` per-author is hardcoded — expose as configurable param on
+  `BaseStore.query()` so callers can widen or tighten per-author diversity without subclassing
+- Vector mode (`retrieval_mode="vector"`) has no diversity loop — all k results can come from
+  one author; add the same diversity pass as hybrid/trust_recency
 
 ## Known Architectural Gaps (carried forward)
 
-- Assembler `_retrieve_chunks` hardcodes `k=2` (critical pressure) or `k=4` (normal) — callers
-  cannot request more chunks without subclassing
 - `diversity_limit=2` per-author is still a hardcoded policy value; can silently reduce results
   below requested `k` when few authors are present
 - Vector mode has no diversity loop — all k results can come from one author
+- `_async_is_duplicate` does not exclude the chunk being upserted (same gap as sync `_is_duplicate`)
+  — an idempotent upsert of an existing chunk is treated as a duplicate and silently dropped
 
 ## Recommended Agent Roles
 
@@ -196,12 +200,10 @@ The `0.7.x` line is complete. Suggested next priorities:
 
 ## Suggested Prompt For The Next Orchestrator
 
-> Read `docs/NCP_0_2_0_HANDOFF_PACKET.md` first. The `0.8.x` line is complete
-> (446 passed, 8 skipped, ruff clean). Starting `0.9.x`. Two suggested priorities:
-> (1) `AsyncPgvectorStore` dedup/GC parity — `async_write` currently skips soft_gc,
-> duplicate detection, and hard_gc; add a lightweight async dedup path so
-> `AsyncPgvectorStore` matches `PgvectorStore` behaviorally;
-> (2) native async whispers — `async_emit_whisper`/`async_drain_whispers` still use
-> `anyio.to_thread.run_sync` because Redis coordination is sync; migrate to
-> `redis.asyncio` for a fully thread-free `post_turn_async` path.
-> Keep test coverage aligned with sync store. Use NCP handoffs for bounded coordination.
+> Read `docs/NCP_0_2_0_HANDOFF_PACKET.md` first. The `0.9.x` line is complete
+> (464 passed, 8 skipped, ruff clean). Starting `0.10.x`. Two suggested priorities:
+> (1) configurable `diversity_limit` — currently hardcoded to 2 per-author in all retrieval paths;
+> expose as a `BaseStore.query(diversity_limit=N)` parameter so callers can widen or tighten it;
+> (2) vector-mode diversity loop — `retrieval_mode="vector"` currently returns up to k results
+> all from one author; add the same author-diversity pass applied in hybrid/trust_recency paths.
+> Keep test coverage aligned across retrieval modes. Use NCP handoffs for bounded coordination.

@@ -2,6 +2,29 @@
 
 All notable changes to Neural Context Protocol will be documented in this file.
 
+## [0.9.x] - 2026-05-30
+
+Two slices completing the 0.9.x line. No breaking changes.
+
+### Added / Changed
+
+- **`AsyncPgvectorStore` dedup/GC parity** (`ncp/stores/pgvector_async.py`):
+  `async_write` now executes all 8 steps of sync `write()`: validate → `_async_soft_gc` →
+  `_async_assert_src_immutable` → `_async_is_duplicate` → INSERT/upsert → `_async_hard_gc`.
+  Returns `False` (no-op) when content similarity > 0.92 in the same zone/layer/pipeline.
+  ON CONFLICT SET now updates all 26 columns (was 4). `max_working_chunks=500`,
+  `gc_threshold=400` added to `__init__`. `_async_hard_gc` uses `executemany` matching sync
+  batch-delete behavior. New: `tests/test_async_pgvector_dedup_gc.py` (8 tests).
+- **Native async Redis whispers** (`ncp/stores/redis_coordination.py`,
+  `ncp/stores/pgvector_async.py`): `AsyncRedisCoordination` class added using
+  `redis.asyncio` — eliminates `anyio.to_thread.run_sync` shim entirely from
+  `AsyncPgvectorStore`. `async_emit_whisper` and `async_drain_whispers` now delegate to
+  `_acoordination.emit_whisper/drain_whispers` directly. `AsyncPgvectorStore` accepts
+  `redis_url=` and `coordination=` kwargs; raises `NCPStoreUnavailableError` when whispers
+  are called without Redis configured. New: `tests/test_async_redis_coordination.py`
+  (10 tests).
+- Suite: `464 passed, 8 skipped`
+
 ## [0.8.x] - 2026-05-30
 
 Two slices completing the 0.8.x line. No breaking changes.

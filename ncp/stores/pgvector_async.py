@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 import time
 from contextlib import asynccontextmanager
-from functools import partial
+from difflib import SequenceMatcher
 from typing import Any, AsyncIterator
 
 import anyio
@@ -26,6 +26,7 @@ from ncp.stores.pgvector import (
     PGVECTOR_SCHEMA_TEMPLATE,
     _validate_identifier,
 )
+from ncp.stores.redis_coordination import AsyncRedisCoordination
 from ncp.types import (
     ConsciousBlock,
     NCPResponse,
@@ -51,14 +52,23 @@ class AsyncPgvectorStore(BaseStore):
         min_pool_connections: int = 2,
         max_pool_connections: int = 10,
         open_pool: bool = False,
+        max_working_chunks: int = 500,
+        gc_threshold: int = 400,
+        redis_url: str | None = None,
+        coordination: AsyncRedisCoordination | None = None,
     ) -> None:
         self.dsn = dsn
         self.schema = _validate_identifier(schema, field="schema")
         self.table_prefix = _validate_identifier(table_prefix, field="table_prefix")
         self._min_pool = min_pool_connections
         self._max_pool = max_pool_connections
+        self.max_working_chunks = max_working_chunks
+        self.gc_threshold = gc_threshold
         self._apool: Any = None
         self._init_lock = anyio.Lock()
+        self._acoordination: AsyncRedisCoordination | None = coordination or (
+            AsyncRedisCoordination(redis_url) if redis_url else None
+        )
 
         if open_pool:
             raise ValueError(
@@ -152,7 +162,11 @@ class AsyncPgvectorStore(BaseStore):
     # ------------------------------------------------------------------
 
     async def async_write(self, chunk: SubconsciousChunk) -> bool:
-        """Persist a chunk using native async DB I/O (no thread pool)."""
+        """Persist a chunk using native async DB I/O (no thread pool).
+
+        Matches sync write() behavior: soft_gc → src_immutability → dedup →
+        INSERT/upsert → hard_gc.
+        """
         chunk = self._validate_chunk_for_write(chunk)
         embedding_val = (
             "[" + ",".join(str(f) for f in chunk.embedding) + "]"
@@ -160,6 +174,10 @@ class AsyncPgvectorStore(BaseStore):
             else None
         )
         async with self._aconnect() as conn:
+            await self._async_soft_gc(conn)
+            await self._async_assert_src_immutable(conn, chunk)
+            if await self._async_is_duplicate(conn, chunk):
+                return False
             async with conn.cursor() as cur:
                 await cur.execute(
                     self._sql(
@@ -175,9 +193,31 @@ class AsyncPgvectorStore(BaseStore):
                             %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                         )
                         ON CONFLICT (chunk_id) DO UPDATE SET
+                            pipeline_id = EXCLUDED.pipeline_id,
+                            scope = EXCLUDED.scope,
+                            zone = EXCLUDED.zone,
+                            layer = EXCLUDED.layer,
+                            chunk_type = EXCLUDED.chunk_type,
                             content = EXCLUDED.content,
                             src = EXCLUDED.src,
+                            written_by = EXCLUDED.written_by,
+                            caused_by = EXCLUDED.caused_by,
+                            conscious_hash = EXCLUDED.conscious_hash,
+                            evidence_id = EXCLUDED.evidence_id,
+                            version = EXCLUDED.version,
+                            supersedes = EXCLUDED.supersedes,
+                            source_refs = EXCLUDED.source_refs,
+                            schema_version = EXCLUDED.schema_version,
+                            created_at = EXCLUDED.created_at,
                             base_trust = EXCLUDED.base_trust,
+                            generation = EXCLUDED.generation,
+                            result_confidence = EXCLUDED.result_confidence,
+                            result_attempts = EXCLUDED.result_attempts,
+                            conditions = EXCLUDED.conditions,
+                            valid_while = EXCLUDED.valid_while,
+                            expiry = EXCLUDED.expiry,
+                            owner = EXCLUDED.owner,
+                            meta = EXCLUDED.meta,
                             embedding = EXCLUDED.embedding
                         """
                     ),
@@ -211,7 +251,114 @@ class AsyncPgvectorStore(BaseStore):
                         embedding_val,
                     ),
                 )
+            await self._async_hard_gc(conn, pipeline_id=chunk.pipeline_id)
         return True
+
+    # ------------------------------------------------------------------
+    # Async dedup/GC helpers — native async equivalents of PgvectorStore
+    # ------------------------------------------------------------------
+
+    async def _async_soft_gc(self, conn: Any) -> None:
+        """Delete expired tombstones, whispers, and turn_records."""
+        now = time.time()
+        for table in ("tombstones", "whispers", "turn_records"):
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    self._sql(
+                        f"DELETE FROM {{schema}}.{{prefix}}{table} WHERE expires_at <= %s"
+                    ),
+                    (now,),
+                )
+
+    async def _async_assert_src_immutable(self, conn: Any, chunk: SubconsciousChunk) -> None:
+        """Raise ValueError if src field changes for an existing chunk_id."""
+        async with conn.cursor() as cur:
+            await cur.execute(
+                self._sql(
+                    "SELECT src FROM {schema}.{prefix}chunks WHERE chunk_id = %s"
+                ),
+                (chunk.chunk_id,),
+            )
+            raw = await cur.fetchone()
+            description = cur.description
+        if raw is None:
+            return
+        row = self._normalize_row(raw, description)
+        existing_src = str(row["src"])
+        if existing_src != chunk.src:
+            raise ValueError(
+                f"src is immutable for chunk_id={chunk.chunk_id}: "
+                f"existing={existing_src} new={chunk.src}"
+            )
+
+    async def _async_is_duplicate(self, conn: Any, chunk: SubconsciousChunk) -> bool:
+        """Return True if a content-similar chunk exists in the same zone/layer/pipeline."""
+        async with conn.cursor() as cur:
+            await cur.execute(
+                self._sql(
+                    """
+                    SELECT content FROM {schema}.{prefix}chunks
+                    WHERE zone = %s AND layer = %s
+                      AND COALESCE(pipeline_id, '') = COALESCE(%s, '')
+                    """
+                ),
+                (chunk.zone, chunk.layer, chunk.pipeline_id),
+            )
+            raw_rows = await cur.fetchall()
+            description = cur.description
+        rows = [self._normalize_row(r, description) for r in raw_rows]
+        for row in rows:
+            if SequenceMatcher(None, chunk.content, str(row["content"])).ratio() > 0.92:
+                return True
+        return False
+
+    async def _async_hard_gc(self, conn: Any, *, pipeline_id: str | None) -> None:
+        """Evict oldest working-zone chunks if count exceeds max_working_chunks."""
+        clauses = ["zone = 'working'"]
+        params: list[object] = []
+        if pipeline_id is not None:
+            clauses.append("pipeline_id = %s")
+            params.append(pipeline_id)
+        where = " AND ".join(clauses)
+
+        async with conn.cursor() as cur:
+            await cur.execute(
+                self._sql(
+                    f"SELECT COUNT(*) AS count FROM {{schema}}.{{prefix}}chunks WHERE {where}"
+                ),
+                tuple(params),
+            )
+            raw = await cur.fetchone()
+            description = cur.description
+        row = self._normalize_row(raw, description) if raw is not None else None
+        count = int(row["count"]) if row is not None else 0
+        if count <= self.max_working_chunks:
+            return
+
+        overflow = count - self.gc_threshold
+        async with conn.cursor() as cur:
+            await cur.execute(
+                self._sql(
+                    f"""
+                    SELECT chunk_id FROM {{schema}}.{{prefix}}chunks
+                    WHERE {where}
+                    ORDER BY created_at ASC
+                    LIMIT %s
+                    """
+                ),
+                (*params, overflow),
+            )
+            stale_rows = await cur.fetchall()
+            description = cur.description
+
+        stale = [self._normalize_row(r, description) for r in stale_rows]
+        if not stale:
+            return
+        async with conn.cursor() as cur:
+            await cur.executemany(
+                self._sql("DELETE FROM {schema}.{prefix}chunks WHERE chunk_id = %s"),
+                [(str(row["chunk_id"]),) for row in stale],
+            )
 
     async def async_query(
         self,
@@ -421,9 +568,13 @@ class AsyncPgvectorStore(BaseStore):
                 )
 
     async def async_emit_whisper(self, whisper: Whisper) -> None:
-        """Emit whisper via Redis coordination (uses thread shim; Redis is fast)."""
-        fn = partial(self.emit_whisper, whisper)
-        await anyio.to_thread.run_sync(fn)
+        """Emit whisper via native async Redis coordination (no thread shim)."""
+        if self._acoordination is None:
+            raise NCPStoreUnavailableError(
+                "AsyncPgvectorStore whisper coordination requires Redis. "
+                "Pass redis_url= or coordination= to enable whispers."
+            )
+        await self._acoordination.emit_whisper(whisper)
 
     async def async_drain_whispers(
         self,
@@ -433,15 +584,18 @@ class AsyncPgvectorStore(BaseStore):
         max_items: int = 3,
         min_confidence: float = 0.60,
     ) -> list[Whisper]:
-        """Drain whispers via Redis coordination (uses thread shim; Redis is fast)."""
-        fn = partial(
-            self.drain_whispers,
+        """Drain whispers via native async Redis coordination (no thread shim)."""
+        if self._acoordination is None:
+            raise NCPStoreUnavailableError(
+                "AsyncPgvectorStore whisper coordination requires Redis. "
+                "Pass redis_url= or coordination= to enable whispers."
+            )
+        return await self._acoordination.drain_whispers(
             agent_id=agent_id,
             pipeline_id=pipeline_id,
             max_items=max_items,
             min_confidence=min_confidence,
         )
-        return await anyio.to_thread.run_sync(fn)
 
     # ------------------------------------------------------------------
     # Chunk validation helper
