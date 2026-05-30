@@ -249,6 +249,7 @@ class SQLiteStore(BaseStore):
         zone: str = "working",
         retrieval_mode: str = "hybrid",
         embedding: list[float] | None = None,
+        diversity_limit: int = 2,
     ) -> list[SubconsciousChunk]:
         _VALID_RETRIEVAL_MODES = ("hybrid", "trust_recency", "vector")
         if retrieval_mode not in _VALID_RETRIEVAL_MODES:
@@ -324,12 +325,12 @@ class SQLiteStore(BaseStore):
             candidates_to_rerank = ranked[:k * 4]
             ranked = self.reranker.rerank(text, candidates_to_rerank)
 
-        diversity_limit = 2
+        _diversity_cap = max(1, diversity_limit)
         author_count: dict[str, int] = {}
         results: list[SubconsciousChunk] = []
         for chunk in ranked:
             author = str(chunk.written_by)
-            if author_count.get(author, 0) >= diversity_limit:
+            if author_count.get(author, 0) >= _diversity_cap:
                 continue
             author_count[author] = author_count.get(author, 0) + 1
             results.append(chunk)

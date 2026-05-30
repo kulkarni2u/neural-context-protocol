@@ -385,6 +385,7 @@ class PgvectorStore(BaseStore):
         zone: str = "working",
         retrieval_mode: str = "hybrid",
         embedding: list[float] | None = None,
+        diversity_limit: int = 2,
     ) -> list[SubconsciousChunk]:
         _VALID_RETRIEVAL_MODES = ("hybrid", "trust_recency", "vector")
         if retrieval_mode not in _VALID_RETRIEVAL_MODES:
@@ -396,6 +397,7 @@ class PgvectorStore(BaseStore):
             return self._query_vector(
                 text=text, embedding=embedding, k=k, min_score=min_score,
                 layer=layer, pipeline_id=pipeline_id, scope=scope, zone=zone,
+                diversity_limit=diversity_limit,
             )
 
         with self._connect() as connection:
@@ -462,12 +464,12 @@ class PgvectorStore(BaseStore):
             candidates_to_rerank = ranked[:k * 4]
             ranked = self.reranker.rerank(text, candidates_to_rerank)
 
-        diversity_limit = 2
+        _diversity_cap = max(1, diversity_limit)
         author_count: dict[str, int] = {}
         results: list[SubconsciousChunk] = []
         for chunk in ranked:
             author = str(chunk.written_by)
-            if author_count.get(author, 0) >= diversity_limit:
+            if author_count.get(author, 0) >= _diversity_cap:
                 continue
             author_count[author] = author_count.get(author, 0) + 1
             results.append(chunk)
@@ -507,6 +509,7 @@ class PgvectorStore(BaseStore):
         pipeline_id: str | None,
         scope: str | None,
         zone: str,
+        diversity_limit: int = 2,
     ) -> list[SubconsciousChunk]:
         if embedding is None:
             if self._embedding_adapter is not None:
@@ -532,9 +535,8 @@ class PgvectorStore(BaseStore):
             where_clauses.append("scope = %s")
             where_params.append(scope)
 
-        limit = max(1, k)
-        if self.reranker is not None and self.reranker.enabled:
-            limit = limit * 4
+        # Always fetch k*4 to give the diversity loop enough candidates.
+        limit = max(1, k * 4)
         # Params order: embedding (SELECT), WHERE params, embedding (ORDER BY), LIMIT
         all_params = tuple([embedding_str] + where_params + [embedding_str, limit])
 
@@ -566,7 +568,20 @@ class PgvectorStore(BaseStore):
             results.append(chunk)
 
         if self.reranker is not None and self.reranker.enabled:
-            results = self.reranker.rerank(text, results)[:max(1, k)]
+            results = self.reranker.rerank(text, results)
+
+        _diversity_cap = max(1, diversity_limit)
+        author_count: dict[str, int] = {}
+        diverse: list[SubconsciousChunk] = []
+        for chunk in results:
+            author = str(chunk.written_by)
+            if author_count.get(author, 0) >= _diversity_cap:
+                continue
+            author_count[author] = author_count.get(author, 0) + 1
+            diverse.append(chunk)
+            if len(diverse) >= max(1, k):
+                break
+        results = diverse
 
         if results:
             now = time.time()

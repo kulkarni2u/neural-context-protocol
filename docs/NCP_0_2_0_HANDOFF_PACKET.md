@@ -8,9 +8,9 @@ agent instead of replaying long chat history.
 
 Latest release:
 
-- PyPI: `neural-context-protocol==0.9.0` *(pending publish)*
+- PyPI: `neural-context-protocol==0.10.0` *(pending publish)*
 - GitHub: `main` branch
-- Suite: `464 passed, 8 skipped`
+- Suite: `479 passed, 8 skipped`
 - Live pgvector + Redis integration suite: `6 passed`
 
 ## What Shipped In 0.2.0
@@ -163,22 +163,31 @@ Latest release:
   without Redis. 10 new tests.
 - Suite: `464 passed, 8 skipped`
 
-## Active Line: 0.10.x (next)
+## What Shipped In 0.10.x
 
-The `0.9.x` line is complete. Suggested next priorities:
+- **Configurable `diversity_limit`**: `BaseStore.query(diversity_limit=N)` parameter added to all
+  implementations. Default=2 preserves existing behavior. `max(1, diversity_limit)` guard prevents
+  zero/negative misuse. 15 new tests across all retrieval modes and stores.
+- **Vector-mode diversity loop**: `_query_vector` now applies the same per-author diversity pass as
+  hybrid/trust_recency. SQL LIMIT changed to `k*4` unconditionally (was `k` without reranker) to
+  give the loop enough candidates. Results respect `diversity_limit` per author.
+- Suite: `479 passed, 8 skipped`
 
-- `diversity_limit=2` per-author is hardcoded — expose as configurable param on
-  `BaseStore.query()` so callers can widen or tighten per-author diversity without subclassing
-- Vector mode (`retrieval_mode="vector"`) has no diversity loop — all k results can come from
-  one author; add the same diversity pass as hybrid/trust_recency
+## Active Line: 0.11.x (next)
+
+The `0.10.x` line is complete. Suggested next priorities:
+
+- **Wire `diversity_limit` through public API**: `assembler._retrieve_chunks`, `api.get_context/run/stream`,
+  `mcp/server.py ncp_get_context`, `.ncp/run.py fetch` — callers currently cannot override diversity
+  through the public surface; same wire-through pattern as k-forwarding in 0.8.x
+- **Fix `_is_duplicate` self-match gap**: both sync and async `_is_duplicate` include the chunk being
+  upserted in the similarity scan — an idempotent upsert of an existing chunk is silently dropped
+  instead of updated. Add `AND chunk_id != %s` to the WHERE clause.
 
 ## Known Architectural Gaps (carried forward)
 
-- `diversity_limit=2` per-author is still a hardcoded policy value; can silently reduce results
-  below requested `k` when few authors are present
-- Vector mode has no diversity loop — all k results can come from one author
-- `_async_is_duplicate` does not exclude the chunk being upserted (same gap as sync `_is_duplicate`)
-  — an idempotent upsert of an existing chunk is treated as a duplicate and silently dropped
+- `diversity_limit` not yet wired through assembler/API/MCP surface — only configurable at direct `store.query()` call sites
+- `_is_duplicate` (sync + async) does not exclude the chunk being upserted — idempotent upserts silently no-op
 
 ## Recommended Agent Roles
 

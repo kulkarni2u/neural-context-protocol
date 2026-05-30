@@ -2,6 +2,24 @@
 
 All notable changes to Neural Context Protocol will be documented in this file.
 
+## [0.10.x] - 2026-05-30
+
+Two slices completing the 0.10.x line. No breaking changes.
+
+### Added / Changed
+
+- **Configurable `diversity_limit`** (`ncp/stores/base.py`, `sqlite.py`, `pgvector.py`,
+  `pgvector_async.py`): `BaseStore.query()` and all implementations now accept
+  `diversity_limit: int = 2`. Replaces the hardcoded per-author cap. Default preserves
+  existing behavior. Guard `max(1, diversity_limit)` prevents zero/negative misuse.
+  New: 15 tests in `tests/test_diversity_limit.py` covering SQLite, PgvectorStore
+  (hybrid + trust_recency + vector), and AsyncPgvectorStore behavioral + signature.
+- **Vector-mode diversity loop** (`ncp/stores/pgvector.py`): `_query_vector` now applies
+  the same author-diversity pass as hybrid/trust_recency. SQL LIMIT changed from
+  `max(1, k)` to `max(1, k*4)` unconditionally to give the diversity loop enough
+  candidates. Results respect `diversity_limit` per author before the final `[:k]` cap.
+- Suite: `479 passed, 8 skipped`
+
 ## [0.9.x] - 2026-05-30
 
 Two slices completing the 0.9.x line. No breaking changes.

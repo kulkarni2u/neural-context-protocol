@@ -115,7 +115,7 @@ def _pgvector_store_with_factory(factory: object) -> PgvectorStore:
 
 
 def test_pgvector_vector_sql_limit_respects_k() -> None:
-    """_query_vector must pass max(1, k) as LIMIT, not min(k, 4)."""
+    """_query_vector must pass k*4 as LIMIT to give diversity-loop headroom."""
     execute_calls: list[tuple] = []
 
     def factory(dsn: str) -> MagicMock:
@@ -135,15 +135,15 @@ def test_pgvector_vector_sql_limit_respects_k() -> None:
     embedding = [0.1] * 1536
     store.query("token auth", k=8, retrieval_mode="vector", embedding=embedding, min_score=0.0)
 
-    # Find the SELECT ... LIMIT %s call and assert LIMIT param == 8
+    # LIMIT must be k*4 (32 for k=8) to give diversity loop enough candidates
     limit_params = [
         params[-1]
         for sql, params in execute_calls
         if "LIMIT" in sql.upper() and params
     ]
     assert limit_params, "no LIMIT-bearing execute call found"
-    assert any(p == 8 for p in limit_params), (
-        f"expected LIMIT=8 somewhere in execute calls, got limit_params={limit_params}"
+    assert any(p == 32 for p in limit_params), (
+        f"expected LIMIT=32 (k*4=8*4) in vector mode, got limit_params={limit_params}"
     )
 
 

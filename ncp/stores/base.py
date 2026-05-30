@@ -46,6 +46,7 @@ class BaseStore(ABC):
         zone: str = "working",
         retrieval_mode: str = "hybrid",
         embedding: list[float] | None = None,
+        diversity_limit: int = 2,
     ) -> list[SubconsciousChunk]:
         """Query stored chunks by text relevance.
 
@@ -57,6 +58,9 @@ class BaseStore(ABC):
         - ``"vector"``: cosine ANN search using stored embeddings.
           Requires ``embedding`` to be provided.  Only supported on
           the pgvector backend; raises ``ValueError`` on SQLite.
+
+        ``diversity_limit`` caps the number of results per author
+        (``written_by``).  Default 2 preserves existing behavior.
         """
 
     @abstractmethod

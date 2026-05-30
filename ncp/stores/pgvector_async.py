@@ -372,6 +372,7 @@ class AsyncPgvectorStore(BaseStore):
         zone: str = "working",
         retrieval_mode: str = "hybrid",
         embedding: list[float] | None = None,
+        diversity_limit: int = 2,
     ) -> list[SubconsciousChunk]:
         """Query chunks using native async DB I/O; score computation stays synchronous."""
         if retrieval_mode == "vector":
@@ -455,12 +456,12 @@ class AsyncPgvectorStore(BaseStore):
                 candidates.append(chunk)
 
         ranked = sorted(candidates, key=lambda c: c.relevance, reverse=True)
-        diversity_limit = 2
+        _diversity_cap = max(1, diversity_limit)
         author_count: dict[str, int] = {}
         results: list[SubconsciousChunk] = []
         for chunk in ranked:
             author = str(chunk.written_by)
-            if author_count.get(author, 0) >= diversity_limit:
+            if author_count.get(author, 0) >= _diversity_cap:
                 continue
             author_count[author] = author_count.get(author, 0) + 1
             results.append(chunk)
