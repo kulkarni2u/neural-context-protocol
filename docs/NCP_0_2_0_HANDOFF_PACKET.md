@@ -8,9 +8,9 @@ agent instead of replaying long chat history.
 
 Latest release:
 
-- PyPI: `neural-context-protocol==0.7.0` *(pending publish)*
+- PyPI: `neural-context-protocol==0.8.0` *(pending publish)*
 - GitHub: `main` branch
-- Suite: `431 passed, 8 skipped`
+- Suite: `446 passed, 8 skipped`
 - Live pgvector + Redis integration suite: `6 passed`
 
 ## What Shipped In 0.2.0
@@ -136,7 +136,29 @@ Latest release:
   `test_pgvector_pool.py` updated; new `tests/test_psycopg3_upgrade.py` (4 tests).
 - Suite: `431 passed, 8 skipped`
 
-## Active Line: 0.8.x (next)
+## What Shipped In 0.8.x
+
+- **Assembler k-forwarding**: `assemble(k=N)`, `assemble_incremental(k=N)`, `api.get_context(k=N)`,
+  `api.run(k=N)`, `api.stream(k=N)` forward k to `store.query`. Default (`k=None`) preserves
+  pressure logic (k=2 critical, k=4 otherwise). Negative k clamped to 1. `ncp_get_context` MCP tool
+  schema adds optional `k`. `.ncp/run.py fetch` k cap also removed. New:
+  `tests/test_assembler_k_forwarding.py` (6 tests).
+- **`AsyncPgvectorStore`** (`ncp/stores/pgvector_async.py`): new `BaseStore` subclass using
+  `psycopg_pool.AsyncConnectionPool`. Eliminates `anyio.to_thread.run_sync` on the hot async path
+  (`async_write`, `async_query`, `async_log_turn_record`, `async_log_conscious`, `async_log_cost`,
+  `async_resolve_recent_ref`). Lazy pool open on first `_aconnect()`. Sync methods raise
+  `NotImplementedError`. New: `tests/test_async_pgvector_store.py` (9 tests).
+- Suite: `446 passed, 8 skipped`
+
+## Active Line: 0.9.x (next)
+
+The `0.8.x` line is complete. Suggested next priorities:
+
+- `AsyncPgvectorStore` dedup/GC parity: `async_write` currently skips soft_gc, duplicate
+  detection, and hard_gc vs sync `write()` — add a lightweight async dedup path
+- `async_emit_whisper` / `async_drain_whispers` native async: currently still use thread shim
+  since Redis coordination is sync; migrate to an async Redis client (e.g. `redis.asyncio`)
+  for fully thread-free `post_turn_async`
 
 The `0.7.x` line is complete. Suggested next priorities:
 
@@ -174,12 +196,12 @@ The `0.7.x` line is complete. Suggested next priorities:
 
 ## Suggested Prompt For The Next Orchestrator
 
-> Read `docs/NCP_0_2_0_HANDOFF_PACKET.md` first. The `0.7.x` line is complete
-> (431 passed, 8 skipped, ruff clean). Starting `0.8.x`. Two suggested priorities:
-> (1) `AsyncPgvectorStore` — true async-native store using `psycopg.AsyncConnection`
-> and `psycopg_pool.AsyncConnectionPool`, eliminating the `anyio.to_thread.run_sync`
-> shim for high-concurrency paths; coexist with existing sync `PgvectorStore`;
-> (2) assembler `k` forwarding — expose a `k` parameter on `_retrieve_chunks` /
-> `get_context` so callers can request more than 4 subconscious chunks without
-> patching internals. Keep SQLite and pgvector aligned. Use NCP handoffs for
-> bounded coordination. Prefer correctness and tests over broad refactors.
+> Read `docs/NCP_0_2_0_HANDOFF_PACKET.md` first. The `0.8.x` line is complete
+> (446 passed, 8 skipped, ruff clean). Starting `0.9.x`. Two suggested priorities:
+> (1) `AsyncPgvectorStore` dedup/GC parity — `async_write` currently skips soft_gc,
+> duplicate detection, and hard_gc; add a lightweight async dedup path so
+> `AsyncPgvectorStore` matches `PgvectorStore` behaviorally;
+> (2) native async whispers — `async_emit_whisper`/`async_drain_whispers` still use
+> `anyio.to_thread.run_sync` because Redis coordination is sync; migrate to
+> `redis.asyncio` for a fully thread-free `post_turn_async` path.
+> Keep test coverage aligned with sync store. Use NCP handoffs for bounded coordination.

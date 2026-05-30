@@ -53,6 +53,8 @@ What is already proven in this repository:
 - IVF-FLAT ANN index (migration 004): `embedding vector_cosine_ops` indexed with `lists=100`; configurable `ivfflat_probes` (default 10) scoped per transaction for recall tuning without pool leakage
 - embedding provider integration: `PgvectorStore` auto-embeds chunks on write and query text at retrieval time via a configured adapter (`openai` → `text-embedding-3-small`; `local` → `sentence-transformers`); enabled via `[embedding]` config section or `NCP_EMBEDDING_ENABLED=true`
 - caller-controlled `k`: `store.query(k=N)` now returns up to N results for any N ≥ 1; the previous hardcoded max-4 cap is removed from all retrieval paths (hybrid, trust_recency, vector)
+- assembler k-forwarding: `assemble(k=N)` / `api.get_context(k=N)` thread k through to `store.query`; default preserves pressure-based logic (2/4)
+- `AsyncPgvectorStore` (`ncp/stores/pgvector_async.py`): async-native pgvector store using `psycopg_pool.AsyncConnectionPool`; eliminates thread-pool shim on write/log/query async paths
 - `log_cost` CLI command in `.ncp/run.py`: external callers (Sarathi, scripts) can post token usage directly into `ncp cost` without going through the full MCP surface
 - restart persistence is validated by the dogfood harness
 - bounded-context benchmarks are reproducible and show large prompt reduction

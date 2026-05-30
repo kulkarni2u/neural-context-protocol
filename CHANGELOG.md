@@ -2,6 +2,32 @@
 
 All notable changes to Neural Context Protocol will be documented in this file.
 
+## [0.8.x] - 2026-05-30
+
+Two slices completing the 0.8.x line. No breaking changes.
+
+### Added / Changed
+
+- **Caller-controlled `k` through assembler** (`assembler.py`, `api.py`, `mcp/server.py`):
+  `assemble(k=N)`, `assemble_incremental(k=N)`, `api.get_context(k=N)`, `api.run(k=N)`,
+  `api.stream(k=N)` now forward k to the store. Default (`k=None`) preserves existing
+  pressure-based logic (k=2 critical, k=4 otherwise). Negative k clamped to 1.
+  `ncp_get_context` MCP tool schema adds optional `k` integer property.
+  `.ncp/run.py fetch` k cap also removed (max(1,k) instead of min(k,4)).
+- **`AsyncPgvectorStore`** (`ncp/stores/pgvector_async.py`): new `BaseStore` subclass
+  using `psycopg_pool.AsyncConnectionPool`. Eliminates `anyio.to_thread.run_sync` on
+  the hot async path (`async_write`, `async_query`, `async_log_turn_record`,
+  `async_log_conscious`, `async_log_cost`, `async_resolve_recent_ref`). Pool opens
+  lazily on first `_aconnect()` call. Sync abstract methods raise `NotImplementedError`.
+  Whisper methods (`async_emit_whisper`, `async_drain_whispers`) retain thread shim
+  since they delegate to Redis coordination.
+
+### Verified
+
+- Full test suite: 446 passed, 8 skipped, ruff clean
+- New `tests/test_assembler_k_forwarding.py` (6 tests)
+- New `tests/test_async_pgvector_store.py` (9 tests)
+
 ## [0.7.x] - 2026-05-30
 
 Two post-0.7.0 slices completing the 0.7.x line. No breaking changes.

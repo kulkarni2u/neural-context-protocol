@@ -57,6 +57,7 @@ MCP_TOOLS: list[dict[str, object]] = [
                 "pipeline_id": {"type": "string", "description": "Pipeline identifier"},
                 "session_id": {"type": "string", "description": "Optional fetch-session token for this turn"},
                 "stream": {"type": "boolean", "description": "If true, returns sections progressively as NDJSON (HTTP) or JSON-RPC notifications (stdio). Default false."},
+                "k": {"type": "integer", "description": "Number of subconscious chunks to retrieve. Overrides the default budget-pressure-based value (2 for critical, 4 otherwise)."},
             },
             "required": ["agent_id", "role", "task", "slot", "intent"],
         },
@@ -176,11 +177,16 @@ def make_handlers(store: BaseStore) -> dict[str, ToolHandler]:
         )
         assembler = Assembler(store=store)
         stream = bool(args.get("stream", False))
+        try:
+            caller_k: int | None = max(1, int(args["k"])) if "k" in args else None  # type: ignore[arg-type]
+        except (ValueError, TypeError):
+            caller_k = None
         if stream:
             sections = list(assembler.assemble_incremental(
                 conscious=conscious,
                 budget=BudgetContext(),
                 query_text=conscious.task + " " + conscious.slot,
+                k=caller_k,
             ))
             assembled = assembler.apply_post_middleware("\n\n".join(t for _, t in sections))
             return StreamResponse(
@@ -191,6 +197,7 @@ def make_handlers(store: BaseStore) -> dict[str, ToolHandler]:
             conscious=conscious,
             budget=BudgetContext(),
             query_text=conscious.task + " " + conscious.slot,
+            k=caller_k,
         )
         return {"context": result.context, "session_id": session_id}
 

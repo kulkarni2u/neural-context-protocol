@@ -67,18 +67,23 @@ class Assembler:
         budget: BudgetContext,
         query_text: str | None = None,
         ctx_window: int | None = None,
+        k: int | None = None,
     ) -> tuple[ConsciousBlock, BudgetContext, list[SubconsciousChunk], list[Whisper]]:
         conscious, budget = self.middleware.pre_assemble(conscious, budget)
         coherence_report = self.coherence.check(conscious)
         coherence_alerts = coherence_report.alerts
         hydrated = conscious if ctx_window is None else conscious.model_copy(update={"ctx_window": ctx_window})
         recent_chunks = self._resolve_recent_refs(hydrated)
-        subconscious = self._retrieve_chunks(hydrated, query_text=query_text, budget=budget)
+        subconscious = self._retrieve_chunks(hydrated, query_text=query_text, budget=budget, k=k)
         subconscious = self._cold_start_bootstrap(hydrated, subconscious)
         combined_chunks = self._dedupe_chunks([*recent_chunks, *subconscious])
         drained_whispers = self._drain_whispers(hydrated)
         combined_whispers: list[Whisper] = [*coherence_alerts, *drained_whispers]
-        if budget.pressure == "critical":
+        if k is not None:
+            k = max(1, k)
+            combined_chunks = combined_chunks[:k]
+            combined_whispers = combined_whispers[:3]
+        elif budget.pressure == "critical":
             combined_chunks = combined_chunks[:2]
             combined_whispers = combined_whispers[:1]
         else:
@@ -93,12 +98,14 @@ class Assembler:
         budget: BudgetContext,
         query_text: str | None = None,
         ctx_window: int | None = None,
+        k: int | None = None,
     ) -> AssemblyResult:
         hydrated, budget, combined_chunks, combined_whispers = self._prepare_assembly(
             conscious=conscious,
             budget=budget,
             query_text=query_text,
             ctx_window=ctx_window,
+            k=k,
         )
         context = self.encoder.assemble(
             conscious=hydrated,
@@ -122,6 +129,7 @@ class Assembler:
         query_text: str | None = None,
         ctx_window: int | None = None,
         max_tokens: int | None = None,
+        k: int | None = None,
     ) -> Iterator[tuple[str, str]]:
         """Yield (label, section_text) in priority order, enforcing max_tokens.
 
@@ -139,6 +147,7 @@ class Assembler:
             budget=budget,
             query_text=query_text,
             ctx_window=ctx_window,
+            k=k,
         )
 
         tokens_used = 0
@@ -269,8 +278,10 @@ class Assembler:
         *,
         query_text: str | None,
         budget: BudgetContext | None = None,
+        k: int | None = None,
     ) -> list[SubconsciousChunk]:
-        k = 2 if (budget is not None and budget.pressure == "critical") else 4
+        if k is None:
+            k = 2 if (budget is not None and budget.pressure == "critical") else 4
         search_text = query_text or f"{conscious.task} {conscious.slot}"
         return self.store.query(
             search_text,
