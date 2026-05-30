@@ -18,13 +18,13 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _require_psycopg2() -> None:
-    if importlib.util.find_spec("psycopg2") is None:
-        pytest.skip("psycopg2 is not installed; install neural-context-protocol[pgvector] first")
+def _require_psycopg() -> None:
+    if importlib.util.find_spec("psycopg") is None:
+        pytest.skip("psycopg is not installed; install neural-context-protocol[pgvector] first")
 
 
 def _pgvector_store() -> PgvectorStore:
-    _require_psycopg2()
+    _require_psycopg()
     schema = f"ncp_it_{uuid4().hex[:8]}"
     return PgvectorStore(
         os.getenv("NCP_PGVECTOR_DSN", "postgresql://postgres:postgres@127.0.0.1:5432/ncp"),

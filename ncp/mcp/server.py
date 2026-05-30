@@ -247,7 +247,7 @@ def make_handlers(store: BaseStore) -> dict[str, ToolHandler]:
                 session.pipeline_id = str(pipeline_id)
             effective_pipeline_id = session.pipeline_id
         try:
-            k = min(int(args.get("k", 2)), 4)
+            k = max(1, int(args.get("k", 2)))
         except (ValueError, TypeError):
             k = 2
         chunks = store.query(text=query_str, k=k, layer=layer, pipeline_id=effective_pipeline_id)

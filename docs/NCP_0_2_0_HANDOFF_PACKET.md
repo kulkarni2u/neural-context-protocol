@@ -8,9 +8,9 @@ agent instead of replaying long chat history.
 
 Latest release:
 
-- PyPI: `neural-context-protocol==0.6.0` *(pending publish)*
+- PyPI: `neural-context-protocol==0.7.0` *(pending publish)*
 - GitHub: `main` branch
-- Suite: `388 passed, 8 skipped`
+- Suite: `431 passed, 8 skipped`
 - Live pgvector + Redis integration suite: `6 passed`
 
 ## What Shipped In 0.2.0
@@ -99,7 +99,7 @@ Latest release:
   `retrieval_mode="vector"` queries via `<=>` cosine operator; SQLite raises
   `ValueError` for vector mode; all three stores gain `embedding` param on
   `query()`.
-- Suite: `388 passed, 8 skipped`
+- Suite: `393 passed, 8 skipped`
 
 ## What Shipped In 0.6.0
 
@@ -124,17 +124,35 @@ Latest release:
 - **Embedding provider integration**: `ncp/adapters/embedding.py` — `BaseEmbeddingAdapter`, `OpenAIEmbeddingAdapter` (`text-embedding-3-small`), `LocalEmbeddingAdapter` (`sentence-transformers`). `PgvectorStore` auto-embeds on `write()` and `_query_vector()` when `embedding_adapter` is configured. `[embedding]` config section + env overrides. Factory wires adapter from config.
 - Suite: `421 passed, 8 skipped`
 
-## Active Line: 0.7.x (next)
+## What Shipped In 0.7.x
 
-The `0.6.x` line is complete. Suggested next priorities:
+- **Caller-controlled `k`** (`PgvectorStore`, `SQLiteStore`, MCP server): removed `min(k, 4)` from all
+  retrieval paths. `store.query(k=N)` now returns up to N results for any N. `mcp/server.py` cap
+  also removed. Diversity-per-author (`diversity_limit=2`) and reranker recall buffer (`k × 4`) preserved.
+  New: `tests/test_query_k_semantics.py` (6 tests).
+- **psycopg3 driver upgrade** (`PgvectorStore`): `psycopg2-binary` → `psycopg[binary]` +
+  `psycopg-pool`. Pool: `ThreadedConnectionPool(min,max,dsn)` → `ConnectionPool(conninfo=dsn,
+  min_size=min, max_size=max, open=True)`. `close()`: `closeall()` → `close()`. Async shim unchanged.
+  `test_pgvector_pool.py` updated; new `tests/test_psycopg3_upgrade.py` (4 tests).
+- Suite: `431 passed, 8 skipped`
 
-- Query result count semantics: relax the max-4 cap on hybrid/trust-recency paths; let callers control `k` fully
-- Async-native pgvector path: replace `anyio.to_thread.run_sync` shim with a native async connection
+## Active Line: 0.8.x (next)
+
+The `0.7.x` line is complete. Suggested next priorities:
+
+- True async-native pgvector path: add `AsyncPgvectorStore` using `psycopg.AsyncConnection` and
+  `psycopg_pool.AsyncConnectionPool` — eliminates `anyio.to_thread.run_sync` overhead for
+  high-concurrency workloads (~400-600 lines of new code alongside existing sync store)
+- Assembler k-forwarding: expose `k` as an assembler parameter so callers can request more than 4
+  chunks without patching internals (currently `_retrieve_chunks` hardcodes `k=4`)
 
 ## Known Architectural Gaps (carried forward)
 
-- query result count semantics still opinionated inside store methods (max 4
-  returned by hybrid/trust_recency paths; vector path honours `k` up to 4)
+- Assembler `_retrieve_chunks` hardcodes `k=2` (critical pressure) or `k=4` (normal) — callers
+  cannot request more chunks without subclassing
+- `diversity_limit=2` per-author is still a hardcoded policy value; can silently reduce results
+  below requested `k` when few authors are present
+- Vector mode has no diversity loop — all k results can come from one author
 
 ## Recommended Agent Roles
 
@@ -156,11 +174,12 @@ The `0.6.x` line is complete. Suggested next priorities:
 
 ## Suggested Prompt For The Next Orchestrator
 
-> Read `docs/NCP_0_2_0_HANDOFF_PACKET.md` first. The `0.6.x` line is complete
-> (421 passed, 8 skipped, ruff clean). Starting `0.7.x`. Two suggested
-> priorities: (1) relax the max-4 query result cap on hybrid and trust-recency
-> retrieval paths — callers should control `k` fully; (2) async-native pgvector
-> path — replace the `anyio.to_thread.run_sync` shim in `async_write` /
-> `async_query` with a real async connection (e.g. `psycopg` v3 async).
-> Keep SQLite and pgvector aligned. Use NCP handoffs for bounded coordination.
-> Prefer correctness and tests over broad refactors.
+> Read `docs/NCP_0_2_0_HANDOFF_PACKET.md` first. The `0.7.x` line is complete
+> (431 passed, 8 skipped, ruff clean). Starting `0.8.x`. Two suggested priorities:
+> (1) `AsyncPgvectorStore` — true async-native store using `psycopg.AsyncConnection`
+> and `psycopg_pool.AsyncConnectionPool`, eliminating the `anyio.to_thread.run_sync`
+> shim for high-concurrency paths; coexist with existing sync `PgvectorStore`;
+> (2) assembler `k` forwarding — expose a `k` parameter on `_retrieve_chunks` /
+> `get_context` so callers can request more than 4 subconscious chunks without
+> patching internals. Keep SQLite and pgvector aligned. Use NCP handoffs for
+> bounded coordination. Prefer correctness and tests over broad refactors.

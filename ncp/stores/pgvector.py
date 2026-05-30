@@ -128,12 +128,12 @@ CREATE INDEX IF NOT EXISTS {prefix}idx_cost_pipeline
 
 def _default_pgvector_connect(dsn: str) -> Any:
     try:
-        import psycopg2
+        import psycopg
     except ModuleNotFoundError as exc:  # pragma: no cover - depends on optional extra
         raise NCPStoreUnavailableError(
-            "pgvector support requires psycopg2. Install it with: pip install 'neural-context-protocol[pgvector]'"
+            "pgvector support requires psycopg. Install it with: pip install 'neural-context-protocol[pgvector]'"
         ) from exc
-    return psycopg2.connect(dsn)
+    return psycopg.connect(dsn)
 
 
 def _validate_identifier(value: str, *, field: str) -> str:
@@ -176,12 +176,15 @@ class PgvectorStore(BaseStore):
             self._pool: Any = None
         else:
             try:
-                from psycopg2 import pool as _pg_pool  # type: ignore[import]
-                self._pool = _pg_pool.ThreadedConnectionPool(
-                    min_pool_connections, max_pool_connections, dsn
+                from psycopg_pool import ConnectionPool as _ConnectionPool  # type: ignore[import]
+                self._pool = _ConnectionPool(
+                    conninfo=dsn,
+                    min_size=min_pool_connections,
+                    max_size=max_pool_connections,
+                    open=True,
                 )
                 self._connect_factory = lambda _dsn: self._pool.getconn()
-            except ImportError:  # pragma: no cover - psycopg2 not installed
+            except ImportError:  # pragma: no cover - psycopg_pool not installed
                 self._pool = None
                 self._connect_factory = _default_pgvector_connect
         self.coordination = coordination or (
@@ -243,7 +246,7 @@ class PgvectorStore(BaseStore):
         """Close all pooled connections. Call when the store is no longer needed."""
         if self._pool is not None:
             try:
-                self._pool.closeall()
+                self._pool.close()
             except Exception:
                 pass
             self._pool = None
@@ -468,7 +471,7 @@ class PgvectorStore(BaseStore):
                 continue
             author_count[author] = author_count.get(author, 0) + 1
             results.append(chunk)
-            if len(results) >= max(1, min(k, 4)):
+            if len(results) >= max(1, k):
                 break
 
         if results:
@@ -529,7 +532,7 @@ class PgvectorStore(BaseStore):
             where_clauses.append("scope = %s")
             where_params.append(scope)
 
-        limit = max(1, min(k, 4))
+        limit = max(1, k)
         if self.reranker is not None and self.reranker.enabled:
             limit = limit * 4
         # Params order: embedding (SELECT), WHERE params, embedding (ORDER BY), LIMIT
@@ -563,7 +566,7 @@ class PgvectorStore(BaseStore):
             results.append(chunk)
 
         if self.reranker is not None and self.reranker.enabled:
-            results = self.reranker.rerank(text, results)[:max(1, min(k, 4))]
+            results = self.reranker.rerank(text, results)[:max(1, k)]
 
         if results:
             now = time.time()

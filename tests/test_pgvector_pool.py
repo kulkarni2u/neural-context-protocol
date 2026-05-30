@@ -1,4 +1,4 @@
-"""Tests for PgvectorStore connection pooling (0.5.x Slice 1)."""
+"""Tests for PgvectorStore connection pooling (updated for psycopg3 in 0.7.x)."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-pytest.importorskip("psycopg2")
+pytest.importorskip("psycopg_pool", reason="pgvector extra not installed")
 
 from ncp.stores.pgvector import PgvectorStore
 
@@ -21,19 +21,24 @@ def _make_mock_conn() -> MagicMock:
 
 
 def test_pool_created_when_no_factory_provided() -> None:
-    """When connect_factory is None, a ThreadedConnectionPool is wired up."""
+    """When connect_factory is None, a psycopg_pool.ConnectionPool is wired up."""
     mock_conn = _make_mock_conn()
     mock_pool = MagicMock()
     mock_pool.getconn.return_value = mock_conn
 
-    with patch("psycopg2.pool.ThreadedConnectionPool", return_value=mock_pool) as pool_cls:
+    with patch("psycopg_pool.ConnectionPool", return_value=mock_pool) as pool_cls:
         store = PgvectorStore(
             "postgresql://localhost/ncp_test",
             connect_factory=None,
             min_pool_connections=1,
             max_pool_connections=5,
         )
-        pool_cls.assert_called_once_with(1, 5, "postgresql://localhost/ncp_test")
+        pool_cls.assert_called_once_with(
+            conninfo="postgresql://localhost/ncp_test",
+            min_size=1,
+            max_size=5,
+            open=True,
+        )
         assert store._pool is mock_pool
 
 
@@ -54,7 +59,7 @@ def test_connection_returned_to_pool_on_success() -> None:
     mock_pool = MagicMock()
     mock_pool.getconn.return_value = mock_conn
 
-    with patch("psycopg2.pool.ThreadedConnectionPool", return_value=mock_pool):
+    with patch("psycopg_pool.ConnectionPool", return_value=mock_pool):
         store = PgvectorStore("postgresql://localhost/ncp_test", connect_factory=None)
 
     mock_pool.reset_mock()
@@ -75,7 +80,7 @@ def test_connection_returned_to_pool_after_exception() -> None:
     mock_pool = MagicMock()
     mock_pool.getconn.return_value = mock_conn
 
-    with patch("psycopg2.pool.ThreadedConnectionPool", return_value=mock_pool):
+    with patch("psycopg_pool.ConnectionPool", return_value=mock_pool):
         store = PgvectorStore("postgresql://localhost/ncp_test", connect_factory=None)
 
     mock_pool.reset_mock()
@@ -89,16 +94,16 @@ def test_connection_returned_to_pool_after_exception() -> None:
 
 
 def test_close_drains_pool() -> None:
-    """close() calls closeall() on the underlying pool."""
+    """close() calls pool.close() on the underlying psycopg3 pool."""
     mock_conn = _make_mock_conn()
     mock_pool = MagicMock()
     mock_pool.getconn.return_value = mock_conn
 
-    with patch("psycopg2.pool.ThreadedConnectionPool", return_value=mock_pool):
+    with patch("psycopg_pool.ConnectionPool", return_value=mock_pool):
         store = PgvectorStore("postgresql://localhost/ncp_test", connect_factory=None)
 
     store.close()
-    mock_pool.closeall.assert_called_once()
+    mock_pool.close.assert_called_once()
     assert store._pool is None
 
 
@@ -108,7 +113,7 @@ def test_close_is_idempotent() -> None:
     mock_pool = MagicMock()
     mock_pool.getconn.return_value = mock_conn
 
-    with patch("psycopg2.pool.ThreadedConnectionPool", return_value=mock_pool):
+    with patch("psycopg_pool.ConnectionPool", return_value=mock_pool):
         store = PgvectorStore("postgresql://localhost/ncp_test", connect_factory=None)
 
     store.close()
@@ -121,6 +126,11 @@ def test_pool_uses_min_max_pool_defaults() -> None:
     mock_pool = MagicMock()
     mock_pool.getconn.return_value = mock_conn
 
-    with patch("psycopg2.pool.ThreadedConnectionPool", return_value=mock_pool) as pool_cls:
+    with patch("psycopg_pool.ConnectionPool", return_value=mock_pool) as pool_cls:
         PgvectorStore("postgresql://localhost/ncp_test")
-        pool_cls.assert_called_once_with(2, 10, "postgresql://localhost/ncp_test")
+        pool_cls.assert_called_once_with(
+            conninfo="postgresql://localhost/ncp_test",
+            min_size=2,
+            max_size=10,
+            open=True,
+        )

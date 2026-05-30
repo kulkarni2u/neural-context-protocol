@@ -333,7 +333,7 @@ class SQLiteStore(BaseStore):
                 continue
             author_count[author] = author_count.get(author, 0) + 1
             results.append(chunk)
-            if len(results) >= max(1, min(k, 4)):
+            if len(results) >= max(1, k):
                 break
 
         if results:

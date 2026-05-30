@@ -49,7 +49,7 @@ providers = [
 tokens = ["tiktoken>=0.7"]
 http = ["aiohttp"]
 redis = ["redis"]
-pgvector = ["psycopg2-binary", "pgvector"]
+pgvector = ["psycopg[binary]", "psycopg-pool", "pgvector"]
 all = [
   "anthropic",
   "openai",

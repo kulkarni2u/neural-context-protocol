@@ -2,6 +2,34 @@
 
 All notable changes to Neural Context Protocol will be documented in this file.
 
+## [0.7.x] - 2026-05-30
+
+Two post-0.7.0 slices completing the 0.7.x line. No breaking changes.
+
+### Added / Changed
+
+- **Caller-controlled `k`** (`PgvectorStore`, `SQLiteStore`, MCP server): removed the
+  hardcoded `min(k, 4)` cap from all retrieval paths. `store.query(k=N)` now returns up to
+  N results for any N ≥ 1. Diversity-per-author cap (`diversity_limit=2`) and the
+  reranker recall buffer (`k × 4`) are preserved. `mcp/server.py` updated to pass the
+  caller's `k` through instead of capping at 4.
+- **psycopg3 driver upgrade** (`PgvectorStore`): replaced EOL `psycopg2-binary` with
+  `psycopg[binary]` and `psycopg-pool`. Pool construction switches from
+  `ThreadedConnectionPool(min, max, dsn)` to `ConnectionPool(conninfo=dsn, min_size=min,
+  max_size=max, open=True)`. `close()` calls `pool.close()` (psycopg3 API) instead of
+  `closeall()`. Synchronous behaviour and the `anyio.to_thread.run_sync` async shim are
+  unchanged.
+
+### Dependency changes
+
+- `[pgvector]` extra: `psycopg2-binary` removed; `psycopg[binary]` + `psycopg-pool` added.
+
+### Verified
+
+- Full test suite: 431 passed, 8 skipped, ruff clean
+- All existing pool tests updated to patch `psycopg_pool.ConnectionPool`
+- New `tests/test_query_k_semantics.py` (6 tests) and `tests/test_psycopg3_upgrade.py` (4 tests)
+
 ## [0.6.x] - 2026-05-28
 
 Three post-0.6.0 slices completing the 0.6.x line. No breaking changes.

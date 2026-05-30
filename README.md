@@ -46,12 +46,13 @@ What is already proven in this repository:
 - `retrieval_mode="vector"` uses pgvector `<=>` cosine ANN search on stored embeddings (pgvector only)
 - optional embedding storage: `SubconsciousChunk.embedding` (1536 dims) persisted via migration 003
 - retrieval feedback calibration: `query()` tracks `retrieval_count`; `calibrate(feedback_mode=True)` auto-boosts frequently-retrieved chunks
-- pgvector connection pooling: `ThreadedConnectionPool` used by default; `close()` drains the pool
+- pgvector connection pooling: `psycopg_pool.ConnectionPool` (psycopg3) used by default; `close()` drains the pool
 - pgvector schema migrations with advisory lock, checksums, and UP/DOWN rollback via `ncp migrate`
 - opt-in streaming: `ncp_get_context` with `"stream": true` delivers context sections progressively as NDJSON (HTTP) or JSON-RPC notifications (stdio), eliminating timeout risk on large assemblies
 - incremental assembly (`assemble_incremental()`) enforces the declared `max_tokens_per_call` budget and yields sections in priority order
 - IVF-FLAT ANN index (migration 004): `embedding vector_cosine_ops` indexed with `lists=100`; configurable `ivfflat_probes` (default 10) scoped per transaction for recall tuning without pool leakage
 - embedding provider integration: `PgvectorStore` auto-embeds chunks on write and query text at retrieval time via a configured adapter (`openai` → `text-embedding-3-small`; `local` → `sentence-transformers`); enabled via `[embedding]` config section or `NCP_EMBEDDING_ENABLED=true`
+- caller-controlled `k`: `store.query(k=N)` now returns up to N results for any N ≥ 1; the previous hardcoded max-4 cap is removed from all retrieval paths (hybrid, trust_recency, vector)
 - `log_cost` CLI command in `.ncp/run.py`: external callers (Sarathi, scripts) can post token usage directly into `ncp cost` without going through the full MCP surface
 - restart persistence is validated by the dogfood harness
 - bounded-context benchmarks are reproducible and show large prompt reduction
