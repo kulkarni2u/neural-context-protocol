@@ -31,8 +31,7 @@ from ncp.stores.pgvector import (
 from ncp.stores.redis_coordination import AsyncRedisCoordination
 from ncp.stores.retrieval import (
     apply_diversity_limit,
-    lexical_signal_for_candidate,
-    normalize_query_terms,
+    build_lexical_candidates,
     normalize_result_limit,
 )
 from ncp.stores.consolidation import cluster_by_tags, find_merge_candidates
@@ -582,30 +581,21 @@ class AsyncPgvectorStore(BaseStore):
                 chunk.relevance = max(0.0, min(1.0, score))
                 candidates.append(chunk)
         else:
-            from rank_bm25 import BM25Okapi  # type: ignore[import]
+            lexical_candidates = build_lexical_candidates(
+                text,
+                [str(row["content"]) for row in rows],
+            )
 
-            query_terms = normalize_query_terms(text)
-            corpus = [row["content"].lower().split() for row in rows]
-            bm25 = BM25Okapi(corpus)
-            raw_scores = bm25.get_scores(text.split())
-            max_bm25 = max(raw_scores) if len(raw_scores) > 0 else 0.0
-            norm = [s / max_bm25 for s in raw_scores] if max_bm25 > 0 else [0.0] * len(raw_scores)
-
-            for score, row, tokens in zip(norm, rows, corpus, strict=True):
+            for row, lexical_candidate in zip(rows, lexical_candidates, strict=True):
                 age_s = max(0.0, now - float(row["created_at"]))
-                bm25_for_policy = lexical_signal_for_candidate(
-                    query_terms=query_terms,
-                    doc_tokens=tokens,
-                    bm25_normalized=score,
-                )
-                if bm25_for_policy is None:
+                if lexical_candidate.lexical_signal is None:
                     continue
                 vector_score = self._vector_similarity_score(
                     query_embedding=embedding,
                     row_embedding=row.get("embedding"),
                 )
                 h = policy.score_with_vector(
-                    bm25_normalized=bm25_for_policy,
+                    bm25_normalized=lexical_candidate.lexical_signal,
                     vector_normalized=vector_score,
                     age_seconds=age_s,
                     base_trust=float(row["base_trust"]),

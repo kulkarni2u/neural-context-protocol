@@ -11,7 +11,9 @@ from ncp.stores.retrieval import (
     DEFAULT_RETRIEVAL_POLICY,
     RetrievalPolicy,
     apply_diversity_limit,
+    build_lexical_candidates,
     lexical_signal_for_candidate,
+    normalize_bm25_scores,
     normalize_query_terms,
     normalize_result_limit,
 )
@@ -181,6 +183,62 @@ def test_apply_diversity_limit_caps_results_per_author() -> None:
         author_getter=lambda item: item.written_by,
     )
     assert [item.chunk_id for item in results] == ["sub_1", "sub_3"]
+
+
+def test_build_lexical_candidates_preserves_input_order() -> None:
+    docs = [
+        "token auth bearer failure",
+        "schema migration notes",
+        "token refresh bearer expiry",
+    ]
+    candidates = build_lexical_candidates("token bearer", docs)
+    assert [candidate.doc_tokens for candidate in candidates] == [
+        ["token", "auth", "bearer", "failure"],
+        ["schema", "migration", "notes"],
+        ["token", "refresh", "bearer", "expiry"],
+    ]
+
+
+def test_build_lexical_candidates_filters_zero_overlap_via_none_signal() -> None:
+    docs = [
+        "token auth bearer failure",
+        "schema migration notes",
+    ]
+    candidates = build_lexical_candidates("token bearer", docs)
+    assert candidates[0].lexical_signal is not None
+    assert candidates[1].lexical_signal is None
+
+
+def test_build_lexical_candidates_blank_query_uses_full_budget_for_all_rows() -> None:
+    candidates = build_lexical_candidates("   ", ["alpha beta", "gamma delta"])
+    assert [candidate.lexical_signal for candidate in candidates] == [pytest.approx(1.0), pytest.approx(1.0)]
+
+
+def test_build_lexical_candidates_normalizes_top_match_to_one() -> None:
+    candidates = build_lexical_candidates(
+        "token bearer failure",
+        [
+            "token bearer failure extra",
+            "token bearer",
+            "schema migration notes",
+        ],
+    )
+    assert candidates[0].lexical_signal == pytest.approx(1.0)
+    assert candidates[1].lexical_signal is not None
+    assert candidates[1].lexical_signal < candidates[0].lexical_signal
+
+
+def test_normalize_bm25_scores_handles_empty_input() -> None:
+    assert normalize_bm25_scores([]) == []
+
+
+def test_normalize_bm25_scores_handles_all_zero_scores() -> None:
+    assert normalize_bm25_scores([0.0, 0.0]) == [0.0, 0.0]
+
+
+def test_normalize_bm25_scores_normalizes_against_max_score() -> None:
+    normalized = normalize_bm25_scores([0.5, 1.0, 0.25])
+    assert normalized == pytest.approx([0.5, 1.0, 0.25])
 
 
 # ---------------------------------------------------------------------------

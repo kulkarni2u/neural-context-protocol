@@ -4,7 +4,7 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [0.16.x] - 2026-05-31
 
-First two `0.16.x` retrieval slices. No breaking changes.
+First three `0.16.x` retrieval slices. No breaking changes.
 
 ### Added / Changed
 
@@ -39,7 +39,17 @@ First two `0.16.x` retrieval slices. No breaking changes.
   separate copies of the same contract.
 - **Regression coverage**: added retrieval-policy unit coverage for the new
   shared contract helpers in `tests/test_retrieval_policy.py`.
-- **Verification**: suite now passes at `556 passed, 8 skipped`.
+- **Shared lexical candidate generation** (`ncp/stores/retrieval.py`): added
+  `build_lexical_candidates()` plus `normalize_bm25_scores()` so BM25
+  normalization, blank-query fallback, and zero-overlap candidate eligibility
+  are built once and reused by all hybrid lexical backends.
+- **Hybrid lexical path alignment** (`ncp/stores/sqlite.py`, `pgvector.py`,
+  `pgvector_async.py`): SQLite, sync pgvector, and async pgvector now consume
+  the shared lexical candidate helper instead of each rebuilding BM25 scoring
+  and eligibility independently.
+- **Regression coverage**: added lexical-helper unit coverage in
+  `tests/test_retrieval_policy.py`.
+- **Verification**: suite now passes at `563 passed, 8 skipped`.
 
 ## [0.15.x] - 2026-05-31
 

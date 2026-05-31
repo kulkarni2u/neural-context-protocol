@@ -11,8 +11,6 @@ from pathlib import Path
 from typing import Any
 import time
 
-from rank_bm25 import BM25Okapi
-
 from ncp.config import NCPConfig
 from ncp.stores.base import BaseStore, NCPStoreUnavailableError
 from ncp.stores.consolidation import cluster_by_tags, find_merge_candidates
@@ -21,8 +19,7 @@ from ncp.stores.retrieval import (
     DEFAULT_RETRIEVAL_POLICY,
     RetrievalPolicy,
     apply_diversity_limit,
-    lexical_signal_for_candidate,
-    normalize_query_terms,
+    build_lexical_candidates,
     normalize_result_limit,
 )
 from ncp.types import CalibrationReport, ConsolidationReport, ConsciousBlock, NCPResponse, SubconsciousChunk, TurnRecord, Whisper
@@ -441,21 +438,13 @@ class PgvectorStore(BaseStore):
                 chunk.relevance = max(0.0, min(1.0, score))
                 candidates.append(chunk)
         else:
-            query_terms = normalize_query_terms(text)
-            corpus = [str(row["content"]).lower().split() for row in rows]
-            bm25 = BM25Okapi(corpus)
-            raw_scores = bm25.get_scores(text.split())
+            lexical_candidates = build_lexical_candidates(
+                text,
+                [str(row["content"]) for row in rows],
+            )
 
-            max_bm25 = max(raw_scores) if len(raw_scores) > 0 else 0.0
-            norm_scores = [s / max_bm25 for s in raw_scores] if max_bm25 > 0 else [0.0] * len(raw_scores)
-
-            for norm_score, row, doc_tokens in zip(norm_scores, rows, corpus, strict=True):
-                bm25_for_policy = lexical_signal_for_candidate(
-                    query_terms=query_terms,
-                    doc_tokens=doc_tokens,
-                    bm25_normalized=norm_score,
-                )
-                if bm25_for_policy is None:
+            for row, lexical_candidate in zip(rows, lexical_candidates, strict=True):
+                if lexical_candidate.lexical_signal is None:
                     continue
 
                 age_seconds = max(0.0, now - float(row["created_at"]))
@@ -464,7 +453,7 @@ class PgvectorStore(BaseStore):
                     row_embedding=row.get("embedding"),
                 )
                 hybrid_score = policy.score_with_vector(
-                    bm25_normalized=bm25_for_policy,
+                    bm25_normalized=lexical_candidate.lexical_signal,
                     vector_normalized=vector_score,
                     age_seconds=age_seconds,
                     base_trust=float(row["base_trust"]),

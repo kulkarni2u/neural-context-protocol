@@ -17,6 +17,8 @@ import math
 from dataclasses import dataclass
 from typing import Callable, TypeVar
 
+from rank_bm25 import BM25Okapi
+
 
 T = TypeVar("T")
 
@@ -131,6 +133,14 @@ class RetrievalPolicy:
 DEFAULT_RETRIEVAL_POLICY = RetrievalPolicy()
 
 
+@dataclass(frozen=True)
+class LexicalCandidate:
+    """Shared lexical retrieval inputs for a single candidate row."""
+
+    doc_tokens: list[str]
+    lexical_signal: float | None
+
+
 def normalize_query_terms(text: str) -> set[str]:
     """Normalize user query text into a lowercased term set."""
     return {term for term in text.lower().split() if term}
@@ -153,6 +163,38 @@ def lexical_signal_for_candidate(
     if not query_terms.intersection(set(doc_tokens)):
         return None
     return max(0.0, min(1.0, bm25_normalized))
+
+
+def normalize_bm25_scores(raw_scores: list[float]) -> list[float]:
+    """Normalize BM25 scores into [0, 1] using the max-score guard."""
+    if not raw_scores:
+        return []
+    max_bm25 = max(raw_scores)
+    if max_bm25 <= 0.0:
+        return [0.0] * len(raw_scores)
+    return [score / max_bm25 for score in raw_scores]
+
+
+def build_lexical_candidates(text: str, documents: list[str]) -> list[LexicalCandidate]:
+    """Build normalized lexical candidate signals in the input row order."""
+    query_terms = normalize_query_terms(text)
+    corpus = [document.lower().split() for document in documents]
+    if not corpus:
+        return []
+    bm25 = BM25Okapi(corpus)
+    raw_scores = bm25.get_scores(text.split())
+    normalized_scores = normalize_bm25_scores(list(raw_scores))
+    return [
+        LexicalCandidate(
+            doc_tokens=doc_tokens,
+            lexical_signal=lexical_signal_for_candidate(
+                query_terms=query_terms,
+                doc_tokens=doc_tokens,
+                bm25_normalized=normalized,
+            ),
+        )
+        for normalized, doc_tokens in zip(normalized_scores, corpus, strict=True)
+    ]
 
 
 def normalize_result_limit(k: int) -> int:
