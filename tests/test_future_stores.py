@@ -14,6 +14,13 @@ from ncp.stores.sqlite import SQLiteStore
 from ncp.types import AlertPayload, ConsciousBlock, HandoffPayload, NCPResponse, SubconsciousChunk, TurnRecord, Whisper
 
 
+def _vec(*values: float) -> list[float]:
+    padded = [0.0] * 1536
+    for index, value in enumerate(values[:1536]):
+        padded[index] = float(value)
+    return padded
+
+
 @dataclass
 class _MemoryPgDB:
     chunks: dict[str, dict[str, object]] = field(default_factory=dict)
@@ -205,6 +212,7 @@ class _FakeCursor:
             "expiry": params[23],
             "owner": params[24],
             "meta": params[25],
+            "embedding": params[26],
         }
 
     def _select_chunks(
@@ -764,6 +772,51 @@ def test_pgvector_store_status_detail_and_cost_summary_with_coordination() -> No
     assert costs["by_agent"][0]["agent_id"] == "planner"
     assert costs["by_model"][0]["model"] == "claude-sonnet"
     assert costs["recent_entries"][0]["turn_id"] == "turn_cost_alpha"
+
+
+def test_pgvector_hybrid_query_uses_vector_signal_to_break_lexical_tie() -> None:
+    db = _MemoryPgDB()
+    store = PgvectorStore(
+        "postgresql://postgres:postgres@127.0.0.1:5432/ncp",
+        connect_factory=_pg_connect_factory(db),
+    )
+    store.write(
+        SubconsciousChunk(
+            chunk_id="sub_far",
+            layer="semantic",
+            content="token auth bearer failure",
+            src="tool_result",
+            pipeline_id="pipe_alpha",
+            written_by="agent_a",
+            base_trust=0.7,
+            embedding=_vec(0.0, 1.0, 0.0),
+        )
+    )
+    store.write(
+        SubconsciousChunk(
+            chunk_id="sub_near",
+            layer="procedural",
+            content="token auth bearer failure",
+            src="tool_result",
+            pipeline_id="pipe_alpha",
+            written_by="agent_b",
+            base_trust=0.7,
+            embedding=_vec(1.0, 0.0, 0.0),
+        )
+    )
+    db.chunks["sub_far"]["created_at"] = 100.0
+    db.chunks["sub_near"]["created_at"] = 100.0
+
+    results = store.query(
+        "token auth bearer failure",
+        pipeline_id="pipe_alpha",
+        k=4,
+        retrieval_mode="hybrid",
+        embedding=_vec(1.0, 0.0, 0.0),
+    )
+
+    assert len(results) >= 2
+    assert results[0].chunk_id == "sub_near"
 
 
 def test_pgvector_store_rejects_invalid_identifiers() -> None:

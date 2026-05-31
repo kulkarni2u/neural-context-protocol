@@ -6,6 +6,7 @@ from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from difflib import SequenceMatcher
 import json
+import math
 from pathlib import Path
 from typing import Any
 import time
@@ -399,6 +400,10 @@ class PgvectorStore(BaseStore):
                 layer=layer, pipeline_id=pipeline_id, scope=scope, zone=zone,
                 diversity_limit=diversity_limit,
             )
+        if embedding is None and self._embedding_adapter is not None:
+            embedding = self._embedding_adapter.embed(text)
+        if embedding is not None and len(embedding) != 1536:
+            raise ValueError(f"embedding must have 1536 dimensions, got {len(embedding)}")
 
         with self._connect() as connection:
             rows = self._load_query_rows(
@@ -446,8 +451,13 @@ class PgvectorStore(BaseStore):
                     bm25_for_policy = 1.0
 
                 age_seconds = max(0.0, now - float(row["created_at"]))
-                hybrid_score = policy.score(
+                vector_score = self._vector_similarity_score(
+                    query_embedding=embedding,
+                    row_embedding=row.get("embedding"),
+                )
+                hybrid_score = policy.score_with_vector(
                     bm25_normalized=bm25_for_policy,
+                    vector_normalized=vector_score,
                     age_seconds=age_seconds,
                     base_trust=float(row["base_trust"]),
                     generation=int(row["generation"]),
@@ -1659,6 +1669,44 @@ class PgvectorStore(BaseStore):
         if isinstance(value, str):
             return [str(item) for item in json.loads(value)]
         raise TypeError(f"Unsupported JSON list payload: {type(value)!r}")
+
+    def _decode_embedding(self, value: Any) -> list[float] | None:
+        if value in (None, ""):
+            return None
+        if isinstance(value, list):
+            return [float(item) for item in value]
+        if isinstance(value, tuple):
+            return [float(item) for item in value]
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            if text.startswith("[") and text.endswith("]"):
+                body = text[1:-1].strip()
+                if not body:
+                    return []
+                return [float(item.strip()) for item in body.split(",")]
+        return None
+
+    def _vector_similarity_score(
+        self,
+        *,
+        query_embedding: list[float] | None,
+        row_embedding: Any,
+    ) -> float | None:
+        if query_embedding is None:
+            return None
+        candidate = self._decode_embedding(row_embedding)
+        if not candidate or len(candidate) != len(query_embedding):
+            return None
+        dot = sum(left * right for left, right in zip(query_embedding, candidate, strict=True))
+        query_norm = math.sqrt(sum(value * value for value in query_embedding))
+        candidate_norm = math.sqrt(sum(value * value for value in candidate))
+        if query_norm == 0.0 or candidate_norm == 0.0:
+            return None
+        cosine = dot / (query_norm * candidate_norm)
+        cosine = max(-1.0, min(1.0, cosine))
+        return (cosine + 1.0) / 2.0
 
     def _with_runtime_age(self, chunk: SubconsciousChunk) -> SubconsciousChunk:
         return chunk.model_copy(update={"age_seconds": max(0.0, chunk.age_seconds)})

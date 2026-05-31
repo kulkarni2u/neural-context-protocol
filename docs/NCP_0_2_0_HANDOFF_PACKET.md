@@ -201,11 +201,15 @@ Current local repo state:
 
 ## Active Line: 0.16.x (next)
 
-The `0.15.x` line is complete. Suggested next priorities:
+The `0.15.x` line is complete, and the first `0.16.x` retrieval slice is now
+in: shared vector-aware retrieval scoring plus sync/async pgvector hybrid
+tie-break parity (`551 passed, 8 skipped`, ruff clean). Suggested next
+priorities:
 
-- **Hybrid retrieval beyond BM25-first**: move from today’s lexical-first fusion
-  toward a clearer multi-signal retrieval contract that works cleanly across
-  SQLite, pgvector sync, and pgvector async
+- **Hybrid retrieval contract cleanup**: move from the first vector-aware tie-
+  break slice toward one explicit multi-signal contract for candidate
+  generation, result caps, diversity limits, and blank-query fallback that
+  works cleanly across SQLite, pgvector sync, and pgvector async
 - **Assembler/store retrieval contract cleanup**: make result caps, diversity
   limits, and blank-query fallback behavior explicit in one place
 - **Async reporting consumption**: thread the new async status/cost/viz parity
@@ -213,9 +217,10 @@ The `0.15.x` line is complete. Suggested next priorities:
 
 ## Known Architectural Gaps (carried forward)
 
-- Retrieval is still BM25-first rather than a richer hybrid/vector-aware policy
-- Sync and async retrieval behavior are aligned, but the ranking contract is
-  still encoded across multiple layers instead of one explicit abstraction
+- SQLite still has lexical-only retrieval while pgvector sync/async now have a
+  vector-assisted hybrid tie-break path
+- Sync and async pgvector behavior are aligned, but the full ranking contract
+  is still encoded across multiple layers instead of one explicit abstraction
 
 ## Recommended Agent Roles
 
@@ -237,10 +242,11 @@ The `0.15.x` line is complete. Suggested next priorities:
 
 ## Suggested Prompt For The Next Orchestrator
 
-> Read `docs/NCP_0_2_0_HANDOFF_PACKET.md` first. The `0.15.x` line is complete
-> (`546 passed, 8 skipped`, ruff clean). Start `0.16.x` with a narrow retrieval
-> architecture slice: define and implement the first real hybrid retrieval step
-> beyond today’s BM25-first fusion while keeping SQLite, PgvectorStore, and
-> AsyncPgvectorStore behavior aligned. Use Sarathi HIGH complexity with
-> multi-agent dispatch and NCP as the default communication spine in every
-> subagent instruction.
+> Read `docs/NCP_0_2_0_HANDOFF_PACKET.md` first. The first `0.16.x` retrieval
+> slice is already in (`551 passed, 8 skipped`, ruff clean): shared vector-aware
+> scoring plus pgvector sync/async hybrid tie-break parity. Continue `0.16.x`
+> with the next narrow retrieval architecture slice: make candidate generation,
+> result caps, diversity limits, and blank-query fallback explicit in one place
+> while keeping SQLite, PgvectorStore, and AsyncPgvectorStore behavior aligned.
+> Use Sarathi HIGH complexity with multi-agent dispatch and NCP as the default
+> communication spine in every subagent instruction.

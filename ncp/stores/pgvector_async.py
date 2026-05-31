@@ -14,6 +14,7 @@ Use PgvectorStore for synchronous callers.
 from __future__ import annotations
 
 import json
+import math
 import time
 from contextlib import asynccontextmanager
 from difflib import SequenceMatcher
@@ -23,6 +24,7 @@ import anyio
 
 from ncp.stores.base import BaseStore, NCPStoreUnavailableError
 from ncp.stores.pgvector import (
+    DEFAULT_RETRIEVAL_POLICY,
     PGVECTOR_SCHEMA_TEMPLATE,
     _validate_identifier,
 )
@@ -521,6 +523,14 @@ class AsyncPgvectorStore(BaseStore):
                 zone=zone,
                 diversity_limit=diversity_limit,
             )
+        if embedding is None and self._embedding_adapter is not None:
+            _adapter = self._embedding_adapter
+            _text = text
+            embedding = await anyio.to_thread.run_sync(
+                lambda: _adapter.embed(_text)  # type: ignore[union-attr]
+            )
+        if embedding is not None and len(embedding) != 1536:
+            raise ValueError(f"embedding must have 1536 dimensions, got {len(embedding)}")
         clauses = ["zone = %s"]
         params: list[Any] = [zone]
         if layer is not None:
@@ -552,8 +562,6 @@ class AsyncPgvectorStore(BaseStore):
         if not rows:
             return []
 
-        # Score computation is CPU-bound Python — synchronous is fine.
-        from ncp.stores.pgvector import DEFAULT_RETRIEVAL_POLICY
         policy = DEFAULT_RETRIEVAL_POLICY
         now = time.time()
         candidates: list[SubconsciousChunk] = []
@@ -585,8 +593,14 @@ class AsyncPgvectorStore(BaseStore):
                 if query_terms and not query_terms.intersection(set(tokens)):
                     continue
                 age_s = max(0.0, now - float(row["created_at"]))
-                h = policy.score(
-                    bm25_normalized=score if query_terms else 1.0,
+                bm25_for_policy = score if query_terms else 1.0
+                vector_score = self._vector_similarity_score(
+                    query_embedding=embedding,
+                    row_embedding=row.get("embedding"),
+                )
+                h = policy.score_with_vector(
+                    bm25_normalized=bm25_for_policy,
+                    vector_normalized=vector_score,
                     age_seconds=age_s,
                     base_trust=float(row["base_trust"]),
                     generation=int(row["generation"]),
@@ -903,6 +917,44 @@ class AsyncPgvectorStore(BaseStore):
             source_refs=[],
             age_seconds=max(0.0, time.time() - created_at),
         )
+
+    def _decode_embedding(self, value: Any) -> list[float] | None:
+        if value in (None, ""):
+            return None
+        if isinstance(value, list):
+            return [float(item) for item in value]
+        if isinstance(value, tuple):
+            return [float(item) for item in value]
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            if text.startswith("[") and text.endswith("]"):
+                body = text[1:-1].strip()
+                if not body:
+                    return []
+                return [float(item.strip()) for item in body.split(",")]
+        return None
+
+    def _vector_similarity_score(
+        self,
+        *,
+        query_embedding: list[float] | None,
+        row_embedding: Any,
+    ) -> float | None:
+        if query_embedding is None:
+            return None
+        candidate = self._decode_embedding(row_embedding)
+        if not candidate or len(candidate) != len(query_embedding):
+            return None
+        dot = sum(left * right for left, right in zip(query_embedding, candidate, strict=True))
+        query_norm = math.sqrt(sum(value * value for value in query_embedding))
+        candidate_norm = math.sqrt(sum(value * value for value in candidate))
+        if query_norm == 0.0 or candidate_norm == 0.0:
+            return None
+        cosine = dot / (query_norm * candidate_norm)
+        cosine = max(-1.0, min(1.0, cosine))
+        return (cosine + 1.0) / 2.0
 
     async def _acount_rows(self, connection: Any, table: str, *, pipeline_id: str | None = None) -> int:
         async with connection.cursor() as cursor:

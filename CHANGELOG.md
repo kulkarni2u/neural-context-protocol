@@ -2,6 +2,34 @@
 
 All notable changes to Neural Context Protocol will be documented in this file.
 
+## [0.16.x] - 2026-05-31
+
+First `0.16.x` retrieval slice. No breaking changes.
+
+### Added / Changed
+
+- **Shared vector-aware retrieval scoring** (`ncp/stores/retrieval.py`):
+  `RetrievalPolicy.score_with_vector()` now blends lexical relevance with an
+  optional vector-similarity signal while preserving the existing trust,
+  recency, and generation weighting. When no vector signal is present, the
+  policy falls back to the existing lexical-only score.
+- **Sync pgvector hybrid tie-break parity** (`ncp/stores/pgvector.py`):
+  `PgvectorStore.query(..., retrieval_mode="hybrid")` now auto-embeds query
+  text when an embedding adapter is configured, validates 1536-dimension query
+  vectors, computes cosine-normalized similarity from stored embeddings, and
+  uses that signal to break lexical ties without changing blank-query fallback
+  behavior.
+- **Async pgvector hybrid tie-break parity** (`ncp/stores/pgvector_async.py`):
+  `AsyncPgvectorStore.async_query(..., retrieval_mode="hybrid")` now mirrors
+  the sync behavior, including adapter-driven query embedding, 1536-dimension
+  validation, cosine-normalized vector scoring, and shared hybrid ranking.
+- **Regression coverage**: added focused sync and async tie-break tests so
+  identical lexical candidates are ordered by vector similarity in both
+  backends:
+  - `tests/test_future_stores.py::test_pgvector_hybrid_query_uses_vector_signal_to_break_lexical_tie`
+  - `tests/test_async_vector_mode.py::test_async_hybrid_uses_vector_signal_to_break_lexical_tie`
+- **Verification**: suite now passes at `551 passed, 8 skipped`.
+
 ## [0.15.x] - 2026-05-31
 
 MACE benchmark plus async pgvector observability parity. No breaking changes.

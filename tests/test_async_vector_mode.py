@@ -76,6 +76,12 @@ def _vec_row(chunk_id: str, distance: float = 0.1, author: str = "agent_a") -> t
     )
 
 
+def _axis_vec(axis: int) -> list[float]:
+    values = [0.0] * 1536
+    values[axis] = 1.0
+    return values
+
+
 # ---------------------------------------------------------------------------
 # Slice 1a: __init__ accepts ivfflat_probes
 # ---------------------------------------------------------------------------
@@ -292,3 +298,46 @@ async def test_async_vector_updates_retrieval_count() -> None:
     assert update_calls, "vector mode must fire retrieval_count UPDATE"
     if results:
         assert results[0].retrieval_count == 1
+
+
+@pytest.mark.anyio
+async def test_async_hybrid_uses_vector_signal_to_break_lexical_tie() -> None:
+    """async_query hybrid mode should use vector similarity when lexical/trust/recency tie."""
+    fake_rows = [
+        (
+            "sub_far", "pipe1", "pipeline", "working", "semantic", "prose",
+            "token auth bearer failure", "tool_result",
+            "agent_a", None, None, None, 1, None, "[]", 1,
+            100.0, 0.7, 0, None, None, "[]", None, None, None, "{}",
+            _axis_vec(1), 0, None,
+        ),
+        (
+            "sub_near", "pipe1", "pipeline", "working", "procedural", "prose",
+            "token auth bearer failure", "tool_result",
+            "agent_b", None, None, None, 1, None, "[]", 1,
+            100.0, 0.7, 0, None, None, "[]", None, None, None, "{}",
+            _axis_vec(0), 0, None,
+        ),
+    ]
+    pool = _make_async_pool(fake_rows)
+    pool._cur.description = [
+        ("chunk_id",), ("pipeline_id",), ("scope",), ("zone",), ("layer",),
+        ("chunk_type",), ("content",), ("src",), ("written_by",), ("caused_by",),
+        ("conscious_hash",), ("evidence_id",), ("version",), ("supersedes",),
+        ("source_refs",), ("schema_version",), ("created_at",), ("base_trust",),
+        ("generation",), ("result_confidence",), ("result_attempts",),
+        ("conditions",), ("valid_while",), ("expiry",), ("owner",), ("meta",),
+        ("embedding",), ("retrieval_count",), ("last_retrieved_at",),
+    ]
+    store = _make_store(pool)
+
+    results = await store.async_query(
+        "token auth bearer failure",
+        k=4,
+        retrieval_mode="hybrid",
+        pipeline_id="pipe1",
+        embedding=_axis_vec(0),
+    )
+
+    assert len(results) >= 2
+    assert results[0].chunk_id == "sub_near"
