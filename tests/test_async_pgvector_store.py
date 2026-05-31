@@ -6,6 +6,7 @@ After implementation, all tests pass: async methods are native (no to_thread shi
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 import sys
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -267,3 +268,150 @@ def test_sync_query_raises_not_implemented() -> None:
 
     with pytest.raises(NotImplementedError):
         store.query("test query")
+
+
+def _fake_aconnect():
+    @asynccontextmanager
+    async def _manager():
+        yield object()
+
+    return _manager
+
+
+@pytest.mark.anyio
+async def test_async_status_detail_is_native_and_matches_sync_shape() -> None:
+    """async_status_detail should avoid thread shim and mirror sync status payload shape."""
+    from ncp.stores.pgvector_async import AsyncPgvectorStore
+
+    mock_pool = _make_async_pool()
+    mock_coord = MagicMock()
+    mock_coord.async_whisper_stats = AsyncMock(
+        return_value={"count": 2, "last_activity_at": 250.0, "by_type": {"share": 1, "dissent": 1}}
+    )
+
+    with patch("psycopg_pool.AsyncConnectionPool", return_value=mock_pool):
+        store = AsyncPgvectorStore("postgresql://localhost/test", coordination=mock_coord)
+
+    store._aconnect = _fake_aconnect()  # type: ignore[method-assign]
+    store._acount_rows = AsyncMock(side_effect=[3, 1, 1, 1, 2])  # type: ignore[method-assign]
+    store._acount_distinct_pipelines = AsyncMock(return_value=2)  # type: ignore[method-assign]
+    store._asum_cost = AsyncMock(return_value=0.031)  # type: ignore[method-assign]
+    store._amax_column = AsyncMock(side_effect=[100.0, 150.0, 200.0])  # type: ignore[method-assign]
+    store._alayer_counts = AsyncMock(return_value={"semantic": 2, "episodic": 1})  # type: ignore[method-assign]
+    store._arecent_pipelines = AsyncMock(return_value=[{"pipeline_id": "pipe_async", "chunk_count": 3, "last_chunk_at": 100.0}])  # type: ignore[method-assign]
+
+    call_log: list[str] = []
+    original = anyio.to_thread.run_sync
+
+    async def spy(fn, *args, **kwargs):  # type: ignore[no-untyped-def]
+        call_log.append(repr(fn))
+        return await original(fn, *args, **kwargs)
+
+    with patch("anyio.to_thread.run_sync", side_effect=spy):
+        detail = await store.async_status_detail(pipeline_id="pipe_async")
+
+    assert not call_log, f"async_status_detail must be native async, got: {call_log}"
+    assert detail["overview"]["chunk_count"] == 3
+    assert detail["overview"]["whisper_count"] == 2
+    assert detail["overview"]["last_activity_at"] == 250.0
+    assert detail["layer_counts"] == {"semantic": 2, "episodic": 1}
+    assert detail["recent_pipelines"][0]["pipeline_id"] == "pipe_async"
+    mock_coord.async_whisper_stats.assert_awaited_once_with(pipeline_id="pipe_async")
+
+
+@pytest.mark.anyio
+async def test_async_cost_summary_is_native_and_matches_sync_shape() -> None:
+    """async_cost_summary should avoid thread shim and mirror sync cost payload shape."""
+    from ncp.stores.pgvector_async import AsyncPgvectorStore
+
+    mock_pool = _make_async_pool()
+    with patch("psycopg_pool.AsyncConnectionPool", return_value=mock_pool):
+        store = AsyncPgvectorStore("postgresql://localhost/test")
+
+    store._aconnect = _fake_aconnect()  # type: ignore[method-assign]
+    store._acost_summary_row = AsyncMock(return_value={  # type: ignore[method-assign]
+        "cost_usd_total": 0.02,
+        "input_tokens_total": 100,
+        "output_tokens_total": 20,
+        "cache_read_tokens_total": 0,
+        "entry_count": 1,
+        "avg_latency_ms": 123.0,
+    })
+    store._acost_group_rows = AsyncMock(side_effect=[  # type: ignore[method-assign]
+        [{"agent_id": "planner", "turns": 1, "cost_usd_total": 0.02}],
+        [{"model": "claude-sonnet", "turns": 1, "cost_usd_total": 0.02}],
+    ])
+    store._arecent_cost_rows = AsyncMock(return_value=[  # type: ignore[method-assign]
+        {
+            "turn_id": "turn_cost_01",
+            "pipeline_id": "pipe_async",
+            "agent_id": "planner",
+            "model": "claude-sonnet",
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "cache_read_tokens": 0,
+            "cost_usd": 0.02,
+            "latency_ms": 123,
+            "logged_at": 250.0,
+        }
+    ])
+
+    call_log: list[str] = []
+    original = anyio.to_thread.run_sync
+
+    async def spy(fn, *args, **kwargs):  # type: ignore[no-untyped-def]
+        call_log.append(repr(fn))
+        return await original(fn, *args, **kwargs)
+
+    with patch("anyio.to_thread.run_sync", side_effect=spy):
+        costs = await store.async_cost_summary(pipeline_id="pipe_async", limit=5)
+
+    assert not call_log, f"async_cost_summary must be native async, got: {call_log}"
+    assert costs["summary"]["entry_count"] == 1
+    assert costs["by_agent"][0]["agent_id"] == "planner"
+    assert costs["by_model"][0]["model"] == "claude-sonnet"
+    assert costs["recent_entries"][0]["turn_id"] == "turn_cost_01"
+
+
+@pytest.mark.anyio
+async def test_async_viz_data_is_native_and_uses_async_whisper_stats() -> None:
+    """async_viz_data should avoid thread shim and surface whisper queue details."""
+    from ncp.stores.pgvector_async import AsyncPgvectorStore
+
+    mock_pool = _make_async_pool()
+    mock_coord = MagicMock()
+    mock_coord.async_whisper_stats = AsyncMock(
+        return_value={"count": 3, "last_activity_at": 300.0, "by_type": {"share": 2, "dissent": 1}}
+    )
+
+    with patch("psycopg_pool.AsyncConnectionPool", return_value=mock_pool):
+        store = AsyncPgvectorStore("postgresql://localhost/test", coordination=mock_coord)
+
+    store._aconnect = _fake_aconnect()  # type: ignore[method-assign]
+    store._achunk_distribution = AsyncMock(return_value=[  # type: ignore[method-assign]
+        {"layer": "semantic", "zone": "working", "count": 2}
+    ])
+    store._aage_brackets = AsyncMock(return_value=[  # type: ignore[method-assign]
+        {"bracket": "<1h", "count": 2, "avg_trust": 0.7, "top_layer": "semantic"}
+    ])
+    store._atop_chunks = AsyncMock(return_value=[  # type: ignore[method-assign]
+        {"chunk_id": "sub_123", "layer": "semantic", "zone": "working", "pipeline_id": "pipe_async", "base_trust": 0.9, "age_seconds": 12.0}
+    ])
+    store._apipeline_summary = AsyncMock(return_value=[  # type: ignore[method-assign]
+        {"pipeline_id": "pipe_async", "chunk_count": 2, "last_activity": 123.0}
+    ])
+
+    call_log: list[str] = []
+    original = anyio.to_thread.run_sync
+
+    async def spy(fn, *args, **kwargs):  # type: ignore[no-untyped-def]
+        call_log.append(repr(fn))
+        return await original(fn, *args, **kwargs)
+
+    with patch("anyio.to_thread.run_sync", side_effect=spy):
+        data = await store.async_viz_data(pipeline_id="pipe_async")
+
+    assert not call_log, f"async_viz_data must be native async, got: {call_log}"
+    assert data["chunk_distribution"][0]["count"] == 2
+    assert data["whisper_queue"] == {"total": 3, "by_type": {"share": 2, "dissent": 1}}
+    mock_coord.async_whisper_stats.assert_awaited_once_with(pipeline_id="pipe_async")

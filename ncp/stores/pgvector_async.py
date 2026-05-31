@@ -153,6 +153,9 @@ class AsyncPgvectorStore(BaseStore):
     def _sql(self, statement: str) -> str:
         return statement.format(schema=self.schema, prefix=self.table_prefix)
 
+    def _table_name(self, logical_name: str) -> str:
+        return f"{self.schema}.{self.table_prefix}{logical_name}"
+
     def _normalize_row(self, row: Any, description: Any) -> dict[str, Any]:
         if isinstance(row, dict):
             return row
@@ -163,6 +166,16 @@ class AsyncPgvectorStore(BaseStore):
             raise TypeError("cursor description required to normalize rows")
         columns = [str(col[0]) for col in description]
         return {col: row[i] for i, col in enumerate(columns)}
+
+    async def _afetchall(self, cursor: Any) -> list[dict[str, Any]]:
+        rows = await cursor.fetchall()
+        return [self._normalize_row(row, getattr(cursor, "description", None)) for row in rows]
+
+    async def _afetchone(self, cursor: Any) -> dict[str, Any] | None:
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        return self._normalize_row(row, getattr(cursor, "description", None))
 
     # ------------------------------------------------------------------
     # Overridden async_* methods — native psycopg3 async I/O
@@ -715,6 +728,111 @@ class AsyncPgvectorStore(BaseStore):
                     ),
                 )
 
+    async def async_status_detail(self, *, pipeline_id: str | None = None) -> dict[str, object]:
+        """Return store status using native async DB I/O."""
+        async with self._aconnect() as conn:
+            overview = {
+                "chunk_count": await self._acount_rows(conn, "chunks", pipeline_id=pipeline_id),
+                "tombstone_count": await self._acount_rows(conn, "tombstones"),
+                "turn_record_count": await self._acount_rows(conn, "turn_records", pipeline_id=pipeline_id),
+                "conscious_snapshot_count": await self._acount_rows(conn, "conscious_log", pipeline_id=pipeline_id),
+                "cost_entry_count": await self._acount_rows(conn, "cost_log", pipeline_id=pipeline_id),
+            }
+            overview["pipeline_count"] = await self._acount_distinct_pipelines(conn)
+            overview["cost_usd_total"] = await self._asum_cost(conn, pipeline_id=pipeline_id)
+            latest_chunk = await self._amax_column(conn, "chunks", "created_at", pipeline_id=pipeline_id)
+            latest_turn = await self._amax_column(conn, "turn_records", "created_at", pipeline_id=pipeline_id)
+            latest_cost = await self._amax_column(conn, "cost_log", "logged_at", pipeline_id=pipeline_id)
+            layer_counts = await self._alayer_counts(conn, pipeline_id=pipeline_id)
+            recent_pipelines = await self._arecent_pipelines(conn, pipeline_id=pipeline_id)
+
+        whisper_stats = (
+            await self._acoordination.async_whisper_stats(pipeline_id=pipeline_id)
+            if self._acoordination is not None
+            else {"count": 0, "last_activity_at": None, "by_type": {}}
+        )
+        overview["whisper_count"] = int(whisper_stats.get("count", 0) or 0)
+        activity_candidates = [
+            value
+            for value in (latest_chunk, latest_turn, latest_cost, whisper_stats.get("last_activity_at"))
+            if value is not None
+        ]
+        overview["last_activity_at"] = max(activity_candidates) if activity_candidates else None
+        return {
+            "overview": overview,
+            "layer_counts": layer_counts,
+            "recent_pipelines": recent_pipelines,
+        }
+
+    async def async_cost_summary(
+        self,
+        *,
+        pipeline_id: str | None = None,
+        limit: int = 10,
+    ) -> dict[str, object]:
+        """Return cost summary using native async DB I/O."""
+        async with self._aconnect() as conn:
+            summary = await self._acost_summary_row(conn, pipeline_id=pipeline_id)
+            by_agent = await self._acost_group_rows(conn, group_by="agent_id", pipeline_id=pipeline_id)
+            by_model = await self._acost_group_rows(conn, group_by="model", pipeline_id=pipeline_id)
+            recent_entries = await self._arecent_cost_rows(conn, pipeline_id=pipeline_id, limit=limit)
+        return {
+            "summary": summary,
+            "by_agent": by_agent,
+            "by_model": by_model,
+            "recent_entries": recent_entries,
+        }
+
+    async def async_viz_data(self, *, pipeline_id: str | None = None) -> dict[str, object]:
+        """Return operator viz data using native async DB I/O."""
+        now = time.time()
+        live_filter = f"chunk_id NOT IN (SELECT chunk_id FROM {self._table_name('tombstones')})"
+        async with self._aconnect() as conn:
+            chunk_distribution = await self._achunk_distribution(
+                conn,
+                pipeline_id=pipeline_id,
+                live_filter=live_filter,
+            )
+            age_brackets = await self._aage_brackets(
+                conn,
+                pipeline_id=pipeline_id,
+                live_filter=live_filter,
+                now=now,
+            )
+            top_chunks = await self._atop_chunks(
+                conn,
+                pipeline_id=pipeline_id,
+                live_filter=live_filter,
+                now=now,
+            )
+            pipeline_summary = await self._apipeline_summary(
+                conn,
+                pipeline_id=pipeline_id,
+                live_filter=live_filter,
+            )
+
+        whisper_queue: dict[str, object]
+        if self._acoordination is not None:
+            try:
+                stats = await self._acoordination.async_whisper_stats(pipeline_id=pipeline_id)
+                by_type = stats.get("by_type", {})
+                whisper_queue = {
+                    "total": int(stats.get("count", 0)),
+                    "by_type": {str(k): int(v) for k, v in by_type.items()} if isinstance(by_type, dict) else {},
+                }
+            except Exception:
+                whisper_queue = {"total": 0, "by_type": {}}
+        else:
+            whisper_queue = {"total": 0, "by_type": {}}
+
+        return {
+            "chunk_distribution": chunk_distribution,
+            "age_brackets": age_brackets,
+            "top_chunks": top_chunks,
+            "pipeline_summary": pipeline_summary,
+            "whisper_queue": whisper_queue,
+        }
+
     async def async_emit_whisper(self, whisper: Whisper) -> None:
         """Emit whisper via native async Redis coordination (no thread shim)."""
         if self._acoordination is None:
@@ -785,6 +903,345 @@ class AsyncPgvectorStore(BaseStore):
             source_refs=[],
             age_seconds=max(0.0, time.time() - created_at),
         )
+
+    async def _acount_rows(self, connection: Any, table: str, *, pipeline_id: str | None = None) -> int:
+        async with connection.cursor() as cursor:
+            statement = f"SELECT COUNT(*) AS count FROM {self._table_name(table)}"
+            params: tuple[object, ...] = ()
+            if pipeline_id is not None and table in {"chunks", "turn_records", "conscious_log", "cost_log"}:
+                statement += " WHERE pipeline_id = %s"
+                params = (pipeline_id,)
+            await cursor.execute(statement, params)
+            row = await self._afetchone(cursor)
+        return int(row["count"] if row is not None else 0)
+
+    async def _acount_distinct_pipelines(self, connection: Any) -> int:
+        async with connection.cursor() as cursor:
+            await cursor.execute(f"SELECT COUNT(DISTINCT pipeline_id) AS count FROM {self._table_name('chunks')}")
+            row = await self._afetchone(cursor)
+        return int(row["count"] if row is not None else 0)
+
+    async def _asum_cost(self, connection: Any, *, pipeline_id: str | None = None) -> float:
+        async with connection.cursor() as cursor:
+            statement = f"SELECT COALESCE(SUM(cost_usd), 0.0) AS total FROM {self._table_name('cost_log')}"
+            params: tuple[object, ...] = ()
+            if pipeline_id is not None:
+                statement += " WHERE pipeline_id = %s"
+                params = (pipeline_id,)
+            await cursor.execute(statement, params)
+            row = await self._afetchone(cursor)
+        return float(row["total"] if row is not None else 0.0)
+
+    async def _amax_column(
+        self,
+        connection: Any,
+        table: str,
+        column: str,
+        *,
+        pipeline_id: str | None = None,
+    ) -> float | None:
+        async with connection.cursor() as cursor:
+            statement = f"SELECT MAX({column}) AS latest FROM {self._table_name(table)}"
+            params: tuple[object, ...] = ()
+            if pipeline_id is not None and table in {"chunks", "turn_records", "conscious_log", "cost_log"}:
+                statement += " WHERE pipeline_id = %s"
+                params = (pipeline_id,)
+            await cursor.execute(statement, params)
+            row = await self._afetchone(cursor)
+        if row is None or row["latest"] is None:
+            return None
+        return float(row["latest"])
+
+    async def _alayer_counts(self, connection: Any, *, pipeline_id: str | None = None) -> dict[str, int]:
+        async with connection.cursor() as cursor:
+            statement = (
+                f"SELECT layer, COUNT(*) AS count FROM {self._table_name('chunks')}"
+                + (" WHERE pipeline_id = %s" if pipeline_id is not None else "")
+                + " GROUP BY layer ORDER BY count DESC, layer ASC"
+            )
+            await cursor.execute(statement, () if pipeline_id is None else (pipeline_id,))
+            rows = await self._afetchall(cursor)
+        return {str(row["layer"]): int(row["count"]) for row in rows}
+
+    async def _arecent_pipelines(self, connection: Any, *, pipeline_id: str | None = None) -> list[dict[str, object]]:
+        async with connection.cursor() as cursor:
+            statement = (
+                "SELECT pipeline_id, COUNT(*) AS chunk_count, MAX(created_at) AS last_chunk_at "
+                f"FROM {self._table_name('chunks')} "
+            )
+            params: tuple[object, ...] = ()
+            if pipeline_id is None:
+                statement += "WHERE pipeline_id IS NOT NULL "
+            else:
+                statement += "WHERE pipeline_id = %s "
+                params = (pipeline_id,)
+            statement += "GROUP BY pipeline_id ORDER BY last_chunk_at DESC LIMIT 5"
+            await cursor.execute(statement, params)
+            rows = await self._afetchall(cursor)
+        return [
+            {
+                "pipeline_id": str(row["pipeline_id"]),
+                "chunk_count": int(row["chunk_count"]),
+                "last_chunk_at": float(row["last_chunk_at"]),
+            }
+            for row in rows
+            if row["pipeline_id"] is not None
+        ]
+
+    async def _acost_summary_row(self, connection: Any, *, pipeline_id: str | None = None) -> dict[str, object]:
+        async with connection.cursor() as cursor:
+            statement = (
+                "SELECT "
+                "COALESCE(SUM(cost_usd), 0.0) AS cost_usd_total, "
+                "COALESCE(SUM(input_tokens), 0) AS input_tokens_total, "
+                "COALESCE(SUM(output_tokens), 0) AS output_tokens_total, "
+                "COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens_total, "
+                "COUNT(*) AS entry_count, "
+                "COALESCE(AVG(latency_ms), 0.0) AS avg_latency_ms "
+                f"FROM {self._table_name('cost_log')}"
+            )
+            params: tuple[object, ...] = ()
+            if pipeline_id is not None:
+                statement += " WHERE pipeline_id = %s"
+                params = (pipeline_id,)
+            await cursor.execute(statement, params)
+            row = await self._afetchone(cursor)
+        return {
+            "cost_usd_total": float(row["cost_usd_total"]),
+            "input_tokens_total": int(row["input_tokens_total"]),
+            "output_tokens_total": int(row["output_tokens_total"]),
+            "cache_read_tokens_total": int(row["cache_read_tokens_total"]),
+            "entry_count": int(row["entry_count"]),
+            "avg_latency_ms": float(row["avg_latency_ms"]),
+        }
+
+    async def _acost_group_rows(
+        self,
+        connection: Any,
+        *,
+        group_by: str,
+        pipeline_id: str | None = None,
+    ) -> list[dict[str, object]]:
+        async with connection.cursor() as cursor:
+            statement = (
+                f"SELECT {group_by}, COUNT(*) AS turns, COALESCE(SUM(cost_usd), 0.0) AS cost_usd_total "
+                f"FROM {self._table_name('cost_log')}"
+            )
+            params: tuple[object, ...] = ()
+            if pipeline_id is not None:
+                statement += " WHERE pipeline_id = %s"
+                params = (pipeline_id,)
+            statement += f" GROUP BY {group_by} ORDER BY cost_usd_total DESC, {group_by} ASC"
+            await cursor.execute(statement, params)
+            rows = await self._afetchall(cursor)
+        return [
+            {
+                group_by: str(row[group_by]),
+                "turns": int(row["turns"]),
+                "cost_usd_total": float(row["cost_usd_total"]),
+            }
+            for row in rows
+        ]
+
+    async def _arecent_cost_rows(
+        self,
+        connection: Any,
+        *,
+        pipeline_id: str | None = None,
+        limit: int,
+    ) -> list[dict[str, object]]:
+        async with connection.cursor() as cursor:
+            statement = (
+                "SELECT turn_id, pipeline_id, agent_id, model, input_tokens, output_tokens, "
+                "cache_read_tokens, cost_usd, latency_ms, logged_at "
+                f"FROM {self._table_name('cost_log')}"
+            )
+            params: list[object] = []
+            if pipeline_id is not None:
+                statement += " WHERE pipeline_id = %s"
+                params.append(pipeline_id)
+            statement += " ORDER BY logged_at DESC LIMIT %s"
+            params.append(max(1, limit))
+            await cursor.execute(statement, tuple(params))
+            rows = await self._afetchall(cursor)
+        return [
+            {
+                "turn_id": str(row["turn_id"]),
+                "pipeline_id": row["pipeline_id"],
+                "agent_id": str(row["agent_id"]),
+                "model": str(row["model"]),
+                "input_tokens": int(row["input_tokens"]),
+                "output_tokens": int(row["output_tokens"]),
+                "cache_read_tokens": int(row["cache_read_tokens"]),
+                "cost_usd": float(row["cost_usd"]),
+                "latency_ms": int(row["latency_ms"] or 0),
+                "logged_at": float(row["logged_at"]),
+            }
+            for row in rows
+        ]
+
+    async def _achunk_distribution(
+        self,
+        connection: Any,
+        *,
+        pipeline_id: str | None,
+        live_filter: str,
+    ) -> list[dict[str, object]]:
+        async with connection.cursor() as cursor:
+            if pipeline_id is not None:
+                await cursor.execute(
+                    f"SELECT layer, zone, COUNT(*) AS count FROM {self._table_name('chunks')}"
+                    f" WHERE {live_filter} AND pipeline_id = %s"
+                    " GROUP BY layer, zone ORDER BY layer, zone",
+                    (pipeline_id,),
+                )
+            else:
+                await cursor.execute(
+                    f"SELECT layer, zone, COUNT(*) AS count FROM {self._table_name('chunks')}"
+                    f" WHERE {live_filter}"
+                    " GROUP BY layer, zone ORDER BY layer, zone"
+                )
+            rows = await self._afetchall(cursor)
+        return [
+            {"layer": str(row["layer"]), "zone": str(row["zone"]), "count": int(row["count"])}
+            for row in rows
+        ]
+
+    async def _aage_brackets(
+        self,
+        connection: Any,
+        *,
+        pipeline_id: str | None,
+        live_filter: str,
+        now: float,
+    ) -> list[dict[str, object]]:
+        bracket_sql = (
+            f"SELECT "
+            f"  CASE "
+            f"    WHEN (%s - created_at) < 3600 THEN '<1h' "
+            f"    WHEN (%s - created_at) < 14400 THEN '1-4h' "
+            f"    WHEN (%s - created_at) < 86400 THEN '4-24h' "
+            f"    ELSE '>24h' "
+            f"  END AS bracket, "
+            f"  COUNT(*) AS count, "
+            f"  AVG(base_trust) AS avg_trust "
+            f"FROM {self._table_name('chunks')} "
+            f"WHERE {live_filter}"
+        )
+        bracket_params: list[object] = [now, now, now, now]
+        if pipeline_id is not None:
+            bracket_sql += " AND pipeline_id = %s"
+            bracket_params.append(pipeline_id)
+        bracket_sql += " GROUP BY bracket ORDER BY bracket"
+        async with connection.cursor() as cursor:
+            await cursor.execute(bracket_sql, tuple(bracket_params))
+            bracket_rows = await self._afetchall(cursor)
+
+        bracket_top_layer: dict[str, str] = {}
+        for bracket_label, age_min, age_max in [
+            ("<1h", 0, 3600),
+            ("1-4h", 3600, 14400),
+            ("4-24h", 14400, 86400),
+            (">24h", 86400, None),
+        ]:
+            tl_sql = (
+                f"SELECT layer, COUNT(*) AS cnt FROM {self._table_name('chunks')}"
+                f" WHERE (%s - created_at) >= %s AND {live_filter}"
+            )
+            tl_params: list[object] = [now, age_min]
+            if age_max is not None:
+                tl_sql += " AND (%s - created_at) < %s"
+                tl_params.extend([now, age_max])
+            if pipeline_id is not None:
+                tl_sql += " AND pipeline_id = %s"
+                tl_params.append(pipeline_id)
+            tl_sql += " GROUP BY layer ORDER BY cnt DESC LIMIT 1"
+            async with connection.cursor() as cursor:
+                await cursor.execute(tl_sql, tuple(tl_params))
+                tl_row = await self._afetchone(cursor)
+            if tl_row is not None:
+                bracket_top_layer[bracket_label] = str(tl_row["layer"])
+
+        return [
+            {
+                "bracket": str(row["bracket"]),
+                "count": int(row["count"]),
+                "avg_trust": round(float(row["avg_trust"]), 4) if row["avg_trust"] is not None else 0.0,
+                "top_layer": bracket_top_layer.get(str(row["bracket"]), "-"),
+            }
+            for row in bracket_rows
+        ]
+
+    async def _atop_chunks(
+        self,
+        connection: Any,
+        *,
+        pipeline_id: str | None,
+        live_filter: str,
+        now: float,
+    ) -> list[dict[str, object]]:
+        async with connection.cursor() as cursor:
+            if pipeline_id is not None:
+                await cursor.execute(
+                    f"SELECT chunk_id, layer, zone, pipeline_id, base_trust, created_at"
+                    f" FROM {self._table_name('chunks')}"
+                    f" WHERE {live_filter} AND pipeline_id = %s"
+                    " ORDER BY base_trust DESC, created_at DESC LIMIT 5",
+                    (pipeline_id,),
+                )
+            else:
+                await cursor.execute(
+                    f"SELECT chunk_id, layer, zone, pipeline_id, base_trust, created_at"
+                    f" FROM {self._table_name('chunks')}"
+                    f" WHERE {live_filter}"
+                    " ORDER BY base_trust DESC, created_at DESC LIMIT 5"
+                )
+            rows = await self._afetchall(cursor)
+        return [
+            {
+                "chunk_id": str(row["chunk_id"])[:16],
+                "layer": str(row["layer"]),
+                "zone": str(row["zone"]),
+                "pipeline_id": row["pipeline_id"],
+                "base_trust": float(row["base_trust"]),
+                "age_seconds": round(now - float(row["created_at"]), 1),
+            }
+            for row in rows
+        ]
+
+    async def _apipeline_summary(
+        self,
+        connection: Any,
+        *,
+        pipeline_id: str | None,
+        live_filter: str,
+    ) -> list[dict[str, object]]:
+        async with connection.cursor() as cursor:
+            if pipeline_id is not None:
+                await cursor.execute(
+                    f"SELECT pipeline_id, COUNT(*) AS chunk_count, MAX(created_at) AS last_activity"
+                    f" FROM {self._table_name('chunks')}"
+                    f" WHERE {live_filter} AND pipeline_id = %s"
+                    " GROUP BY pipeline_id ORDER BY last_activity DESC",
+                    (pipeline_id,),
+                )
+            else:
+                await cursor.execute(
+                    f"SELECT pipeline_id, COUNT(*) AS chunk_count, MAX(created_at) AS last_activity"
+                    f" FROM {self._table_name('chunks')}"
+                    f" WHERE {live_filter} AND pipeline_id IS NOT NULL"
+                    " GROUP BY pipeline_id ORDER BY last_activity DESC LIMIT 20"
+                )
+            rows = await self._afetchall(cursor)
+        return [
+            {
+                "pipeline_id": str(row["pipeline_id"]),
+                "chunk_count": int(row["chunk_count"]),
+                "last_activity": float(row["last_activity"]),
+            }
+            for row in rows
+            if row["pipeline_id"] is not None
+        ]
 
     # ------------------------------------------------------------------
     # Async consolidation — full parity with sync consolidate()

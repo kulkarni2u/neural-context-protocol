@@ -6,11 +6,11 @@ agent instead of replaying long chat history.
 
 ## Current State
 
-Latest release:
+Current local repo state:
 
-- PyPI: `neural-context-protocol==0.11.0` *(pending publish)*
-- GitHub: `main` branch
-- Suite: `498 passed, 8 skipped`
+- Version: `0.6.0`
+- GitHub branch: `main`
+- Suite: `546 passed, 8 skipped`
 - Live pgvector + Redis integration suite: `6 passed`
 
 ## What Shipped In 0.2.0
@@ -199,20 +199,23 @@ Latest release:
   `user_verified` src always protected. Returns `CalibrationReport`. 8 new tests.
 - Suite: `540 passed, 8 skipped`
 
-## Active Line: 0.15.x (next)
+## Active Line: 0.16.x (next)
 
-The `0.14.x` line is complete. Suggested next priorities:
+The `0.15.x` line is complete. Suggested next priorities:
 
-- **`ncp status` async path**: `AsyncPgvectorStore.status_detail()` and `cost_summary()` still
-  raise `NotImplementedError` — add async parity for operator observability
-- **`async_query` last_retrieved_at update**: `async_query` currently only updates
-  `retrieval_count` but sync `query` also sets `last_retrieved_at`; add the timestamp update
-- **`AsyncPgvectorStore.viz_data()` async parity**: for dashboard/debugging support
+- **Hybrid retrieval beyond BM25-first**: move from today’s lexical-first fusion
+  toward a clearer multi-signal retrieval contract that works cleanly across
+  SQLite, pgvector sync, and pgvector async
+- **Assembler/store retrieval contract cleanup**: make result caps, diversity
+  limits, and blank-query fallback behavior explicit in one place
+- **Async reporting consumption**: thread the new async status/cost/viz parity
+  into any async operator or service paths that still rely on sync-only access
 
 ## Known Architectural Gaps (carried forward)
 
-- `AsyncPgvectorStore.viz_data()`, `status_detail()`, `cost_summary()` still raise NotImplementedError
-- `async_query` does not update `last_retrieved_at` on returned chunks (sync does)
+- Retrieval is still BM25-first rather than a richer hybrid/vector-aware policy
+- Sync and async retrieval behavior are aligned, but the ranking contract is
+  still encoded across multiple layers instead of one explicit abstraction
 
 ## Recommended Agent Roles
 
@@ -234,11 +237,10 @@ The `0.14.x` line is complete. Suggested next priorities:
 
 ## Suggested Prompt For The Next Orchestrator
 
-> Read `docs/NCP_0_2_0_HANDOFF_PACKET.md` first. The `0.14.x` line is complete
-> (540 passed, 8 skipped, ruff clean). Starting `0.15.x`. Suggested priorities:
-> (1) `AsyncPgvectorStore.status_detail()` and `cost_summary()` async parity — both raise
-> NotImplementedError; implement async SELECT aggregations matching the sync versions;
-> (2) `async_query` last_retrieved_at update — sync `query()` sets `last_retrieved_at` on
-> returned chunks via UPDATE; async only updates `retrieval_count`, missing the timestamp.
-> Use Sarathi HIGH complexity with multi-agent dispatch (Claude=orchestrator, OpenCode/Codex=impl)
-> and NCP spine in every subagent instruction.
+> Read `docs/NCP_0_2_0_HANDOFF_PACKET.md` first. The `0.15.x` line is complete
+> (`546 passed, 8 skipped`, ruff clean). Start `0.16.x` with a narrow retrieval
+> architecture slice: define and implement the first real hybrid retrieval step
+> beyond today’s BM25-first fusion while keeping SQLite, PgvectorStore, and
+> AsyncPgvectorStore behavior aligned. Use Sarathi HIGH complexity with
+> multi-agent dispatch and NCP as the default communication spine in every
+> subagent instruction.

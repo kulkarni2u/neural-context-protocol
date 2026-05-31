@@ -5,6 +5,7 @@ All tests must be RED before implementation. After implementation, all tests pas
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import anyio
@@ -210,3 +211,54 @@ async def test_async_drain_whispers_raises_without_redis() -> None:
 
     with pytest.raises(NCPStoreUnavailableError, match="[Rr]edis"):
         await store.async_drain_whispers(agent_id="claude")
+
+
+@pytest.mark.anyio
+async def test_async_whisper_stats_returns_counts_latest_and_types() -> None:
+    """async_whisper_stats should mirror sync whisper reporting without thread shims."""
+    from ncp.stores.redis_coordination import AsyncRedisCoordination
+    from ncp.types import Whisper
+
+    coord = AsyncRedisCoordination("redis://localhost", client_factory=MagicMock())
+    coord._aclient_or_raise = AsyncMock(return_value=SimpleNamespace())  # type: ignore[method-assign]
+    coord._async_iter_whisper_ids = AsyncMock(return_value=["w1", "w2", "w3"])  # type: ignore[method-assign]
+
+    whispers = {
+        "w1": Whisper(
+            whisper_id="w1",
+            from_agent="claude",
+            target="opencode",
+            whisper_type="share",
+            payload={"ask": "implement", "files": [], "slice": "async_status"},
+            confidence=0.9,
+            pipeline_id="pipe_async",
+            created_at=100.0,
+        ),
+        "w2": Whisper(
+            whisper_id="w2",
+            from_agent="opencode",
+            target="claude",
+            whisper_type="dissent",
+            payload={"issue": "missing test", "alternatives": ["add focused async test"]},
+            confidence=0.95,
+            pipeline_id="pipe_async",
+            created_at=250.0,
+        ),
+        "w3": Whisper(
+            whisper_id="w3",
+            from_agent="planner",
+            target="executor",
+            whisper_type="nudge",
+            payload="other pipeline",
+            confidence=0.7,
+            pipeline_id="other",
+            created_at=300.0,
+        ),
+    }
+    coord._async_load_whisper = AsyncMock(side_effect=lambda _client, whisper_id: whispers[whisper_id])  # type: ignore[method-assign]
+
+    stats = await coord.async_whisper_stats(pipeline_id="pipe_async")
+
+    assert stats["count"] == 2
+    assert stats["last_activity_at"] == 250.0
+    assert stats["by_type"] == {"share": 1, "dissent": 1}

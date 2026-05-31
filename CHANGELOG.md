@@ -4,7 +4,7 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [0.15.x] - 2026-05-31
 
-MACE benchmark slice. No breaking changes.
+MACE benchmark plus async pgvector observability parity. No breaking changes.
 
 ### Added / Changed
 
@@ -26,6 +26,18 @@ MACE benchmark slice. No breaking changes.
 - **Canonical benchmark run**: `python benchmarks/mace/run.py --turns 40`
   currently yields composite `0.9608` with D1 `0.8695`, D2 `1.0000`,
   D3 `1.0000`, D4 `1.0000`.
+- **`AsyncPgvectorStore` observability parity** (`ncp/stores/pgvector_async.py`):
+  added native async `async_status_detail()`, `async_cost_summary()`, and
+  `async_viz_data()` so the async pgvector path now has the same status/cost/viz
+  surface as the sync pgvector store without falling back to
+  `anyio.to_thread.run_sync`.
+- **`AsyncRedisCoordination.async_whisper_stats()`** (`ncp/stores/redis_coordination.py`):
+  added native async whisper queue stats with `count`, `last_activity_at`, and
+  `by_type`; sync `whisper_stats()` now exposes the same `by_type` rollup.
+- **`BaseStore` async reporting wrappers** (`ncp/stores/base.py`): added
+  `async_status_detail()`, `async_cost_summary()`, and `async_viz_data()` for
+  backend parity.
+- **Verification**: suite now passes at `546 passed, 8 skipped`.
 
 ## [0.14.x] - 2026-05-30
 

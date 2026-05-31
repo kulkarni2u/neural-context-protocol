@@ -122,10 +122,11 @@ class RedisCoordination:
             deleted += int(bool(client.delete(self._payload_key(whisper_id))))
         return deleted
 
-    def whisper_stats(self, *, pipeline_id: str | None = None) -> dict[str, float | int | None]:
+    def whisper_stats(self, *, pipeline_id: str | None = None) -> dict[str, float | int | dict[str, int] | None]:
         client = self._client_or_raise()
         count = 0
         latest: float | None = None
+        by_type: dict[str, int] = {}
         for whisper_id in self._iter_whisper_ids(client):
             whisper = self._load_whisper(client, whisper_id)
             if whisper is None:
@@ -134,7 +135,8 @@ class RedisCoordination:
                 continue
             count += 1
             latest = whisper.created_at if latest is None else max(latest, whisper.created_at)
-        return {"count": count, "last_activity_at": latest}
+            by_type[whisper.whisper_type] = by_type.get(whisper.whisper_type, 0) + 1
+        return {"count": count, "last_activity_at": latest, "by_type": by_type}
 
     def drain_whispers(
         self,
@@ -421,3 +423,41 @@ class AsyncRedisCoordination:
             ttl_seconds=int(payload.get("ttl_seconds", 60)),
             dissent_target=str(payload.get("dissent_target") or "") or None,
         )
+
+    async def _async_iter_whisper_ids(self, client: Any) -> list[str]:
+        pattern = f"{self.whisper_payload_prefix}:*"
+        if hasattr(client, "scan_iter"):
+            return [
+                str(key).split(":")[-1]
+                async for key in client.scan_iter(match=pattern)
+            ]
+        if hasattr(client, "keys"):
+            return [str(key).split(":")[-1] for key in await client.keys(pattern)]
+        hashes = getattr(client, "hashes", None)
+        if isinstance(hashes, dict):
+            return [
+                str(key).split(":")[-1]
+                for key in hashes
+                if str(key).startswith(f"{self.whisper_payload_prefix}:")
+            ]
+        return []
+
+    async def async_whisper_stats(
+        self,
+        *,
+        pipeline_id: str | None = None,
+    ) -> dict[str, float | int | dict[str, int] | None]:
+        client = await self._aclient_or_raise()
+        count = 0
+        latest: float | None = None
+        by_type: dict[str, int] = {}
+        for whisper_id in await self._async_iter_whisper_ids(client):
+            whisper = await self._async_load_whisper(client, whisper_id)
+            if whisper is None:
+                continue
+            if pipeline_id is not None and whisper.pipeline_id != pipeline_id:
+                continue
+            count += 1
+            latest = whisper.created_at if latest is None else max(latest, whisper.created_at)
+            by_type[whisper.whisper_type] = by_type.get(whisper.whisper_type, 0) + 1
+        return {"count": count, "last_activity_at": latest, "by_type": by_type}

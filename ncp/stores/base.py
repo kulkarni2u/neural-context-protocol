@@ -267,3 +267,23 @@ class BaseStore(ABC):
         """Asynchronously persist cost telemetry using thread pool."""
         fn = partial(self.log_cost, agent_id=agent_id, response=response)
         await anyio.to_thread.run_sync(fn)
+
+    async def async_viz_data(self, *, pipeline_id: str | None = None) -> dict[str, object]:
+        """Asynchronously build operator viz data using thread pool."""
+        fn = partial(self.viz_data, pipeline_id=pipeline_id)
+        return await anyio.to_thread.run_sync(fn)
+
+    async def async_status_detail(self, *, pipeline_id: str | None = None) -> dict[str, object]:
+        """Asynchronously build status detail using thread pool."""
+        fn = partial(self.status_detail, pipeline_id=pipeline_id)
+        return await anyio.to_thread.run_sync(fn)
+
+    async def async_cost_summary(
+        self,
+        *,
+        pipeline_id: str | None = None,
+        limit: int = 10,
+    ) -> dict[str, object]:
+        """Asynchronously build cost summary using thread pool."""
+        fn = partial(self.cost_summary, pipeline_id=pipeline_id, limit=limit)
+        return await anyio.to_thread.run_sync(fn)
