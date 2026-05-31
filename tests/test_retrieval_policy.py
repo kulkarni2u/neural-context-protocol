@@ -81,6 +81,52 @@ def test_lexical_only_policy_ignores_recency_and_trust() -> None:
     assert s1 == pytest.approx(s2, rel=1e-9)
 
 
+def test_vector_aware_score_matches_score_when_vector_missing() -> None:
+    p = RetrievalPolicy()
+    base = p.score(bm25_normalized=0.65, age_seconds=120.0, base_trust=0.8, generation=1)
+    hybrid = p.score_with_vector(
+        bm25_normalized=0.65,
+        vector_normalized=None,
+        age_seconds=120.0,
+        base_trust=0.8,
+        generation=1,
+    )
+    assert hybrid == pytest.approx(base, rel=1e-9)
+
+
+def test_vector_aware_score_remains_bounded_in_unit_interval() -> None:
+    p = RetrievalPolicy()
+    for bm25 in (0.0, 0.4, 1.0):
+        for vector in (0.0, 0.5, 1.0):
+            score = p.score_with_vector(
+                bm25_normalized=bm25,
+                vector_normalized=vector,
+                age_seconds=600.0,
+                base_trust=0.7,
+                generation=0,
+            )
+            assert 0.0 <= score <= 1.0
+
+
+def test_vector_signal_can_break_tie_between_same_lexical_chunks() -> None:
+    p = RetrievalPolicy()
+    stronger_vector = p.score_with_vector(
+        bm25_normalized=0.6,
+        vector_normalized=0.95,
+        age_seconds=120.0,
+        base_trust=0.7,
+        generation=0,
+    )
+    weaker_vector = p.score_with_vector(
+        bm25_normalized=0.6,
+        vector_normalized=0.10,
+        age_seconds=120.0,
+        base_trust=0.7,
+        generation=0,
+    )
+    assert stronger_vector > weaker_vector
+
+
 # ---------------------------------------------------------------------------
 # SQLiteStore hybrid retrieval integration tests
 # ---------------------------------------------------------------------------

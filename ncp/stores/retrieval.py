@@ -64,6 +64,41 @@ class RetrievalPolicy:
         )
         return fused * gen_penalty
 
+    def score_with_vector(
+        self,
+        *,
+        bm25_normalized: float,
+        vector_normalized: float | None,
+        age_seconds: float,
+        base_trust: float,
+        generation: int = 0,
+        vector_mix: float = 0.5,
+    ) -> float:
+        """Compute hybrid score with an optional vector similarity signal.
+
+        The existing lexical weight is preserved as the total "relevance"
+        budget. When a vector score is present, lexical and vector signals are
+        blended within that budget using ``vector_mix``.
+        """
+        if vector_normalized is None:
+            return self.score(
+                bm25_normalized=bm25_normalized,
+                age_seconds=age_seconds,
+                base_trust=base_trust,
+                generation=generation,
+            )
+
+        mix = max(0.0, min(1.0, vector_mix))
+        lexical = max(0.0, min(1.0, bm25_normalized))
+        vector = max(0.0, min(1.0, vector_normalized))
+        blended_relevance = ((1.0 - mix) * lexical) + (mix * vector)
+        return self.score(
+            bm25_normalized=blended_relevance,
+            age_seconds=age_seconds,
+            base_trust=base_trust,
+            generation=generation,
+        )
+
     def score_no_bm25(
         self,
         *,
