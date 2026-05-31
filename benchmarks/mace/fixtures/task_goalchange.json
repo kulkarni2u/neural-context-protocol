@@ -1,0 +1,9 @@
+{
+  "task_id": "mace_goalchange_v1",
+  "description": "Handle a mid-pipeline goal change without losing coherence",
+  "initial_goal": "Design a context assembly pipeline that stays under 2000 tokens and preserves conscious, subconscious, and whisper blocks.",
+  "goal_change": {
+    "at_turn": 20,
+    "new_goal": "The budget is now 1200 tokens. Compress each block further while keeping all three store types present and preserving retrieval quality."
+  }
+}

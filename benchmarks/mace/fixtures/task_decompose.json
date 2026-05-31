@@ -1,0 +1,20 @@
+{
+  "task_id": "mace_canonical_v1",
+  "description": "Build a token-efficient context assembly system",
+  "initial_goal": "Design and implement a Python module that assembles structured context blocks from three stores: conscious, subconscious, and whisper. The module must keep total context under 2000 tokens regardless of pipeline depth.",
+  "goal_change": {
+    "at_turn": 20,
+    "new_goal": "The token budget has been tightened. Redesign the assembly to stay under 1200 tokens. Preserve all three store types but compress each block further."
+  },
+  "known_dead_ends": [
+    "api/v1",
+    "api/v2",
+    "oauth_basic"
+  ],
+  "acceptance_criteria": [
+    "Module assembles context under token budget",
+    "All three block types present",
+    "Compression strategy documented",
+    "Unit test for token budget enforcement"
+  ]
+}

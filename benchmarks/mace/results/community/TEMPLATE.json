@@ -1,0 +1,43 @@
+{
+  "benchmark": "MACE",
+  "version": "1.0",
+  "timestamp": "2026-05-31T00:00:00Z",
+  "system": "YOUR_SYSTEM_NAME",
+  "system_version": "x.y.z",
+  "system_repo": "https://github.com/...",
+  "provider": "anthropic",
+  "turns": 40,
+  "notes": "Optional: describe your approach",
+  "dimensions": {
+    "d1": {
+      "dimension": "D1_token_efficiency",
+      "score": 0.0,
+      "primary_checkpoint": 40,
+      "primary_reduction_ratio": 1.0,
+      "checkpoints": {
+        "turn_10": {"baseline_tokens": 0, "ncp_tokens": 0, "reduction_ratio": 1.0},
+        "turn_20": {"baseline_tokens": 0, "ncp_tokens": 0, "reduction_ratio": 1.0},
+        "turn_40": {"baseline_tokens": 0, "ncp_tokens": 0, "reduction_ratio": 1.0}
+      }
+    },
+    "d2": {
+      "dimension": "D2_handoff_quality",
+      "score": 0.0,
+      "h1_uncertainty_propagation": 0.0,
+      "h2_constraint_propagation": 0.0,
+      "h3_whisper_delivery": 0.0
+    },
+    "d3": {
+      "dimension": "D3_deadend_prevention",
+      "score": 0.0,
+      "retried_count": 0,
+      "total_dead_ends": 3
+    },
+    "d4": {
+      "dimension": "D4_goal_coherence",
+      "score": 0.0,
+      "turns_to_full_coherence": null
+    }
+  },
+  "composite_score": 0.0
+}

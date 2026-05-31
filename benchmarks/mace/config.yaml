@@ -1,0 +1,28 @@
+{
+  "pipeline": {
+    "agents": ["planner", "executor", "critic"],
+    "turns": 40,
+    "turn_checkpoints": [10, 20, 30, 40, 60]
+  },
+  "task": {
+    "canonical": "fixtures/task_decompose.json",
+    "goal_change_fixture": "fixtures/task_goalchange.json",
+    "goal_change_at_turn": 20
+  },
+  "providers": {
+    "primary": "anthropic"
+  },
+  "scoring": {
+    "d1_weight": 0.30,
+    "d2_weight": 0.25,
+    "d3_weight": 0.25,
+    "d4_weight": 0.20,
+    "composite": "weighted_mean"
+  },
+  "output": {
+    "results_dir": "results",
+    "save_baseline": true,
+    "save_traces": true,
+    "verbose": false
+  }
+}

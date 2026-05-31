@@ -2,6 +2,31 @@
 
 All notable changes to Neural Context Protocol will be documented in this file.
 
+## [0.15.x] - 2026-05-31
+
+MACE benchmark slice. No breaking changes.
+
+### Added / Changed
+
+- **MACE benchmark suite** (`benchmarks/mace/`): new reproducible benchmark for
+  multi-agent context coordination efficiency with four dimensions:
+  token efficiency, handoff quality, dead-end prevention, and goal coherence.
+- **D1 integration**: wired to the existing coding pipeline benchmark so token
+  efficiency reuses the established data source instead of duplicating a second
+  token-growth harness.
+- **Deterministic D2-D4 harness** (`benchmarks/mace/harness/`): runs against
+  the real NCP SQLite store + assembler path, avoiding provider credentials
+  while still exercising chunk retrieval, whisper delivery, conscious-state
+  propagation, and dead-end memory.
+- **Result artifacts**: `run.py` now writes `benchmarks/mace/results/ncp.json`,
+  `baseline.json`, and `traces/ncp_trace.json`, plus a community submission
+  template.
+- **Docs**: README benchmark section now points to MACE as the end-to-end
+  benchmark entry point.
+- **Canonical benchmark run**: `python benchmarks/mace/run.py --turns 40`
+  currently yields composite `0.9608` with D1 `0.8695`, D2 `1.0000`,
+  D3 `1.0000`, D4 `1.0000`.
+
 ## [0.14.x] - 2026-05-30
 
 Two slices completing the 0.14.x line. No breaking changes.

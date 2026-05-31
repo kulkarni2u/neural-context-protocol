@@ -166,6 +166,16 @@ Benchmark write-ups:
 - [docs/NCP_BENCHMARK_CODING_PIPELINE.md](./docs/NCP_BENCHMARK_CODING_PIPELINE.md)
 - [docs/NCP_BENCHMARK_RESEARCH_PIPELINE.md](./docs/NCP_BENCHMARK_RESEARCH_PIPELINE.md)
 
+Cross-agent benchmark suite:
+
+```bash
+python benchmarks/mace/run.py
+```
+
+- [benchmarks/mace/README.md](./benchmarks/mace/README.md)
+- current canonical `--turns 40` MACE score: `0.9608`
+- D1 `0.8695`, D2 `1.0000`, D3 `1.0000`, D4 `1.0000`
+
 ## How NCP Reduces Token Cost
 
 Multi-agent workflows that replay full history accumulate tokens quadratically.
