@@ -56,6 +56,7 @@ class AsyncPgvectorStore(BaseStore):
         gc_threshold: int = 400,
         redis_url: str | None = None,
         coordination: AsyncRedisCoordination | None = None,
+        embedding_adapter: object | None = None,
     ) -> None:
         self.dsn = dsn
         self.schema = _validate_identifier(schema, field="schema")
@@ -64,6 +65,7 @@ class AsyncPgvectorStore(BaseStore):
         self._max_pool = max_pool_connections
         self.max_working_chunks = max_working_chunks
         self.gc_threshold = gc_threshold
+        self._embedding_adapter: object | None = embedding_adapter
         self._apool: Any = None
         self._init_lock = anyio.Lock()
         self._acoordination: AsyncRedisCoordination | None = coordination or (
@@ -168,6 +170,13 @@ class AsyncPgvectorStore(BaseStore):
         INSERT/upsert → hard_gc.
         """
         chunk = self._validate_chunk_for_write(chunk)
+        if self._embedding_adapter is not None and chunk.embedding is None:
+            _adapter = self._embedding_adapter
+            _content = chunk.content
+            embedding_vec = await anyio.to_thread.run_sync(
+                lambda: _adapter.embed(_content)  # type: ignore[union-attr]
+            )
+            chunk = chunk.model_copy(update={"embedding": embedding_vec})
         embedding_val = (
             "[" + ",".join(str(f) for f in chunk.embedding) + "]"
             if chunk.embedding is not None
@@ -468,6 +477,24 @@ class AsyncPgvectorStore(BaseStore):
             results.append(chunk)
             if len(results) >= max(1, k):
                 break
+
+        if results:
+            now = time.time()
+            chunk_ids = [c.chunk_id for c in results]
+            async with self._aconnect() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        self._sql(
+                            "UPDATE {schema}.{prefix}chunks"
+                            " SET retrieval_count = retrieval_count + 1, last_retrieved_at = %s"
+                            " WHERE chunk_id = ANY(%s)"
+                        ),
+                        (now, chunk_ids),
+                    )
+            for chunk in results:
+                chunk.retrieval_count += 1
+                chunk.last_retrieved_at = now
+
         return results
 
     async def async_log_turn_record(self, record: TurnRecord) -> None:
