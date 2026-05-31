@@ -8,9 +8,9 @@ agent instead of replaying long chat history.
 
 Latest release:
 
-- PyPI: `neural-context-protocol==0.10.0` *(pending publish)*
+- PyPI: `neural-context-protocol==0.11.0` *(pending publish)*
 - GitHub: `main` branch
-- Suite: `479 passed, 8 skipped`
+- Suite: `498 passed, 8 skipped`
 - Live pgvector + Redis integration suite: `6 passed`
 
 ## What Shipped In 0.2.0
@@ -173,21 +173,30 @@ Latest release:
   give the loop enough candidates. Results respect `diversity_limit` per author.
 - Suite: `479 passed, 8 skipped`
 
-## Active Line: 0.11.x (next)
+## What Shipped In 0.11.x
 
-The `0.10.x` line is complete. Suggested next priorities:
+- **`diversity_limit` wire-through**: threaded end-to-end from assembler → api → MCP tools
+  (`ncp_get_context`, `ncp_fetch`) → `.ncp/run.py` `get_context`/`fetch`. `None` uses store
+  default (2). 14 new tests including behavioral MCP handler call-through tests.
+- **`_is_duplicate` self-match fix**: `AND chunk_id != ?/%s` added to WHERE clause in all
+  three stores (SQLite, PgvectorStore, AsyncPgvectorStore). Idempotent upserts of existing
+  chunks now succeed instead of being silently dropped. 5 new tests.
+- Suite: `498 passed, 8 skipped`
 
-- **Wire `diversity_limit` through public API**: `assembler._retrieve_chunks`, `api.get_context/run/stream`,
-  `mcp/server.py ncp_get_context`, `.ncp/run.py fetch` — callers currently cannot override diversity
-  through the public surface; same wire-through pattern as k-forwarding in 0.8.x
-- **Fix `_is_duplicate` self-match gap**: both sync and async `_is_duplicate` include the chunk being
-  upserted in the similarity scan — an idempotent upsert of an existing chunk is silently dropped
-  instead of updated. Add `AND chunk_id != %s` to the WHERE clause.
+## Active Line: 0.12.x (next)
+
+The `0.11.x` line is complete. Suggested next priorities:
+
+- **`async_write` auto-embed parity**: `AsyncPgvectorStore.async_write` does not call
+  `_embedding_adapter.embed()` when `chunk.embedding is None` (no `_embedding_adapter` in `__init__`);
+  add `embedding_adapter=` kwarg and match `PgvectorStore.write()` auto-embed behavior
+- **Retrieval feedback calibration for async**: `async_query` doesn't increment `retrieval_count`/
+  `last_retrieved_at` on returned chunks (sync `query` does via UPDATE); add the async UPDATE path
 
 ## Known Architectural Gaps (carried forward)
 
-- `diversity_limit` not yet wired through assembler/API/MCP surface — only configurable at direct `store.query()` call sites
-- `_is_duplicate` (sync + async) does not exclude the chunk being upserted — idempotent upserts silently no-op
+- `AsyncPgvectorStore.async_write` skips auto-embed (no `_embedding_adapter` wired in)
+- `AsyncPgvectorStore.async_query` skips retrieval-count update on returned chunks
 
 ## Recommended Agent Roles
 

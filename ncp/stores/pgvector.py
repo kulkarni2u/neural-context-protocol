@@ -1693,9 +1693,10 @@ class PgvectorStore(BaseStore):
                     """
                     SELECT content FROM {schema}.{prefix}chunks
                     WHERE zone = %s AND layer = %s AND COALESCE(pipeline_id, '') = COALESCE(%s, '')
+                      AND chunk_id != %s
                     """
                 ),
-                (chunk.zone, chunk.layer, chunk.pipeline_id),
+                (chunk.zone, chunk.layer, chunk.pipeline_id, chunk.chunk_id),
             )
             rows = self._fetchall(cursor)
         finally:

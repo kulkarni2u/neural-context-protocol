@@ -68,13 +68,14 @@ class Assembler:
         query_text: str | None = None,
         ctx_window: int | None = None,
         k: int | None = None,
+        diversity_limit: int | None = None,
     ) -> tuple[ConsciousBlock, BudgetContext, list[SubconsciousChunk], list[Whisper]]:
         conscious, budget = self.middleware.pre_assemble(conscious, budget)
         coherence_report = self.coherence.check(conscious)
         coherence_alerts = coherence_report.alerts
         hydrated = conscious if ctx_window is None else conscious.model_copy(update={"ctx_window": ctx_window})
         recent_chunks = self._resolve_recent_refs(hydrated)
-        subconscious = self._retrieve_chunks(hydrated, query_text=query_text, budget=budget, k=k)
+        subconscious = self._retrieve_chunks(hydrated, query_text=query_text, budget=budget, k=k, diversity_limit=diversity_limit)
         subconscious = self._cold_start_bootstrap(hydrated, subconscious)
         combined_chunks = self._dedupe_chunks([*recent_chunks, *subconscious])
         drained_whispers = self._drain_whispers(hydrated)
@@ -99,6 +100,7 @@ class Assembler:
         query_text: str | None = None,
         ctx_window: int | None = None,
         k: int | None = None,
+        diversity_limit: int | None = None,
     ) -> AssemblyResult:
         hydrated, budget, combined_chunks, combined_whispers = self._prepare_assembly(
             conscious=conscious,
@@ -106,6 +108,7 @@ class Assembler:
             query_text=query_text,
             ctx_window=ctx_window,
             k=k,
+            diversity_limit=diversity_limit,
         )
         context = self.encoder.assemble(
             conscious=hydrated,
@@ -130,6 +133,7 @@ class Assembler:
         ctx_window: int | None = None,
         max_tokens: int | None = None,
         k: int | None = None,
+        diversity_limit: int | None = None,
     ) -> Iterator[tuple[str, str]]:
         """Yield (label, section_text) in priority order, enforcing max_tokens.
 
@@ -148,6 +152,7 @@ class Assembler:
             query_text=query_text,
             ctx_window=ctx_window,
             k=k,
+            diversity_limit=diversity_limit,
         )
 
         tokens_used = 0
@@ -279,15 +284,20 @@ class Assembler:
         query_text: str | None,
         budget: BudgetContext | None = None,
         k: int | None = None,
+        diversity_limit: int | None = None,
     ) -> list[SubconsciousChunk]:
         if k is None:
             k = 2 if (budget is not None and budget.pressure == "critical") else 4
         search_text = query_text or f"{conscious.task} {conscious.slot}"
+        extra: dict = {}
+        if diversity_limit is not None:
+            extra["diversity_limit"] = diversity_limit
         return self.store.query(
             search_text,
             k=k,
             pipeline_id=conscious.pipeline_id,
             zone="working",
+            **extra,
         )
 
     def _cold_start_bootstrap(

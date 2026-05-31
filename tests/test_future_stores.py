@@ -46,11 +46,13 @@ class _FakeCursor:
             self._rows = [] if row is None else [{"src": row["src"]}]
             return
         if "SELECT content FROM" in normalized and "COALESCE(pipeline_id, '') = COALESCE(%s, '')" in normalized:
-            zone, layer, pipeline_id = params
+            zone, layer, pipeline_id, exclude_chunk_id = params
             self._rows = [
                 {"content": row["content"]}
                 for row in self._db.chunks.values()
-                if row["zone"] == zone and row["layer"] == layer and (row["pipeline_id"] or "") == (pipeline_id or "")
+                if row["zone"] == zone and row["layer"] == layer
+                and (row["pipeline_id"] or "") == (pipeline_id or "")
+                and row["chunk_id"] != exclude_chunk_id
             ]
             return
         if "INSERT INTO" in normalized and "chunks (" in normalized:

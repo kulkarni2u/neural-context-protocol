@@ -58,6 +58,7 @@ MCP_TOOLS: list[dict[str, object]] = [
                 "session_id": {"type": "string", "description": "Optional fetch-session token for this turn"},
                 "stream": {"type": "boolean", "description": "If true, returns sections progressively as NDJSON (HTTP) or JSON-RPC notifications (stdio). Default false."},
                 "k": {"type": "integer", "description": "Number of subconscious chunks to retrieve. Overrides the default budget-pressure-based value (2 for critical, 4 otherwise)."},
+                "diversity_limit": {"type": "integer", "description": "Max chunks per author in retrieved results. Default 2. Set higher to allow more results from one author."},
             },
             "required": ["agent_id", "role", "task", "slot", "intent"],
         },
@@ -103,6 +104,7 @@ MCP_TOOLS: list[dict[str, object]] = [
                 "query": {"type": "string", "description": "Specific description of needed context"},
                 "layer": {"type": "string", "enum": ["episodic", "procedural", "semantic", "social", "any"], "description": "Optional layer filter"},
                 "k": {"type": "integer", "description": "Number of chunks (default 2, max 4)"},
+                "diversity_limit": {"type": "integer", "description": "Max chunks per author. Default 2."},
                 "agent_id": {"type": "string", "description": "Agent identifier to scope fetch budget"},
                 "pipeline_id": {"type": "string", "description": "Pipeline identifier to scope fetch budget"},
                 "session_id": {"type": "string", "description": "Optional fetch-session token returned by ncp_get_context"},
@@ -181,12 +183,17 @@ def make_handlers(store: BaseStore) -> dict[str, ToolHandler]:
             caller_k: int | None = max(1, int(args["k"])) if "k" in args else None  # type: ignore[arg-type]
         except (ValueError, TypeError):
             caller_k = None
+        try:
+            caller_diversity_limit: int | None = max(1, int(args["diversity_limit"])) if "diversity_limit" in args else None  # type: ignore[arg-type]
+        except (ValueError, TypeError):
+            caller_diversity_limit = None
         if stream:
             sections = list(assembler.assemble_incremental(
                 conscious=conscious,
                 budget=BudgetContext(),
                 query_text=conscious.task + " " + conscious.slot,
                 k=caller_k,
+                diversity_limit=caller_diversity_limit,
             ))
             assembled = assembler.apply_post_middleware("\n\n".join(t for _, t in sections))
             return StreamResponse(
@@ -198,6 +205,7 @@ def make_handlers(store: BaseStore) -> dict[str, ToolHandler]:
             budget=BudgetContext(),
             query_text=conscious.task + " " + conscious.slot,
             k=caller_k,
+            diversity_limit=caller_diversity_limit,
         )
         return {"context": result.context, "session_id": session_id}
 
@@ -257,7 +265,14 @@ def make_handlers(store: BaseStore) -> dict[str, ToolHandler]:
             k = max(1, int(args.get("k", 2)))
         except (ValueError, TypeError):
             k = 2
-        chunks = store.query(text=query_str, k=k, layer=layer, pipeline_id=effective_pipeline_id)
+        try:
+            fetch_diversity_limit: int | None = max(1, int(args["diversity_limit"])) if "diversity_limit" in args else None  # type: ignore[arg-type]
+        except (ValueError, TypeError):
+            fetch_diversity_limit = None
+        query_extra: dict = {}
+        if fetch_diversity_limit is not None:
+            query_extra["diversity_limit"] = fetch_diversity_limit
+        chunks = store.query(text=query_str, k=k, layer=layer, pipeline_id=effective_pipeline_id, **query_extra)
         if not chunks:
             return {"result": "ncp_fetch:no_results query_too_specific_or_layer_empty"}
         return {"result": _encode_fetch_results(chunks)}

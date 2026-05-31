@@ -300,9 +300,10 @@ class AsyncPgvectorStore(BaseStore):
                     SELECT content FROM {schema}.{prefix}chunks
                     WHERE zone = %s AND layer = %s
                       AND COALESCE(pipeline_id, '') = COALESCE(%s, '')
+                      AND chunk_id != %s
                     """
                 ),
-                (chunk.zone, chunk.layer, chunk.pipeline_id),
+                (chunk.zone, chunk.layer, chunk.pipeline_id, chunk.chunk_id),
             )
             raw_rows = await cur.fetchall()
             description = cur.description

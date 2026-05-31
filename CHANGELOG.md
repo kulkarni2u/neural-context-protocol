@@ -2,6 +2,24 @@
 
 All notable changes to Neural Context Protocol will be documented in this file.
 
+## [0.11.x] - 2026-05-30
+
+Two slices completing the 0.11.x line. No breaking changes.
+
+### Added / Changed
+
+- **`diversity_limit` wire-through** (`ncp/assembler.py`, `ncp/api.py`, `ncp/mcp/server.py`,
+  `.ncp/run.py`): `diversity_limit: int | None = None` threaded from
+  `Assembler._retrieve_chunks` → `_prepare_assembly` → `assemble`/`assemble_incremental` →
+  `api.get_context/run/stream` → MCP `_handle_get_context`/`_handle_fetch` → `store.query`.
+  `ncp_get_context` and `ncp_fetch` inputSchema updated. `.ncp/run.py get_context` and `fetch`
+  both extract and forward. `None` means "store uses own default (2)". 14 new tests.
+- **`_is_duplicate` self-match fix** (`ncp/stores/sqlite.py`, `pgvector.py`,
+  `pgvector_async.py`): added `AND chunk_id != ?/%s` to WHERE clause in all three stores.
+  Idempotent upsert of an existing chunk now proceeds correctly instead of being silently
+  rejected as a self-duplicate. 5 new tests + fake-cursor update in `test_future_stores.py`.
+- Suite: `498 passed, 8 skipped`
+
 ## [0.10.x] - 2026-05-30
 
 Two slices completing the 0.10.x line. No breaking changes.

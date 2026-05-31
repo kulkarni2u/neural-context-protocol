@@ -1418,8 +1418,9 @@ class SQLiteStore(BaseStore):
             """
             SELECT content FROM chunks
             WHERE zone = ? AND layer = ? AND IFNULL(pipeline_id, '') = IFNULL(?, '')
+              AND chunk_id != ?
             """,
-            (chunk.zone, chunk.layer, chunk.pipeline_id),
+            (chunk.zone, chunk.layer, chunk.pipeline_id, chunk.chunk_id),
         ).fetchall()
         for row in rows:
             similarity = SequenceMatcher(None, chunk.content, str(row["content"])).ratio()
