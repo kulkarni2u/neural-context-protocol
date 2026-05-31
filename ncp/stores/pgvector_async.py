@@ -57,6 +57,7 @@ class AsyncPgvectorStore(BaseStore):
         redis_url: str | None = None,
         coordination: AsyncRedisCoordination | None = None,
         embedding_adapter: object | None = None,
+        ivfflat_probes: int = 10,
     ) -> None:
         self.dsn = dsn
         self.schema = _validate_identifier(schema, field="schema")
@@ -66,6 +67,7 @@ class AsyncPgvectorStore(BaseStore):
         self.max_working_chunks = max_working_chunks
         self.gc_threshold = gc_threshold
         self._embedding_adapter: object | None = embedding_adapter
+        self._ivfflat_probes = ivfflat_probes
         self._apool: Any = None
         self._init_lock = anyio.Lock()
         self._acoordination: AsyncRedisCoordination | None = coordination or (
@@ -370,6 +372,107 @@ class AsyncPgvectorStore(BaseStore):
                 [(str(row["chunk_id"]),) for row in stale],
             )
 
+    async def _async_query_vector(
+        self,
+        *,
+        text: str,
+        embedding: list[float] | None,
+        k: int,
+        min_score: float,
+        layer: str | None,
+        pipeline_id: str | None,
+        scope: str | None,
+        zone: str,
+        diversity_limit: int = 2,
+    ) -> list[SubconsciousChunk]:
+        if embedding is None:
+            if self._embedding_adapter is not None:
+                _adapter = self._embedding_adapter
+                _text = text
+                embedding = await anyio.to_thread.run_sync(
+                    lambda: _adapter.embed(_text)  # type: ignore[union-attr]
+                )
+            else:
+                raise ValueError("retrieval_mode='vector' requires an embedding to be provided")
+        if len(embedding) != 1536:
+            raise ValueError(f"embedding must have 1536 dimensions, got {len(embedding)}")
+        embedding_str = "[" + ",".join(str(f) for f in embedding) + "]"
+
+        where_clauses = ["zone = %s", "embedding IS NOT NULL"]
+        where_params: list[object] = [zone]
+        if layer is not None:
+            where_clauses.append("layer = %s")
+            where_params.append(layer)
+        if pipeline_id is None:
+            where_clauses.append("(pipeline_id IS NULL OR scope = 'global')")
+        else:
+            where_clauses.append("(pipeline_id = %s OR scope = 'global')")
+            where_params.append(pipeline_id)
+        if scope is not None:
+            where_clauses.append("scope = %s")
+            where_params.append(scope)
+
+        limit = max(1, k * 4)
+        all_params = tuple([embedding_str] + where_params + [embedding_str, limit])
+
+        async with self._aconnect() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("SET LOCAL ivfflat.probes = %s", (self._ivfflat_probes,))
+                await cur.execute(
+                    self._sql(
+                        "SELECT *, (embedding <=> %s::vector) AS vec_distance"
+                        f" FROM {{schema}}.{{prefix}}chunks"
+                        f" WHERE {' AND '.join(where_clauses)}"
+                        " ORDER BY embedding <=> %s::vector LIMIT %s"
+                    ),
+                    all_params,
+                )
+                raw_rows = await cur.fetchall()
+                description = cur.description
+
+        rows = [self._normalize_row(r, description) for r in raw_rows]
+        results: list[SubconsciousChunk] = []
+        for row in rows:
+            distance = float(row.get("vec_distance") or 1.0)
+            score = 1.0 / (1.0 + distance)
+            if score < min_score:
+                continue
+            chunk = self._row_to_chunk(row)
+            chunk.relevance = max(0.0, min(1.0, score))
+            results.append(chunk)
+
+        _diversity_cap = max(1, diversity_limit)
+        author_count: dict[str, int] = {}
+        diverse: list[SubconsciousChunk] = []
+        for chunk in results:
+            author = str(chunk.written_by)
+            if author_count.get(author, 0) >= _diversity_cap:
+                continue
+            author_count[author] = author_count.get(author, 0) + 1
+            diverse.append(chunk)
+            if len(diverse) >= max(1, k):
+                break
+        results = diverse
+
+        if results:
+            now = time.time()
+            chunk_ids = [c.chunk_id for c in results]
+            async with self._aconnect() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        self._sql(
+                            "UPDATE {schema}.{prefix}chunks"
+                            " SET retrieval_count = retrieval_count + 1, last_retrieved_at = %s"
+                            " WHERE chunk_id = ANY(%s)"
+                        ),
+                        (now, chunk_ids),
+                    )
+            for chunk in results:
+                chunk.retrieval_count += 1
+                chunk.last_retrieved_at = now
+
+        return results
+
     async def async_query(
         self,
         text: str,
@@ -385,9 +488,22 @@ class AsyncPgvectorStore(BaseStore):
         diversity_limit: int = 2,
     ) -> list[SubconsciousChunk]:
         """Query chunks using native async DB I/O; score computation stays synchronous."""
-        if retrieval_mode == "vector":
+        _VALID_RETRIEVAL_MODES = ("hybrid", "trust_recency", "vector")
+        if retrieval_mode not in _VALID_RETRIEVAL_MODES:
             raise ValueError(
-                "retrieval_mode='vector' is not yet supported in AsyncPgvectorStore"
+                f"Unknown retrieval_mode {retrieval_mode!r}; expected one of {_VALID_RETRIEVAL_MODES}"
+            )
+        if retrieval_mode == "vector":
+            return await self._async_query_vector(
+                text=text,
+                embedding=embedding,
+                k=k,
+                min_score=min_score,
+                layer=layer,
+                pipeline_id=pipeline_id,
+                scope=scope,
+                zone=zone,
+                diversity_limit=diversity_limit,
             )
         clauses = ["zone = %s"]
         params: list[Any] = [zone]
