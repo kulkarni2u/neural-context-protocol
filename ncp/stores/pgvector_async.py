@@ -27,8 +27,11 @@ from ncp.stores.pgvector import (
     _validate_identifier,
 )
 from ncp.stores.redis_coordination import AsyncRedisCoordination
+from ncp.stores.consolidation import cluster_by_tags, find_merge_candidates
 from ncp.types import (
+    CalibrationReport,
     ConsciousBlock,
+    ConsolidationReport,
     NCPResponse,
     SubconsciousChunk,
     TurnRecord,
@@ -782,6 +785,272 @@ class AsyncPgvectorStore(BaseStore):
             source_refs=[],
             age_seconds=max(0.0, time.time() - created_at),
         )
+
+    # ------------------------------------------------------------------
+    # Async consolidation — full parity with sync consolidate()
+    # ------------------------------------------------------------------
+
+    async def async_consolidate(
+        self,
+        *,
+        pipeline_id: str | None = None,
+        dry_run: bool = False,
+        similarity_threshold: float = 0.65,
+        trust_floor: float = 0.10,
+    ) -> ConsolidationReport:
+        """Merge redundant chunks using async DB I/O. Full parity with consolidate()."""
+        started = time.monotonic()
+        report = ConsolidationReport(dry_run=dry_run, pipeline_id=pipeline_id)
+
+        async with self._aconnect() as conn:
+            async with conn.cursor() as cur:
+                if pipeline_id is not None:
+                    await cur.execute(
+                        self._sql(
+                            "SELECT * FROM {schema}.{prefix}chunks"
+                            " WHERE chunk_id NOT IN"
+                            " (SELECT chunk_id FROM {schema}.{prefix}tombstones)"
+                            " AND pipeline_id = %s"
+                        ),
+                        (pipeline_id,),
+                    )
+                else:
+                    await cur.execute(
+                        self._sql(
+                            "SELECT * FROM {schema}.{prefix}chunks"
+                            " WHERE chunk_id NOT IN"
+                            " (SELECT chunk_id FROM {schema}.{prefix}tombstones)"
+                        )
+                    )
+                rows = await cur.fetchall()
+                desc = cur.description
+
+        all_chunks = [self._row_to_chunk(self._normalize_row(r, desc)) for r in rows]
+        eligible = [c for c in all_chunks if c.base_trust >= trust_floor]
+        report.skipped += len(all_chunks) - len(eligible)
+        clusters = cluster_by_tags(eligible)
+        report.clusters_scanned = len(clusters)
+
+        for cluster in clusters:
+            candidates = find_merge_candidates(cluster, similarity_threshold=similarity_threshold)
+            for keeper, losers in candidates:
+                loser_ids = [c.chunk_id for c in losers]
+                report.merge_log.append({
+                    "kept": keeper.chunk_id,
+                    "merged": loser_ids,
+                    "layer": keeper.layer,
+                    "zone": keeper.zone,
+                    "pipeline_id": keeper.pipeline_id,
+                })
+                if not dry_run:
+                    async with self._aconnect() as conn:
+                        async with conn.cursor() as cur:
+                            for loser_id in loser_ids:
+                                await cur.execute(
+                                    self._sql(
+                                        "DELETE FROM {schema}.{prefix}chunks"
+                                        " WHERE chunk_id = %s"
+                                    ),
+                                    (loser_id,),
+                                )
+                                await cur.execute(
+                                    self._sql(
+                                        "INSERT INTO {schema}.{prefix}tombstones"
+                                        " (chunk_id, forward_ref, tombstoned_at, expires_at)"
+                                        " VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING"
+                                    ),
+                                    (loser_id, keeper.chunk_id, time.time(), time.time() + 86400),
+                                )
+                            supersedes_json = json.dumps(loser_ids)
+                            new_gen = keeper.generation + 1
+                            await cur.execute(
+                                self._sql(
+                                    "UPDATE {schema}.{prefix}chunks"
+                                    " SET generation = %s, supersedes = %s"
+                                    " WHERE chunk_id = %s"
+                                ),
+                                (new_gen, supersedes_json, keeper.chunk_id),
+                            )
+                report.merged += 1
+                report.tombstoned += len(loser_ids)
+
+            report.skipped += sum(
+                1 for c in cluster
+                if not any(
+                    c.chunk_id == k.chunk_id or c.chunk_id in [m.chunk_id for m in ls]
+                    for k, ls in candidates
+                )
+            )
+
+        if not dry_run and report.merged > 0:
+            await self._async_emit_consolidation_whisper(pipeline_id=pipeline_id)
+
+        report.duration_seconds = time.monotonic() - started
+        return report
+
+    async def _async_emit_consolidation_whisper(self, *, pipeline_id: str | None) -> None:
+        """Emit consolidation_ready whisper via async coordination. Silently swallows errors."""
+        if self._acoordination is None:
+            return
+        whisper = Whisper(
+            from_agent="ncp_consolidator",
+            target="*",
+            whisper_type="consolidation_ready",
+            payload=f"consolidation_complete pipeline:{pipeline_id or 'all'}",
+            confidence=1.0,
+            pipeline_id=pipeline_id,
+        )
+        try:
+            await self._acoordination.emit_whisper(whisper)
+        except Exception:
+            pass
+
+    async def async_calibrate(
+        self,
+        *,
+        pipeline_id: str | None = None,
+        chunk_id: str | None = None,
+        trust: float | None = None,
+        dry_run: bool = False,
+        decay_factor: float = 0.85,
+        recency_half_life_seconds: float = 14400,
+        feedback_mode: bool = False,
+        feedback_weight: float = 0.15,
+    ) -> CalibrationReport:
+        """Re-score base_trust on live chunks using async DB I/O. Full parity with calibrate()."""
+        started = time.monotonic()
+        report = CalibrationReport(dry_run=dry_run, pipeline_id=pipeline_id)
+
+        if chunk_id is not None:
+            if trust is None or not (0.0 <= trust <= 1.0):
+                raise ValueError(
+                    f"trust must be in [0.0, 1.0] when chunk_id is specified, got {trust!r}"
+                )
+            row = None
+            desc = None
+            async with self._aconnect() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        self._sql(
+                            "SELECT * FROM {schema}.{prefix}chunks"
+                            " WHERE chunk_id = %s"
+                            " AND chunk_id NOT IN"
+                            " (SELECT chunk_id FROM {schema}.{prefix}tombstones)"
+                        ),
+                        (chunk_id,),
+                    )
+                    row = await cur.fetchone()
+                    desc = cur.description
+            if row is None:
+                report.skipped += 1
+                report.duration_seconds = time.monotonic() - started
+                return report
+            chunk_obj = self._row_to_chunk(self._normalize_row(row, desc))
+            report.change_log.append({
+                "chunk_id": chunk_id,
+                "old_trust": chunk_obj.base_trust,
+                "new_trust": trust,
+                "reason": "manual_override",
+            })
+            if not dry_run:
+                async with self._aconnect() as conn:
+                    async with conn.cursor() as cur:
+                        await cur.execute(
+                            self._sql(
+                                "UPDATE {schema}.{prefix}chunks"
+                                " SET base_trust = %s WHERE chunk_id = %s"
+                            ),
+                            (trust, chunk_id),
+                        )
+            report.adjusted += 1
+            report.duration_seconds = time.monotonic() - started
+            return report
+
+        cutoff_age = recency_half_life_seconds
+        async with self._aconnect() as conn:
+            async with conn.cursor() as cur:
+                if pipeline_id is not None:
+                    await cur.execute(
+                        self._sql(
+                            "SELECT chunk_id, base_trust, src, generation, created_at,"
+                            " retrieval_count FROM {schema}.{prefix}chunks"
+                            " WHERE chunk_id NOT IN"
+                            " (SELECT chunk_id FROM {schema}.{prefix}tombstones)"
+                            " AND pipeline_id = %s"
+                        ),
+                        (pipeline_id,),
+                    )
+                else:
+                    await cur.execute(
+                        self._sql(
+                            "SELECT chunk_id, base_trust, src, generation, created_at,"
+                            " retrieval_count FROM {schema}.{prefix}chunks"
+                            " WHERE chunk_id NOT IN"
+                            " (SELECT chunk_id FROM {schema}.{prefix}tombstones)"
+                        )
+                    )
+                rows = await cur.fetchall()
+                desc = cur.description
+
+        updates: list[tuple[float, str]] = []
+        now = time.time()
+        for row in rows:
+            r = self._normalize_row(row, desc)
+            cid = str(r["chunk_id"])
+            bt = float(r.get("base_trust", 0.7))
+            src = str(r.get("src") or "")
+            generation = int(r.get("generation") or 0)
+            created_at = float(r.get("created_at") or now)
+            rc = int(r.get("retrieval_count") or 0)
+            age_seconds = max(0.0, now - created_at)
+
+            if src == "user_verified":
+                report.protected += 1
+                continue
+
+            if not feedback_mode:
+                if age_seconds > cutoff_age and bt > 0.5 and generation == 0:
+                    new_trust = max(0.0, bt * decay_factor)
+                    report.change_log.append({
+                        "chunk_id": cid,
+                        "old_trust": bt,
+                        "new_trust": new_trust,
+                        "reason": "batch_decay",
+                    })
+                    updates.append((new_trust, cid))
+                    report.adjusted += 1
+                else:
+                    report.skipped += 1
+            else:
+                if rc > 0:
+                    boost = feedback_weight * min(1.0, rc / 10)
+                    new_trust = min(1.0, bt + boost)
+                    report.change_log.append({
+                        "chunk_id": cid,
+                        "old_trust": bt,
+                        "new_trust": new_trust,
+                        "reason": "retrieval_feedback",
+                        "retrieval_count": rc,
+                    })
+                    updates.append((new_trust, cid))
+                    report.feedback_adjusted += 1
+                else:
+                    report.skipped += 1
+
+        if not dry_run and updates:
+            async with self._aconnect() as conn:
+                async with conn.cursor() as cur:
+                    for new_trust, cid in updates:
+                        await cur.execute(
+                            self._sql(
+                                "UPDATE {schema}.{prefix}chunks"
+                                " SET base_trust = %s WHERE chunk_id = %s"
+                            ),
+                            (new_trust, cid),
+                        )
+
+        report.duration_seconds = time.monotonic() - started
+        return report
 
     # ------------------------------------------------------------------
     # Sync abstract methods — not supported on async-native store

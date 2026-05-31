@@ -2,6 +2,28 @@
 
 All notable changes to Neural Context Protocol will be documented in this file.
 
+## [0.14.x] - 2026-05-30
+
+Two slices completing the 0.14.x line. No breaking changes.
+
+### Added / Changed
+
+- **`AsyncPgvectorStore.async_consolidate()`** (`ncp/stores/pgvector_async.py`): full async
+  parity with sync `PgvectorStore.consolidate()`. Loads live chunks with async SELECT, filters
+  by `trust_floor`, clusters with `cluster_by_tags()`, finds merge candidates via
+  `find_merge_candidates()` (BM25 / SequenceMatcher), then for each merge group:
+  async DELETE loser, INSERT tombstone (forward_ref, expires_at=+86400s), UPDATE keeper
+  (generation+1, supersedes). Emits `consolidation_ready` whisper via
+  `_async_emit_consolidation_whisper()` when `merged > 0` and not `dry_run`. Returns
+  `ConsolidationReport`. 8 new tests.
+- **`AsyncPgvectorStore.async_calibrate()`** (`ncp/stores/pgvector_async.py`): full async
+  parity with sync `PgvectorStore.calibrate()`. Two modes — manual (chunk_id + trust →
+  direct UPDATE) and batch (decay: `new_trust = base_trust * decay_factor` for old/high-trust
+  gen-0 chunks; feedback: `new_trust = base_trust + feedback_weight * min(1.0, rc/10)` for
+  chunks with `retrieval_count > 0`). `user_verified` chunks are always protected. Returns
+  `CalibrationReport`. 8 new tests.
+- Suite: `540 passed, 8 skipped`
+
 ## [0.11.x] - 2026-05-30
 
 Two slices completing the 0.11.x line. No breaking changes.

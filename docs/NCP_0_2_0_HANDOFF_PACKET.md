@@ -183,20 +183,36 @@ Latest release:
   chunks now succeed instead of being silently dropped. 5 new tests.
 - Suite: `498 passed, 8 skipped`
 
-## Active Line: 0.12.x (next)
+## What Shipped In 0.14.x
 
-The `0.11.x` line is complete. Suggested next priorities:
+- **`AsyncPgvectorStore.async_consolidate()`**: full async parity with sync `consolidate()`.
+  SELECT all live chunks (not in tombstones), filter by `trust_floor`, cluster with
+  `cluster_by_tags()`, run `find_merge_candidates()` per cluster (BM25/SequenceMatcher). For each
+  merge group: async DELETE loser, INSERT tombstone (forward_ref → keeper, expires_at +86400s),
+  UPDATE keeper (generation+1, supersedes=JSON list). Emits `consolidation_ready` whisper via
+  `_async_emit_consolidation_whisper()` when merged > 0 and not dry_run. Returns
+  `ConsolidationReport`. 8 new tests.
+- **`AsyncPgvectorStore.async_calibrate()`**: full async parity with sync `calibrate()`.
+  Manual mode: SELECT chunk by chunk_id, UPDATE base_trust. Batch decay mode: SELECT all chunks,
+  apply `base_trust * decay_factor` to eligible (old/high-trust/gen-0). Feedback mode: boost
+  `base_trust` by `feedback_weight * min(1.0, retrieval_count/10)` for retrieved chunks.
+  `user_verified` src always protected. Returns `CalibrationReport`. 8 new tests.
+- Suite: `540 passed, 8 skipped`
 
-- **`async_write` auto-embed parity**: `AsyncPgvectorStore.async_write` does not call
-  `_embedding_adapter.embed()` when `chunk.embedding is None` (no `_embedding_adapter` in `__init__`);
-  add `embedding_adapter=` kwarg and match `PgvectorStore.write()` auto-embed behavior
-- **Retrieval feedback calibration for async**: `async_query` doesn't increment `retrieval_count`/
-  `last_retrieved_at` on returned chunks (sync `query` does via UPDATE); add the async UPDATE path
+## Active Line: 0.15.x (next)
+
+The `0.14.x` line is complete. Suggested next priorities:
+
+- **`ncp status` async path**: `AsyncPgvectorStore.status_detail()` and `cost_summary()` still
+  raise `NotImplementedError` — add async parity for operator observability
+- **`async_query` last_retrieved_at update**: `async_query` currently only updates
+  `retrieval_count` but sync `query` also sets `last_retrieved_at`; add the timestamp update
+- **`AsyncPgvectorStore.viz_data()` async parity**: for dashboard/debugging support
 
 ## Known Architectural Gaps (carried forward)
 
-- `AsyncPgvectorStore.async_write` skips auto-embed (no `_embedding_adapter` wired in)
-- `AsyncPgvectorStore.async_query` skips retrieval-count update on returned chunks
+- `AsyncPgvectorStore.viz_data()`, `status_detail()`, `cost_summary()` still raise NotImplementedError
+- `async_query` does not update `last_retrieved_at` on returned chunks (sync does)
 
 ## Recommended Agent Roles
 
@@ -218,10 +234,11 @@ The `0.11.x` line is complete. Suggested next priorities:
 
 ## Suggested Prompt For The Next Orchestrator
 
-> Read `docs/NCP_0_2_0_HANDOFF_PACKET.md` first. The `0.9.x` line is complete
-> (464 passed, 8 skipped, ruff clean). Starting `0.10.x`. Two suggested priorities:
-> (1) configurable `diversity_limit` — currently hardcoded to 2 per-author in all retrieval paths;
-> expose as a `BaseStore.query(diversity_limit=N)` parameter so callers can widen or tighten it;
-> (2) vector-mode diversity loop — `retrieval_mode="vector"` currently returns up to k results
-> all from one author; add the same author-diversity pass applied in hybrid/trust_recency paths.
-> Keep test coverage aligned across retrieval modes. Use NCP handoffs for bounded coordination.
+> Read `docs/NCP_0_2_0_HANDOFF_PACKET.md` first. The `0.14.x` line is complete
+> (540 passed, 8 skipped, ruff clean). Starting `0.15.x`. Suggested priorities:
+> (1) `AsyncPgvectorStore.status_detail()` and `cost_summary()` async parity — both raise
+> NotImplementedError; implement async SELECT aggregations matching the sync versions;
+> (2) `async_query` last_retrieved_at update — sync `query()` sets `last_retrieved_at` on
+> returned chunks via UPDATE; async only updates `retrieval_count`, missing the timestamp.
+> Use Sarathi HIGH complexity with multi-agent dispatch (Claude=orchestrator, OpenCode/Codex=impl)
+> and NCP spine in every subagent instruction.
