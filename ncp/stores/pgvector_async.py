@@ -29,6 +29,12 @@ from ncp.stores.pgvector import (
     _validate_identifier,
 )
 from ncp.stores.redis_coordination import AsyncRedisCoordination
+from ncp.stores.retrieval import (
+    apply_diversity_limit,
+    lexical_signal_for_candidate,
+    normalize_query_terms,
+    normalize_result_limit,
+)
 from ncp.stores.consolidation import cluster_by_tags, find_merge_candidates
 from ncp.types import (
     CalibrationReport,
@@ -430,7 +436,8 @@ class AsyncPgvectorStore(BaseStore):
             where_clauses.append("scope = %s")
             where_params.append(scope)
 
-        limit = max(1, k * 4)
+        result_limit = normalize_result_limit(k)
+        limit = result_limit * 4
         all_params = tuple([embedding_str] + where_params + [embedding_str, limit])
 
         async with self._aconnect() as conn:
@@ -459,18 +466,12 @@ class AsyncPgvectorStore(BaseStore):
             chunk.relevance = max(0.0, min(1.0, score))
             results.append(chunk)
 
-        _diversity_cap = max(1, diversity_limit)
-        author_count: dict[str, int] = {}
-        diverse: list[SubconsciousChunk] = []
-        for chunk in results:
-            author = str(chunk.written_by)
-            if author_count.get(author, 0) >= _diversity_cap:
-                continue
-            author_count[author] = author_count.get(author, 0) + 1
-            diverse.append(chunk)
-            if len(diverse) >= max(1, k):
-                break
-        results = diverse
+        results = apply_diversity_limit(
+            results,
+            k=result_limit,
+            diversity_limit=diversity_limit,
+            author_getter=lambda chunk: str(chunk.written_by),
+        )
 
         if results:
             now = time.time()
@@ -565,6 +566,7 @@ class AsyncPgvectorStore(BaseStore):
         policy = DEFAULT_RETRIEVAL_POLICY
         now = time.time()
         candidates: list[SubconsciousChunk] = []
+        result_limit = normalize_result_limit(k)
 
         if retrieval_mode == "trust_recency":
             for row in rows:
@@ -582,7 +584,7 @@ class AsyncPgvectorStore(BaseStore):
         else:
             from rank_bm25 import BM25Okapi  # type: ignore[import]
 
-            query_terms = {t for t in text.lower().split() if t}
+            query_terms = normalize_query_terms(text)
             corpus = [row["content"].lower().split() for row in rows]
             bm25 = BM25Okapi(corpus)
             raw_scores = bm25.get_scores(text.split())
@@ -590,10 +592,14 @@ class AsyncPgvectorStore(BaseStore):
             norm = [s / max_bm25 for s in raw_scores] if max_bm25 > 0 else [0.0] * len(raw_scores)
 
             for score, row, tokens in zip(norm, rows, corpus, strict=True):
-                if query_terms and not query_terms.intersection(set(tokens)):
-                    continue
                 age_s = max(0.0, now - float(row["created_at"]))
-                bm25_for_policy = score if query_terms else 1.0
+                bm25_for_policy = lexical_signal_for_candidate(
+                    query_terms=query_terms,
+                    doc_tokens=tokens,
+                    bm25_normalized=score,
+                )
+                if bm25_for_policy is None:
+                    continue
                 vector_score = self._vector_similarity_score(
                     query_embedding=embedding,
                     row_embedding=row.get("embedding"),
@@ -612,17 +618,12 @@ class AsyncPgvectorStore(BaseStore):
                 candidates.append(chunk)
 
         ranked = sorted(candidates, key=lambda c: c.relevance, reverse=True)
-        _diversity_cap = max(1, diversity_limit)
-        author_count: dict[str, int] = {}
-        results: list[SubconsciousChunk] = []
-        for chunk in ranked:
-            author = str(chunk.written_by)
-            if author_count.get(author, 0) >= _diversity_cap:
-                continue
-            author_count[author] = author_count.get(author, 0) + 1
-            results.append(chunk)
-            if len(results) >= max(1, k):
-                break
+        results = apply_diversity_limit(
+            ranked,
+            k=result_limit,
+            diversity_limit=diversity_limit,
+            author_getter=lambda chunk: str(chunk.written_by),
+        )
 
         if results:
             now = time.time()

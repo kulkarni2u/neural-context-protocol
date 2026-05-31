@@ -201,17 +201,18 @@ Current local repo state:
 
 ## Active Line: 0.16.x (next)
 
-The `0.15.x` line is complete, and the first `0.16.x` retrieval slice is now
-in: shared vector-aware retrieval scoring plus sync/async pgvector hybrid
-tie-break parity (`551 passed, 8 skipped`, ruff clean). Suggested next
-priorities:
+The `0.15.x` line is complete, and the first two `0.16.x` retrieval slices are
+now in: shared vector-aware retrieval scoring plus sync/async pgvector hybrid
+tie-break parity, then shared retrieval-contract helpers for blank-query
+fallback, zero-overlap gating, normalized result caps, and diversity trimming
+(`556 passed, 8 skipped`, ruff clean). Suggested next priorities:
 
-- **Hybrid retrieval contract cleanup**: move from the first vector-aware tie-
-  break slice toward one explicit multi-signal contract for candidate
-  generation, result caps, diversity limits, and blank-query fallback that
-  works cleanly across SQLite, pgvector sync, and pgvector async
-- **Assembler/store retrieval contract cleanup**: make result caps, diversity
-  limits, and blank-query fallback behavior explicit in one place
+- **Candidate-generation cleanup**: move from the shared trimming helpers
+  toward one explicit candidate-generation contract for lexical, trust/recency,
+  and vector-assisted retrieval across SQLite, pgvector sync, and pgvector async
+- **Assembler/store retrieval contract cleanup**: keep tightening the contract
+  boundary so assembly pressure logic and store-level retrieval behavior stay
+  explicit and predictable
 - **Async reporting consumption**: thread the new async status/cost/viz parity
   into any async operator or service paths that still rely on sync-only access
 
@@ -219,8 +220,8 @@ priorities:
 
 - SQLite still has lexical-only retrieval while pgvector sync/async now have a
   vector-assisted hybrid tie-break path
-- Sync and async pgvector behavior are aligned, but the full ranking contract
-  is still encoded across multiple layers instead of one explicit abstraction
+- The trimming and fallback contract is shared now, but candidate generation is
+  still partly encoded inside each backend instead of one explicit abstraction
 
 ## Recommended Agent Roles
 
@@ -242,11 +243,12 @@ priorities:
 
 ## Suggested Prompt For The Next Orchestrator
 
-> Read `docs/NCP_0_2_0_HANDOFF_PACKET.md` first. The first `0.16.x` retrieval
-> slice is already in (`551 passed, 8 skipped`, ruff clean): shared vector-aware
-> scoring plus pgvector sync/async hybrid tie-break parity. Continue `0.16.x`
-> with the next narrow retrieval architecture slice: make candidate generation,
-> result caps, diversity limits, and blank-query fallback explicit in one place
-> while keeping SQLite, PgvectorStore, and AsyncPgvectorStore behavior aligned.
-> Use Sarathi HIGH complexity with multi-agent dispatch and NCP as the default
-> communication spine in every subagent instruction.
+> Read `docs/NCP_0_2_0_HANDOFF_PACKET.md` first. The first two `0.16.x`
+> retrieval slices are already in (`556 passed, 8 skipped`, ruff clean):
+> shared vector-aware scoring plus a shared retrieval contract for blank-query
+> fallback, zero-overlap gating, result caps, and diversity trimming. Continue
+> `0.16.x` with the next narrow retrieval architecture slice: unify candidate
+> generation more explicitly across SQLite, PgvectorStore, and
+> AsyncPgvectorStore while keeping current behavior stable. Use Sarathi HIGH
+> complexity with multi-agent dispatch and NCP as the default communication
+> spine in every subagent instruction.

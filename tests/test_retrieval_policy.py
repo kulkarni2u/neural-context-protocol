@@ -2,11 +2,19 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 
-from ncp.stores.retrieval import DEFAULT_RETRIEVAL_POLICY, RetrievalPolicy
+from ncp.stores.retrieval import (
+    DEFAULT_RETRIEVAL_POLICY,
+    RetrievalPolicy,
+    apply_diversity_limit,
+    lexical_signal_for_candidate,
+    normalize_query_terms,
+    normalize_result_limit,
+)
 from ncp.stores.sqlite import SQLiteStore
 from ncp.types import SubconsciousChunk
 
@@ -125,6 +133,54 @@ def test_vector_signal_can_break_tie_between_same_lexical_chunks() -> None:
         generation=0,
     )
     assert stronger_vector > weaker_vector
+
+
+def test_normalize_query_terms_trims_and_lowercases() -> None:
+    assert normalize_query_terms("  Token   Auth  bearer  ") == {"token", "auth", "bearer"}
+
+
+def test_lexical_signal_filters_zero_overlap() -> None:
+    assert lexical_signal_for_candidate(
+        query_terms={"token", "auth"},
+        doc_tokens=["schema", "migration"],
+        bm25_normalized=0.9,
+    ) is None
+
+
+def test_lexical_signal_uses_full_budget_for_blank_query() -> None:
+    assert lexical_signal_for_candidate(
+        query_terms=set(),
+        doc_tokens=["anything"],
+        bm25_normalized=0.2,
+    ) == pytest.approx(1.0)
+
+
+def test_normalize_result_limit_enforces_minimum_one() -> None:
+    assert normalize_result_limit(0) == 1
+    assert normalize_result_limit(-3) == 1
+    assert normalize_result_limit(5) == 5
+
+
+@dataclass
+class _Candidate:
+    chunk_id: str
+    written_by: str
+
+
+def test_apply_diversity_limit_caps_results_per_author() -> None:
+    ranked = [
+        _Candidate("sub_1", "alice"),
+        _Candidate("sub_2", "alice"),
+        _Candidate("sub_3", "bob"),
+        _Candidate("sub_4", "alice"),
+    ]
+    results = apply_diversity_limit(
+        ranked,
+        k=4,
+        diversity_limit=1,
+        author_getter=lambda item: item.written_by,
+    )
+    assert [item.chunk_id for item in results] == ["sub_1", "sub_3"]
 
 
 # ---------------------------------------------------------------------------

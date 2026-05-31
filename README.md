@@ -43,6 +43,7 @@ What is already proven in this repository:
 - the pgvector durable path now supports Redis-backed whisper delivery and Redis-backed fetch-session limits
 - retrieval now filters lexical zero-overlap noise and reranks surviving matches with NCP's trust/age/generation weighting
 - hybrid retrieval on pgvector now blends lexical relevance with optional vector similarity through one shared retrieval policy in both sync and async stores, so identical lexical candidates can be broken by embedding closeness without changing blank-query fallback behavior
+- blank-query fallback, zero-overlap lexical gating, normalized result caps, and author diversity trimming now live in shared retrieval helpers instead of being duplicated across SQLite and pgvector stores
 - `retrieval_mode="trust_recency"` enables pure trust+recency ranking for non-BM25 backends
 - `retrieval_mode="vector"` uses pgvector `<=>` cosine ANN search on stored embeddings (pgvector only)
 - optional embedding storage: `SubconsciousChunk.embedding` (1536 dims) persisted via migration 003

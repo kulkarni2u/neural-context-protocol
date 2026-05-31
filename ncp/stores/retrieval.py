@@ -15,6 +15,10 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import Callable, TypeVar
+
+
+T = TypeVar("T")
 
 
 @dataclass
@@ -125,3 +129,55 @@ class RetrievalPolicy:
 
 
 DEFAULT_RETRIEVAL_POLICY = RetrievalPolicy()
+
+
+def normalize_query_terms(text: str) -> set[str]:
+    """Normalize user query text into a lowercased term set."""
+    return {term for term in text.lower().split() if term}
+
+
+def lexical_signal_for_candidate(
+    *,
+    query_terms: set[str],
+    doc_tokens: list[str],
+    bm25_normalized: float,
+) -> float | None:
+    """Return lexical relevance budget or None when the candidate should be skipped.
+
+    Blank queries intentionally treat every candidate as eligible and use the
+    full lexical budget so trust/recency (and optional vector signals) can rank
+    the current working set without accidental BM25 noise.
+    """
+    if not query_terms:
+        return 1.0
+    if not query_terms.intersection(set(doc_tokens)):
+        return None
+    return max(0.0, min(1.0, bm25_normalized))
+
+
+def normalize_result_limit(k: int) -> int:
+    """Normalize requested result count to the runtime minimum contract."""
+    return max(1, k)
+
+
+def apply_diversity_limit(
+    ranked: list[T],
+    *,
+    k: int,
+    diversity_limit: int,
+    author_getter: Callable[[T], str],
+) -> list[T]:
+    """Trim ranked candidates using the shared author-diversity contract."""
+    result_cap = normalize_result_limit(k)
+    per_author_cap = max(1, diversity_limit)
+    author_count: dict[str, int] = {}
+    results: list[T] = []
+    for item in ranked:
+        author = author_getter(item)
+        if author_count.get(author, 0) >= per_author_cap:
+            continue
+        author_count[author] = author_count.get(author, 0) + 1
+        results.append(item)
+        if len(results) >= result_cap:
+            break
+    return results

@@ -4,7 +4,7 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [0.16.x] - 2026-05-31
 
-First `0.16.x` retrieval slice. No breaking changes.
+First two `0.16.x` retrieval slices. No breaking changes.
 
 ### Added / Changed
 
@@ -28,7 +28,18 @@ First `0.16.x` retrieval slice. No breaking changes.
   backends:
   - `tests/test_future_stores.py::test_pgvector_hybrid_query_uses_vector_signal_to_break_lexical_tie`
   - `tests/test_async_vector_mode.py::test_async_hybrid_uses_vector_signal_to_break_lexical_tie`
-- **Verification**: suite now passes at `551 passed, 8 skipped`.
+- **Shared retrieval contract helpers** (`ncp/stores/retrieval.py`): added
+  `normalize_query_terms()`, `lexical_signal_for_candidate()`,
+  `normalize_result_limit()`, and `apply_diversity_limit()` so blank-query
+  fallback, zero-overlap lexical gating, result-cap normalization, and
+  author-diversity trimming are defined in one place.
+- **Store alignment** (`ncp/stores/sqlite.py`, `pgvector.py`,
+  `pgvector_async.py`): SQLite, sync pgvector, async pgvector, and vector-mode
+  result trimming now all use the shared retrieval helpers instead of carrying
+  separate copies of the same contract.
+- **Regression coverage**: added retrieval-policy unit coverage for the new
+  shared contract helpers in `tests/test_retrieval_policy.py`.
+- **Verification**: suite now passes at `556 passed, 8 skipped`.
 
 ## [0.15.x] - 2026-05-31
 

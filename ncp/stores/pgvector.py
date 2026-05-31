@@ -17,7 +17,14 @@ from ncp.config import NCPConfig
 from ncp.stores.base import BaseStore, NCPStoreUnavailableError
 from ncp.stores.consolidation import cluster_by_tags, find_merge_candidates
 from ncp.stores.redis_coordination import RedisCoordination
-from ncp.stores.retrieval import DEFAULT_RETRIEVAL_POLICY, RetrievalPolicy
+from ncp.stores.retrieval import (
+    DEFAULT_RETRIEVAL_POLICY,
+    RetrievalPolicy,
+    apply_diversity_limit,
+    lexical_signal_for_candidate,
+    normalize_query_terms,
+    normalize_result_limit,
+)
 from ncp.types import CalibrationReport, ConsolidationReport, ConsciousBlock, NCPResponse, SubconsciousChunk, TurnRecord, Whisper
 
 
@@ -434,7 +441,7 @@ class PgvectorStore(BaseStore):
                 chunk.relevance = max(0.0, min(1.0, score))
                 candidates.append(chunk)
         else:
-            query_terms = {term for term in text.lower().split() if term}
+            query_terms = normalize_query_terms(text)
             corpus = [str(row["content"]).lower().split() for row in rows]
             bm25 = BM25Okapi(corpus)
             raw_scores = bm25.get_scores(text.split())
@@ -443,12 +450,13 @@ class PgvectorStore(BaseStore):
             norm_scores = [s / max_bm25 for s in raw_scores] if max_bm25 > 0 else [0.0] * len(raw_scores)
 
             for norm_score, row, doc_tokens in zip(norm_scores, rows, corpus, strict=True):
-                if query_terms:
-                    if len(query_terms.intersection(set(doc_tokens))) == 0:
-                        continue
-                    bm25_for_policy = norm_score
-                else:
-                    bm25_for_policy = 1.0
+                bm25_for_policy = lexical_signal_for_candidate(
+                    query_terms=query_terms,
+                    doc_tokens=doc_tokens,
+                    bm25_normalized=norm_score,
+                )
+                if bm25_for_policy is None:
+                    continue
 
                 age_seconds = max(0.0, now - float(row["created_at"]))
                 vector_score = self._vector_similarity_score(
@@ -469,22 +477,18 @@ class PgvectorStore(BaseStore):
                 candidates.append(chunk)
 
         ranked = sorted(candidates, key=lambda c: c.relevance, reverse=True)
+        result_limit = normalize_result_limit(k)
 
         if self.reranker is not None and self.reranker.enabled:
-            candidates_to_rerank = ranked[:k * 4]
+            candidates_to_rerank = ranked[:result_limit * 4]
             ranked = self.reranker.rerank(text, candidates_to_rerank)
 
-        _diversity_cap = max(1, diversity_limit)
-        author_count: dict[str, int] = {}
-        results: list[SubconsciousChunk] = []
-        for chunk in ranked:
-            author = str(chunk.written_by)
-            if author_count.get(author, 0) >= _diversity_cap:
-                continue
-            author_count[author] = author_count.get(author, 0) + 1
-            results.append(chunk)
-            if len(results) >= max(1, k):
-                break
+        results = apply_diversity_limit(
+            ranked,
+            k=result_limit,
+            diversity_limit=diversity_limit,
+            author_getter=lambda chunk: str(chunk.written_by),
+        )
 
         if results:
             now = time.time()
@@ -546,7 +550,8 @@ class PgvectorStore(BaseStore):
             where_params.append(scope)
 
         # Always fetch k*4 to give the diversity loop enough candidates.
-        limit = max(1, k * 4)
+        result_limit = normalize_result_limit(k)
+        limit = result_limit * 4
         # Params order: embedding (SELECT), WHERE params, embedding (ORDER BY), LIMIT
         all_params = tuple([embedding_str] + where_params + [embedding_str, limit])
 
@@ -580,18 +585,12 @@ class PgvectorStore(BaseStore):
         if self.reranker is not None and self.reranker.enabled:
             results = self.reranker.rerank(text, results)
 
-        _diversity_cap = max(1, diversity_limit)
-        author_count: dict[str, int] = {}
-        diverse: list[SubconsciousChunk] = []
-        for chunk in results:
-            author = str(chunk.written_by)
-            if author_count.get(author, 0) >= _diversity_cap:
-                continue
-            author_count[author] = author_count.get(author, 0) + 1
-            diverse.append(chunk)
-            if len(diverse) >= max(1, k):
-                break
-        results = diverse
+        results = apply_diversity_limit(
+            results,
+            k=result_limit,
+            diversity_limit=diversity_limit,
+            author_getter=lambda chunk: str(chunk.written_by),
+        )
 
         if results:
             now = time.time()

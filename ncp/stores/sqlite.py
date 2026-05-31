@@ -15,7 +15,14 @@ from rank_bm25 import BM25Okapi
 from ncp.config import NCPConfig
 from ncp.stores.base import BaseStore, NCPStoreUnavailableError
 from ncp.stores.consolidation import cluster_by_tags, find_merge_candidates
-from ncp.stores.retrieval import DEFAULT_RETRIEVAL_POLICY, RetrievalPolicy
+from ncp.stores.retrieval import (
+    DEFAULT_RETRIEVAL_POLICY,
+    RetrievalPolicy,
+    apply_diversity_limit,
+    lexical_signal_for_candidate,
+    normalize_query_terms,
+    normalize_result_limit,
+)
 from ncp.types import CalibrationReport, ConsolidationReport, ConsciousBlock, NCPResponse, SubconsciousChunk, TurnRecord, Whisper
 
 
@@ -290,7 +297,7 @@ class SQLiteStore(BaseStore):
                 chunk.relevance = max(0.0, min(1.0, score))
                 candidates.append(chunk)
         else:
-            query_terms = {term for term in text.lower().split() if term}
+            query_terms = normalize_query_terms(text)
             corpus = [row["content"].lower().split() for row in rows]
             bm25 = BM25Okapi(corpus)
             raw_scores = bm25.get_scores(text.split())
@@ -299,12 +306,13 @@ class SQLiteStore(BaseStore):
             norm_scores = [s / max_bm25 for s in raw_scores] if max_bm25 > 0 else [0.0] * len(raw_scores)
 
             for norm_score, row, doc_tokens in zip(norm_scores, rows, corpus, strict=True):
-                if query_terms:
-                    if len(query_terms.intersection(set(doc_tokens))) == 0:
-                        continue
-                    bm25_for_policy = norm_score
-                else:
-                    bm25_for_policy = 1.0
+                bm25_for_policy = lexical_signal_for_candidate(
+                    query_terms=query_terms,
+                    doc_tokens=doc_tokens,
+                    bm25_normalized=norm_score,
+                )
+                if bm25_for_policy is None:
+                    continue
 
                 age_seconds = max(0.0, now - float(row["created_at"]))
                 hybrid_score = policy.score(
@@ -320,22 +328,18 @@ class SQLiteStore(BaseStore):
                 candidates.append(chunk)
 
         ranked = sorted(candidates, key=lambda c: c.relevance, reverse=True)
+        result_limit = normalize_result_limit(k)
 
         if self.reranker is not None and self.reranker.enabled:
-            candidates_to_rerank = ranked[:k * 4]
+            candidates_to_rerank = ranked[:result_limit * 4]
             ranked = self.reranker.rerank(text, candidates_to_rerank)
 
-        _diversity_cap = max(1, diversity_limit)
-        author_count: dict[str, int] = {}
-        results: list[SubconsciousChunk] = []
-        for chunk in ranked:
-            author = str(chunk.written_by)
-            if author_count.get(author, 0) >= _diversity_cap:
-                continue
-            author_count[author] = author_count.get(author, 0) + 1
-            results.append(chunk)
-            if len(results) >= max(1, k):
-                break
+        results = apply_diversity_limit(
+            ranked,
+            k=result_limit,
+            diversity_limit=diversity_limit,
+            author_getter=lambda chunk: str(chunk.written_by),
+        )
 
         if results:
             now = time.time()
