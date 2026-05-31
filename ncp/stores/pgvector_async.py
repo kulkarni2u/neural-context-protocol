@@ -33,6 +33,8 @@ from ncp.stores.retrieval import (
     apply_diversity_limit,
     build_lexical_candidates,
     normalize_result_limit,
+    score_trust_recency_candidate,
+    score_vector_distance,
 )
 from ncp.stores.consolidation import cluster_by_tags, find_merge_candidates
 from ncp.types import (
@@ -457,8 +459,9 @@ class AsyncPgvectorStore(BaseStore):
         rows = [self._normalize_row(r, description) for r in raw_rows]
         results: list[SubconsciousChunk] = []
         for row in rows:
-            distance = float(row.get("vec_distance") or 1.0)
-            score = 1.0 / (1.0 + distance)
+            score = score_vector_distance(
+                None if row.get("vec_distance") is None else float(row["vec_distance"])
+            )
             if score < min_score:
                 continue
             chunk = self._row_to_chunk(row)
@@ -569,9 +572,10 @@ class AsyncPgvectorStore(BaseStore):
 
         if retrieval_mode == "trust_recency":
             for row in rows:
-                age_s = max(0.0, now - float(row["created_at"]))
-                score = policy.score_no_bm25(
-                    age_seconds=age_s,
+                score = score_trust_recency_candidate(
+                    policy,
+                    created_at=float(row["created_at"]),
+                    now=now,
                     base_trust=float(row["base_trust"]),
                     generation=int(row["generation"]),
                 )

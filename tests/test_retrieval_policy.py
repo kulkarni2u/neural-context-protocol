@@ -16,6 +16,8 @@ from ncp.stores.retrieval import (
     normalize_bm25_scores,
     normalize_query_terms,
     normalize_result_limit,
+    score_trust_recency_candidate,
+    score_vector_distance,
 )
 from ncp.stores.sqlite import SQLiteStore
 from ncp.types import SubconsciousChunk
@@ -239,6 +241,33 @@ def test_normalize_bm25_scores_handles_all_zero_scores() -> None:
 def test_normalize_bm25_scores_normalizes_against_max_score() -> None:
     normalized = normalize_bm25_scores([0.5, 1.0, 0.25])
     assert normalized == pytest.approx([0.5, 1.0, 0.25])
+
+
+def test_score_trust_recency_candidate_matches_policy_score_no_bm25() -> None:
+    policy = RetrievalPolicy()
+    score = score_trust_recency_candidate(
+        policy,
+        created_at=100.0,
+        now=250.0,
+        base_trust=0.8,
+        generation=2,
+    )
+    expected = policy.score_no_bm25(
+        age_seconds=150.0,
+        base_trust=0.8,
+        generation=2,
+    )
+    assert score == pytest.approx(expected)
+
+
+def test_score_vector_distance_prefers_smaller_distance() -> None:
+    assert score_vector_distance(0.1) > score_vector_distance(0.9)
+
+
+def test_score_vector_distance_is_bounded_and_handles_missing() -> None:
+    assert score_vector_distance(None) == pytest.approx(0.5)
+    assert score_vector_distance(0.0) == pytest.approx(1.0)
+    assert 0.0 <= score_vector_distance(3.0) <= 1.0
 
 
 # ---------------------------------------------------------------------------

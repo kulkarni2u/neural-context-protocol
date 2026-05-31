@@ -4,7 +4,7 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [0.16.x] - 2026-05-31
 
-First three `0.16.x` retrieval slices. No breaking changes.
+First four `0.16.x` retrieval slices. No breaking changes.
 
 ### Added / Changed
 
@@ -49,7 +49,16 @@ First three `0.16.x` retrieval slices. No breaking changes.
   and eligibility independently.
 - **Regression coverage**: added lexical-helper unit coverage in
   `tests/test_retrieval_policy.py`.
-- **Verification**: suite now passes at `563 passed, 8 skipped`.
+- **Shared non-lexical retrieval helpers** (`ncp/stores/retrieval.py`): added
+  `score_trust_recency_candidate()` and `score_vector_distance()` so the
+  trust/recency-only and vector-distance scoring math are defined in one place.
+- **Non-lexical path alignment** (`ncp/stores/pgvector.py`,
+  `ncp/stores/pgvector_async.py`): sync and async pgvector retrieval now both
+  consume the shared trust/recency and vector-distance helpers instead of
+  carrying duplicate scoring math.
+- **Regression coverage**: added non-lexical helper unit coverage in
+  `tests/test_retrieval_policy.py`.
+- **Verification**: suite now passes at `566 passed, 8 skipped`.
 
 ## [0.15.x] - 2026-05-31
 

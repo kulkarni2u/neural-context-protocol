@@ -197,6 +197,31 @@ def build_lexical_candidates(text: str, documents: list[str]) -> list[LexicalCan
     ]
 
 
+def score_trust_recency_candidate(
+    policy: RetrievalPolicy,
+    *,
+    created_at: float,
+    now: float,
+    base_trust: float,
+    generation: int,
+) -> float:
+    """Shared trust/recency-only candidate score."""
+    age_seconds = max(0.0, now - created_at)
+    return policy.score_no_bm25(
+        age_seconds=age_seconds,
+        base_trust=base_trust,
+        generation=generation,
+    )
+
+
+def score_vector_distance(distance: float | None) -> float:
+    """Convert pgvector distance into the shared [0, 1] relevance space."""
+    if distance is None:
+        distance = 1.0
+    bounded = max(0.0, float(distance))
+    return 1.0 / (1.0 + bounded)
+
+
 def normalize_result_limit(k: int) -> int:
     """Normalize requested result count to the runtime minimum contract."""
     return max(1, k)

@@ -45,6 +45,7 @@ What is already proven in this repository:
 - hybrid retrieval on pgvector now blends lexical relevance with optional vector similarity through one shared retrieval policy in both sync and async stores, so identical lexical candidates can be broken by embedding closeness without changing blank-query fallback behavior
 - blank-query fallback, zero-overlap lexical gating, normalized result caps, and author diversity trimming now live in shared retrieval helpers instead of being duplicated across SQLite and pgvector stores
 - lexical candidate generation now uses one shared BM25 normalization + eligibility helper in SQLite and both pgvector retrieval paths, so the hybrid lexical pipeline is no longer reimplemented three times
+- trust/recency scoring and vector-distance-to-relevance scoring now also live in shared retrieval helpers for the pgvector sync and async paths, reducing non-lexical retrieval drift
 - `retrieval_mode="trust_recency"` enables pure trust+recency ranking for non-BM25 backends
 - `retrieval_mode="vector"` uses pgvector `<=>` cosine ANN search on stored embeddings (pgvector only)
 - optional embedding storage: `SubconsciousChunk.embedding` (1536 dims) persisted via migration 003
