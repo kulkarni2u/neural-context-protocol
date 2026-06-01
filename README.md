@@ -142,8 +142,9 @@ ncp serve --host 127.0.0.1 --port 4242 --cwd /path/to/project
 For the scalable local path:
 
 ```bash
+podman machine start podman-machine-default || true
 ncp init --store pgvector
-./scripts/infra_up.sh
+NCP_CONTAINER_ENGINE=podman ./scripts/infra_up.sh
 ncp migrate apply --cwd /path/to/project
 ncp status --cwd /path/to/project
 ncp serve --host 127.0.0.1 --port 4242 --cwd /path/to/project
@@ -155,6 +156,24 @@ This uses the repo’s first-class local compose stack:
 - [scripts/infra_up.sh](./scripts/infra_up.sh)
 - [scripts/infra_down.sh](./scripts/infra_down.sh)
 - [scripts/test_pgvector_integration.sh](./scripts/test_pgvector_integration.sh)
+
+If you want to prove the live pgvector path before starting the server:
+
+```bash
+NCP_CONTAINER_ENGINE=podman ./scripts/test_pgvector_integration.sh
+```
+
+This exercises the real Podman-backed Postgres/pgvector + Redis stack from
+[`compose.yaml`](./compose.yaml) and runs the live integration suite end to end.
+
+If you want Sarathi to orchestrate the same local validation flow:
+
+```bash
+SARATHI_EXEC_COMMANDS=1 NCP_CONTAINER_ENGINE=podman sarathi run \
+  "Validate the live NCP pgvector path end to end: ensure local pgvector+redis infra is running, apply migrations if needed, run scripts/test_pgvector_integration.sh, and report the exact pass/fail result with blockers." \
+  --policy-pack /path/to/project/policy-pack \
+  --ncp
+```
 
 ## Setup Success Signals
 

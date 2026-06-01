@@ -80,7 +80,8 @@ ncp init --store pgvector
 Use the repo’s compose-backed helpers:
 
 ```bash
-./scripts/infra_up.sh
+podman machine start podman-machine-default || true
+NCP_CONTAINER_ENGINE=podman ./scripts/infra_up.sh
 ```
 
 This starts:
@@ -117,7 +118,7 @@ ncp serve --host 127.0.0.1 --port 4242 --cwd /path/to/project
 ### 6. Optional live integration verification
 
 ```bash
-./scripts/test_pgvector_integration.sh
+NCP_CONTAINER_ENGINE=podman ./scripts/test_pgvector_integration.sh
 ```
 
 This validates:
@@ -125,6 +126,20 @@ This validates:
 - durable pgvector behavior
 - reporting parity
 - Redis-backed coordination
+
+### 7. Optional Sarathi-orchestrated validation
+
+If you want the same local validation driven through Sarathi:
+
+```bash
+SARATHI_EXEC_COMMANDS=1 NCP_CONTAINER_ENGINE=podman sarathi run \
+  "Validate the live NCP pgvector path end to end: ensure local pgvector+redis infra is running, apply migrations if needed, run scripts/test_pgvector_integration.sh, and report the exact pass/fail result with blockers." \
+  --policy-pack /path/to/project/policy-pack \
+  --ncp
+```
+
+This keeps the execution on the same Podman-backed compose stack while letting
+Sarathi orchestrate the flow and capture the lifecycle.
 
 ## Start the MCP Server
 
