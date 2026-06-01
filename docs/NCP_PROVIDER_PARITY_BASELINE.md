@@ -69,6 +69,7 @@ What it does **not** mean:
 - it does not prove NCP improves task success versus alternative context strategies
 - it does not prove quality retention under compression
 - it does not replace matched-budget efficacy benchmarking
+- retrieval quality is now separately measured in `benchmarks/retrieval/`
 
 More precisely:
 
@@ -83,3 +84,54 @@ The honest claim today is:
   continuation pattern on the live MCP dogfood path
 - current baseline is `5/5` contract success and `5/5` continuation success
   for all three providers on the current harness version
+
+## Retrieval Quality Baseline
+
+This section covers BM25 recall@k on a labeled 24-chunk set, measured
+independently of provider parity.
+
+### What it measures
+
+BM25-based recall and precision at rank k, evaluated against 12 labeled queries
+over a 24-chunk corpus (12 signal chunks spanning constraint / decision /
+dead-end categories, plus 12 distractors). Each query has a known ground-truth
+set of relevant chunk IDs; recall@k and precision@k are computed from the
+intersection of retrieved and relevant chunks.
+
+This is the SQLite BM25-only path. The pgvector path (when configured) would
+add vector similarity scoring on top of BM25; the numbers below reflect the
+BM25-only result.
+
+### Command
+
+```bash
+python3 benchmarks/retrieval/run.py --k 4
+```
+
+### Results
+
+| Metric | Value |
+|---|---|
+| k | 4 |
+| Labeled queries | 12 |
+| Signal chunks | 12 (4 constraint, 4 decision, 4 dead-end) |
+| Distractor chunks | 12 |
+| mean_precision_at_4 | 0.25 |
+| mean_recall_at_4 | 1.00 |
+| mean_relevant_rank | 1.00 |
+| queries_with_perfect_recall | 12 |
+
+Observed on June 1, 2026 with:
+
+```bash
+python3 benchmarks/retrieval/run.py --k 4
+```
+
+### Notes
+
+- BM25 term-overlap scoring drives recall here; pgvector cosine similarity
+  would further improve ranking on semantically similar but lexically distinct
+  queries
+- The diversity cap test records how many constraint-category chunks appear in
+  top-k at `diversity_limit=1`, `diversity_limit=2`, and uncapped
+  (`diversity_limit=100`); a tighter cap should not increase the count vs no cap

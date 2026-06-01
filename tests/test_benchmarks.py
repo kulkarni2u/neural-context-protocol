@@ -19,6 +19,13 @@ def test_token_unit_is_explicit() -> None:
     assert token_unit() in {"tiktoken", "word_split"}
 
 
+def test_estimate_tokens_word_split_exact_when_no_tiktoken() -> None:
+    if token_unit() == "word_split":
+        assert estimate_tokens("alpha beta gamma") == 3
+    else:
+        assert estimate_tokens("alpha beta gamma") > 0
+
+
 def test_coding_pipeline_benchmark_beats_naive_replay(tmp_path: Path) -> None:
     artifact = run_coding_pipeline_benchmark(
         store_path=tmp_path / "bench.db",

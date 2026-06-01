@@ -28,7 +28,7 @@ Observed on June 1, 2026:
 - final sliding-window recall: `0.00`
 - reported deficit: `false`
 
-First needle eviction turns for the sliding-window baseline:
+First needle eviction turns (NCP retrieval — first turn where NCP failed to retrieve the needle):
 
 - `needle_01`: retained through the final turn
 - `needle_02`: retained through the final turn
@@ -51,6 +51,19 @@ That is useful signal.
 It means the current retrieval stack is meaningfully better than a simple
 window on this task shape, but it is not yet strong enough to claim that
 important old constraints are preserved reliably under pressure.
+
+## Methodology note
+
+Each needle is retrieved with its own targeted query (`query_text=needle.query_text`).
+This is the standard recall-at-k methodology for retrieval evals: it tests whether
+the retrieval system can surface a specific item when asked for it directly.
+
+In production, a single `get_context` call assembles up to `k` chunks from one query.
+This benchmark measures single-needle retrieval capability, not multi-constraint
+recall in one shot. At `budget=4` and `k_needles=6`, NCP makes 6 separate targeted
+queries per turn rather than one unified query. Readers should interpret the recall
+number as a ceiling on what targeted retrieval can achieve, not as what a single
+assembly call would return.
 
 ## Artifact contract
 

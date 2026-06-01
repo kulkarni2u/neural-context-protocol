@@ -89,6 +89,8 @@ def needle_recall(
         raise ValueError("k_needles must be >= 1")
     if budget < 1:
         raise ValueError("budget must be >= 1")
+    if turns <= k_needles:
+        raise ValueError("turns must be > k_needles to produce a recall curve")
 
     store = SQLiteStore(store_path)
     assembler = Assembler(store=store)

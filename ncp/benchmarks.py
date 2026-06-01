@@ -286,8 +286,11 @@ def _run_pipeline_benchmark(
     final_naive = int(baseline_summary["raw_replay"]["final_tokens"])
     reduction_factor = round(final_naive / final_ncp, 2) if final_ncp else 0.0
     overhead = assembly_overhead(embed_tokens=0, retrieval_ops=turns, whisper_writes=0)
-    prompt_token_savings_vs_raw = final_naive - final_ncp
-    net_prompt_token_equivalent_vs_raw = round(prompt_token_savings_vs_raw - overhead.token_equivalent, 2)
+    total_token_savings_vs_raw = sum(
+        int(row["raw_replay_input_tokens"]) - int(row["ncp_input_tokens"])
+        for row in turn_rows
+    )
+    net_total_token_equivalent_vs_raw = round(total_token_savings_vs_raw - overhead.token_equivalent, 2)
 
     return {
         "benchmark": benchmark_name,
@@ -313,10 +316,11 @@ def _run_pipeline_benchmark(
             "beats_rolling_summary": peak_ncp < int(baseline_summary["rolling_summary"]["peak_tokens"]),
             "economics": {
                 "reference_model": "gpt-4o-mini",
-                "prompt_token_savings_vs_raw_replay": prompt_token_savings_vs_raw,
+                "total_token_savings_vs_raw_replay": total_token_savings_vs_raw,
+                "final_turn_savings_vs_raw_replay": final_naive - final_ncp,
                 "assembly_overhead_usd": round(overhead.total_cost_usd, 8),
                 "assembly_overhead_token_equivalent": round(overhead.token_equivalent, 2),
-                "net_prompt_token_equivalent_vs_raw_replay": net_prompt_token_equivalent_vs_raw,
+                "net_total_token_equivalent_vs_raw_replay": net_total_token_equivalent_vs_raw,
             },
             "material_reduction": reduction_factor >= 3.0,
             "pass": (

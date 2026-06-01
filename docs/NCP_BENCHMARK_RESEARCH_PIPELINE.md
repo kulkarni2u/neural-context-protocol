@@ -42,9 +42,9 @@ Observed on June 1, 2026:
 - reduction factor vs raw replay at the final turn: `16.35x`
 - reduction factor vs sliding window at the final turn: `2.04x`
 - reduction factor vs rolling summary at the final turn: `9.13x`
-- prompt token savings vs raw replay: `1596`
-- estimated assembly overhead token-equivalent: `480.0`
-- net token-equivalent savings vs raw replay: `1116.0`
+- final-turn savings vs raw replay: `1596`
+- estimated assembly overhead token-equivalent (total across all turns): `480.0`
+- net total token-equivalent savings vs raw replay: see artifact `economics.net_total_token_equivalent_vs_raw_replay`
 
 ## Interpretation
 

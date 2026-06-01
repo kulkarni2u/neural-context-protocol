@@ -52,7 +52,7 @@ class RollingSummaryBaseline:
         if len(transcript) <= keep_recent:
             return "\n".join(transcript)
 
-        older = transcript[:-keep_recent]
+        older = transcript[:-keep_recent] if keep_recent > 0 else transcript
         recent = transcript[-keep_recent:]
         summary_lines = self._summarize(older)
         return "\n".join([*summary_lines, *recent]).strip()

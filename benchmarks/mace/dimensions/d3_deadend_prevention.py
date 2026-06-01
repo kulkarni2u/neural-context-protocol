@@ -14,15 +14,12 @@ class D3DeadEndPrevention:
 
     def score_output(self, agent_output: str, attempted_paths: list[str] | None = None) -> dict[str, object]:
         retried: list[str] = []
-        if attempted_paths is not None:
+        if attempted_paths is None:
+            # No structured paths provided — treat as no-memory: all dead ends retried
+            retried = list(self.known_dead_ends)
+        else:
             attempted = {path.lower() for path in attempted_paths}
             retried = [path for path in self.known_dead_ends if path.lower() in attempted]
-        else:
-            lower = agent_output.lower()
-            for path in self.known_dead_ends:
-                normalized = path.replace("/", "_").lower()
-                if path.lower() in lower or normalized in lower:
-                    retried.append(path)
         score = 1.0 - (len(retried) / len(self.known_dead_ends))
         self.retry_results = {
             "known_dead_ends": self.known_dead_ends,

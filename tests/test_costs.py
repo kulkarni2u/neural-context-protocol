@@ -45,6 +45,27 @@ def test_assembly_overhead_reports_cost_and_token_equivalent() -> None:
     assert overhead.token_equivalent > 0.0
 
 
+def test_assembly_overhead_embed_cost_uses_per_million_pricing() -> None:
+    overhead = assembly_overhead(
+        embed_tokens=1_000_000,
+        retrieval_ops=0,
+        whisper_writes=0,
+        reference_model="gpt-4o-mini",
+        embedding_unit_price=0.02,
+    )
+
+    assert overhead.embed_token_cost_usd == pytest.approx(0.02)
+    assert overhead.retrieval_cost_usd == pytest.approx(0.0)
+    assert overhead.total_cost_usd == pytest.approx(0.02)
+
+
+def test_assembly_overhead_zero_inputs_produces_zero_cost() -> None:
+    overhead = assembly_overhead(reference_model="gpt-4o-mini")
+
+    assert overhead.total_cost_usd == 0.0
+    assert overhead.token_equivalent == 0.0
+
+
 def test_assembly_overhead_requires_known_reference_model() -> None:
     with pytest.raises(KeyError, match="No pricing configured"):
         assembly_overhead(reference_model="missing-model")
