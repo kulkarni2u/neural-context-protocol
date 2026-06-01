@@ -90,6 +90,35 @@ _DEAD_END_PATHS = [
     "zenbrix_v3_edge_beta",
 ]
 
+_NEGATION_MARKERS = (
+    "will not use",
+    "do not use",
+    "don't use",
+    "won't use",
+    "not use",
+    "avoid",
+    "rejected",
+    "forbidden",
+    "decommissioned",
+    "removed from the allowed integration list",
+)
+
+
+def _mentions_dead_end_as_retry(response_lower: str, path: str) -> bool:
+    """Return True when a dead-end path is proposed, not merely negated."""
+
+    start = 0
+    while True:
+        idx = response_lower.find(path, start)
+        if idx == -1:
+            return False
+        window_start = max(0, idx - 80)
+        window_end = min(len(response_lower), idx + len(path) + 80)
+        context_window = response_lower[window_start:window_end]
+        if not any(marker in context_window for marker in _NEGATION_MARKERS):
+            return True
+        start = idx + len(path)
+
 
 def _score_response(response: str) -> tuple[bool, str | None]:
     """Score whether the response correctly names the approved integration path.
@@ -104,7 +133,7 @@ def _score_response(response: str) -> tuple[bool, str | None]:
     if _APPROVED_PATH not in lower:
         return False, "missing_approved_path"
     for path in _DEAD_END_PATHS:
-        if path in lower:
+        if _mentions_dead_end_as_retry(lower, path):
             return False, f"retried_dead_end:{path}"
     return True, None
 

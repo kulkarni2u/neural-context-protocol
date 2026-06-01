@@ -258,6 +258,8 @@ Observed benchmark snapshot:
 | Research pipeline (36 turns) | raw replay | 1,700 peak | 156 peak | 16.35x |
 | Research pipeline (36 turns) | sliding window (8) | 212 peak | 156 peak | 2.04x |
 | Research pipeline (36 turns) | rolling summary (4/4) | 950 peak | 156 peak | 9.13x |
+| Matched-budget efficacy (Claude, 5 attempts) | sliding window | 0.0 success rate | 0.8 success rate | +0.8 |
+| Cross-host shared context (Claude -> OpenCode, 5 attempts) | sliding window | 0.0 success rate | 0.8 success rate | +0.8 |
 | Live handoff example | bounded task prompt | ~677 estimated | ~265 estimated | 60.9% |
 
 Needle recall snapshot:
@@ -285,11 +287,18 @@ Benchmark notes:
   - rolling summary (`every_k=4`, `keep_recent=4`)
 - the benchmarks now also report a first-pass assembly-overhead estimate so
   raw prompt savings are not presented as free
+- the first live real-provider slices now differentiate:
+  - matched-budget efficacy with `claude-cli`: `NCP 0.8` vs `window 0.0`
+  - cross-host shared context with `claude-cli -> opencode-cli`: `NCP 0.8` vs `window 0.0`
 
 ### What These Benchmarks Do Not Show
 
 - the coding and research pipeline benchmarks still use deterministic pipeline
   agents, not live providers
+- the current live efficacy evidence is still early:
+  - one provider-specific matched-budget run
+  - one cross-host provider pairing
+  - one timeout in each 5-attempt series
 - the pipeline benchmarks do not yet include real agents in the loop
 - the new needle benchmark is a retrieval-pressure probe, not a user-facing
   success-rate benchmark

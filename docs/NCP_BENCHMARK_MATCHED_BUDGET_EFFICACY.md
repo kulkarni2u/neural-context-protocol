@@ -124,6 +124,39 @@ As of June 1, 2026:
 - runtime proof exists
 - bounded baseline proof exists
 - retrieval-pressure proof exists
-- matched-budget real-agent efficacy proof does not yet exist
+- the first live matched-budget real-agent result now exists for `claude-cli`
 
-That is the gap this benchmark is meant to close.
+### Current live result
+
+Command used:
+
+```bash
+python3 benchmarks/efficacy/run.py \
+  --continuation-adapter claude-cli \
+  --budget 600 \
+  --attempts 5 \
+  --adapter-timeout-seconds 30
+```
+
+Observed result:
+
+- token unit: `word_split`
+- NCP success rate: `0.8`
+- sliding-window success rate: `0.0`
+- NCP median prompt tokens: `132`
+- sliding-window median prompt tokens: `656`
+- timeout rate:
+  - NCP: `0.2`
+  - sliding-window: `0.0`
+
+Interpretation:
+
+- this is the first live provider-backed result showing differentiated task
+  success in favor of NCP on the current harness
+- it is still early evidence, not final comparative proof
+- the run covers one provider and one task shape only
+- the rolling-summary control is still pending implementation in the live
+  benchmark harness
+
+That makes the status stronger than "groundwork only", but still short of the
+full threshold defined above.

@@ -135,3 +135,47 @@ python3 benchmarks/retrieval/run.py --k 4
 - The diversity cap test records how many constraint-category chunks appear in
   top-k at `diversity_limit=1`, `diversity_limit=2`, and uncapped
   (`diversity_limit=100`); a tighter cap should not increase the count vs no cap
+
+## Cross-host Shared Context Baseline
+
+This section covers a live cross-host benchmark where:
+
+- Host A uses `claude-cli`
+- Host B uses `opencode-cli`
+- Host B either reads the shared NCP store or receives only a sliding-window
+  transcript control
+
+### Command
+
+```bash
+python3 benchmarks/crosshost/run.py \
+  --host-a-adapter claude-cli \
+  --host-b-adapter opencode-cli \
+  --budget 600 \
+  --attempts 5 \
+  --host-a-timeout-seconds 30 \
+  --host-b-timeout-seconds 20
+```
+
+### Current result
+
+Observed on June 1, 2026:
+
+| Metric | Value |
+|---|---|
+| token unit | `word_split` |
+| Host B NCP success rate | `0.8` |
+| Host B window success rate | `0.0` |
+| delta_success_rate | `+0.8` |
+| Host B NCP median prompt tokens | `132` |
+| Host B window median prompt tokens | `656` |
+| timeout note | attempt 2 inherited a `host_a_timeout` |
+
+### Interpretation
+
+- this is the first live cross-host result showing differentiated success from
+  the shared NCP substrate over a window-only control
+- the evidence is still narrow:
+  - one provider pairing
+  - one task shape
+  - one Host A timeout inside the 5-attempt run

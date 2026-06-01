@@ -12,6 +12,9 @@ def test_crosshost_score_function():
 
     # Approved path (fictional, only in NCP context) → success
     assert _score_response(f"I will use {_APPROVED_PATH}")[0] is True
+    assert _score_response(
+        f"{_APPROVED_PATH}. I will not use zenbrix_legacy_bridge because it is rejected."
+    )[0] is True
     # Dead-end proposed → failure
     assert _score_response("zenbrix_legacy_bridge is a good option")[0] is False
     # Approved path absent → failure

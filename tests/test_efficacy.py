@@ -14,6 +14,9 @@ def test_efficacy_scoring_honors_constraints():
     # Success: names the approved path, no dead-ends
     assert _score_response(f"I will use {approved} as instructed")[0] is True
     assert _score_response(f"the integration proceeds via {approved}")[0] is True
+    assert _score_response(
+        f"I will use {approved} and will not use {dead_end} because it was rejected."
+    )[0] is True
     # Failure: dead-end retried
     assert _score_response(f"let us try {dead_end} for the integration")[0] is False
     assert _score_response("zenbrix_v2_mesh is available")[0] is False

@@ -37,6 +37,22 @@ changes.
   `benchmarks/efficacy/TEMPLATE.json`): added the first explicit matched-budget
   real-agent efficacy contract and artifact template without claiming results
   that have not been run yet.
+- **Live provider-backed benchmark harnesses** (`benchmarks/efficacy/run.py`,
+  `benchmarks/crosshost/run.py`, `benchmarks/retrieval/run.py`): added real
+  benchmark execution paths for matched-budget efficacy, cross-host shared
+  context, and labeled retrieval quality, plus focused regression coverage in
+  `tests/test_efficacy.py`, `tests/test_crosshost.py`, `tests/test_baselines.py`,
+  and `tests/test_retrieval_policy.py`.
+- **Scoring fix for rejected-path mentions** (`benchmarks/efficacy/run.py`):
+  the live efficacy scorer now distinguishes "mentions a rejected path to avoid
+  it" from "proposes a rejected path", preventing false negatives when a model
+  correctly says it will not use a dead-end path.
+- **Current live evidence** (`README.md`,
+  `docs/NCP_BENCHMARK_MATCHED_BUDGET_EFFICACY.md`,
+  `docs/NCP_PROVIDER_PARITY_BASELINE.md`):
+  - matched-budget efficacy with `claude-cli`: `NCP 0.8` vs `window 0.0`
+  - cross-host shared context with `claude-cli -> opencode-cli`: `NCP 0.8` vs
+    `window 0.0`
 
 ## [1.0.0] - 2026-06-01
 
