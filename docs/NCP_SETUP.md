@@ -127,20 +127,6 @@ This validates:
 - reporting parity
 - Redis-backed coordination
 
-### 7. Optional Sarathi-orchestrated validation
-
-If you want the same local validation driven through Sarathi:
-
-```bash
-SARATHI_EXEC_COMMANDS=1 NCP_CONTAINER_ENGINE=podman sarathi run \
-  "Validate the live NCP pgvector path end to end: ensure local pgvector+redis infra is running, apply migrations if needed, run scripts/test_pgvector_integration.sh, and report the exact pass/fail result with blockers." \
-  --policy-pack /path/to/project/policy-pack \
-  --ncp
-```
-
-This keeps the execution on the same Podman-backed compose stack while letting
-Sarathi orchestrate the flow and capture the lifecycle.
-
 ## Start the MCP Server
 
 NCP’s public transport is HTTP/SSE MCP:

@@ -1,8 +1,8 @@
 # NCP End-to-End Handoff Packet
 
-This document is the current restart/orchestration packet for the NCP project.
-Use it as the primary context for Claude, OpenCode, or another bounded coding
-agent instead of replaying long chat history.
+This document is the current restart packet for the NCP project. Use it as the
+primary context for Claude, OpenCode, or another bounded coding agent instead
+of replaying long chat history.
 
 ## Current State
 
@@ -50,8 +50,8 @@ Current local repo state:
   partner/reviewer orchestration loops
 - Handoff timeout failures now surface as clean NCP errors with runner name,
   timeout budget, and prompt size instead of raw Python tracebacks
-- NCP handoff orchestration validated end to end, including orchestrator-managed
-  usage with Sarathi as one integration example
+- NCP handoff workflow validated end to end across bounded implementation and
+  review lanes
 
 ### Docs
 
@@ -123,7 +123,7 @@ Current local repo state:
 ## What Shipped In 0.6.x
 
 - **Migration 004 — IVF-FLAT index**: `CREATE INDEX ... USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100)` on the embedding column. `PgvectorStore` gains `ivfflat_probes: int = 10`; `SET LOCAL ivfflat.probes` prepended before every ANN SELECT.
-- **`log_cost` CLI**: `.ncp/run.py log_cost` exposes `log_cost_raw` to external callers so orchestrators and scripts can post token usage into `ncp cost`.
+- **`log_cost` CLI**: `.ncp/run.py log_cost` exposes `log_cost_raw` to external callers so scripts and host runtimes can post token usage into `ncp cost`.
 - **Embedding provider integration**: `ncp/adapters/embedding.py` — `BaseEmbeddingAdapter`, `OpenAIEmbeddingAdapter` (`text-embedding-3-small`), `LocalEmbeddingAdapter` (`sentence-transformers`). `PgvectorStore` auto-embeds on `write()` and `_query_vector()` when `embedding_adapter` is configured. `[embedding]` config section + env overrides. Factory wires adapter from config.
 - Suite: `421 passed, 8 skipped`
 
@@ -235,7 +235,7 @@ Suggested next priorities:
 - **Claude**: bounded implementation/planning partner
 - **OpenCode**: bounded reviewer (`opencode/deepseek-v4-flash-free`)
 - **NCP**: handoff transport and shared bounded context
-- **Orchestrator (for example Sarathi)**: task/evidence tracking
+- **Task runner / host process**: task and evidence tracking
 
 ## Recommended Orchestration Loop
 
@@ -256,5 +256,5 @@ Suggested next priorities:
 > lexical candidate generation, and shared non-lexical scoring helpers.
 > Continue `0.16.x` with the next narrow retrieval architecture slice: make the
 > assembler/store retrieval boundary more explicit while keeping current
-> behavior stable. Use a multi-agent orchestrator when helpful, and keep NCP as
+> behavior stable. Use a multi-agent task runner when helpful, and keep NCP as
 > the default communication spine in every subagent instruction.

@@ -166,15 +166,6 @@ NCP_CONTAINER_ENGINE=podman ./scripts/test_pgvector_integration.sh
 This exercises the real Podman-backed Postgres/pgvector + Redis stack from
 [`compose.yaml`](./compose.yaml) and runs the live integration suite end to end.
 
-If you want Sarathi to orchestrate the same local validation flow:
-
-```bash
-SARATHI_EXEC_COMMANDS=1 NCP_CONTAINER_ENGINE=podman sarathi run \
-  "Validate the live NCP pgvector path end to end: ensure local pgvector+redis infra is running, apply migrations if needed, run scripts/test_pgvector_integration.sh, and report the exact pass/fail result with blockers." \
-  --policy-pack /path/to/project/policy-pack \
-  --ncp
-```
-
 ## Setup Success Signals
 
 After setup you should be able to run:
@@ -276,9 +267,8 @@ Properties of the loop:
 - timeouts surface as clean NCP-owned errors
 - the same pattern works on SQLite or pgvector + Redis
 
-NCP has been proven under a real orchestrator-managed workflow too, including
-Sarathi as one integration example, but NCP itself does not depend on any
-single orchestrator.
+NCP has been proven under real multi-provider workflows, but NCP itself does
+not depend on any single orchestrator, framework, or host runtime.
 
 ## Current Feature Surface
 

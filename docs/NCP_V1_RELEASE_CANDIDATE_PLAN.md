@@ -23,7 +23,7 @@ NCP V1 should be presented as:
 
 NCP should **not** be presented as:
 
-- a Sarathi feature
+- an internal orchestration feature
 - a Claude/OpenCode-specific workflow wrapper
 - a generic AI orchestration product
 
@@ -70,7 +70,7 @@ following are true:
 
 1. The public product definition is stable.
    - NCP is described as a context runtime and shared memory layer.
-   - Sarathi is mentioned only as one validation/orchestration example.
+   - Public docs do not depend on any internal orchestration naming.
 
 2. The runtime modes are explicit and documented.
    - local/default mode: SQLite
@@ -116,13 +116,10 @@ The following should not block the release candidate:
 ### 1. Product Positioning Cleanup
 
 Objective:
-- make NCP read like a standalone product, not a sidecar to Sarathi
+- make NCP read like a standalone product, not a sidecar to an internal orchestration process
 
 Required changes:
-- remove Sarathi-centric framing from public docs
-- keep Sarathi only as:
-  - one validation example
-  - one consumer/integration example
+- remove orchestration-specific framing from public docs
 - rewrite public wording that implies NCP depends on a specific orchestrator
 
 Primary files:
@@ -133,8 +130,8 @@ Primary files:
 - `CHANGELOG.md`
 
 Acceptance criteria:
-- a new reader can understand NCP without knowing Sarathi exists
-- Sarathi mentions, where retained, read as integration examples only
+- a new reader can understand NCP without knowing any internal process exists
+- any retained integration examples read as optional host usage, not product identity
 
 ### 2. Release Story Cleanup
 
@@ -268,7 +265,7 @@ Primary targets:
 - `docs/NCP_POST_V1_ROADMAP.md`
 
 Acceptance criteria:
-- no public doc implies NCP is primarily a Sarathi component
+- no public doc implies NCP is primarily part of an internal orchestration stack
 - no public doc contradicts the README’s product definition
 
 ### 7. Visual Support
@@ -298,7 +295,7 @@ Acceptance criteria:
 ### Release Slice A — Positioning + README
 
 - rewrite README
-- remove Sarathi-centric framing from core public docs
+- remove orchestration-centric framing from core public docs
 - add diagrams
 
 ### Release Slice B — Guided Setup
@@ -350,19 +347,19 @@ Acceptance criteria:
 - `docs/NCP_BENCHMARK_RESEARCH_PIPELINE.md`
 - `benchmarks/mace/README.md`
 
-### Specific Sarathi-related cleanup
+### Specific orchestration-related cleanup
 
 Current public references that should be reframed or reduced:
 
-- README proof bullets mentioning Sarathi
-- README token-efficiency example labeled as “Sarathi planning handoff”
-- `docs/NCP_MCP_DOGFOOD_LOOP.md` sections that describe Sarathi usage as if it
-  defines NCP’s intended product posture
+- README proof bullets that mention internal orchestration examples
+- README token-efficiency examples labeled like internal handoff flows
+- `docs/NCP_MCP_DOGFOOD_LOOP.md` sections that describe internal orchestration
+  usage as if it defines NCP’s intended product posture
 - `docs/NCP_ACTIVE_HANDOFF_PACKET.md` recommended roles/orchestration loop
 
 Policy:
 - keep NCP-first product language
-- move Sarathi references into “validation / integration example” framing
+- move orchestration references into “validation / integration example” framing
 
 ---
 
@@ -370,7 +367,8 @@ Policy:
 
 NCP V1 RC is complete when:
 
-- README and primary docs describe NCP without relying on Sarathi framing
+- README and primary docs describe NCP without relying on internal orchestration framing
+- README and primary docs describe NCP as a plug-and-play MCP connector/runtime
 - runtime modes are explicit and coherent
 - first-run setup offers a clear SQLite vs pgvector + Redis choice
 - current retrieval line is closed for V1

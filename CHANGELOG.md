@@ -88,7 +88,7 @@ breaking changes.
   `docs/NCP_MCP_DOGFOOD_LOOP.md`, `docs/NCP_ACTIVE_HANDOFF_PACKET.md`):
   setup now documents SQLite vs pgvector + Redis as the two supported runtime
   modes; the README has been rewritten as an NCP-first landing page with
-  architecture diagrams; stale Sarathi-centric framing has been reduced to
+  architecture diagrams; stale orchestration-centric framing has been reduced to
   optional integration-example language; and the active handoff packet has been
   renamed to reflect its real scope.
 - **Verification**: suite now passes at `574 passed, 8 skipped`.
@@ -273,7 +273,7 @@ Three post-0.6.0 slices completing the 0.6.x line. No breaking changes.
 
 - **IVF-FLAT index** (`migration 004`): `CREATE INDEX ... USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100)` on `{prefix}chunks`. Matches the `<=>` cosine operator used by `retrieval_mode="vector"`. Reversible via DOWN section.
 - **`ivfflat_probes` on `PgvectorStore`**: new constructor param `ivfflat_probes: int = 10`; `_query_vector` prepends `SET LOCAL ivfflat.probes = %s` before every ANN SELECT, scoped to the transaction so it cannot leak across pool connections.
-- **`log_cost` CLI command** in `.ncp/run.py`: exposes `log_cost_raw` to external callers (Sarathi, scripts) via `python3 .ncp/run.py log_cost '{"agent_id":...,"model":...,"input_tokens":...,"output_tokens":...}'`. Turn ID auto-generated if omitted. Output visible in `ncp cost`.
+- **`log_cost` CLI command** in `.ncp/run.py`: exposes `log_cost_raw` to external callers (scripts, host runtimes) via `python3 .ncp/run.py log_cost '{"agent_id":...,"model":...,"input_tokens":...,"output_tokens":...}'`. Turn ID auto-generated if omitted. Output visible in `ncp cost`.
 - **Embedding provider integration** (`ncp/adapters/embedding.py`): `BaseEmbeddingAdapter` (contract + `_validate_dims`), `OpenAIEmbeddingAdapter` (`text-embedding-3-small`, 1536 dims), `LocalEmbeddingAdapter` (`sentence-transformers`, model-configurable). Both do lazy imports — zero dependency footprint unless enabled.
 - **Auto-embed on write** (`PgvectorStore`): if `embedding_adapter` is set and `chunk.embedding is None`, calls `adapter.embed(chunk.content)` and attaches the vector before the DB upsert.
 - **Auto-embed on query** (`PgvectorStore._query_vector`): if `embedding_adapter` is set and no `embedding` is passed, auto-embeds the query text instead of raising `ValueError`.
