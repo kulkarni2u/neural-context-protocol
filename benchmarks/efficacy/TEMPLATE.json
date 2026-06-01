@@ -1,0 +1,43 @@
+{
+  "benchmark": "matched_budget_efficacy",
+  "task_shape": "two_call_continuation",
+  "token_unit": "word_split",
+  "target_budget": {
+    "kind": "prompt_tokens",
+    "value": 0
+  },
+  "providers": [
+    {
+      "provider": "claude-cli",
+      "strategies": [
+        {
+          "name": "ncp",
+          "attempts": [],
+          "summary": {
+            "success_rate": 0.0,
+            "median_prompt_tokens": 0.0,
+            "timeout_rate": 0.0
+          }
+        },
+        {
+          "name": "sliding_window",
+          "attempts": [],
+          "summary": {
+            "success_rate": 0.0,
+            "median_prompt_tokens": 0.0,
+            "timeout_rate": 0.0
+          }
+        },
+        {
+          "name": "rolling_summary",
+          "attempts": [],
+          "summary": {
+            "success_rate": 0.0,
+            "median_prompt_tokens": 0.0,
+            "timeout_rate": 0.0
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -27,6 +27,8 @@ class AssemblyResult:
     conscious: ConsciousBlock
     chunks: list[SubconsciousChunk]
     whispers: list[Whisper]
+    evicted_high_relevance: list[tuple[str, float]]
+    evicted_whispers: list[tuple[str, float]]
 
 
 class Assembler:
@@ -69,7 +71,14 @@ class Assembler:
         ctx_window: int | None = None,
         k: int | None = None,
         diversity_limit: int | None = None,
-    ) -> tuple[ConsciousBlock, BudgetContext, list[SubconsciousChunk], list[Whisper]]:
+    ) -> tuple[
+        ConsciousBlock,
+        BudgetContext,
+        list[SubconsciousChunk],
+        list[Whisper],
+        list[tuple[str, float]],
+        list[tuple[str, float]],
+    ]:
         conscious, budget = self.middleware.pre_assemble(conscious, budget)
         coherence_report = self.coherence.check(conscious)
         coherence_alerts = coherence_report.alerts
@@ -84,14 +93,25 @@ class Assembler:
             diversity_limit=diversity_limit,
         )
         subconscious = self._cold_start_bootstrap(hydrated, subconscious)
-        combined_chunks = self._dedupe_chunks([*recent_chunks, *subconscious])[:chunk_cap]
+        deduped_chunks = self._dedupe_chunks([*recent_chunks, *subconscious])
+        evicted_high_relevance = [
+            (chunk.chunk_id, float(chunk.relevance))
+            for chunk in deduped_chunks[chunk_cap:]
+            if float(chunk.relevance) >= 0.5
+        ]
+        combined_chunks = deduped_chunks[:chunk_cap]
         drain_cap = max(0, whisper_cap - len(coherence_alerts))
         drained_whispers = (
             [] if drain_cap == 0 else self._drain_whispers(hydrated, max_items=drain_cap)
         )
-        combined_whispers: list[Whisper] = [*coherence_alerts, *drained_whispers]
-        combined_whispers = combined_whispers[:whisper_cap]
-        return hydrated, budget, combined_chunks, combined_whispers
+        all_whispers: list[Whisper] = [*coherence_alerts, *drained_whispers]
+        evicted_whispers = [
+            (whisper.whisper_id, float(whisper.confidence))
+            for whisper in all_whispers[whisper_cap:]
+            if float(whisper.confidence) >= 0.6
+        ]
+        combined_whispers = all_whispers[:whisper_cap]
+        return hydrated, budget, combined_chunks, combined_whispers, evicted_high_relevance, evicted_whispers
 
     def assemble(
         self,
@@ -103,7 +123,7 @@ class Assembler:
         k: int | None = None,
         diversity_limit: int | None = None,
     ) -> AssemblyResult:
-        hydrated, budget, combined_chunks, combined_whispers = self._prepare_assembly(
+        hydrated, budget, combined_chunks, combined_whispers, evicted_high_relevance, evicted_whispers = self._prepare_assembly(
             conscious=conscious,
             budget=budget,
             query_text=query_text,
@@ -123,6 +143,8 @@ class Assembler:
             conscious=hydrated,
             chunks=combined_chunks,
             whispers=combined_whispers,
+            evicted_high_relevance=evicted_high_relevance,
+            evicted_whispers=evicted_whispers,
         )
 
     def assemble_incremental(
@@ -147,7 +169,7 @@ class Assembler:
         Callers that use post_assemble middleware should apply it to the
         concatenated result: ``mw.post_assemble("\\n\\n".join(t for _, t in sections))``.
         """
-        hydrated, budget, combined_chunks, combined_whispers = self._prepare_assembly(
+        hydrated, budget, combined_chunks, combined_whispers, _, _ = self._prepare_assembly(
             conscious=conscious,
             budget=budget,
             query_text=query_text,

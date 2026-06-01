@@ -1,6 +1,6 @@
 import pytest
 
-from ncp.costs import calculate_cost
+from ncp.costs import assembly_overhead, calculate_cost
 
 
 def test_calculate_cost_uses_default_pricing() -> None:
@@ -31,3 +31,33 @@ def test_calculate_cost_supports_pricing_override() -> None:
 def test_calculate_cost_requires_known_model() -> None:
     with pytest.raises(KeyError, match="No pricing configured"):
         calculate_cost(model="missing-model", input_tokens=1, output_tokens=1)
+
+
+def test_assembly_overhead_reports_cost_and_token_equivalent() -> None:
+    overhead = assembly_overhead(
+        embed_tokens=1000,
+        retrieval_ops=10,
+        whisper_writes=4,
+        reference_model="gpt-4o-mini",
+    )
+
+    assert overhead.total_cost_usd > 0.0
+    assert overhead.token_equivalent > 0.0
+
+
+def test_assembly_overhead_requires_known_reference_model() -> None:
+    with pytest.raises(KeyError, match="No pricing configured"):
+        assembly_overhead(reference_model="missing-model")
+
+
+def test_assembly_overhead_token_equivalent_handles_zero_reference_price() -> None:
+    overhead = assembly_overhead(
+        embed_tokens=1000,
+        retrieval_ops=10,
+        whisper_writes=4,
+        reference_model="free-model",
+        pricing={"free-model": {"input": 0.0, "output": 0.0, "cache_read": 0.0}},
+    )
+
+    assert overhead.total_cost_usd > 0.0
+    assert overhead.token_equivalent == 0.0

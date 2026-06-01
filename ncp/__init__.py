@@ -1,7 +1,7 @@
 """Public package surface for Neural Context Protocol."""
 
 from .api import agent, configure, emit, get_context, run, stream, write_memory
-from .benchmarks import estimate_tokens, run_coding_pipeline_benchmark, run_research_pipeline_benchmark
+from .benchmarks import estimate_tokens, run_coding_pipeline_benchmark, run_research_pipeline_benchmark, token_unit
 from .dogfood import (
     get_live_provider_readiness,
     load_dogfood_adapter,
@@ -31,5 +31,6 @@ __all__ = [
     "run_coding_pipeline_benchmark",
     "run_research_pipeline_benchmark",
     "stream",
+    "token_unit",
     "write_memory",
 ]

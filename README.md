@@ -248,13 +248,24 @@ For host configs, use:
 
 ## Benchmarks
 
-Observed benchmark snapshot, against a naive full-replay floor:
+Observed benchmark snapshot:
 
 | Scenario | Baseline | Baseline tokens | NCP tokens | Reduction |
-|---|---|---|---|
-| Coding pipeline (40 turns) | naive full replay | 1,927 peak | 174 peak | 17.52x |
-| Research pipeline (36 turns) | naive full replay | 1,700 peak | 156 peak | 16.35x |
+|---|---|---:|---:|---:|
+| Coding pipeline (40 turns) | raw replay | 1,927 peak | 174 peak | 17.52x |
+| Coding pipeline (40 turns) | sliding window (8) | 212 peak | 174 peak | 1.93x |
+| Coding pipeline (40 turns) | rolling summary (4/4) | 1,176 peak | 174 peak | 10.69x |
+| Research pipeline (36 turns) | raw replay | 1,700 peak | 156 peak | 16.35x |
+| Research pipeline (36 turns) | sliding window (8) | 212 peak | 156 peak | 2.04x |
+| Research pipeline (36 turns) | rolling summary (4/4) | 950 peak | 156 peak | 9.13x |
 | Live handoff example | bounded task prompt | ~677 estimated | ~265 estimated | 60.9% |
+
+Needle recall snapshot:
+
+- `python3 benchmarks/needle/run.py --turns 24 --needles 6 --budget 4`
+- final NCP recall: `0.50`
+- equal-budget sliding-window recall: `0.00`
+- this is intentionally a hard retrieval-pressure eval, not a marketing number
 
 MACE benchmark:
 
@@ -264,11 +275,24 @@ MACE benchmark:
 - D3 `1.0000`
 - D4 `1.0000`
 
+Benchmark notes:
+
+- current local artifacts use `word_split` token accounting unless `tiktoken`
+  is installed
+- the coding and research pipeline benchmarks now include two more realistic
+  non-agent baselines:
+  - sliding window (`last_entries=8`)
+  - rolling summary (`every_k=4`, `keep_recent=4`)
+- the benchmarks now also report a first-pass assembly-overhead estimate so
+  raw prompt savings are not presented as free
+
 ### What These Benchmarks Do Not Show
 
-- the coding and research pipeline benchmarks currently compare NCP against
-  naive full replay, which is a floor, not a realistic competitor
+- the coding and research pipeline benchmarks still use deterministic pipeline
+  agents, not live providers
 - the pipeline benchmarks do not yet include real agents in the loop
+- the new needle benchmark is a retrieval-pressure probe, not a user-facing
+  success-rate benchmark
 - MACE currently uses deterministic agents, so it is not yet the final quality proof
 - all current workflow results assume a host that follows the NCP contract:
   `ncp_get_context`, optional `ncp_fetch`, `ncp_write_memory`, `ncp_emit_whisper`
@@ -277,6 +301,8 @@ Relevant benchmark docs:
 
 - [docs/NCP_BENCHMARK_CODING_PIPELINE.md](./docs/NCP_BENCHMARK_CODING_PIPELINE.md)
 - [docs/NCP_BENCHMARK_RESEARCH_PIPELINE.md](./docs/NCP_BENCHMARK_RESEARCH_PIPELINE.md)
+- [docs/NCP_BENCHMARK_NEEDLE_RECALL.md](./docs/NCP_BENCHMARK_NEEDLE_RECALL.md)
+- [docs/NCP_BENCHMARK_MATCHED_BUDGET_EFFICACY.md](./docs/NCP_BENCHMARK_MATCHED_BUDGET_EFFICACY.md)
 - [benchmarks/mace/README.md](./benchmarks/mace/README.md)
 
 ## Optional Bounded Agent Handoffs
@@ -284,7 +310,7 @@ Relevant benchmark docs:
 NCP can also drive a bounded partner/reviewer loop over its own whisper queue:
 
 ```bash
-ncp emit --from-agent codex --to claude --type share --pipeline-id pipe_demo --payload "slice=pgvector files=ncp/stores/pgvector.py ask=implement_and_handoff"
+ncp emit --from-agent codex --to claude --type share --pipeline-id pipe_demo --payload '{"slice":"pgvector","files":["ncp/stores/pgvector.py"],"ask":"implement_and_handoff"}'
 ncp handoff claude --cwd /path/to/project --pipeline-id pipe_demo --emit-to opencode
 ncp handoff opencode --cwd /path/to/project --pipeline-id pipe_demo --emit-to claude
 ```
@@ -343,6 +369,8 @@ Tool-specific setup examples:
 - [docs/NCP_PROTOCOL_SPEC.md](./docs/NCP_PROTOCOL_SPEC.md) - normative protocol reference
 - [docs/NCP_MCP_DOGFOOD_LOOP.md](./docs/NCP_MCP_DOGFOOD_LOOP.md) - deterministic MCP proof path
 - [docs/NCP_PROVIDER_PARITY_BASELINE.md](./docs/NCP_PROVIDER_PARITY_BASELINE.md) - host parity snapshot
+- [docs/NCP_BENCHMARK_NEEDLE_RECALL.md](./docs/NCP_BENCHMARK_NEEDLE_RECALL.md) - retrieval-pressure eval
+- [docs/NCP_BENCHMARK_MATCHED_BUDGET_EFFICACY.md](./docs/NCP_BENCHMARK_MATCHED_BUDGET_EFFICACY.md) - real-agent eval contract
 - [docs/NCP_ACTIVE_HANDOFF_PACKET.md](./docs/NCP_ACTIVE_HANDOFF_PACKET.md) - active handoff packet for the current roadmap line
 - [docs/NCP_POST_V1_ROADMAP.md](./docs/NCP_POST_V1_ROADMAP.md) - post-V1 roadmap history
 - [docs/NCP_R2_STORAGE.md](./docs/NCP_R2_STORAGE.md) - storage direction and local infra notes

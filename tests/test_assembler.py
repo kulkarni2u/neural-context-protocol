@@ -112,6 +112,68 @@ def test_assembler_resolves_recent_refs_and_reduces_critical_pressure(tmp_path: 
     assert result.whispers[0].whisper_type == "alert"
 
 
+def test_assembler_reports_evicted_high_relevance_chunks(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "evict.db")
+    assembler = Assembler(store=store)
+    recent_refs: list[str] = []
+    for index in range(3):
+        record = assembler.post_turn(
+            conscious=_make_conscious(),
+            response=NCPResponse(
+                content=f"result_{index}",
+                input_tokens=10,
+                output_tokens=5,
+                cost_usd=0.0,
+                model="gpt_4_1",
+                pipeline_id="pipe_1",
+                turn_id=f"turn_evict_{index}",
+                latency_ms=1,
+            ),
+            result_summary=f"needle constraint_{index} preserve this exact benchmark fact",
+            result_full=f"needle constraint_{index} preserve this exact benchmark fact",
+        )
+        recent_refs.append(f"r:sub/{record.turn_id}")
+
+    result = assembler.assemble(
+        conscious=_make_conscious(recent=recent_refs),
+        budget=BudgetContext(pressure="medium"),
+        k=1,
+    )
+
+    assert len(result.chunks) == 1
+    assert result.evicted_high_relevance
+    evicted_ids = {chunk_id for chunk_id, _ in result.evicted_high_relevance}
+    assert evicted_ids
+
+
+def test_assembler_reports_evicted_whispers_without_draining_queue(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "whispers.db")
+    store.emit_whisper(
+        Whisper(
+            from_agent="planner",
+            target="executor",
+            whisper_type="nudge",
+            payload="follow_up_review",
+            confidence=0.9,
+            pipeline_id="pipe_1",
+        )
+    )
+
+    assembler = Assembler(store=store)
+    result = assembler.assemble(
+        conscious=_make_conscious(slot_age=6, slot_confidence=0.4, drift_score=0.35),
+        budget=BudgetContext(pressure="critical"),
+    )
+
+    assert len(result.whispers) == 1
+    assert result.whispers[0].whisper_type == "alert"
+    assert result.evicted_whispers
+    assert any(confidence >= 0.6 for _, confidence in result.evicted_whispers)
+
+    remaining = store.drain_whispers(agent_id="executor", pipeline_id="pipe_1", max_items=5)
+    assert any(whisper.payload == "follow_up_review" for whisper in remaining)
+
+
 def test_assembler_post_turn_logs_cost_and_memory_chunks(tmp_path: Path) -> None:
     store = SQLiteStore(tmp_path / "store.db")
     assembler = Assembler(store=store)
