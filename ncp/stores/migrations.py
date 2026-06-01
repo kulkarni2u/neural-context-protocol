@@ -106,7 +106,8 @@ class MigrationRunner:
 
     def bootstrap(self) -> None:
         """Create the schema_versions tracking table if absent."""
-        sql = self._sub(
+        create_schema_sql = self._sub("CREATE SCHEMA IF NOT EXISTS {schema};")
+        create_table_sql = self._sub(
             "CREATE TABLE IF NOT EXISTS {schema}.{prefix}schema_versions ("
             "    version INTEGER PRIMARY KEY,"
             "    name TEXT NOT NULL,"
@@ -116,7 +117,8 @@ class MigrationRunner:
         )
         cur = self._conn.cursor()
         try:
-            cur.execute(sql)
+            cur.execute(create_schema_sql)
+            cur.execute(create_table_sql)
             self._conn.commit()
         finally:
             cur.close()

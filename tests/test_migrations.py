@@ -132,6 +132,18 @@ def test_bootstrap_creates_schema_versions_table(tmp_path: Path) -> None:
     conn.commit.assert_called_once()
 
 
+def test_bootstrap_creates_schema_before_schema_versions_table(tmp_path: Path) -> None:
+    conn = _mock_conn()
+    runner = _runner(conn, tmp_path)
+
+    runner.bootstrap()
+
+    execute_calls = conn.cursor.return_value.execute.call_args_list
+    assert len(execute_calls) >= 2
+    assert "CREATE SCHEMA IF NOT EXISTS ncp" in str(execute_calls[0])
+    assert "CREATE TABLE IF NOT EXISTS ncp.ncp_schema_versions" in str(execute_calls[1])
+
+
 # ── applied_versions ──────────────────────────────────────────────────────────
 
 def test_applied_versions_returns_empty_when_none_applied(tmp_path: Path) -> None:
