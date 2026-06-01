@@ -2,10 +2,27 @@
 
 All notable changes to Neural Context Protocol will be documented in this file.
 
-## [0.16.x] - 2026-05-31
+## [1.0.0] - 2026-06-01
 
-Current `0.16.x` retrieval and V1 release-candidate cleanup slices. No
-breaking changes.
+First stable public release of Neural Context Protocol.
+
+This release rolls the `0.2.0` through `0.16.x` development lines into a
+coherent V1 product surface:
+
+- local-first SQLite runtime
+- scalable pgvector + Redis runtime
+- HTTP/SSE MCP runtime
+- bounded retrieval, `ncp_fetch`, and whispers
+- operator tooling: `status`, `cost`, `explain`, `viz`, `batch`,
+  `consolidate`, `calibrate`
+- live Podman-backed pgvector + Redis validation
+- end-to-end provider handoff proof across Claude and OpenCode
+
+Verification at release cut:
+
+- `575 passed, 8 skipped`
+- `python -m build` passes
+- live Podman pgvector + Redis integration: `6 passed`
 
 ### Added / Changed
 
@@ -91,7 +108,7 @@ breaking changes.
   architecture diagrams; stale orchestration-centric framing has been reduced to
   optional integration-example language; and the active handoff packet has been
   renamed to reflect its real scope.
-- **Verification**: suite now passes at `574 passed, 8 skipped`.
+- **Verification**: suite now passes at `575 passed, 8 skipped`.
 
 ## [0.15.x] - 2026-05-31
 

@@ -8,9 +8,9 @@ of replaying long chat history.
 
 Current local repo state:
 
-- Version: `0.6.0`
+- Version: `1.0.0`
 - GitHub branch: `main`
-- Suite: `574 passed, 8 skipped`
+- Suite: `575 passed, 8 skipped`
 - Live pgvector + Redis integration suite: `6 passed`
 
 ## What Shipped In 0.2.0
@@ -202,26 +202,27 @@ Current local repo state:
   `user_verified` src always protected. Returns `CalibrationReport`. 8 new tests.
 - Suite: `540 passed, 8 skipped`
 
-## Active Line: 0.16.x (next)
+## Active Line: Post-1.0 follow-ups
 
-The `0.15.x` line is complete, and the first five `0.16.x` retrieval slices
-are now in: shared vector-aware retrieval scoring plus sync/async pgvector
-hybrid tie-break parity, then shared retrieval-contract helpers for blank-query
-fallback, zero-overlap gating, normalized result caps, and diversity trimming,
-then shared lexical candidate generation for the hybrid path, then shared
-non-lexical scoring helpers for trust/recency and vector distance, then
-assembler retrieval-cap cleanup so chunk/whisper pressure limits are derived in
-one place and forwarded consistently (`574 passed, 8 skipped`, ruff clean).
+`1.0.0` is the stable stop line for the original V1 product scope. The former
+`0.16.x` retrieval cleanup slices are already absorbed into that release:
+shared vector-aware retrieval scoring, sync/async pgvector hybrid tie-break
+parity, shared retrieval-contract helpers for blank-query fallback,
+zero-overlap gating, normalized result caps, diversity trimming, shared lexical
+candidate generation, shared non-lexical scoring helpers, and assembler
+retrieval-cap cleanup (`575 passed, 8 skipped`, ruff clean).
+
 Suggested next priorities:
 
-- **Candidate-generation boundary cleanup**: now that caps are explicit, decide
-  whether trust/recency candidate generation should be abstracted further so
-  SQLite, sync pgvector, and async pgvector stay aligned without widening the
-  current retrieval contract
+- **Candidate-generation boundary cleanup**: decide whether trust/recency
+  candidate generation should be abstracted further so SQLite, sync pgvector,
+  and async pgvector stay aligned without widening the stable `1.0.0`
+  retrieval contract
 - **SQLite parity decision**: decide whether SQLite should stay lexical-only or
-  grow a more explicit trust/recency candidate-generation helper path too
-- **Async reporting consumption**: thread the new async status/cost/viz parity
-  into any async operator or service paths that still rely on sync-only access
+  grow a more explicit trust/recency candidate-generation helper path as a
+  post-1.0 improvement
+- **Async reporting consumption**: thread the async status/cost/viz parity into
+  any async operator or service paths that still rely on sync-only access
 
 ## Known Architectural Gaps (carried forward)
 
@@ -250,11 +251,8 @@ Suggested next priorities:
 
 ## Suggested Prompt For The Next Orchestrator
 
-> Read `docs/NCP_ACTIVE_HANDOFF_PACKET.md` first. The first five `0.16.x`
-> retrieval slices are already in (`574 passed, 8 skipped`, ruff clean):
-> shared vector-aware scoring, shared retrieval-contract helpers, shared
-> lexical candidate generation, and shared non-lexical scoring helpers.
-> Continue `0.16.x` with the next narrow retrieval architecture slice: make the
-> assembler/store retrieval boundary more explicit while keeping current
-> behavior stable. Use a multi-agent task runner when helpful, and keep NCP as
+> Read `docs/NCP_ACTIVE_HANDOFF_PACKET.md` first. `1.0.0` is already cut as the
+> stable V1 product surface (`575 passed, 8 skipped`, ruff clean). Continue on
+> the post-1.0 line with a narrow retrieval or async-operability improvement.
+> Keep the stable `1.0.0` contract intact, prefer small slices, and use NCP as
 > the default communication spine in every subagent instruction.

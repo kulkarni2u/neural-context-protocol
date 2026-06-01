@@ -1,5 +1,9 @@
 # NCP V1 Release Candidate Plan
 
+> **Status: FULFILLED** — The work in this document was closed by the `1.0.0`
+> release. It is retained as the historical checklist that turned the repo from
+> a late pre-release line into the first stable public release.
+
 This document defines the work required to turn the current NCP repository into
 a coherent V1 release candidate.
 

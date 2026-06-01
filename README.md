@@ -18,6 +18,8 @@ tools, agent frameworks, or orchestrators, but the product itself is:
 - cross-agent signaling
 - one shared MCP surface
 
+`1.0.0` is the stable V1 release line.
+
 ## Why It Exists
 
 Multi-agent workflows usually fail in a few predictable ways:
