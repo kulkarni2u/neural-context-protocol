@@ -20,6 +20,10 @@ tools, agent frameworks, or orchestrators, but the product itself is:
 
 `1.0.0` is the stable V1 release line.
 
+NCP is a context substrate. It gives agents bounded, persistent, shareable
+context that makes multi-agent systems cheaper and more coherent. It does not
+replace planning, orchestration, or judgment.
+
 ## Why It Exists
 
 Multi-agent workflows usually fail in a few predictable ways:
@@ -68,9 +72,11 @@ The product story is simple:
 - **SQLite** is the default mode.
 - **pgvector + Redis** is the scalable mode.
 
-## What Is Proven
+## What Is Demonstrated
 
-This repository currently proves:
+### Demonstrated
+
+This repository currently demonstrates:
 
 - shared MCP access over HTTP/SSE
 - durable memory writes and cross-host reads
@@ -91,6 +97,20 @@ Concrete proof points already in the repo:
 - live pgvector + Redis integration tests are green on the local compose stack
 - retrieval logic is now largely shared across SQLite, sync pgvector, and async pgvector
 - `ncp handoff claude` / `ncp handoff opencode` support bounded whisper-driven partner/reviewer loops
+
+The strongest current claim is simple:
+
+- multiple hosts can operate on one bounded shared memory substrate instead of
+  replaying giant transcripts independently
+
+### Not Yet Independently Validated
+
+This repository does not yet independently validate:
+
+- efficacy against realistic competing baselines like sliding-window or rolling-summary context
+- quality retention under compression at matched budgets
+- retrieval recall under pressure
+- real-agent success-rate deltas at matched budget
 
 ## Quick Start
 
@@ -228,13 +248,13 @@ For host configs, use:
 
 ## Benchmarks
 
-Observed benchmark snapshot:
+Observed benchmark snapshot, against a naive full-replay floor:
 
-| Scenario | Naive replay tokens | NCP tokens | Reduction |
+| Scenario | Baseline | Baseline tokens | NCP tokens | Reduction |
 |---|---|---|---|
-| Coding pipeline (40 turns) | 1,927 peak | 174 peak | 17.52x |
-| Research pipeline (36 turns) | 1,700 peak | 156 peak | 16.35x |
-| Orchestrator handoff example (live) | ~677 estimated | ~265 estimated | 60.9% |
+| Coding pipeline (40 turns) | naive full replay | 1,927 peak | 174 peak | 17.52x |
+| Research pipeline (36 turns) | naive full replay | 1,700 peak | 156 peak | 16.35x |
+| Live handoff example | bounded task prompt | ~677 estimated | ~265 estimated | 60.9% |
 
 MACE benchmark:
 
@@ -243,6 +263,15 @@ MACE benchmark:
 - D2 `1.0000`
 - D3 `1.0000`
 - D4 `1.0000`
+
+### What These Benchmarks Do Not Show
+
+- the coding and research pipeline benchmarks currently compare NCP against
+  naive full replay, which is a floor, not a realistic competitor
+- the pipeline benchmarks do not yet include real agents in the loop
+- MACE currently uses deterministic agents, so it is not yet the final quality proof
+- all current workflow results assume a host that follows the NCP contract:
+  `ncp_get_context`, optional `ncp_fetch`, `ncp_write_memory`, `ncp_emit_whisper`
 
 Relevant benchmark docs:
 

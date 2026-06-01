@@ -6,6 +6,8 @@ path.
 
 It is not a marketing claim.
 It is the current engineering truth for the live CLI-backed continuation path.
+It proves provider interoperability on the bounded continuation slice, not
+comparative agent efficacy.
 
 ## Harness version
 
@@ -61,6 +63,12 @@ At the moment:
 - all three providers pass this bounded parity slice cleanly
 - the parity claim is limited to this exact continuation scenario and these
   explicit timeout budgets
+
+What it does **not** mean:
+
+- it does not prove NCP improves task success versus alternative context strategies
+- it does not prove quality retention under compression
+- it does not replace matched-budget efficacy benchmarking
 
 More precisely:
 

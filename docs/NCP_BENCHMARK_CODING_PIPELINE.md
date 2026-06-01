@@ -1,12 +1,12 @@
 # NCP Coding Pipeline Benchmark
-## First reproducible bounded-context result against naive replay
+## First reproducible bounded-context result against naive full replay
 
 This document records the first runnable benchmark artifact for NCP.
 
-It measures:
+It currently measures:
 
 - NCP bounded context assembly
-- naive full-history replay
+- naive full-history replay as a worst-case floor
 
 The benchmark uses:
 
@@ -35,11 +35,18 @@ Observed on May 23, 2026:
 
 ## Interpretation
 
-This is a credible first bounded-context result:
+This is a credible first bounded-context result against a weak baseline:
 
 - NCP stays far below naive replay as turn depth grows
 - the turn-40 path remains comfortably under the current `<= 2000` launch gate
 - the benchmark is deterministic and rerunnable from the repo
+
+What it does **not** show yet:
+
+- whether NCP beats a realistic sliding-window baseline
+- whether NCP beats a rolling-summary baseline
+- whether quality is retained at matched budget
+- whether a real model succeeds more often with NCP context
 
 This is still only one benchmark shape.
 The complementary research-style benchmark now exists in
@@ -57,7 +64,7 @@ The JSON output includes:
 
 ## Current claim
 
-The honest claim supported by this artifact is:
+The honest claim supported by this artifact today is:
 
 - on the first coding-pipeline benchmark, NCP keeps context materially more
-  bounded than naive replay
+  bounded than naive full replay

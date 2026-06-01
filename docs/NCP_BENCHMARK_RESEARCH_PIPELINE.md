@@ -1,12 +1,12 @@
 # NCP Research Pipeline Benchmark
-## Second reproducible bounded-context result against naive replay
+## Second reproducible bounded-context result against naive full replay
 
 This document records the research-style benchmark artifact for NCP.
 
-It measures:
+It currently measures:
 
 - NCP bounded context assembly
-- naive full-history replay
+- naive full-history replay as a worst-case floor
 
 The benchmark uses:
 
@@ -35,11 +35,18 @@ Observed on May 23, 2026:
 
 ## Interpretation
 
-This is a credible second bounded-context result:
+This is a credible second bounded-context result against a weak baseline:
 
 - NCP stays far below naive replay in a tool-heavier research-shaped flow
 - the turn-36 path remains comfortably under the current `<= 2000` launch gate
 - the benchmark is deterministic and rerunnable from the repo
+
+What it does **not** show yet:
+
+- whether NCP beats a realistic sliding-window baseline
+- whether NCP beats a rolling-summary baseline
+- whether quality is retained at matched budget
+- whether a real model succeeds more often with NCP context
 
 ## Artifact contract
 
@@ -53,7 +60,7 @@ The JSON output includes:
 
 ## Current claim
 
-The honest claim supported by this artifact is:
+The honest claim supported by this artifact today is:
 
 - on the research-pipeline benchmark, NCP keeps context materially more bounded
-  than naive replay
+  than naive full replay
