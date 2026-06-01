@@ -57,7 +57,10 @@ CREATE TABLE IF NOT EXISTS {schema}.{prefix}chunks (
     valid_while TEXT,
     expiry DOUBLE PRECISION,
     owner TEXT,
-    meta JSONB DEFAULT '{{}}'::jsonb
+    meta JSONB DEFAULT '{{}}'::jsonb,
+    embedding vector(1536),
+    retrieval_count INTEGER DEFAULT 0,
+    last_retrieved_at DOUBLE PRECISION
 );
 
 CREATE TABLE IF NOT EXISTS {schema}.{prefix}tombstones (
@@ -120,6 +123,10 @@ CREATE INDEX IF NOT EXISTS {prefix}idx_chunks_layer
     ON {schema}.{prefix}chunks(layer);
 CREATE INDEX IF NOT EXISTS {prefix}idx_chunks_created
     ON {schema}.{prefix}chunks(created_at);
+CREATE INDEX IF NOT EXISTS {prefix}idx_chunks_embedding
+    ON {schema}.{prefix}chunks
+    USING ivfflat (embedding vector_cosine_ops)
+    WITH (lists = 100);
 CREATE INDEX IF NOT EXISTS {prefix}idx_whispers_target
     ON {schema}.{prefix}whispers(target, expires_at);
 CREATE INDEX IF NOT EXISTS {prefix}idx_whispers_pipeline

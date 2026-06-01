@@ -250,7 +250,11 @@ def test_pgvector_live_status_and_cost_reporting() -> None:
             from_agent="claude",
             target="opencode",
             whisper_type="share",
-            payload="check live reporting path",
+            payload={
+                "slice": "live_reporting",
+                "files": ["ncp/stores/pgvector.py"],
+                "ask": "check live reporting path",
+            },
             confidence=0.95,
             pipeline_id="pipe_live_report",
         )
@@ -283,7 +287,11 @@ def test_pgvector_live_redis_coordination_for_whispers_and_fetch_sessions() -> N
             from_agent="claude",
             target="opencode",
             whisper_type="share",
-            payload="handoff the live pgvector slice",
+            payload={
+                "slice": "live_pgvector",
+                "files": ["tests/test_pgvector_integration.py"],
+                "ask": "handoff the live pgvector slice",
+            },
             confidence=0.95,
             pipeline_id="pipe_live_coord",
         )
@@ -325,6 +333,11 @@ def test_pgvector_live_redis_coordination_for_whispers_and_fetch_sessions() -> N
 
     err = _handle_request(_call("ncp_fetch", {"query": "coordination fetch", "session_id": "live_coord_sess"}, req_id=99), handlers)
 
-    assert [whisper.payload for whisper in peeked] == ["handoff the live pgvector slice"]
-    assert [whisper.payload for whisper in drained] == ["handoff the live pgvector slice"]
+    expected_payload = {
+        "slice": "live_pgvector",
+        "files": ["tests/test_pgvector_integration.py"],
+        "ask": "handoff the live pgvector slice",
+    }
+    assert [json.loads(whisper.payload) for whisper in peeked] == [expected_payload]
+    assert [json.loads(whisper.payload) for whisper in drained] == [expected_payload]
     assert _error(err)["message"] == "Tool error: ncp_fetch limit reached: max 3 per session"

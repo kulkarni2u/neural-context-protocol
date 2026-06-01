@@ -40,7 +40,7 @@ STARTED_POSTGRES=0
 cleanup() {
   local status=$?
   if [[ "$STARTED_POSTGRES" -eq 1 && "${NCP_KEEP_INFRA:-0}" != "1" ]]; then
-    $COMPOSE_CMD -f "$COMPOSE_FILE" down >/dev/null 2>&1 || true
+    $COMPOSE_CMD -f "$COMPOSE_FILE" down -v >/dev/null 2>&1 || true
   fi
   exit "$status"
 }
@@ -57,6 +57,7 @@ if importlib.util.find_spec("psycopg2") is None:
 PY
 
 echo "Using: $COMPOSE_CMD"
+$COMPOSE_CMD -f "$COMPOSE_FILE" down -v >/dev/null 2>&1 || true
 $COMPOSE_CMD -f "$COMPOSE_FILE" up -d postgres redis
 STARTED_POSTGRES=1
 
