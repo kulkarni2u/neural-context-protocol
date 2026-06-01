@@ -1,6 +1,6 @@
 # NCP Setup
 
-This guide covers the public first-run setup for Neural Context Protocol.
+This guide covers first-run setup for Neural Context Protocol.
 
 ## Install
 
@@ -10,13 +10,22 @@ Base package:
 pip install neural-context-protocol
 ```
 
-With a provider SDK:
+If you want the scalable local mode too:
 
 ```bash
-pip install 'neural-context-protocol[providers]'
+pip install 'neural-context-protocol[pgvector,redis]'
 ```
 
-## Initialize a project
+## Choose Your Runtime Mode
+
+NCP supports two setup paths:
+
+| Mode | Best for | Backing services |
+|---|---|---|
+| SQLite | default local-first setup | local `.ncp/store.db` |
+| pgvector + Redis | scalable local lab setup | Postgres/pgvector + Redis |
+
+## Initialize a Project
 
 From your project root:
 
@@ -24,169 +33,204 @@ From your project root:
 ncp init
 ```
 
-This creates:
+Interactive terminals will prompt for the store mode.
+
+You can also choose explicitly:
+
+```bash
+ncp init --store sqlite
+ncp init --store pgvector
+```
+
+Initialization creates:
 
 - `.ncp/config.toml`
 - `CLAUDE.md`
 
-## Check local status
+## SQLite Setup
+
+This is the default local-first path.
 
 ```bash
+ncp init --store sqlite
 ncp status
 ncp cost
 ncp explain
+ncp serve --host 127.0.0.1 --port 4242 --cwd /path/to/project
 ```
 
-This verifies that the active NCP store can be opened and that the CLI is wired
-correctly. `ncp status` surfaces store and activity rollups; `ncp cost`
-surfaces token and USD rollups from `cost_log`; `ncp explain` summarizes the
-same state in a short human-readable operator view.
+Expected behavior:
 
-## Start the MCP server
+- store path resolves to `.ncp/store.db`
+- no external services are required
+- MCP is available at `http://127.0.0.1:4242/mcp`
 
-NCP’s public transport is HTTP/SSE MCP:
+## pgvector + Redis Setup
+
+This is the scalable local path.
+
+### 1. Initialize
 
 ```bash
-ncp serve --host 127.0.0.1 --port 4242 --cwd /path/to/your/project
+ncp init --store pgvector
 ```
 
-HTTP endpoints:
+### 2. Bring up local infra
 
-- `GET /healthz`
-- `GET /sse`
-- `POST /mcp`
-
-For host configs, prefer `http://127.0.0.1:4242/mcp`.
-
-## R2 local infra preview
-
-The `0.2.0` storage path (current version `0.6.0`) uses local containerized
-infrastructure for Postgres/pgvector and Redis:
+Use the repo’s compose-backed helpers:
 
 ```bash
 ./scripts/infra_up.sh
 ```
 
-This does not change the current default store. SQLite remains the active
-implementation by default. `store.type = "pgvector"` supports the durable
-chunk/query path, core turn/cost/conscious persistence, Redis-backed
-coordination for whispers plus fetch-session limits, and operator reporting via
-`ncp status`, `ncp cost`, and `ncp explain`.
+This starts:
 
-To run the live pgvector integration suite against the local containerized
-stack:
+- Postgres/pgvector
+- Redis
+
+Equivalent local compose stack:
+
+- [compose.yaml](../compose.yaml)
+- [scripts/infra_up.sh](../scripts/infra_up.sh)
+- [scripts/infra_down.sh](../scripts/infra_down.sh)
+
+### 3. Apply pgvector schema migrations
+
+```bash
+ncp migrate apply --cwd /path/to/project
+```
+
+### 4. Verify the scalable path
+
+```bash
+ncp status --cwd /path/to/project
+ncp cost --cwd /path/to/project
+ncp explain --cwd /path/to/project
+```
+
+### 5. Start MCP
+
+```bash
+ncp serve --host 127.0.0.1 --port 4242 --cwd /path/to/project
+```
+
+### 6. Optional live integration verification
 
 ```bash
 ./scripts/test_pgvector_integration.sh
 ```
 
-This runner brings up both Postgres/pgvector and Redis, then validates durable
-pgvector behavior, reporting parity, and Redis-backed coordination on the same
-local stack.
+This validates:
 
-## Run the examples
+- durable pgvector behavior
+- reporting parity
+- Redis-backed coordination
+
+## Start the MCP Server
+
+NCP’s public transport is HTTP/SSE MCP:
 
 ```bash
-python3 examples/01_quickstart.py
-python3 examples/02_multi_agent.py
+ncp serve --host 127.0.0.1 --port 4242 --cwd /path/to/project
 ```
 
-## Claude Code setup
+Endpoints:
 
-1. Initialize the repo with `ncp init`
+- `GET /healthz`
+- `GET /sse`
+- `POST /mcp`
+
+Preferred host endpoint:
+
+- `http://127.0.0.1:4242/mcp`
+
+## Common Validation Commands
+
+```bash
+ncp status --cwd /path/to/project
+ncp cost --cwd /path/to/project
+ncp explain --cwd /path/to/project
+ncp dogfood --cwd /path/to/project
+```
+
+What they tell you:
+
+- `status` — store/activity rollups
+- `cost` — token and USD rollups
+- `explain` — human-readable operator summary
+- `dogfood` — deterministic MCP proof
+
+## Multi-Tool Sharing
+
+Each coding tool connects to the same NCP server:
+
+```text
+Claude / Codex / OpenCode / other MCP host
+  -> ncp serve (HTTP/SSE)
+  -> shared NCP runtime
+  -> SQLite or pgvector + Redis
+```
+
+The shared memory is in the runtime/store, not in the client process.
+
+## Tool-Specific Setup Examples
+
+### Claude Code
+
+1. Initialize with `ncp init`
 2. Copy the example MCP config:
 
 ```bash
 cp examples/06_claude_code/mcp_servers.json .mcp.json
 ```
 
-3. Start the HTTP/SSE MCP server:
+3. Start the server:
 
 ```bash
-ncp serve --host 127.0.0.1 --port 4242 --cwd /path/to/your/project
+ncp serve --host 127.0.0.1 --port 4242 --cwd /path/to/project
 ```
 
-Expected tools:
+Expected tool surface:
 
 - `ncp_get_context`
 - `ncp_write_memory`
 - `ncp_emit_whisper`
 - `ncp_fetch`
 
-## Codex CLI setup
+### Codex CLI
 
-1. Initialize the repo with `ncp init`
-2. Copy the Codex MCP example config from `examples/07_codex_cli/` into the MCP
-   config location your Codex build uses
-3. Start the HTTP/SSE MCP server:
+1. Initialize with `ncp init`
+2. Copy the MCP example from `examples/07_codex_cli/`
+3. Start the server:
 
 ```bash
-ncp serve --host 127.0.0.1 --port 4242 --cwd /path/to/your/project
+ncp serve --host 127.0.0.1 --port 4242 --cwd /path/to/project
 ```
 
-Recommended session loop:
+Recommended loop:
 
 1. call `ncp_get_context`
-2. do the provider turn
+2. run the provider turn
 3. persist durable memory with `ncp_write_memory`
 4. use `ncp_fetch` only for bounded retrieval
 
-## How multi-tool sharing works
+## Optional Whisper Handoff Loop
 
-Each coding tool (Claude Code, Codex, OpenCode) connects to one shared
-`ncp serve` process over HTTP/SSE. They all read and write to the same
-`.ncp/store.db` SQLite file.
-
-```
-Claude Code  ─┐
-Codex        ─┼→  ncp serve (HTTP/SSE)  →  .ncp/store.db
-OpenCode     ─┘
-```
-
-The store is the shared memory, not the process. A memory written by an agent
-in Claude Code is visible to an agent in Codex on its next `ncp_get_context`
-call, because they point at the same database.
-
-You do not need to coordinate multiple local MCP processes. The important part
-is that each MCP config should point at the same NCP server:
-
-- SSE discovery: `http://127.0.0.1:4242/sse`
-- JSON-RPC POST endpoint: `http://127.0.0.1:4242/mcp`
-
-When the client supports HTTP transport directly, configure `http://127.0.0.1:4242/mcp`.
-Keep `/sse` available as the discovery stream.
-
-## Dogfood loop
-
-Run the deterministic MCP proof:
+NCP can also drive a bounded partner/reviewer loop over its whisper queue:
 
 ```bash
-ncp dogfood
+ncp emit --cwd /path/to/project --from-agent codex --to claude --type share --pipeline-id pipe_demo --payload "slice=pgvector files=ncp/stores/pgvector.py ask=implement_and_handoff"
+ncp handoff claude --cwd /path/to/project --pipeline-id pipe_demo --emit-to opencode
+ncp handoff opencode --cwd /path/to/project --pipeline-id pipe_demo --emit-to claude
 ```
 
-## Whisper handoff loop
+Notes:
 
-NCP can also drive a bounded partner/reviewer loop over its own whisper queue:
+- queue reads are non-destructive until the provider run succeeds
+- the same loop works on SQLite and on pgvector + Redis
+- the value is bounded task handoff, not orchestrator lock-in
 
-```bash
-ncp emit --cwd /path/to/your/project --from-agent codex --to claude --type share --pipeline-id pipe_demo --payload "slice=pgvector files=ncp/stores/pgvector.py ask=implement_and_handoff"
-ncp handoff claude --cwd /path/to/your/project --pipeline-id pipe_demo --emit-to opencode
-ncp handoff opencode --cwd /path/to/your/project --pipeline-id pipe_demo --emit-to claude
-```
-
-Operational notes:
-
-- handoff queue reads are non-destructive until the provider run succeeds
-- Claude works best as the bounded implementation/planning partner in this loop
-- OpenCode works well as the bounded reviewer
-- the public value of the loop is not only coordination correctness, but prompt-size reduction from whisper-based task deltas instead of replaying the full task prompt
-- with `store.type = "pgvector"`, the same loop now works through Redis-backed coordination instead of requiring a SQLite store
-
-In the current live Sarathi-managed proof for the `pgvector` storage slice, the
-compact handoff route reduced one Claude planning dispatch from `677`
-estimated bridge-prompt tokens to `265` estimated handoff tokens.
-
-Run the release preflight:
+## Release Preflight
 
 ```bash
 bash scripts/release_preflight.sh

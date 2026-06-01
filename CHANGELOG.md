@@ -4,7 +4,8 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [0.16.x] - 2026-05-31
 
-First four `0.16.x` retrieval slices. No breaking changes.
+Current `0.16.x` retrieval and V1 release-candidate cleanup slices. No
+breaking changes.
 
 ### Added / Changed
 
@@ -16,6 +17,13 @@ First four `0.16.x` retrieval slices. No breaking changes.
 - **Regression coverage**: added timeout-path tests in
   `tests/test_agent_handoff.py` and CLI error-surface coverage in
   `tests/test_cli.py`.
+- **Guided init setup** (`ncp/cli.py`): `ncp init` now supports explicit
+  `--store sqlite|pgvector` selection, defaults safely to `sqlite` in
+  non-interactive runs, and prompts in interactive terminals so first-run setup
+  can choose between the local-first SQLite path and the scalable pgvector +
+  Redis path.
+- **Regression coverage**: added CLI init coverage for default SQLite config
+  generation and explicit pgvector initialization.
 
 - **Shared vector-aware retrieval scoring** (`ncp/stores/retrieval.py`):
   `RetrievalPolicy.score_with_vector()` now blends lexical relevance with an
@@ -76,7 +84,14 @@ First four `0.16.x` retrieval slices. No breaking changes.
   destructively drained and silently dropped.
 - **Regression coverage**: added assembler whisper-cap forwarding coverage in
   `tests/test_assembler_k_forwarding.py`.
-- **Verification**: suite now passes at `572 passed, 8 skipped`.
+- **Public docs cleanup for V1 RC** (`README.md`, `docs/NCP_SETUP.md`,
+  `docs/NCP_MCP_DOGFOOD_LOOP.md`, `docs/NCP_ACTIVE_HANDOFF_PACKET.md`):
+  setup now documents SQLite vs pgvector + Redis as the two supported runtime
+  modes; the README has been rewritten as an NCP-first landing page with
+  architecture diagrams; stale Sarathi-centric framing has been reduced to
+  optional integration-example language; and the active handoff packet has been
+  renamed to reflect its real scope.
+- **Verification**: suite now passes at `574 passed, 8 skipped`.
 
 ## [0.15.x] - 2026-05-31
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from importlib import resources
 from pathlib import Path
+import sys
 from urllib.parse import urlsplit, urlunsplit
 
 import json
@@ -34,6 +35,24 @@ CLAUDE_MD_TEMPLATE = """# NCP Conventions
 
 def _load_config_template() -> str:
     return resources.files("ncp").joinpath("templates/config.toml.example").read_text()
+
+
+def _render_config_template(*, store_type: str) -> str:
+    template = _load_config_template()
+    return template.replace('type = "sqlite"', f'type = "{store_type}"', 1)
+
+
+def _resolve_init_store_choice(*, store: str | None) -> str:
+    if store is not None:
+        return store
+    if sys.stdin.isatty():
+        return click.prompt(
+            "Choose your NCP store mode",
+            type=click.Choice(["sqlite", "pgvector"], case_sensitive=False),
+            default="sqlite",
+            show_choices=True,
+        ).lower()
+    return "sqlite"
 
 
 def _resolve_runtime_store(config: NCPConfig) -> BaseStore:
@@ -221,18 +240,37 @@ def main() -> None:
 
 @main.command("init")
 @click.option("--cwd", type=click.Path(path_type=Path), default=Path.cwd)
-def init_command(cwd: Path) -> None:
+@click.option(
+    "--store",
+    "store_type",
+    type=click.Choice(["sqlite", "pgvector"], case_sensitive=False),
+    default=None,
+    help="Store mode to initialize. Interactive terminals prompt if omitted; non-interactive runs default to sqlite.",
+)
+def init_command(cwd: Path, store_type: str | None) -> None:
     """Initialize `.ncp/config.toml` and a minimal `CLAUDE.md`."""
 
     config_dir = cwd / ".ncp"
     config_dir.mkdir(parents=True, exist_ok=True)
     config_path = config_dir / "config.toml"
+    selected_store = _resolve_init_store_choice(store=store_type)
+    config_created = False
     if not config_path.exists():
-        config_path.write_text(_load_config_template())
+        config_path.write_text(_render_config_template(store_type=selected_store))
+        config_created = True
     claude_path = cwd / "CLAUDE.md"
     if not claude_path.exists():
         claude_path.write_text(CLAUDE_MD_TEMPLATE)
     console.print(f"Initialized NCP in {cwd}")
+    if config_created:
+        console.print(f"Store mode: [bold]{selected_store}[/bold]")
+    else:
+        console.print(f"Existing config preserved at {config_path}")
+    effective_store = selected_store if config_created else "existing"
+    if effective_store == "sqlite":
+        console.print("Next: run `ncp status --cwd .` and `ncp serve --cwd .` for the local-first path.")
+    elif effective_store == "pgvector":
+        console.print("Next: run `./scripts/infra_up.sh`, then `ncp migrate apply --cwd .` and `ncp serve --cwd .`.")
 
 
 @main.command("status")

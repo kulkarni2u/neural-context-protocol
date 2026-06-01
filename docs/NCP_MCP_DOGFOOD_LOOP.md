@@ -4,7 +4,7 @@
 This document describes the deterministic dogfood loops that now ship inside
 the package.
 
-It is intentionally narrower than the full multi-provider Sarathi run.
+It is intentionally narrower than the full multi-provider live-provider run.
 The purpose is to prove the transport and persistence contract before we start
 claiming real provider parity.
 
@@ -36,8 +36,8 @@ The dogfood artifact defaults to the working NCP role split:
 - critic: `codex`
 
 These are labels in the first deterministic proof artifact.
-They define the intended Sarathi routing posture without pretending that the
-real provider turn loop is already complete.
+They define one working routing posture without pretending that the real
+provider turn loop is already complete.
 
 ## What the loop proves
 
@@ -96,7 +96,7 @@ There is now a compact repeatability mode for continuation adapters:
 - `ncp dogfood --continuation-adapter claude-cli --attempts 5 --adapter-timeout-seconds 20`
 - `ncp dogfood --continuation-adapter codex-cli --attempts 5 --adapter-timeout-seconds 20`
 
-This mode exists to support Sarathi provider stabilization work without
+This mode exists to support provider stabilization work without
 attaching oversized raw artifacts to every task event.
 
 The repeatability artifact includes:
@@ -140,7 +140,7 @@ Observed on May 24, 2026:
 It does not yet prove:
 
 - real external-model continuation after `ncp_fetch`
-- Sarathi evidence capture from a live provider run
+- orchestrator evidence capture from a live provider run
 - provider parity beyond the current bounded continuation slice
 
 Those are the next layer, not this layer.
@@ -218,16 +218,16 @@ For repeatability mode, expect:
 - `summary.continuation_success_rate`
 - `summary.stable`
 
-## How Sarathi should use it
+## Orchestrator Integration
 
-Sarathi should treat this loop as the bounded proof step before a real
+An orchestrator should treat this loop as the bounded proof step before a real
 provider-managed dogfood run.
 
 Recommended order:
 
 1. run `ncp dogfood`
 2. record the artifact
-3. promote the same topology into a live Sarathi task with:
+3. promote the same topology into a live orchestrated task with:
    - Claude planning
    - OpenCode execution
    - Codex verification

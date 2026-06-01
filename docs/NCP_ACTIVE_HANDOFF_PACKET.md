@@ -10,7 +10,7 @@ Current local repo state:
 
 - Version: `0.6.0`
 - GitHub branch: `main`
-- Suite: `546 passed, 8 skipped`
+- Suite: `574 passed, 8 skipped`
 - Live pgvector + Redis integration suite: `6 passed`
 
 ## What Shipped In 0.2.0
@@ -50,7 +50,8 @@ Current local repo state:
   partner/reviewer orchestration loops
 - Handoff timeout failures now surface as clean NCP errors with runner name,
   timeout budget, and prompt size instead of raw Python tracebacks
-- Sarathi + NCP handoff orchestration validated end to end
+- NCP handoff orchestration validated end to end, including orchestrator-managed
+  usage with Sarathi as one integration example
 
 ### Docs
 
@@ -122,7 +123,7 @@ Current local repo state:
 ## What Shipped In 0.6.x
 
 - **Migration 004 — IVF-FLAT index**: `CREATE INDEX ... USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100)` on the embedding column. `PgvectorStore` gains `ivfflat_probes: int = 10`; `SET LOCAL ivfflat.probes` prepended before every ANN SELECT.
-- **`log_cost` CLI**: `.ncp/run.py log_cost` exposes `log_cost_raw` to external callers so Sarathi and scripts can post token usage into `ncp cost`.
+- **`log_cost` CLI**: `.ncp/run.py log_cost` exposes `log_cost_raw` to external callers so orchestrators and scripts can post token usage into `ncp cost`.
 - **Embedding provider integration**: `ncp/adapters/embedding.py` — `BaseEmbeddingAdapter`, `OpenAIEmbeddingAdapter` (`text-embedding-3-small`), `LocalEmbeddingAdapter` (`sentence-transformers`). `PgvectorStore` auto-embeds on `write()` and `_query_vector()` when `embedding_adapter` is configured. `[embedding]` config section + env overrides. Factory wires adapter from config.
 - Suite: `421 passed, 8 skipped`
 
@@ -210,7 +211,7 @@ fallback, zero-overlap gating, normalized result caps, and diversity trimming,
 then shared lexical candidate generation for the hybrid path, then shared
 non-lexical scoring helpers for trust/recency and vector distance, then
 assembler retrieval-cap cleanup so chunk/whisper pressure limits are derived in
-one place and forwarded consistently (`572 passed, 8 skipped`, ruff clean).
+one place and forwarded consistently (`574 passed, 8 skipped`, ruff clean).
 Suggested next priorities:
 
 - **Candidate-generation boundary cleanup**: now that caps are explicit, decide
@@ -234,7 +235,7 @@ Suggested next priorities:
 - **Claude**: bounded implementation/planning partner
 - **OpenCode**: bounded reviewer (`opencode/deepseek-v4-flash-free`)
 - **NCP**: handoff transport and shared bounded context
-- **Sarathi**: task/evidence tracking
+- **Orchestrator (for example Sarathi)**: task/evidence tracking
 
 ## Recommended Orchestration Loop
 
@@ -249,11 +250,11 @@ Suggested next priorities:
 
 ## Suggested Prompt For The Next Orchestrator
 
-> Read `docs/NCP_0_2_0_HANDOFF_PACKET.md` first. The first five `0.16.x`
-> retrieval slices are already in (`572 passed, 8 skipped`, ruff clean):
+> Read `docs/NCP_ACTIVE_HANDOFF_PACKET.md` first. The first five `0.16.x`
+> retrieval slices are already in (`574 passed, 8 skipped`, ruff clean):
 > shared vector-aware scoring, shared retrieval-contract helpers, shared
 > lexical candidate generation, and shared non-lexical scoring helpers.
 > Continue `0.16.x` with the next narrow retrieval architecture slice: make the
 > assembler/store retrieval boundary more explicit while keeping current
-> behavior stable. Use Sarathi HIGH complexity with multi-agent dispatch and
-> NCP as the default communication spine in every subagent instruction.
+> behavior stable. Use a multi-agent orchestrator when helpful, and keep NCP as
+> the default communication spine in every subagent instruction.

@@ -16,6 +16,32 @@ def test_cli_init_creates_config_and_claude_md(tmp_path: Path) -> None:
     assert result.exit_code == 0
     assert (tmp_path / ".ncp" / "config.toml").exists()
     assert (tmp_path / "CLAUDE.md").exists()
+    config_text = (tmp_path / ".ncp" / "config.toml").read_text()
+    assert 'type = "sqlite"' in config_text
+
+
+def test_cli_init_can_select_pgvector_store(tmp_path: Path) -> None:
+    runner = CliRunner()
+
+    result = runner.invoke(main, ["init", "--cwd", str(tmp_path), "--store", "pgvector"])
+
+    assert result.exit_code == 0
+    config_text = (tmp_path / ".ncp" / "config.toml").read_text()
+    assert 'type = "pgvector"' in config_text
+    assert "Store mode: pgvector" in result.output
+
+
+def test_cli_init_preserves_existing_config(tmp_path: Path) -> None:
+    runner = CliRunner()
+
+    first = runner.invoke(main, ["init", "--cwd", str(tmp_path), "--store", "sqlite"])
+    second = runner.invoke(main, ["init", "--cwd", str(tmp_path), "--store", "pgvector"])
+
+    assert first.exit_code == 0
+    assert second.exit_code == 0
+    config_text = (tmp_path / ".ncp" / "config.toml").read_text()
+    assert 'type = "sqlite"' in config_text
+    assert "Existing config preserved" in second.output
 
 
 def test_cli_status_renders_table(tmp_path: Path) -> None:
