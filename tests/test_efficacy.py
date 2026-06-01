@@ -24,6 +24,20 @@ def test_efficacy_scoring_honors_constraints():
     assert _score_response("use the recommended secure integration path")[0] is False
 
 
+def test_efficacy_artifact_uses_honest_control_contract():
+    from benchmarks.efficacy.run import run_efficacy
+
+    artifact = run_efficacy(
+        continuation_adapter="local",
+        budget=600,
+        attempts=1,
+        pipeline_id="pipe_efficacy_contract",
+    )
+
+    assert artifact["benchmark"] == "window_control_efficacy"
+    assert artifact["comparison_contract"] == "ncp_vs_fixed_sliding_window_control"
+
+
 @pytest.mark.skipif(not CLAUDE_AVAILABLE, reason="claude CLI not on PATH")
 def test_efficacy_claude_smoke(tmp_path):
     from benchmarks.efficacy.run import run_efficacy
@@ -34,7 +48,7 @@ def test_efficacy_claude_smoke(tmp_path):
         adapter_timeout_seconds=30.0,
         pipeline_id="pipe_efficacy_claude_smoke",
     )
-    assert artifact["benchmark"] == "matched_budget_efficacy"
+    assert artifact["benchmark"] == "window_control_efficacy"
     assert artifact["provider"] == "claude-cli"
     assert "ncp" in artifact
     assert "sliding_window" in artifact
@@ -51,7 +65,7 @@ def test_efficacy_opencode_smoke(tmp_path):
         adapter_timeout_seconds=20.0,
         pipeline_id="pipe_efficacy_opencode_smoke",
     )
-    assert artifact["benchmark"] == "matched_budget_efficacy"
+    assert artifact["benchmark"] == "window_control_efficacy"
     assert 0.0 <= artifact["ncp"]["summary"]["success_rate"] <= 1.0
 
 
@@ -65,5 +79,5 @@ def test_efficacy_codex_smoke(tmp_path):
         adapter_timeout_seconds=25.0,
         pipeline_id="pipe_efficacy_codex_smoke",
     )
-    assert artifact["benchmark"] == "matched_budget_efficacy"
+    assert artifact["benchmark"] == "window_control_efficacy"
     assert 0.0 <= artifact["ncp"]["summary"]["success_rate"] <= 1.0

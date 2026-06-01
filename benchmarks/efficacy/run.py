@@ -1,9 +1,10 @@
-"""Matched-budget efficacy benchmark — NCP vs sliding-window.
+"""Sliding-window control efficacy benchmark — NCP vs fixed window.
 
 The scenario plants an oauth constraint + dead-end facts into a fresh SQLite
 store, then asks both the NCP condition and the sliding-window condition to
-produce an integration plan.  Scoring is deterministic: the response must
-mention 'oauth' and must NOT propose any previously rejected dead-end paths.
+produce an integration plan. Scoring is deterministic: the response must name
+the exact approved path and must NOT propose any previously rejected dead-end
+paths.
 """
 
 from __future__ import annotations
@@ -396,7 +397,7 @@ def run_efficacy(
     pipeline_id: str = "bench_efficacy",
     cwd: str | Path | None = None,
 ) -> dict[str, object]:
-    """Run matched-budget efficacy benchmark for one adapter.
+    """Run the sliding-window control efficacy benchmark for one adapter.
 
     Returns a structured artifact with NCP and sliding-window conditions,
     per-attempt detail, and summary statistics.
@@ -444,7 +445,8 @@ def run_efficacy(
             sw_attempts.append(sw_result)
 
     return {
-        "benchmark": "matched_budget_efficacy",
+        "benchmark": "window_control_efficacy",
+        "comparison_contract": "ncp_vs_fixed_sliding_window_control",
         "provider": continuation_adapter,
         "budget": budget,
         "attempts": attempts,
@@ -470,7 +472,7 @@ def main() -> None:
     import json
 
     parser = argparse.ArgumentParser(
-        description="Matched-budget efficacy benchmark — NCP vs sliding-window."
+        description="Sliding-window control efficacy benchmark — NCP vs fixed window."
     )
     parser.add_argument(
         "--continuation-adapter",

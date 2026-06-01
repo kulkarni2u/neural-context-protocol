@@ -39,5 +39,6 @@
         }
       ]
     }
-  ]
+  ],
+  "_note": "Template remains the future matched-budget target artifact. The current live harness in benchmarks/efficacy/run.py emits benchmark=window_control_efficacy until true budget matching is implemented."
 }

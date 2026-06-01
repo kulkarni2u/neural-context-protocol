@@ -68,7 +68,7 @@ What it does **not** mean:
 
 - it does not prove NCP improves task success versus alternative context strategies
 - it does not prove quality retention under compression
-- it does not replace matched-budget efficacy benchmarking
+- it does not replace future matched-budget efficacy benchmarking
 - retrieval quality is now separately measured in `benchmarks/retrieval/`
 
 More precisely:
@@ -175,6 +175,7 @@ Observed on June 1, 2026:
 
 - this is the first live cross-host result showing differentiated success from
   the shared NCP substrate over a window-only control
+- the control is a fixed sliding window, not a matched-budget comparator
 - the evidence is still narrow:
   - one provider pairing
   - one task shape

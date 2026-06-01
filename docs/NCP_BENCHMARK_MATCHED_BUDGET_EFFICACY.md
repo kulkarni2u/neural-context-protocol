@@ -1,17 +1,20 @@
-# NCP Matched-Budget Efficacy Benchmark
-## Groundwork for real-agent comparative evaluation
+# NCP Efficacy Benchmark Contract
+## Matched-budget target, current sliding-window control evidence
 
-This document is intentionally a benchmark contract, not a claimed result.
+This document is intentionally a benchmark contract first, not a blanket claim.
 
 The current repository proves runtime correctness and bounded-context behavior.
-It does **not** yet prove that real providers succeed more often with NCP than
-with realistic alternative context strategies at the same budget.
+It now also includes an initial live efficacy result against a fixed
+sliding-window control. It does **not** yet prove that real providers succeed
+more often with NCP than with realistic alternative context strategies at the
+same budget.
 
 This document defines the next eval needed to answer that question honestly.
 
 ## Goal
 
-Measure whether real providers complete the same task more reliably when given:
+Ultimate goal: measure whether real providers complete the same task more
+reliably when given:
 
 1. NCP-bounded context
 2. a fixed sliding-window baseline
@@ -124,9 +127,9 @@ As of June 1, 2026:
 - runtime proof exists
 - bounded baseline proof exists
 - retrieval-pressure proof exists
-- the first live matched-budget real-agent result now exists for `claude-cli`
+- the first live real-agent control result now exists for `claude-cli`
 
-### Current live result
+### Current live control result
 
 Command used:
 
@@ -153,6 +156,10 @@ Interpretation:
 
 - this is the first live provider-backed result showing differentiated task
   success in favor of NCP on the current harness
+- this run is **not** a matched-budget result:
+  - the sliding-window control is clamped by the configured budget
+  - the NCP condition uses assembled bounded context but is not hard-capped to
+    the same prompt band yet
 - it is still early evidence, not final comparative proof
 - the run covers one provider and one task shape only
 - the rolling-summary control is still pending implementation in the live
