@@ -102,6 +102,48 @@ def test_opencode_failure_does_not_consume_handoff(tmp_path: Path) -> None:
     assert [whisper.payload for whisper in remaining] == ["review pgvector cleanup patch"]
 
 
+def test_claude_timeout_raises_actionable_error_and_does_not_consume_handoff(tmp_path: Path) -> None:
+    runner = CliRunner()
+    runner.invoke(main, ["init", "--cwd", str(tmp_path)])
+    store = SQLiteStore(tmp_path / ".ncp" / "store.db")
+    _seed_whisper(store, target="claude", payload="review timeout path")
+
+    _, handoffs = load_handoffs(cwd=tmp_path, agent_id="claude", pipeline_id="pipe_handoff")
+
+    with pytest.raises(RuntimeError, match="timed out after 1.5s"):
+        run_claude_partner(
+            cwd=tmp_path,
+            agent_id="claude",
+            handoffs=handoffs,
+            timeout_seconds=1.5,
+            command=[sys.executable, "-c", "import time; time.sleep(5)"],
+        )
+
+    remaining = store.peek_whispers(agent_id="claude", pipeline_id="pipe_handoff")
+    assert [whisper.payload for whisper in remaining] == ["review timeout path"]
+
+
+def test_opencode_timeout_raises_actionable_error_and_does_not_consume_handoff(tmp_path: Path) -> None:
+    runner = CliRunner()
+    runner.invoke(main, ["init", "--cwd", str(tmp_path)])
+    store = SQLiteStore(tmp_path / ".ncp" / "store.db")
+    _seed_whisper(store, target="opencode", payload="review timeout path")
+
+    _, handoffs = load_handoffs(cwd=tmp_path, agent_id="opencode", pipeline_id="pipe_handoff")
+
+    with pytest.raises(RuntimeError, match="timed out after 1.5s"):
+        run_opencode_reviewer(
+            cwd=tmp_path,
+            agent_id="opencode",
+            handoffs=handoffs,
+            timeout_seconds=1.5,
+            command=[sys.executable, "-c", "import time; time.sleep(5)"],
+        )
+
+    remaining = store.peek_whispers(agent_id="opencode", pipeline_id="pipe_handoff")
+    assert [whisper.payload for whisper in remaining] == ["review timeout path"]
+
+
 def test_opencode_review_parses_json_text_payload(tmp_path: Path) -> None:
     runner = CliRunner()
     runner.invoke(main, ["init", "--cwd", str(tmp_path)])

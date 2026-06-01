@@ -25,6 +25,52 @@ DEFAULT_OPENCODE_REVIEW_INSTRUCTION = (
 )
 
 
+def _render_timeout_error(
+    *,
+    runner_name: str,
+    timeout_seconds: float,
+    prompt: str,
+    exc: subprocess.TimeoutExpired,
+) -> str:
+    details: list[str] = [f"{runner_name} handoff timed out after {timeout_seconds:.1f}s"]
+    details.append(f"prompt_chars={len(prompt)}")
+    stdout_text = (exc.stdout.decode() if isinstance(exc.stdout, bytes) else exc.stdout) or ""
+    stderr_text = (exc.stderr.decode() if isinstance(exc.stderr, bytes) else exc.stderr) or ""
+    if stdout_text.strip():
+        details.append(f"stdout={stdout_text.strip()[:240]}")
+    if stderr_text.strip():
+        details.append(f"stderr={stderr_text.strip()[:240]}")
+    return " | ".join(details)
+
+
+def _run_handoff_subprocess(
+    *,
+    runner_name: str,
+    command: list[str],
+    cwd: Path,
+    prompt: str,
+    timeout_seconds: float,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            command,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            _render_timeout_error(
+                runner_name=runner_name,
+                timeout_seconds=timeout_seconds,
+                prompt=prompt,
+                exc=exc,
+            )
+        ) from exc
+
+
 class HandoffStore(Protocol):
     """Kept for backward compatibility — BaseStore now declares both methods."""
 
@@ -174,8 +220,9 @@ def run_claude_partner(
     """Run the repo-bound Claude implementation-partner path."""
 
     prompt = build_claude_partner_prompt(cwd=cwd, handoffs=handoffs, instruction=instruction)
-    completed = subprocess.run(
-        command
+    completed = _run_handoff_subprocess(
+        runner_name="Claude",
+        command=command
         or [
             "claude",
             "-p",
@@ -188,10 +235,8 @@ def run_claude_partner(
             prompt,
         ],
         cwd=cwd,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=timeout_seconds,
+        prompt=prompt,
+        timeout_seconds=timeout_seconds,
     )
     if completed.returncode != 0:
         raise RuntimeError(completed.stderr.strip() or completed.stdout.strip() or "Claude partner run failed")
@@ -205,13 +250,14 @@ def run_opencode_reviewer(
     handoffs: list[Whisper],
     instruction: str | None = None,
     command: list[str] | None = None,
-    timeout_seconds: float = 30.0,
+    timeout_seconds: float = 45.0,
 ) -> str:
     """Run the repo-bound OpenCode review path."""
 
     prompt = build_opencode_review_prompt(cwd=cwd, handoffs=handoffs, instruction=instruction)
-    completed = subprocess.run(
-        command
+    completed = _run_handoff_subprocess(
+        runner_name="OpenCode",
+        command=command
         or [
             "opencode",
             "run",
@@ -224,10 +270,8 @@ def run_opencode_reviewer(
             prompt,
         ],
         cwd=cwd,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=timeout_seconds,
+        prompt=prompt,
+        timeout_seconds=timeout_seconds,
     )
     if completed.returncode != 0:
         raise RuntimeError(completed.stderr.strip() or completed.stdout.strip() or "OpenCode review run failed")

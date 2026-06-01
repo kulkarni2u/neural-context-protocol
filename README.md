@@ -270,6 +270,7 @@ This keeps the handoff bounded:
 - Claude consumes pending whispers for `claude`, works in the bound repo root, and can emit one bounded follow-up whisper.
 - OpenCode consumes pending whispers for `opencode`, returns a JSON review payload, and can emit one bounded follow-up whisper.
 - Whisper queue reads are non-destructive until the consumer run succeeds, so a failed provider call does not lose the handoff.
+- Handoff subprocess timeouts now surface as clean NCP-owned errors with runner name, timeout budget, and prompt size, so a slow Claude/OpenCode review no longer explodes into a raw Python traceback.
 
 When Sarathi routes a child task through this handoff path, it no longer needs
 to send the full provider bridge prompt as the primary instruction. The current

@@ -48,6 +48,8 @@ Current local repo state:
 
 - `ncp handoff claude` and `ncp handoff opencode` commands for whisper-driven
   partner/reviewer orchestration loops
+- Handoff timeout failures now surface as clean NCP errors with runner name,
+  timeout budget, and prompt size instead of raw Python tracebacks
 - Sarathi + NCP handoff orchestration validated end to end
 
 ### Docs

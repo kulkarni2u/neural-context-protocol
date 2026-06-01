@@ -8,6 +8,15 @@ First four `0.16.x` retrieval slices. No breaking changes.
 
 ### Added / Changed
 
+- **Handoff timeout reliability** (`ncp/agent_handoff.py`, `ncp/cli.py`):
+  provider subprocess timeouts in `ncp handoff claude` / `ncp handoff opencode`
+  now surface as clean NCP-owned errors with runner name, timeout budget, and
+  prompt size instead of raw Python tracebacks. OpenCode handoff default timeout
+  is now `45s`.
+- **Regression coverage**: added timeout-path tests in
+  `tests/test_agent_handoff.py` and CLI error-surface coverage in
+  `tests/test_cli.py`.
+
 - **Shared vector-aware retrieval scoring** (`ncp/stores/retrieval.py`):
   `RetrievalPolicy.score_with_vector()` now blends lexical relevance with an
   optional vector-similarity signal while preserving the existing trust,

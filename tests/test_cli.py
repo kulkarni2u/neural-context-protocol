@@ -438,6 +438,46 @@ def test_cli_handoff_reports_missing_queue_cleanly(tmp_path: Path) -> None:
     assert "No pending NCP handoffs for claude." in result.output
 
 
+def test_cli_handoff_claude_reports_timeout_cleanly(
+    tmp_path: Path,
+    monkeypatch: object,
+) -> None:
+    runner = CliRunner()
+    runner.invoke(main, ["init", "--cwd", str(tmp_path)])
+    store = SQLiteStore(tmp_path / ".ncp" / "store.db")
+    store.emit_whisper(
+        Whisper(
+            from_agent="codex",
+            target="claude",
+            whisper_type="nudge",
+            payload="timeout review",
+            confidence=0.95,
+            pipeline_id="pipe_handoff_cli",
+        )
+    )
+
+    monkeypatch.setattr(
+        "ncp.agent_handoff.run_claude_partner",
+        lambda **_: (_ for _ in ()).throw(RuntimeError("Claude handoff timed out after 30.0s")),
+    )
+
+    result = runner.invoke(
+        main,
+        [
+            "handoff",
+            "claude",
+            "--cwd",
+            str(tmp_path),
+            "--pipeline-id",
+            "pipe_handoff_cli",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "Claude handoff timed out after 30.0s" in result.output
+    assert store.peek_whispers(agent_id="claude", pipeline_id="pipe_handoff_cli") != []
+
+
 def test_cli_emit_reports_store_unavailable_cleanly(tmp_path: Path) -> None:
     runner = CliRunner()
     runner.invoke(main, ["init", "--cwd", str(tmp_path)])
