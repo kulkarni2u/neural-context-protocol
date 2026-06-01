@@ -203,17 +203,20 @@ Current local repo state:
 
 ## Active Line: 0.16.x (next)
 
-The `0.15.x` line is complete, and the first four `0.16.x` retrieval slices
+The `0.15.x` line is complete, and the first five `0.16.x` retrieval slices
 are now in: shared vector-aware retrieval scoring plus sync/async pgvector
 hybrid tie-break parity, then shared retrieval-contract helpers for blank-query
 fallback, zero-overlap gating, normalized result caps, and diversity trimming,
 then shared lexical candidate generation for the hybrid path, then shared
-non-lexical scoring helpers for trust/recency and vector distance (`566
-passed, 8 skipped`, ruff clean). Suggested next priorities:
+non-lexical scoring helpers for trust/recency and vector distance, then
+assembler retrieval-cap cleanup so chunk/whisper pressure limits are derived in
+one place and forwarded consistently (`572 passed, 8 skipped`, ruff clean).
+Suggested next priorities:
 
-- **Assembler/store retrieval contract cleanup**: move up one layer now that
-  lexical and non-lexical scoring helpers are shared, and make the assembly
-  pressure logic versus store-level retrieval responsibilities more explicit
+- **Candidate-generation boundary cleanup**: now that caps are explicit, decide
+  whether trust/recency candidate generation should be abstracted further so
+  SQLite, sync pgvector, and async pgvector stay aligned without widening the
+  current retrieval contract
 - **SQLite parity decision**: decide whether SQLite should stay lexical-only or
   grow a more explicit trust/recency candidate-generation helper path too
 - **Async reporting consumption**: thread the new async status/cost/viz parity
@@ -223,8 +226,8 @@ passed, 8 skipped`, ruff clean). Suggested next priorities:
 
 - SQLite still has lexical-only retrieval while pgvector sync/async now have a
   vector-assisted hybrid tie-break path
-- The scoring math is shared now, but the assembler/store retrieval boundary is
-  still more implicit than it should be
+- The scoring math and assembly caps are shared now, but candidate-generation
+  responsibilities across SQLite and pgvector are still not fully unified
 
 ## Recommended Agent Roles
 
@@ -246,8 +249,8 @@ passed, 8 skipped`, ruff clean). Suggested next priorities:
 
 ## Suggested Prompt For The Next Orchestrator
 
-> Read `docs/NCP_0_2_0_HANDOFF_PACKET.md` first. The first four `0.16.x`
-> retrieval slices are already in (`566 passed, 8 skipped`, ruff clean):
+> Read `docs/NCP_0_2_0_HANDOFF_PACKET.md` first. The first five `0.16.x`
+> retrieval slices are already in (`572 passed, 8 skipped`, ruff clean):
 > shared vector-aware scoring, shared retrieval-contract helpers, shared
 > lexical candidate generation, and shared non-lexical scoring helpers.
 > Continue `0.16.x` with the next narrow retrieval architecture slice: make the

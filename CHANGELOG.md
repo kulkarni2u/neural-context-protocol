@@ -67,7 +67,16 @@ First four `0.16.x` retrieval slices. No breaking changes.
   carrying duplicate scoring math.
 - **Regression coverage**: added non-lexical helper unit coverage in
   `tests/test_retrieval_policy.py`.
-- **Verification**: suite now passes at `566 passed, 8 skipped`.
+- **Assembler retrieval-cap boundary cleanup** (`ncp/assembler.py`): chunk and
+  whisper caps are now derived once via a shared `_assembly_caps()` helper, so
+  pressure-based retrieval limits are forwarded consistently to both
+  `store.query()` and `drain_whispers()` instead of being decided once at query
+  time and again during post-query trimming. When coherence alerts fully occupy
+  the whisper budget, queued whispers now remain pending instead of being
+  destructively drained and silently dropped.
+- **Regression coverage**: added assembler whisper-cap forwarding coverage in
+  `tests/test_assembler_k_forwarding.py`.
+- **Verification**: suite now passes at `572 passed, 8 skipped`.
 
 ## [0.15.x] - 2026-05-31
 

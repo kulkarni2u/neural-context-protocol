@@ -74,22 +74,23 @@ class Assembler:
         coherence_report = self.coherence.check(conscious)
         coherence_alerts = coherence_report.alerts
         hydrated = conscious if ctx_window is None else conscious.model_copy(update={"ctx_window": ctx_window})
+        chunk_cap, whisper_cap = self._assembly_caps(budget=budget, k=k)
         recent_chunks = self._resolve_recent_refs(hydrated)
-        subconscious = self._retrieve_chunks(hydrated, query_text=query_text, budget=budget, k=k, diversity_limit=diversity_limit)
+        subconscious = self._retrieve_chunks(
+            hydrated,
+            query_text=query_text,
+            budget=budget,
+            k=chunk_cap,
+            diversity_limit=diversity_limit,
+        )
         subconscious = self._cold_start_bootstrap(hydrated, subconscious)
-        combined_chunks = self._dedupe_chunks([*recent_chunks, *subconscious])
-        drained_whispers = self._drain_whispers(hydrated)
+        combined_chunks = self._dedupe_chunks([*recent_chunks, *subconscious])[:chunk_cap]
+        drain_cap = max(0, whisper_cap - len(coherence_alerts))
+        drained_whispers = (
+            [] if drain_cap == 0 else self._drain_whispers(hydrated, max_items=drain_cap)
+        )
         combined_whispers: list[Whisper] = [*coherence_alerts, *drained_whispers]
-        if k is not None:
-            k = max(1, k)
-            combined_chunks = combined_chunks[:k]
-            combined_whispers = combined_whispers[:3]
-        elif budget.pressure == "critical":
-            combined_chunks = combined_chunks[:2]
-            combined_whispers = combined_whispers[:1]
-        else:
-            combined_chunks = combined_chunks[:4]
-            combined_whispers = combined_whispers[:3]
+        combined_whispers = combined_whispers[:whisper_cap]
         return hydrated, budget, combined_chunks, combined_whispers
 
     def assemble(
@@ -322,11 +323,11 @@ class Assembler:
     # Step 4: drain whisper queue
     # ------------------------------------------------------------------
 
-    def _drain_whispers(self, conscious: ConsciousBlock) -> list[Whisper]:
+    def _drain_whispers(self, conscious: ConsciousBlock, *, max_items: int = 3) -> list[Whisper]:
         return self.store.drain_whispers(
             agent_id=conscious.agent_id,
             pipeline_id=conscious.pipeline_id,
-            max_items=3,
+            max_items=max_items,
             min_confidence=0.60,
         )
 
@@ -343,6 +344,18 @@ class Assembler:
             seen.add(chunk.chunk_id)
             deduped.append(chunk)
         return deduped
+
+    def _assembly_caps(
+        self,
+        *,
+        budget: BudgetContext,
+        k: int | None,
+    ) -> tuple[int, int]:
+        if k is not None:
+            return max(1, k), 3
+        if budget.pressure == "critical":
+            return 2, 1
+        return 4, 3
 
     def _write_with_retry(self, chunk: SubconsciousChunk, *, retries: int = 2, backoff_ms: int = 50) -> None:
         for attempt in range(retries + 1):

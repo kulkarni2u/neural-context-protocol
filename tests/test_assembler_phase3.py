@@ -333,3 +333,53 @@ def test_assembler_goal_version_coherence_alert(tmp_path: Path) -> None:
     )
 
     assert any("goal_version_mismatch" in w.payload for w in result.whispers)
+
+
+def test_assembler_keeps_queued_whispers_when_coherence_alert_consumes_cap(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "store.db")
+
+    from ncp.types import NCPResponse as Resp, Whisper
+
+    other = _make_conscious(
+        agent_id="planner",
+        goal_version=2,
+        task="delegate",
+        slot="planning",
+        intent="coordinate",
+    )
+    store.log_conscious(other, snapshot_hash="hash_planner")
+    store.log_cost(
+        agent_id="planner",
+        response=Resp(
+            content="ok",
+            input_tokens=1,
+            output_tokens=1,
+            cost_usd=0.0,
+            model="test",
+            turn_id="turn_planner",
+            latency_ms=0,
+            pipeline_id="pipe_1",
+        ),
+    )
+    store.emit_whisper(
+        Whisper(
+            from_agent="reviewer",
+            target="executor",
+            whisper_type="nudge",
+            payload="queued_follow_up",
+            confidence=0.9,
+            pipeline_id="pipe_1",
+        )
+    )
+
+    assembler = Assembler(store=store)
+    result = assembler.assemble(
+        conscious=_make_conscious(agent_id="executor", goal_version=1, task="align", slot="check"),
+        budget=BudgetContext(pressure="critical"),
+    )
+
+    assert len(result.whispers) == 1
+    assert "goal_version_mismatch" in result.whispers[0].payload
+
+    pending = store.peek_whispers(agent_id="executor", pipeline_id="pipe_1", max_items=3)
+    assert any(whisper.payload == "queued_follow_up" for whisper in pending)
