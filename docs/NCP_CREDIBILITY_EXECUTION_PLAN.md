@@ -185,7 +185,8 @@ This execution pass is complete when:
 - docs are honest
 - benchmark baselines are realistic
 - recall is measured
-- real-agent matched-budget efficacy is measured
+- real-agent efficacy is measured honestly, with the current sliding-window
+  control labeled clearly and future matched-budget work tracked separately
 - benchmark economics include overhead
 - MACE no longer relies on circular scoring
 
