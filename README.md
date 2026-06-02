@@ -20,6 +20,10 @@ tools, agent frameworks, or orchestrators, but the product itself is:
 
 `1.0.0` is the stable V1 release line.
 
+NCP is a context substrate. It gives agents bounded, persistent, shareable
+context that makes multi-agent systems cheaper and more coherent. It does not
+replace planning, orchestration, or judgment.
+
 ## Why It Exists
 
 Multi-agent workflows usually fail in a few predictable ways:
@@ -68,9 +72,11 @@ The product story is simple:
 - **SQLite** is the default mode.
 - **pgvector + Redis** is the scalable mode.
 
-## What Is Proven
+## What Is Demonstrated
 
-This repository currently proves:
+### Demonstrated
+
+This repository currently demonstrates:
 
 - shared MCP access over HTTP/SSE
 - durable memory writes and cross-host reads
@@ -91,6 +97,19 @@ Concrete proof points already in the repo:
 - live pgvector + Redis integration tests are green on the local compose stack
 - retrieval logic is now largely shared across SQLite, sync pgvector, and async pgvector
 - `ncp handoff claude` / `ncp handoff opencode` support bounded whisper-driven partner/reviewer loops
+
+The strongest current claim is simple:
+
+- multiple hosts can operate on one bounded shared memory substrate instead of
+  replaying giant transcripts independently
+
+### Not Yet Independently Validated
+
+This repository does not yet independently validate at broad confidence:
+
+- efficacy against multiple realistic competing baselines across providers
+- quality retention under compression at truly matched budgets
+- real-agent success-rate deltas across a broad provider/task matrix
 
 ## Quick Start
 
@@ -230,11 +249,24 @@ For host configs, use:
 
 Observed benchmark snapshot:
 
-| Scenario | Naive replay tokens | NCP tokens | Reduction |
-|---|---|---|---|
-| Coding pipeline (40 turns) | 1,927 peak | 174 peak | 17.52x |
-| Research pipeline (36 turns) | 1,700 peak | 156 peak | 16.35x |
-| Orchestrator handoff example (live) | ~677 estimated | ~265 estimated | 60.9% |
+| Scenario | Baseline | Baseline tokens | NCP tokens | Reduction |
+|---|---|---:|---:|---:|
+| Coding pipeline (40 turns) | raw replay | 1,927 peak | 174 peak | 17.52x |
+| Coding pipeline (40 turns) | sliding window (8) | 212 peak | 174 peak | 1.93x |
+| Coding pipeline (40 turns) | rolling summary (4/4) | 1,176 peak | 174 peak | 10.69x |
+| Research pipeline (36 turns) | raw replay | 1,700 peak | 156 peak | 16.35x |
+| Research pipeline (36 turns) | sliding window (8) | 212 peak | 156 peak | 2.04x |
+| Research pipeline (36 turns) | rolling summary (4/4) | 950 peak | 156 peak | 9.13x |
+| Sliding-window control efficacy (Claude, 5 attempts) | sliding window | 0.0 success rate | 0.8 success rate | +0.8 |
+| Cross-host shared context (Claude -> OpenCode, 5 attempts) | sliding window | 0.0 success rate | 0.8 success rate | +0.8 |
+| Live handoff example | bounded task prompt | ~677 estimated | ~265 estimated | 60.9% |
+
+Needle recall snapshot:
+
+- `python3 benchmarks/needle/run.py --turns 24 --needles 6 --budget 4`
+- final NCP recall: `0.50`
+- equal-budget sliding-window recall: `0.00`
+- this is intentionally a hard retrieval-pressure eval, not a marketing number
 
 MACE benchmark:
 
@@ -244,10 +276,41 @@ MACE benchmark:
 - D3 `1.0000`
 - D4 `1.0000`
 
+Benchmark notes:
+
+- current local artifacts use `word_split` token accounting unless `tiktoken`
+  is installed
+- the coding and research pipeline benchmarks now include two more realistic
+  non-agent baselines:
+  - sliding window (`last_entries=8`)
+  - rolling summary (`every_k=4`, `keep_recent=4`)
+- the benchmarks now also report a first-pass assembly-overhead estimate so
+  raw prompt savings are not presented as free
+- the first live real-provider slices now differentiate:
+  - sliding-window control efficacy with `claude-cli`: `NCP 0.8` vs `window 0.0`
+  - cross-host shared context with `claude-cli -> opencode-cli`: `NCP 0.8` vs `window 0.0`
+
+### What These Benchmarks Do Not Show
+
+- the coding and research pipeline benchmarks still use deterministic pipeline
+  agents, not live providers
+- the current live efficacy evidence is still early:
+  - one provider-specific sliding-window control run
+  - one cross-host provider pairing
+  - one timeout in each 5-attempt series
+- the pipeline benchmarks do not yet include real agents in the loop
+- the new needle benchmark is a retrieval-pressure probe, not a user-facing
+  success-rate benchmark
+- MACE currently uses deterministic agents, so it is not yet the final quality proof
+- all current workflow results assume a host that follows the NCP contract:
+  `ncp_get_context`, optional `ncp_fetch`, `ncp_write_memory`, `ncp_emit_whisper`
+
 Relevant benchmark docs:
 
 - [docs/NCP_BENCHMARK_CODING_PIPELINE.md](./docs/NCP_BENCHMARK_CODING_PIPELINE.md)
 - [docs/NCP_BENCHMARK_RESEARCH_PIPELINE.md](./docs/NCP_BENCHMARK_RESEARCH_PIPELINE.md)
+- [docs/NCP_BENCHMARK_NEEDLE_RECALL.md](./docs/NCP_BENCHMARK_NEEDLE_RECALL.md)
+- [docs/NCP_BENCHMARK_MATCHED_BUDGET_EFFICACY.md](./docs/NCP_BENCHMARK_MATCHED_BUDGET_EFFICACY.md)
 - [benchmarks/mace/README.md](./benchmarks/mace/README.md)
 
 ## Optional Bounded Agent Handoffs
@@ -255,7 +318,7 @@ Relevant benchmark docs:
 NCP can also drive a bounded partner/reviewer loop over its own whisper queue:
 
 ```bash
-ncp emit --from-agent codex --to claude --type share --pipeline-id pipe_demo --payload "slice=pgvector files=ncp/stores/pgvector.py ask=implement_and_handoff"
+ncp emit --from-agent codex --to claude --type share --pipeline-id pipe_demo --payload '{"slice":"pgvector","files":["ncp/stores/pgvector.py"],"ask":"implement_and_handoff"}'
 ncp handoff claude --cwd /path/to/project --pipeline-id pipe_demo --emit-to opencode
 ncp handoff opencode --cwd /path/to/project --pipeline-id pipe_demo --emit-to claude
 ```
@@ -314,6 +377,8 @@ Tool-specific setup examples:
 - [docs/NCP_PROTOCOL_SPEC.md](./docs/NCP_PROTOCOL_SPEC.md) - normative protocol reference
 - [docs/NCP_MCP_DOGFOOD_LOOP.md](./docs/NCP_MCP_DOGFOOD_LOOP.md) - deterministic MCP proof path
 - [docs/NCP_PROVIDER_PARITY_BASELINE.md](./docs/NCP_PROVIDER_PARITY_BASELINE.md) - host parity snapshot
+- [docs/NCP_BENCHMARK_NEEDLE_RECALL.md](./docs/NCP_BENCHMARK_NEEDLE_RECALL.md) - retrieval-pressure eval
+- [docs/NCP_BENCHMARK_MATCHED_BUDGET_EFFICACY.md](./docs/NCP_BENCHMARK_MATCHED_BUDGET_EFFICACY.md) - real-agent eval contract
 - [docs/NCP_ACTIVE_HANDOFF_PACKET.md](./docs/NCP_ACTIVE_HANDOFF_PACKET.md) - active handoff packet for the current roadmap line
 - [docs/NCP_POST_V1_ROADMAP.md](./docs/NCP_POST_V1_ROADMAP.md) - post-V1 roadmap history
 - [docs/NCP_R2_STORAGE.md](./docs/NCP_R2_STORAGE.md) - storage direction and local infra notes

@@ -2,6 +2,58 @@
 
 All notable changes to Neural Context Protocol will be documented in this file.
 
+## [Unreleased]
+
+Credibility-hardening work on the benchmark branch. No product-surface breaking
+changes.
+
+### Added / Changed
+
+- **Realistic pipeline baselines** (`ncp/bench/baselines.py`,
+  `ncp/benchmarks.py`): coding and research pipeline benchmarks now report
+  three deterministic baseline families instead of only raw replay:
+  `raw_replay`, `sliding_window`, and `rolling_summary`.
+- **Explicit token unit reporting** (`ncp/benchmarks.py`, `ncp/__init__.py`):
+  benchmark artifacts now record whether token counts came from `tiktoken` or
+  the fallback `word_split` heuristic in the current environment.
+- **Needle recall benchmark** (`benchmarks/needle/run.py`): added a
+  retrieval-pressure eval that compares NCP recall against an equal-budget
+  sliding window and reports first-eviction timing per planted fact.
+- **Assembly-overhead economics** (`ncp/costs.py`, `ncp/benchmarks.py`):
+  benchmark artifacts now report a first-pass assembly-overhead estimate and a
+  net token-equivalent savings figure instead of treating prompt savings as
+  free.
+- **Assembler silent-drop visibility** (`ncp/assembler.py`): assembly results
+  now expose evicted high-relevance chunks and evicted whispers so drop
+  behavior can be inspected explicitly in credibility-focused tests.
+- **Docs honesty pass** (`README.md`,
+  `docs/NCP_BENCHMARK_CODING_PIPELINE.md`,
+  `docs/NCP_BENCHMARK_RESEARCH_PIPELINE.md`,
+  `docs/NCP_BENCHMARK_NEEDLE_RECALL.md`,
+  `docs/NCP_BENCHMARK_MATCHED_BUDGET_EFFICACY.md`): benchmark docs now separate runtime
+  truth from unresolved efficacy questions and document the current benchmark
+  gaps more explicitly.
+- **WO-3 groundwork** (`docs/NCP_BENCHMARK_MATCHED_BUDGET_EFFICACY.md`,
+  `benchmarks/efficacy/TEMPLATE.json`): added the first explicit matched-budget
+  real-agent efficacy contract and artifact template without claiming results
+  that have not been run yet.
+- **Live provider-backed benchmark harnesses** (`benchmarks/efficacy/run.py`,
+  `benchmarks/crosshost/run.py`, `benchmarks/retrieval/run.py`): added real
+  benchmark execution paths for sliding-window control efficacy, cross-host shared
+  context, and labeled retrieval quality, plus focused regression coverage in
+  `tests/test_efficacy.py`, `tests/test_crosshost.py`, `tests/test_baselines.py`,
+  and `tests/test_retrieval_policy.py`.
+- **Scoring fix for rejected-path mentions** (`benchmarks/efficacy/run.py`):
+  the live efficacy scorer now distinguishes "mentions a rejected path to avoid
+  it" from "proposes a rejected path", preventing false negatives when a model
+  correctly says it will not use a dead-end path.
+- **Current live evidence** (`README.md`,
+  `docs/NCP_BENCHMARK_MATCHED_BUDGET_EFFICACY.md`,
+  `docs/NCP_PROVIDER_PARITY_BASELINE.md`):
+  - sliding-window control efficacy with `claude-cli`: `NCP 0.8` vs `window 0.0`
+  - cross-host shared context with `claude-cli -> opencode-cli`: `NCP 0.8` vs
+    `window 0.0`
+
 ## [1.0.0] - 2026-06-01
 
 First stable public release of Neural Context Protocol.

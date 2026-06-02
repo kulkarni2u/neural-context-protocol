@@ -3,9 +3,18 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import cast
+
+from ncp.bench.baselines import (
+    BaselineStrategy,
+    RawReplayBaseline,
+    RollingSummaryBaseline,
+    SlidingWindowBaseline,
+)
 
 from ncp.assembler import Assembler
 from ncp.api import agent
+from ncp.costs import assembly_overhead
 from ncp.stores.sqlite import SQLiteStore
 from ncp.types import BudgetContext, NCPResponse, SubconsciousChunk
 
@@ -51,13 +60,43 @@ _RESEARCH_TOPICS: list[str] = [
 ]
 
 
+def _load_tiktoken_encoder() -> object | None:
+    try:
+        import tiktoken  # type: ignore[import-not-found]
+
+        return tiktoken.get_encoding("cl100k_base")
+    except Exception:
+        return None
+
+
+_TIKTOKEN_ENCODER = _load_tiktoken_encoder()
+
+
 def estimate_tokens(text: str) -> int:
-    """Use the same simple split heuristic as the current runtime."""
+    """Estimate token count with a real tokenizer when available."""
 
     stripped = text.strip()
     if not stripped:
         return 0
+    if _TIKTOKEN_ENCODER is not None:
+        return len(cast(object, _TIKTOKEN_ENCODER).encode(stripped))  # type: ignore[attr-defined]
     return len(stripped.split())
+
+
+def token_unit() -> str:
+    """Return the token-counting unit used by estimate_tokens()."""
+
+    return "tiktoken" if _TIKTOKEN_ENCODER is not None else "word_split"
+
+
+def _baseline_metadata(baseline: BaselineStrategy) -> dict[str, object]:
+    metadata: dict[str, object] = {"name": baseline.name}
+    if isinstance(baseline, SlidingWindowBaseline):
+        metadata["last_entries"] = baseline.last_entries
+    if isinstance(baseline, RollingSummaryBaseline):
+        metadata["every_k"] = baseline.every_k
+        metadata["keep_recent"] = baseline.keep_recent
+    return metadata
 
 
 def run_coding_pipeline_benchmark(
@@ -124,6 +163,11 @@ def _run_pipeline_benchmark(
     transcript: list[str] = []
     recent_by_agent: dict[str, list[str]] = {}
     turn_rows: list[dict[str, object]] = []
+    baselines: list[BaselineStrategy] = [
+        RawReplayBaseline(),
+        SlidingWindowBaseline(last_entries=8),
+        RollingSummaryBaseline(every_k=4, keep_recent=4),
+    ]
 
     for index in range(turns):
         role_name, role, owns, must_not = role_rotation[index % len(role_rotation)]
@@ -162,8 +206,14 @@ def _run_pipeline_benchmark(
 
         ncp_context_tokens = estimate_tokens(assembly.context)
         ncp_input_tokens = estimate_tokens(assembly.context + "\n" + turn)
-        naive_context = "\n".join(transcript)
-        naive_input_tokens = estimate_tokens((naive_context + "\n" + turn).strip())
+        baseline_contexts = {
+            baseline.name: baseline.context_for(transcript=transcript, turn=turn)
+            for baseline in baselines
+        }
+        baseline_input_tokens = {
+            name: estimate_tokens((context + "\n" + turn).strip())
+            for name, context in baseline_contexts.items()
+        }
 
         result_summary = result_builder(
             turn_number=turn_number,
@@ -211,23 +261,50 @@ def _run_pipeline_benchmark(
                 "topic": topic,
                 "ncp_context_tokens": ncp_context_tokens,
                 "ncp_input_tokens": ncp_input_tokens,
-                "naive_input_tokens": naive_input_tokens,
+                "naive_input_tokens": baseline_input_tokens["raw_replay"],
+                "raw_replay_input_tokens": baseline_input_tokens["raw_replay"],
+                "sliding_window_input_tokens": baseline_input_tokens["sliding_window"],
+                "rolling_summary_input_tokens": baseline_input_tokens["rolling_summary"],
             }
         )
 
     peak_ncp = max(int(row["ncp_input_tokens"]) for row in turn_rows)
-    peak_naive = max(int(row["naive_input_tokens"]) for row in turn_rows)
     final_ncp = int(turn_rows[-1]["ncp_input_tokens"])
-    final_naive = int(turn_rows[-1]["naive_input_tokens"])
+    baseline_summary: dict[str, dict[str, object]] = {}
+    for baseline in baselines:
+        token_key = f"{baseline.name}_input_tokens"
+        peak_tokens = max(int(row[token_key]) for row in turn_rows)
+        final_tokens = int(turn_rows[-1][token_key])
+        reduction_factor = round(final_tokens / final_ncp, 2) if final_ncp else 0.0
+        baseline_summary[baseline.name] = {
+            "peak_tokens": peak_tokens,
+            "final_tokens": final_tokens,
+            "reduction_factor_vs_ncp": reduction_factor,
+            "config": _baseline_metadata(baseline),
+        }
+    peak_naive = int(baseline_summary["raw_replay"]["peak_tokens"])
+    final_naive = int(baseline_summary["raw_replay"]["final_tokens"])
     reduction_factor = round(final_naive / final_ncp, 2) if final_ncp else 0.0
+    overhead = assembly_overhead(embed_tokens=0, retrieval_ops=turns, whisper_writes=0)
+    total_token_savings_vs_raw = sum(
+        int(row["raw_replay_input_tokens"]) - int(row["ncp_input_tokens"])
+        for row in turn_rows
+    )
+    net_total_token_equivalent_vs_raw = round(total_token_savings_vs_raw - overhead.token_equivalent, 2)
 
     return {
         "benchmark": benchmark_name,
         "pipeline_id": pipeline_id,
         "turns": turns,
         "agents": [role for role, _, _, _ in role_rotation],
+        "token_unit": token_unit(),
         "turn_rows": turn_rows,
         "summary": {
+            "ncp": {
+                "peak_tokens": peak_ncp,
+                "final_tokens": final_ncp,
+            },
+            "baselines": baseline_summary,
             "peak_ncp_tokens": peak_ncp,
             "peak_naive_tokens": peak_naive,
             "final_ncp_tokens": final_ncp,
@@ -235,8 +312,23 @@ def _run_pipeline_benchmark(
             "reduction_factor": reduction_factor,
             "bounded_under_2000": peak_ncp <= 2000,
             "beats_naive": peak_ncp < peak_naive,
+            "beats_sliding_window": peak_ncp < int(baseline_summary["sliding_window"]["peak_tokens"]),
+            "beats_rolling_summary": peak_ncp < int(baseline_summary["rolling_summary"]["peak_tokens"]),
+            "economics": {
+                "reference_model": "gpt-4o-mini",
+                "total_token_savings_vs_raw_replay": total_token_savings_vs_raw,
+                "final_turn_savings_vs_raw_replay": final_naive - final_ncp,
+                "assembly_overhead_usd": round(overhead.total_cost_usd, 8),
+                "assembly_overhead_token_equivalent": round(overhead.token_equivalent, 2),
+                "net_total_token_equivalent_vs_raw_replay": net_total_token_equivalent_vs_raw,
+            },
             "material_reduction": reduction_factor >= 3.0,
-            "pass": peak_ncp <= 2000 and peak_ncp < peak_naive and reduction_factor >= 3.0,
+            "pass": (
+                peak_ncp <= 2000
+                and peak_ncp < peak_naive
+                and peak_ncp < int(baseline_summary["sliding_window"]["peak_tokens"])
+                and reduction_factor >= 3.0
+            ),
         },
     }
 

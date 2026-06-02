@@ -21,6 +21,7 @@ from ncp.stores.retrieval import (
 )
 from ncp.stores.sqlite import SQLiteStore
 from ncp.types import SubconsciousChunk
+from benchmarks.retrieval.run import retrieval_quality
 
 
 # ---------------------------------------------------------------------------
@@ -406,3 +407,34 @@ def test_hybrid_retrieval_generation_penalty_demotes_derived_chunks(tmp_path: Pa
     assert len(results) >= 2
     ids = [c.chunk_id for c in results]
     assert ids[0] == "sub_gen0"
+
+
+# ---------------------------------------------------------------------------
+# WO-6: Retrieval quality harness tests
+# ---------------------------------------------------------------------------
+
+
+def test_retrieval_quality_harness_reports_recall_and_precision(tmp_path):
+    artifact = retrieval_quality(
+        store_path=tmp_path / "ret.db",
+        k=4,
+        pipeline_id="pipe_ret_test",
+    )
+    assert artifact["benchmark"] == "retrieval_quality"
+    assert artifact["labeled_set"]["queries"] == 12
+    for row in artifact["per_query_results"]:
+        assert 0.0 <= row["precision_at_k"] <= 1.0
+        assert 0.0 <= row["recall_at_k"] <= 1.0
+    # Mean recall should be > 0 — BM25 should find most labeled chunks
+    assert artifact["summary"]["mean_recall_at_k"] > 0.0
+
+
+def test_retrieval_quality_diversity_cap_reduces_duplicate_layers(tmp_path):
+    artifact = retrieval_quality(
+        store_path=tmp_path / "ret-div.db",
+        k=4,
+        pipeline_id="pipe_ret_div",
+    )
+    cap_test = artifact["summary"]["diversity_cap_test"]
+    # tighter cap should not increase chunks vs no cap
+    assert cap_test["diversity_limit_1"]["constraint_chunks_in_top_k"] <= cap_test["diversity_limit_default"]["constraint_chunks_in_top_k"]

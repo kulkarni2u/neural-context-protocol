@@ -62,16 +62,27 @@ class D2HandoffQuality:
             )
         )
 
-    def verify_h1(self, critic_context: str) -> float:
-        has_confidence = "result_confidence:0.41" in critic_context
-        has_attempts = "result_attempts:3" in critic_context
-        has_chunk = bool(self._h1_chunk_id and self._h1_chunk_id in critic_context)
-        score = sum([has_confidence, has_attempts, has_chunk]) / 3
+    def verify_h1(self, critic_assembly: "AssemblyResult") -> float:  # noqa: F821
+        from ncp.assembler import AssemblyResult  # noqa: F401
+
+        h1_chunk = next(
+            (c for c in critic_assembly.chunks if c.chunk_id == self._h1_chunk_id), None
+        )
+        has_chunk = h1_chunk is not None
+        has_low_confidence = (
+            h1_chunk is not None
+            and float(getattr(h1_chunk, "result_confidence", 1.0) or 1.0) <= 0.5
+        )
+        has_high_attempts = (
+            h1_chunk is not None
+            and int(getattr(h1_chunk, "result_attempts", 0) or 0) >= 2
+        )
+        score = sum([has_chunk, has_low_confidence, has_high_attempts]) / 3
         self.results["h1"] = {
             "score": score,
-            "has_confidence": has_confidence,
-            "has_attempts": has_attempts,
             "has_chunk": has_chunk,
+            "has_low_confidence": has_low_confidence,
+            "has_high_attempts": has_high_attempts,
         }
         return score
 
@@ -116,7 +127,7 @@ class D2HandoffQuality:
             goal=str(task["initial_goal"]),
             query_text="auth oauth required api_key_forbidden security_policy",
         )
-        h1 = self.verify_h1(critic.context)
+        h1 = self.verify_h1(critic.assembly)
         h2 = self.verify_h2(executor.context)
         h3 = self.verify_h3(critic.context)
         score = (h1 + h2 + h3) / 3

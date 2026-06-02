@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ncp.api import agent
-from ncp.assembler import Assembler
+from ncp.assembler import Assembler, AssemblyResult
 from ncp.stores.sqlite import SQLiteStore
 from ncp.types import BudgetContext, ConsciousBlock, NCPResponse, SubconsciousChunk
 
@@ -23,6 +23,7 @@ class TurnOutcome:
     context: str
     output: AgentOutput
     response: NCPResponse
+    assembly: AssemblyResult
 
 
 class MACEPipeline:
@@ -123,6 +124,7 @@ class MACEPipeline:
             context=assembly.context,
             output=output,
             response=response,
+            assembly=assembly,
         )
 
     def run_round(
