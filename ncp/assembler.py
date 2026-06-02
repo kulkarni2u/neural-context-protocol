@@ -8,6 +8,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from dataclasses import dataclass
 from hashlib import sha256
+import json
 import time
 
 import anyio
@@ -82,6 +83,7 @@ class Assembler:
         conscious, budget = self.middleware.pre_assemble(conscious, budget)
         coherence_report = self.coherence.check(conscious)
         coherence_alerts = coherence_report.alerts
+        coherence_sensors = coherence_report.sensors
         hydrated = conscious if ctx_window is None else conscious.model_copy(update={"ctx_window": ctx_window})
         chunk_cap, whisper_cap = self._assembly_caps(budget=budget, k=k)
         recent_chunks = self._resolve_recent_refs(hydrated)
@@ -104,7 +106,8 @@ class Assembler:
         drained_whispers = (
             [] if drain_cap == 0 else self._drain_whispers(hydrated, max_items=drain_cap)
         )
-        all_whispers: list[Whisper] = [*coherence_alerts, *drained_whispers]
+        hydrated = self._apply_drift_feedback(hydrated, drained_whispers)
+        all_whispers: list[Whisper] = [*coherence_alerts, *coherence_sensors, *drained_whispers]
         evicted_whispers = [
             (whisper.whisper_id, float(whisper.confidence))
             for whisper in all_whispers[whisper_cap:]
@@ -417,3 +420,31 @@ class Assembler:
                 raise RuntimeError(
                     f"Failed to persist chunk after {retries + 1} attempts: {chunk.chunk_id}"
                 ) from None
+
+    # ------------------------------------------------------------------
+    # Drift feedback loop
+    # ------------------------------------------------------------------
+
+    def _apply_drift_feedback(
+        self,
+        conscious: ConsciousBlock,
+        drained: list[Whisper],
+    ) -> ConsciousBlock:
+        for whisper in drained:
+            if whisper.whisper_type != "world_check":
+                continue
+            try:
+                payload = whisper.payload
+                if isinstance(payload, str):
+                    data = json.loads(payload)
+                elif isinstance(payload, dict):
+                    data = payload
+                else:
+                    continue
+                detected_drift = float(data.get("detected_drift", 0.0))
+                if 0.0 <= detected_drift <= 1.0:
+                    conscious = conscious.model_copy(update={"drift_score": detected_drift})
+                break
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue
+        return conscious

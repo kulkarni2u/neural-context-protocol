@@ -102,11 +102,14 @@ def test_whispers_section_is_last_when_present(tmp_path: Path) -> None:
 
 # ── no-whispers case ──────────────────────────────────────────────────────────
 
-def test_no_whispers_section_when_queue_empty(tmp_path: Path) -> None:
+def test_sensor_whisper_in_assembly_when_queue_empty(tmp_path: Path) -> None:
     store = _store(tmp_path)
     assembler = Assembler(store=store)
     sections = list(assembler.assemble_incremental(conscious=_conscious(), budget=_budget()))
-    assert all(s[0] != "whispers" for s in sections)
+    labels = [s[0] for s in sections]
+    assert labels[-1] == "whispers"
+    assert "t:sensor" in sections[-1][1]
+    assert "drift_score_sample" in sections[-1][1]
 
 
 # ── budget enforcement ────────────────────────────────────────────────────────

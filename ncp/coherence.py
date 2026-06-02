@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, field
 
 from ncp.types import AlertPayload, ConsciousBlock, Whisper
 
@@ -14,6 +15,7 @@ class CoherenceReport:
     alerts: list[Whisper]
     goal_versions: dict[str, int]
     passed: bool
+    sensors: list[Whisper] = field(default_factory=list)
 
 
 class CoherenceChecker:
@@ -24,15 +26,18 @@ class CoherenceChecker:
     missing data (no store, no pipeline) produces an empty pass.
     """
 
-    def __init__(self, store: object | None = None) -> None:
+    def __init__(self, store: object | None = None, turn: int = 0) -> None:
         self._store = store
+        self._turn = turn
 
     def check(self, conscious: ConsciousBlock) -> CoherenceReport:
         alerts: list[Whisper] = []
+        sensors: list[Whisper] = []
         goal_versions: dict[str, int] = {}
 
         goal_versions[conscious.agent_id] = conscious.goal_version
         alerts.extend(self._check_slot_health(conscious))
+        sensors.extend(self._emit_drift_sensor(conscious))
 
         if self._store is not None and conscious.pipeline_id is not None:
             try:
@@ -46,6 +51,7 @@ class CoherenceChecker:
             alerts=alerts,
             goal_versions=goal_versions,
             passed=len(alerts) == 0,
+            sensors=sensors,
         )
 
     def _check_slot_health(self, conscious: ConsciousBlock) -> list[Whisper]:
@@ -94,6 +100,36 @@ class CoherenceChecker:
                     )
                 )
         return alerts
+
+    def _emit_drift_sensor(self, conscious: ConsciousBlock) -> list[Whisper]:
+        sensor = Whisper(
+            from_agent="ncp_system",
+            target=conscious.agent_id,
+            whisper_type="sensor",
+            payload=json.dumps({
+                "code": "drift_score_sample",
+                "drift_score": conscious.drift_score,
+                "turn": self._turn,
+            }),
+            confidence=1.0,
+            pipeline_id=conscious.pipeline_id,
+        )
+        self._log_drift_history(conscious)
+        return [sensor]
+
+    def _log_drift_history(self, conscious: ConsciousBlock) -> None:
+        store = self._store
+        if store is None or conscious.pipeline_id is None:
+            return
+        if hasattr(store, "log_drift_history"):
+            try:
+                store.log_drift_history(
+                    session_id=conscious.pipeline_id,
+                    turn=self._turn,
+                    drift_score=conscious.drift_score,
+                )
+            except Exception:
+                pass
 
     def _load_pipeline_goal_versions(self, conscious: ConsciousBlock) -> dict[str, int]:
         versions: dict[str, int] = {}

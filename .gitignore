@@ -17,8 +17,11 @@ CLAUDE.md
 .sarathi
 .gstack/
 .claude/
+.codex/
 policy-pack/
 SARATHI.md
+capture.pcap
+benchmarks/mace/results/
 
 # Internal working docs (local only, not tracked)
 docs/CLAUDE_STABILIZATION.md

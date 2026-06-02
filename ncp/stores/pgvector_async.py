@@ -578,6 +578,7 @@ class AsyncPgvectorStore(BaseStore):
                     now=now,
                     base_trust=float(row["base_trust"]),
                     generation=int(row["generation"]),
+                    written_at_drift=float(row["written_at_drift"]) if row.get("written_at_drift") is not None else 0.0,
                 )
                 if score < min_score:
                     continue
@@ -604,6 +605,7 @@ class AsyncPgvectorStore(BaseStore):
                     age_seconds=age_s,
                     base_trust=float(row["base_trust"]),
                     generation=int(row["generation"]),
+                    written_at_drift=float(row["written_at_drift"]) if row.get("written_at_drift") is not None else 0.0,
                 )
                 if h < min_score:
                     continue
@@ -705,6 +707,20 @@ class AsyncPgvectorStore(BaseStore):
                         conscious.model_dump_json(),
                         time.time(),
                     ),
+                )
+
+    async def async_log_drift_history(self, *, session_id: str, turn: int, drift_score: float) -> None:
+        """Persist a drift sensor reading using native async DB I/O."""
+        async with self._aconnect() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    self._sql(
+                        """
+                        INSERT INTO {schema}.{prefix}drift_history (session_id, turn, drift_score, ts)
+                        VALUES (%s, %s, %s, %s)
+                        """
+                    ),
+                    (session_id, turn, drift_score, time.time()),
                 )
 
     async def async_log_cost(self, *, agent_id: str, response: NCPResponse) -> None:
@@ -897,6 +913,7 @@ class AsyncPgvectorStore(BaseStore):
             evidence_id=row.get("evidence_id"),
             generation=int(row.get("generation", 0)),
             base_trust=float(row.get("base_trust", 0.7)),
+            written_at_drift=float(row["written_at_drift"]) if row.get("written_at_drift") is not None else 0.0,
             result_confidence=row.get("result_confidence"),
             result_attempts=row.get("result_attempts"),
             conditions=[],

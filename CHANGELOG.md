@@ -9,6 +9,17 @@ changes.
 
 ### Added / Changed
 
+- **Drift sensor metric** (`ncp/coherence.py`, `ncp/assembler.py`, `ncp/types.py`,
+  `ncp/stores/`): upgraded `drift_score` from a threshold alert into a full sensor
+  metric. Every turn emits a `sensor`-type whisper (`drift_score_sample`) with the
+  raw drift reading; a feedback loop in `_prepare_assembly` drains `world_check`
+  whispers and back-propagates `detected_drift` to the next turn's
+  `ConsciousBlock.drift_score`; retrieval scores are discounted by
+  `written_at_drift` when drift > 0.3; `SubconsciousChunk` has a new
+  `written_at_drift` field persisted in both SQLite and pgvector schemas; all
+  stores expose a `drift_history` table and `log_drift_history()` method for
+  time-series tracking.
+
 - **Realistic pipeline baselines** (`ncp/bench/baselines.py`,
   `ncp/benchmarks.py`): coding and research pipeline benchmarks now report
   three deterministic baseline families instead of only raw replay:

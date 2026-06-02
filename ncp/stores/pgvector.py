@@ -60,7 +60,8 @@ CREATE TABLE IF NOT EXISTS {schema}.{prefix}chunks (
     meta JSONB DEFAULT '{{}}'::jsonb,
     embedding vector(1536),
     retrieval_count INTEGER DEFAULT 0,
-    last_retrieved_at DOUBLE PRECISION
+    last_retrieved_at DOUBLE PRECISION,
+    written_at_drift DOUBLE PRECISION DEFAULT 0.0
 );
 
 CREATE TABLE IF NOT EXISTS {schema}.{prefix}tombstones (
@@ -137,6 +138,16 @@ CREATE INDEX IF NOT EXISTS {prefix}idx_conscious_agent
     ON {schema}.{prefix}conscious_log(agent_id, logged_at);
 CREATE INDEX IF NOT EXISTS {prefix}idx_cost_pipeline
     ON {schema}.{prefix}cost_log(pipeline_id, logged_at);
+
+CREATE TABLE IF NOT EXISTS {schema}.{prefix}drift_history (
+    session_id TEXT NOT NULL,
+    turn INTEGER NOT NULL,
+    drift_score DOUBLE PRECISION NOT NULL,
+    ts DOUBLE PRECISION NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS {prefix}idx_drift_session
+    ON {schema}.{prefix}drift_history(session_id, turn);
 """
 
 
@@ -318,10 +329,10 @@ class PgvectorStore(BaseStore):
                             written_by, caused_by, conscious_hash, evidence_id, version, supersedes,
                             source_refs, schema_version, created_at, base_trust, generation,
                             result_confidence, result_attempts, conditions, valid_while, expiry, owner, meta,
-                            embedding
+                            embedding, written_at_drift
                         ) VALUES (
                             %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                         )
                         ON CONFLICT (chunk_id) DO UPDATE SET
                             pipeline_id = EXCLUDED.pipeline_id,
@@ -349,7 +360,8 @@ class PgvectorStore(BaseStore):
                             expiry = EXCLUDED.expiry,
                             owner = EXCLUDED.owner,
                             meta = EXCLUDED.meta,
-                            embedding = EXCLUDED.embedding
+                            embedding = EXCLUDED.embedding,
+                            written_at_drift = EXCLUDED.written_at_drift
                         """
                     ),
                     (
@@ -380,6 +392,7 @@ class PgvectorStore(BaseStore):
                         chunk.owner,
                         json.dumps({}),
                         embedding_val,
+                        chunk.written_at_drift,
                     ),
                 )
             finally:
@@ -441,6 +454,7 @@ class PgvectorStore(BaseStore):
                     now=now,
                     base_trust=float(row["base_trust"]),
                     generation=int(row["generation"]),
+                    written_at_drift=float(row["written_at_drift"]) if row.get("written_at_drift") is not None else 0.0,
                 )
                 if score < min_score:
                     continue
@@ -468,6 +482,7 @@ class PgvectorStore(BaseStore):
                     age_seconds=age_seconds,
                     base_trust=float(row["base_trust"]),
                     generation=int(row["generation"]),
+                    written_at_drift=float(row["written_at_drift"]) if row.get("written_at_drift") is not None else 0.0,
                 )
                 if hybrid_score < min_score:
                     continue
@@ -792,6 +807,22 @@ class PgvectorStore(BaseStore):
                         latency_ms,
                         time.time(),
                     ),
+                )
+            finally:
+                self._close_cursor(cursor)
+
+    def log_drift_history(self, *, session_id: str, turn: int, drift_score: float) -> None:
+        with self._connect() as connection:
+            cursor = connection.cursor()
+            try:
+                cursor.execute(
+                    self._sql(
+                        """
+                        INSERT INTO {schema}.{prefix}drift_history (session_id, turn, drift_score, ts)
+                        VALUES (%s, %s, %s, %s)
+                        """
+                    ),
+                    (session_id, turn, drift_score, time.time()),
                 )
             finally:
                 self._close_cursor(cursor)
@@ -1644,6 +1675,7 @@ class PgvectorStore(BaseStore):
             evidence_id=row["evidence_id"],
             generation=int(row["generation"]),
             base_trust=float(row["base_trust"]),
+            written_at_drift=float(row["written_at_drift"]) if row.get("written_at_drift") is not None else 0.0,
             result_confidence=row["result_confidence"],
             result_attempts=row["result_attempts"],
             conditions=self._decode_json_list(row["conditions"]),
