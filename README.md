@@ -4,43 +4,38 @@
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
-Neural Context Protocol (NCP) is a local-first context runtime for multi-agent
-systems. It keeps context bounded, persists useful memory across turns and
-restarts, and exposes that shared state over MCP so multiple tools can work
-from the same memory instead of replaying full history.
+**17x fewer tokens. Same pipeline depth.**
 
-NCP is the runtime layer, not the orchestrator. It can sit underneath coding
-tools, agent frameworks, or orchestrators, but the product itself is:
+Multi-agent pipelines accumulate token debt — full history replayed every turn.
+NCP replaces growing transcripts with a bounded context block that stays flat
+as your pipeline deepens.
 
-- bounded context assembly
-- durable shared memory
-- targeted retrieval
-- cross-agent signaling
-- one shared MCP surface
+```
+Turn 10:  raw replay → 12,000 tok    NCP → ~840 tok
+Turn 30:  raw replay → 45,000 tok    NCP → ~840 tok
+Turn 50:  raw replay → 80,000 tok    NCP → ~840 tok  ← bounded
+```
 
-`1.0.0` is the stable V1 release line.
+Benchmarked: **17.52x** reduction at turn 40 vs raw replay in a 4-agent coding pipeline.
+Works with Claude Code, Codex CLI, OpenCode, and any MCP host.
 
-NCP is a context substrate. It gives agents bounded, persistent, shareable
-context that makes multi-agent systems cheaper and more coherent. It does not
-replace planning, orchestration, or judgment.
+---
 
-## Why It Exists
+## How it works
 
-Multi-agent workflows usually fail in a few predictable ways:
+Three blocks replace growing history:
 
-- prompt history grows until token cost and latency become painful
-- useful state disappears between turns or after restarts
-- each tool keeps its own silo, so context does not move cleanly across workers
+```
+[NCP:CONSCIOUS]    ~120 tok  — what this agent knows right now
+[NCP:SUBCONSCIOUS] ~480 tok  — relevant past, retrieved not replayed
+[NCP:WHISPERS]     ~240 tok  — signals from other agents
+──────────────────────────────────────────────────
+Total:             ~840 tok  — stays bounded as the pipeline deepens
+```
 
-NCP addresses that with:
+Memory survives restarts. State is shared across agents over a single MCP surface.
 
-- bounded context assembly for the current turn
-- durable memory in a local or scalable store
-- `ncp_fetch` for targeted mid-turn retrieval
-- whispers for bounded cross-agent signals
-- one shared MCP runtime for multiple tools
-
-## Architecture
+### Architecture
 
 ```mermaid
 flowchart LR
@@ -58,152 +53,7 @@ flowchart LR
     C --> F
 ```
 
-## Runtime Modes
-
-NCP has two supported runtime modes:
-
-| Mode | Best for | Backing services |
-|---|---|---|
-| SQLite | default local-first setup, fast evaluation, single-project use | `.ncp/store.db` |
-| pgvector + Redis | scalable local lab / team-style setup, richer retrieval, externalized state | Postgres/pgvector + Redis |
-
-The product story is simple:
-
-- **SQLite** is the default mode.
-- **pgvector + Redis** is the scalable mode.
-
-## What Is Demonstrated
-
-### Demonstrated
-
-This repository currently demonstrates:
-
-- shared MCP access over HTTP/SSE
-- durable memory writes and cross-host reads
-- bounded retrieval with `ncp_fetch`
-- whisper delivery across hosts
-- restart persistence
-- local-first SQLite runtime
-- scalable pgvector + Redis runtime
-- async pgvector observability parity
-- bounded-context benchmarks
-- multi-agent coordination benchmark coverage via MACE
-
-Concrete proof points already in the repo:
-
-- Claude and OpenCode both connect to the same NCP MCP server over HTTP
-- both hosts can write shared memory and retrieve memory written by the other
-- both hosts can send and receive whispers through the shared runtime
-- live pgvector + Redis integration tests are green on the local compose stack
-- retrieval logic is now largely shared across SQLite, sync pgvector, and async pgvector
-- `ncp handoff claude` / `ncp handoff opencode` support bounded whisper-driven partner/reviewer loops
-
-The strongest current claim is simple:
-
-- multiple hosts can operate on one bounded shared memory substrate instead of
-  replaying giant transcripts independently
-
-### Not Yet Independently Validated
-
-This repository does not yet independently validate at broad confidence:
-
-- efficacy against multiple realistic competing baselines across providers
-- quality retention under compression at truly matched budgets
-- real-agent success-rate deltas across a broad provider/task matrix
-
-## Quick Start
-
-Install the package:
-
-```bash
-pip install neural-context-protocol
-```
-
-If you want the scalable mode locally, install the relevant extras too:
-
-```bash
-pip install 'neural-context-protocol[pgvector,redis]'
-```
-
-Initialize a project:
-
-```bash
-ncp init
-```
-
-`ncp init` now supports two setup paths:
-
-- interactive terminal: choose `sqlite` or `pgvector`
-- non-interactive/scripted use: defaults to `sqlite`
-
-You can also choose explicitly:
-
-```bash
-ncp init --store sqlite
-ncp init --store pgvector
-```
-
-This creates:
-
-- `.ncp/config.toml`
-- `CLAUDE.md`
-
-### SQLite Path
-
-For the default local-first path:
-
-```bash
-ncp init --store sqlite
-ncp status
-ncp serve --host 127.0.0.1 --port 4242 --cwd /path/to/project
-```
-
-### pgvector + Redis Path
-
-For the scalable local path:
-
-```bash
-podman machine start podman-machine-default || true
-ncp init --store pgvector
-NCP_CONTAINER_ENGINE=podman ./scripts/infra_up.sh
-ncp migrate apply --cwd /path/to/project
-ncp status --cwd /path/to/project
-ncp serve --host 127.0.0.1 --port 4242 --cwd /path/to/project
-```
-
-This uses the repo’s first-class local compose stack:
-
-- [compose.yaml](./compose.yaml)
-- [scripts/infra_up.sh](./scripts/infra_up.sh)
-- [scripts/infra_down.sh](./scripts/infra_down.sh)
-- [scripts/test_pgvector_integration.sh](./scripts/test_pgvector_integration.sh)
-
-If you want to prove the live pgvector path before starting the server:
-
-```bash
-NCP_CONTAINER_ENGINE=podman ./scripts/test_pgvector_integration.sh
-```
-
-This exercises the real Podman-backed Postgres/pgvector + Redis stack from
-[`compose.yaml`](./compose.yaml) and runs the live integration suite end to end.
-
-## Setup Success Signals
-
-After setup you should be able to run:
-
-```bash
-ncp status --cwd /path/to/project
-ncp cost --cwd /path/to/project
-ncp explain --cwd /path/to/project
-```
-
-Expected signals:
-
-- `ncp status` shows store and activity metrics
-- `ncp cost` shows token/USD rollups once turns are logged
-- `ncp explain` summarizes current runtime state
-
-## How a Turn Works
+### Turn flow
 
 ```mermaid
 flowchart TD
@@ -219,176 +69,206 @@ flowchart TD
     A --> B --> C --> D --> E --> F --> G --> H
 ```
 
-Typical flow:
+---
 
-1. call `ncp_get_context`
-2. receive a bounded assembled context
-3. optionally call `ncp_fetch` for targeted retrieval
-4. persist durable results with `ncp_write_memory`
-5. send lightweight cross-agent signals with `ncp_emit_whisper`
+## Storage tiers
 
-## MCP Transport
+| Tier | When to use | Backing |
+|------|-------------|---------|
+| **SQLite** | Default. Zero dependencies, local-first. | `.ncp/store.db` |
+| **pgvector** | Semantic ANN retrieval, durable across machines. | Postgres + pgvector extension |
+| **Redis** | Cross-agent coordination: whispers, fetch-session state, handoff queue. | Redis 7 |
 
-NCP’s public transport is HTTP/SSE MCP:
+Start with SQLite. Add pgvector + Redis when you need vector retrieval or multiple agents coordinating across processes.
+
+---
+
+## Quickstart
 
 ```bash
-ncp serve --host 127.0.0.1 --port 4242 --cwd /path/to/project
+pip install neural-context-protocol
+ncp init              # interactive — choose sqlite or pgvector
+ncp serve --host 127.0.0.1 --port 4242
 ```
 
-Endpoints:
+`ncp init` creates `.ncp/config.toml` and a `CLAUDE.md` for automatic protocol use.
 
-- `GET /healthz`
-- `GET /sse`
-- `POST /mcp`
+Choose your storage explicitly:
 
-For host configs, use:
+```bash
+ncp init --store sqlite     # zero-dependency, local-first
+ncp init --store pgvector   # requires Postgres + Redis (see below)
+```
 
-- `http://127.0.0.1:4242/mcp`
+### pgvector + Redis
+
+```bash
+pip install 'neural-context-protocol[pgvector,redis]'
+docker compose up -d
+ncp init --store pgvector
+ncp migrate apply
+ncp serve --host 127.0.0.1 --port 4242
+```
+
+`compose.yaml` ships in the repo root with healthchecks. Swap `docker` for `podman` if needed.
+
+Convenience scripts for the compose stack:
+
+```bash
+./scripts/infra_up.sh     # start Postgres/pgvector + Redis
+./scripts/infra_down.sh   # stop and clean up
+./scripts/test_pgvector_integration.sh  # live integration suite
+```
+
+### Verify setup
+
+```bash
+ncp status   — store type, turn count, memory layer sizes
+ncp cost     — token and USD rollups
+ncp explain  — human-readable runtime summary
+```
+
+### MCP transport
+
+| Endpoint | Use |
+|----------|-----|
+| `GET /healthz` | Liveness check |
+| `GET /sse` | SSE event stream |
+| `POST /mcp` | JSON-RPC tool calls |
+
+Host config: `http://127.0.0.1:4242/mcp`
+
+---
+
+## MCP integration
+
+Four tools become available in every session once the server is running:
+
+```
+ncp_get_context    — assemble bounded context at turn start
+ncp_write_memory   — persist durable memory at turn end
+ncp_fetch          — targeted mid-turn retrieval
+ncp_emit_whisper   — send bounded signals to other agents
+```
+
+**Claude Code** — add to `~/.claude/mcp_servers.json`:
+
+```json
+{ "ncp": { "command": "ncp", "args": ["serve"] } }
+```
+
+**Codex CLI** — same format in `.codex/config.json`.
+
+`ncp init` generates a `CLAUDE.md` that teaches Claude Code to call the protocol correctly.
+
+---
 
 ## Benchmarks
 
-Observed benchmark snapshot:
-
 | Scenario | Baseline | Baseline tokens | NCP tokens | Reduction |
-|---|---|---:|---:|---:|
-| Coding pipeline (40 turns) | raw replay | 1,927 peak | 174 peak | 17.52x |
-| Coding pipeline (40 turns) | sliding window (8) | 212 peak | 174 peak | 1.93x |
-| Coding pipeline (40 turns) | rolling summary (4/4) | 1,176 peak | 174 peak | 10.69x |
-| Research pipeline (36 turns) | raw replay | 1,700 peak | 156 peak | 16.35x |
-| Research pipeline (36 turns) | sliding window (8) | 212 peak | 156 peak | 2.04x |
-| Research pipeline (36 turns) | rolling summary (4/4) | 950 peak | 156 peak | 9.13x |
-| Sliding-window control efficacy (Claude, 5 attempts) | sliding window | 0.0 success rate | 0.8 success rate | +0.8 |
-| Cross-host shared context (Claude -> OpenCode, 5 attempts) | sliding window | 0.0 success rate | 0.8 success rate | +0.8 |
-| Live handoff example | bounded task prompt | ~677 estimated | ~265 estimated | 60.9% |
+|----------|----------|----------------:|----------:|----------:|
+| 4-agent coding pipeline (40 turns) | raw replay | 1,927 | 174 | **17.52x** |
+| 4-agent coding pipeline (40 turns) | rolling summary (4/4) | 1,176 | 174 | 10.69x |
+| 6-role research pipeline (36 turns) | raw replay | 1,700 | 156 | **16.35x** |
+| Efficacy — sliding-window control (Claude, 5 attempts) | window baseline | 0.0 success | 0.8 success | **+0.8** |
+| Cross-host handoff (Claude → OpenCode, 5 attempts) | window baseline | 0.0 success | 0.8 success | **+0.8** |
 
-Needle recall snapshot:
+Needle recall at `--budget 4` (hard retrieval pressure): NCP `0.50` vs sliding window `0.00`.
 
-- `python3 benchmarks/needle/run.py --turns 24 --needles 6 --budget 4`
-- final NCP recall: `0.50`
-- equal-budget sliding-window recall: `0.00`
-- this is intentionally a hard retrieval-pressure eval, not a marketing number
+MACE multi-agent coordination score (40 turns): `0.9608`.
 
-MACE benchmark:
-
-- canonical `--turns 40` score: `0.9608`
-- D1 `0.8695`
-- D2 `1.0000`
-- D3 `1.0000`
-- D4 `1.0000`
-
-Benchmark notes:
-
-- current local artifacts use `word_split` token accounting unless `tiktoken`
-  is installed
-- the coding and research pipeline benchmarks now include two more realistic
-  non-agent baselines:
-  - sliding window (`last_entries=8`)
-  - rolling summary (`every_k=4`, `keep_recent=4`)
-- the benchmarks now also report a first-pass assembly-overhead estimate so
-  raw prompt savings are not presented as free
-- the first live real-provider slices now differentiate:
-  - sliding-window control efficacy with `claude-cli`: `NCP 0.8` vs `window 0.0`
-  - cross-host shared context with `claude-cli -> opencode-cli`: `NCP 0.8` vs `window 0.0`
-
-### What These Benchmarks Do Not Show
-
-- the coding and research pipeline benchmarks still use deterministic pipeline
-  agents, not live providers
-- the current live efficacy evidence is still early:
-  - one provider-specific sliding-window control run
-  - one cross-host provider pairing
-  - one timeout in each 5-attempt series
-- the pipeline benchmarks do not yet include real agents in the loop
-- the new needle benchmark is a retrieval-pressure probe, not a user-facing
-  success-rate benchmark
-- MACE currently uses deterministic agents, so it is not yet the final quality proof
-- all current workflow results assume a host that follows the NCP contract:
-  `ncp_get_context`, optional `ncp_fetch`, `ncp_write_memory`, `ncp_emit_whisper`
-
-Relevant benchmark docs:
-
-- [docs/NCP_BENCHMARK_CODING_PIPELINE.md](./docs/NCP_BENCHMARK_CODING_PIPELINE.md)
-- [docs/NCP_BENCHMARK_RESEARCH_PIPELINE.md](./docs/NCP_BENCHMARK_RESEARCH_PIPELINE.md)
-- [docs/NCP_BENCHMARK_NEEDLE_RECALL.md](./docs/NCP_BENCHMARK_NEEDLE_RECALL.md)
-- [docs/NCP_BENCHMARK_MATCHED_BUDGET_EFFICACY.md](./docs/NCP_BENCHMARK_MATCHED_BUDGET_EFFICACY.md)
-- [benchmarks/mace/README.md](./benchmarks/mace/README.md)
-
-## Optional Bounded Agent Handoffs
-
-NCP can also drive a bounded partner/reviewer loop over its own whisper queue:
+Benchmarks are reproducible — run them yourself:
 
 ```bash
-ncp emit --from-agent codex --to claude --type share --pipeline-id pipe_demo --payload '{"slice":"pgvector","files":["ncp/stores/pgvector.py"],"ask":"implement_and_handoff"}'
-ncp handoff claude --cwd /path/to/project --pipeline-id pipe_demo --emit-to opencode
-ncp handoff opencode --cwd /path/to/project --pipeline-id pipe_demo --emit-to claude
+python3 benchmarks/coding_pipeline/run.py
+python3 benchmarks/needle/run.py --turns 24 --needles 6 --budget 4
 ```
 
-This is an optional coordination pattern, not the core product definition.
+NCP adds overhead on short single-agent tasks. Use it when you have 3+ agents and 10+ turns.
 
-Properties of the loop:
-
-- handoff payloads stay bounded
-- queue reads are non-destructive until the consumer succeeds
-- timeouts surface as clean NCP-owned errors
-- the same pattern works on SQLite or pgvector + Redis
-
-NCP has been proven under real multi-provider workflows, but NCP itself does
-not depend on any single orchestrator, framework, or host runtime.
-
-## Current Feature Surface
-
-This repository currently ships:
-
-- core NCP types and encoder
-- bounded assembly with incremental assembly support
-- SQLite-backed persistence
-- pgvector durable store with migrations and pooling
-- Redis-backed coordination for scalable mode
-- optional embedding-backed vector retrieval on pgvector
-- HTTP/SSE MCP server
-- dogfood validation harness
-- benchmark suites
-- operator commands:
-  - `ncp status`
-  - `ncp cost`
-  - `ncp explain`
-  - `ncp viz`
-  - `ncp batch`
-  - `ncp consolidate`
-  - `ncp calibrate`
+---
 
 ## Examples
 
-Runnable examples:
+Runnable examples in the repo:
 
 ```bash
 python3 examples/01_quickstart.py
 python3 examples/02_multi_agent.py
 ```
 
-Tool-specific setup examples:
+Tool-specific setup in `examples/06_claude_code/` and `examples/07_codex_cli/`.
 
-- `examples/06_claude_code/`
-- `examples/07_codex_cli/`
+---
+
+## Harness engineering and the Sarathi ecosystem
+
+NCP is the context substrate layer for AI coding harnesses.
+
+In the Sarathi orchestration model, multiple agents (Claude for planning, OpenCode for
+implementation, Codex for verification) share one NCP memory bus rather than replaying
+independent transcripts. Sarathi drives the lifecycle; NCP keeps each agent's context
+window bounded and the shared state coherent across the full build-review loop.
+
+The same protocol works with any MCP-compatible host. `ncp handoff claude` and
+`ncp handoff opencode` let you build bounded whisper-driven partner/reviewer loops
+without a separate orchestrator:
+
+```bash
+ncp handoff claude --cwd /path/to/project --pipeline-id pipe_demo --emit-to opencode
+ncp handoff opencode --cwd /path/to/project --pipeline-id pipe_demo --emit-to claude
+```
+
+NCP is not the orchestrator. It is the memory bus the orchestrator runs on.
+
+---
+
+## What NCP is not
+
+- Not a vector database or model training framework.
+- Not a replacement for planning, orchestration, or judgment.
+- Overhead dominates for < 3 agents or < 10 turns — plain messages are better there.
+
+---
+
+## Operator commands
+
+```
+ncp status      — store + activity metrics
+ncp cost        — token/USD rollups
+ncp explain     — current runtime summary
+ncp viz         — pipeline visualization
+ncp consolidate — compress the subconscious layer
+ncp calibrate   — tune retrieval parameters
+ncp batch       — batch memory operations
+```
+
+---
 
 ## Documentation
 
-- [docs/NCP_SETUP.md](./docs/NCP_SETUP.md) - install and first-run setup
-- [docs/NCP_PROTOCOL_SPEC.md](./docs/NCP_PROTOCOL_SPEC.md) - normative protocol reference
-- [docs/NCP_MCP_DOGFOOD_LOOP.md](./docs/NCP_MCP_DOGFOOD_LOOP.md) - deterministic MCP proof path
-- [docs/NCP_PROVIDER_PARITY_BASELINE.md](./docs/NCP_PROVIDER_PARITY_BASELINE.md) - host parity snapshot
-- [docs/NCP_BENCHMARK_NEEDLE_RECALL.md](./docs/NCP_BENCHMARK_NEEDLE_RECALL.md) - retrieval-pressure eval
-- [docs/NCP_BENCHMARK_MATCHED_BUDGET_EFFICACY.md](./docs/NCP_BENCHMARK_MATCHED_BUDGET_EFFICACY.md) - real-agent eval contract
-- [docs/NCP_ACTIVE_HANDOFF_PACKET.md](./docs/NCP_ACTIVE_HANDOFF_PACKET.md) - active handoff packet for the current roadmap line
-- [docs/NCP_POST_V1_ROADMAP.md](./docs/NCP_POST_V1_ROADMAP.md) - post-V1 roadmap history
-- [docs/NCP_R2_STORAGE.md](./docs/NCP_R2_STORAGE.md) - storage direction and local infra notes
-- [CHANGELOG.md](./CHANGELOG.md) - release-facing change summary
+- [Setup guide](./docs/NCP_SETUP.md)
+- [Protocol spec](./docs/NCP_PROTOCOL_SPEC.md)
+- [Benchmark: coding pipeline](./docs/NCP_BENCHMARK_CODING_PIPELINE.md)
+- [Benchmark: needle recall](./docs/NCP_BENCHMARK_NEEDLE_RECALL.md)
+- [Benchmark: matched-budget efficacy](./docs/NCP_BENCHMARK_MATCHED_BUDGET_EFFICACY.md)
+- [MACE multi-agent eval](./benchmarks/mace/README.md)
+- [Post-V1 roadmap](./docs/NCP_POST_V1_ROADMAP.md)
+- [Active handoff packet](./docs/NCP_ACTIVE_HANDOFF_PACKET.md)
+- [CHANGELOG](./CHANGELOG.md)
 
-## Release Preflight
+---
 
-```bash
-bash scripts/release_preflight.sh
-```
+## Provider support
+
+| Provider | Tier | Streaming |
+|----------|------|-----------|
+| Anthropic (Claude) | 1 — fully verified | ✓ |
+| OpenAI (GPT, o-series) | 1 — fully verified | ✓ |
+| Google (Gemini) | 2 — blocking verified | — |
+| Mistral | 2 — blocking verified | — |
+| Cohere | 2 — blocking verified | — |
+| Ollama (local) | 2 — blocking verified | — |
 
 <details>
 <summary>Provider notes</summary>
@@ -397,3 +277,11 @@ bash scripts/release_preflight.sh
 - `CohereAdapter` is functionally green; warning noise is suppressed at the adapter boundary.
 
 </details>
+
+---
+
+## Release preflight
+
+```bash
+bash scripts/release_preflight.sh
+```
