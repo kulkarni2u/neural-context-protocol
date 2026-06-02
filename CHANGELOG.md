@@ -4,8 +4,11 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [Unreleased]
 
-Credibility-hardening work on the benchmark branch. No product-surface breaking
-changes.
+No unreleased changes yet.
+
+## [1.0.1] - 2026-06-02
+
+Credibility-hardening patch release. No product-surface breaking changes.
 
 ### Added / Changed
 
