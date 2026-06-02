@@ -139,6 +139,9 @@ class BaseStore(ABC):
     ) -> None:
         """Persist raw cost telemetry without a full NCPResponse."""
 
+    def log_drift_history(self, *, session_id: str, turn: int, drift_score: float) -> None:
+        """Persist a drift sensor reading for time-series tracking."""
+
     @abstractmethod
     def get_pipeline_goal_versions(
         self,
@@ -257,6 +260,11 @@ class BaseStore(ABC):
     async def async_resolve_recent_ref(self, ref: str) -> TurnRecord | None:
         """Asynchronously resolve a recent ref using thread pool."""
         return await anyio.to_thread.run_sync(self.resolve_recent_ref, ref)
+
+    async def async_log_drift_history(self, *, session_id: str, turn: int, drift_score: float) -> None:
+        """Asynchronously persist a drift sensor reading using thread pool."""
+        fn = partial(self.log_drift_history, session_id=session_id, turn=turn, drift_score=drift_score)
+        await anyio.to_thread.run_sync(fn)
 
     async def async_log_conscious(self, conscious: ConsciousBlock, *, snapshot_hash: str) -> None:
         """Asynchronously persist a conscious-block snapshot using thread pool."""

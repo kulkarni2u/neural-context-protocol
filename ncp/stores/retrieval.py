@@ -55,20 +55,25 @@ class RetrievalPolicy:
         age_seconds: float,
         base_trust: float,
         generation: int = 0,
+        written_at_drift: float = 0.0,
     ) -> float:
         """Compute fused hybrid score for a single candidate chunk.
 
         Returns a value in [0, 1]. Generation penalty is applied
         multiplicatively so heavily-derived chunks are naturally demoted.
+        Chunks written during high drift (written_at_drift > 0.3) are
+        discounted by (1 - written_at_drift).
         """
         recency = math.exp(-0.693 * max(0.0, age_seconds) / self.recency_half_life_seconds)
         gen_penalty = 0.9 ** max(0, generation)
+        drift = max(0.0, min(1.0, written_at_drift))
+        drift_penalty = 1.0 - drift if drift > 0.3 else 1.0
         fused = (
             self.w_lexical * max(0.0, bm25_normalized)
             + self.w_recency * recency
             + self.w_trust * max(0.0, min(1.0, base_trust))
         )
-        return fused * gen_penalty
+        return fused * gen_penalty * drift_penalty
 
     def score_with_vector(
         self,
@@ -79,6 +84,7 @@ class RetrievalPolicy:
         base_trust: float,
         generation: int = 0,
         vector_mix: float = 0.5,
+        written_at_drift: float = 0.0,
     ) -> float:
         """Compute hybrid score with an optional vector similarity signal.
 
@@ -92,6 +98,7 @@ class RetrievalPolicy:
                 age_seconds=age_seconds,
                 base_trust=base_trust,
                 generation=generation,
+                written_at_drift=written_at_drift,
             )
 
         mix = max(0.0, min(1.0, vector_mix))
@@ -103,6 +110,7 @@ class RetrievalPolicy:
             age_seconds=age_seconds,
             base_trust=base_trust,
             generation=generation,
+            written_at_drift=written_at_drift,
         )
 
     def score_no_bm25(
@@ -111,15 +119,20 @@ class RetrievalPolicy:
         age_seconds: float,
         base_trust: float,
         generation: int = 0,
+        written_at_drift: float = 0.0,
     ) -> float:
         """Score without BM25 for non-lexical backends.
 
         Weights are renormalized to (w_recency + w_trust) so the result
         stays in [0, 1] even though the lexical signal is absent.
         Generation penalty is still applied multiplicatively.
+        Chunks written during high drift (written_at_drift > 0.3) are
+        discounted by (1 - written_at_drift).
         """
         recency = math.exp(-0.693 * max(0.0, age_seconds) / self.recency_half_life_seconds)
         gen_penalty = 0.9 ** max(0, generation)
+        drift = max(0.0, min(1.0, written_at_drift))
+        drift_penalty = 1.0 - drift if drift > 0.3 else 1.0
         w_sum = self.w_recency + self.w_trust
         if w_sum == 0.0:
             return 0.0
@@ -127,7 +140,7 @@ class RetrievalPolicy:
             self.w_recency * recency
             + self.w_trust * max(0.0, min(1.0, base_trust))
         ) / w_sum
-        return fused * gen_penalty
+        return fused * gen_penalty * drift_penalty
 
 
 DEFAULT_RETRIEVAL_POLICY = RetrievalPolicy()
@@ -204,6 +217,7 @@ def score_trust_recency_candidate(
     now: float,
     base_trust: float,
     generation: int,
+    written_at_drift: float = 0.0,
 ) -> float:
     """Shared trust/recency-only candidate score."""
     age_seconds = max(0.0, now - created_at)
@@ -211,6 +225,7 @@ def score_trust_recency_candidate(
         age_seconds=age_seconds,
         base_trust=base_trust,
         generation=generation,
+        written_at_drift=written_at_drift,
     )
 
 

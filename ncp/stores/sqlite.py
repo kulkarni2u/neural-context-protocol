@@ -52,7 +52,8 @@ CREATE TABLE IF NOT EXISTS chunks (
     owner TEXT,
     meta TEXT DEFAULT '{}',
     retrieval_count INTEGER DEFAULT 0,
-    last_retrieved_at REAL
+    last_retrieved_at REAL,
+    written_at_drift REAL DEFAULT 0.0
 );
 
 CREATE TABLE IF NOT EXISTS tombstones (
@@ -117,6 +118,15 @@ CREATE INDEX IF NOT EXISTS idx_whispers_pipeline ON whispers(pipeline_id, expire
 CREATE INDEX IF NOT EXISTS idx_turns_agent ON turn_records(agent_id, pipeline_id);
 CREATE INDEX IF NOT EXISTS idx_conscious_agent ON conscious_log(agent_id, logged_at);
 CREATE INDEX IF NOT EXISTS idx_cost_pipeline ON cost_log(pipeline_id, logged_at);
+
+CREATE TABLE IF NOT EXISTS drift_history (
+    session_id TEXT NOT NULL,
+    turn INTEGER NOT NULL,
+    drift_score REAL NOT NULL,
+    ts REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_drift_session ON drift_history(session_id, turn);
 """
 
 
@@ -187,6 +197,9 @@ class SQLiteStore(BaseStore):
             for ddl in (
                 "ALTER TABLE chunks ADD COLUMN retrieval_count INTEGER DEFAULT 0",
                 "ALTER TABLE chunks ADD COLUMN last_retrieved_at REAL",
+                "ALTER TABLE chunks ADD COLUMN written_at_drift REAL DEFAULT 0.0",
+                "CREATE TABLE IF NOT EXISTS drift_history (session_id TEXT NOT NULL, turn INTEGER NOT NULL, drift_score REAL NOT NULL, ts REAL NOT NULL)",
+                "CREATE INDEX IF NOT EXISTS idx_drift_session ON drift_history(session_id, turn)",
             ):
                 try:
                     connection.execute(ddl)
@@ -206,8 +219,9 @@ class SQLiteStore(BaseStore):
                     chunk_id, pipeline_id, scope, zone, layer, chunk_type, content, src,
                     written_by, caused_by, conscious_hash, evidence_id, version, supersedes,
                     source_refs, schema_version, created_at, base_trust, generation,
-                    result_confidence, result_attempts, conditions, valid_while, expiry, owner, meta
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    result_confidence, result_attempts, conditions, valid_while, expiry, owner, meta,
+                    written_at_drift
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     chunk.chunk_id,
@@ -236,6 +250,7 @@ class SQLiteStore(BaseStore):
                     chunk.expiry,
                     chunk.owner,
                     json.dumps({}),
+                    chunk.written_at_drift,
                 ),
             )
             self._hard_gc(connection, pipeline_id=chunk.pipeline_id)
@@ -287,6 +302,7 @@ class SQLiteStore(BaseStore):
                     age_seconds=age_seconds,
                     base_trust=float(row["base_trust"]),
                     generation=int(row["generation"]),
+                    written_at_drift=float(row["written_at_drift"]) if row["written_at_drift"] is not None else 0.0,
                 )
                 if score < min_score:
                     continue
@@ -309,6 +325,7 @@ class SQLiteStore(BaseStore):
                     age_seconds=age_seconds,
                     base_trust=float(row["base_trust"]),
                     generation=int(row["generation"]),
+                    written_at_drift=float(row["written_at_drift"]) if row["written_at_drift"] is not None else 0.0,
                 )
                 if hybrid_score < min_score:
                     continue
@@ -815,6 +832,13 @@ class SQLiteStore(BaseStore):
         except Exception:
             pass
 
+    def log_drift_history(self, *, session_id: str, turn: int, drift_score: float) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO drift_history (session_id, turn, drift_score, ts) VALUES (?, ?, ?, ?)",
+                (session_id, turn, drift_score, time.time()),
+            )
+
     def status(self) -> dict[str, int | float]:
         with self._connect() as connection:
             chunks = connection.execute("SELECT COUNT(*) AS count FROM chunks").fetchone()["count"]
@@ -1317,6 +1341,7 @@ class SQLiteStore(BaseStore):
             evidence_id=row["evidence_id"],
             generation=int(row["generation"]),
             base_trust=float(row["base_trust"]),
+            written_at_drift=float(row["written_at_drift"]) if row["written_at_drift"] is not None else 0.0,
             result_confidence=row["result_confidence"],
             result_attempts=row["result_attempts"],
             conditions=json.loads(row["conditions"]),

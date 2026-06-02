@@ -30,6 +30,7 @@ WhisperType = Literal[
     "dissent",
     "world_check",
     "consolidation_ready",
+    "sensor",
 ]
 
 
@@ -180,6 +181,7 @@ class SubconsciousChunk(NCPModel):
 
     generation: int = 0
     base_trust: float = 0.7
+    written_at_drift: float = 0.0
 
     result_confidence: float | None = None
     result_attempts: int | None = None
@@ -253,7 +255,7 @@ class SubconsciousChunk(NCPModel):
             raise ValueError("result_attempts must be >= 0 when provided")
         return value
 
-    @field_validator("base_trust", "result_confidence", "relevance")
+    @field_validator("base_trust", "result_confidence", "relevance", "written_at_drift")
     @classmethod
     def _chunk_unit_interval(cls, value: float | None, info: object) -> float | None:
         if value is None:
