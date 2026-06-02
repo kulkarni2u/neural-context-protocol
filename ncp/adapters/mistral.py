@@ -18,7 +18,7 @@ class MistralAdapter(BaseAdapter):
         timeout: float = 120.0,
     ) -> None:
         try:
-            from mistralai.client import Mistral
+            from mistralai import Mistral
         except ImportError as err:
             raise ImportError(
                 "mistralai is required. Install it with: pip install 'neural-context-protocol[providers]'"
@@ -26,7 +26,7 @@ class MistralAdapter(BaseAdapter):
         resolved_key = api_key or environ.get("MISTRAL_API_KEY", "")
         self._client = Mistral(
             api_key=self._require_api_key(resolved_key, env_var="MISTRAL_API_KEY"),
-            timeout_ms=int(timeout * 1000),
+            timeout=timeout,
         )
         self._model = model
         self._max_tokens = max_tokens

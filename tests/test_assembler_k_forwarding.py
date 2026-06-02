@@ -116,13 +116,13 @@ def test_assemble_k_overrides_pressure_default(tmp_path: Path) -> None:
 
 
 def test_assemble_explicit_k_keeps_default_whisper_cap(tmp_path: Path) -> None:
-    """Explicit k widens chunk retrieval but should not widen whisper drain above 3."""
+    """Critical pressure enforces whisper_cap=1 regardless of explicit k."""
     store, _, whisper_caps = _store_spy_with_whispers(tmp_path)
     assembler = Assembler(store=store)
 
     assembler.assemble(conscious=_conscious(), budget=_budget("critical"), k=6)
 
-    assert whisper_caps[0] == 3, f"explicit k should keep whisper cap at 3, got {whisper_caps[0]}"
+    assert whisper_caps[0] == 1, f"critical pressure should cap whispers at 1 even with explicit k, got {whisper_caps[0]}"
 
 
 # ---------------------------------------------------------------------------

@@ -47,8 +47,9 @@ class BaseAdapter(ABC):
         )
 
     def _require_api_key(self, api_key: str, *, env_var: str) -> str:
-        if api_key.strip():
-            return api_key
+        stripped = api_key.strip()
+        if stripped:
+            return stripped
         raise NCPAdapterConfigurationError(
             f"{type(self).__name__} requires {env_var}; configure it or pass api_key explicitly"
         )

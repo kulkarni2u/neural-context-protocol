@@ -32,13 +32,14 @@ def test_chunk_accepts_valid_embedding() -> None:
     assert len(chunk.embedding) == _EMBEDDING_DIM  # type: ignore[arg-type]
 
 
-def test_chunk_rejects_wrong_dimension_embedding() -> None:
-    with pytest.raises(Exception, match="1536"):
-        SubconsciousChunk(layer="semantic", content="hello", src="synthesis", embedding=[0.1] * 10)
+def test_chunk_accepts_any_nonzero_dimension_embedding() -> None:
+    # Any non-empty embedding is accepted (pgvector validates dimensions at query time)
+    chunk = SubconsciousChunk(layer="semantic", content="hello", src="synthesis", embedding=[0.1] * 10)
+    assert len(chunk.embedding) == 10  # type: ignore[arg-type]
 
 
 def test_chunk_rejects_zero_dimension_embedding() -> None:
-    with pytest.raises(Exception, match="1536"):
+    with pytest.raises(Exception, match="empty"):
         SubconsciousChunk(layer="semantic", content="hello", src="synthesis", embedding=[])
 
 

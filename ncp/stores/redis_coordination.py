@@ -55,25 +55,28 @@ class RedisCoordination:
         payload_key = self._payload_key(whisper.whisper_id)
         index_key = self._target_index_key(whisper.target)
         expires_at = whisper.created_at + whisper.ttl_seconds
-        client.hset(
-            payload_key,
-            mapping={
-                "whisper_id": whisper.whisper_id,
-                "pipeline_id": whisper.pipeline_id or "",
-                "from_agent": whisper.from_agent,
-                "target": whisper.target,
-                "whisper_type": whisper.whisper_type,
-                "payload": whisper.payload,
-                "confidence": str(whisper.confidence),
-                "ref": whisper.ref or "",
-                "created_at": str(whisper.created_at),
-                "ttl_seconds": str(whisper.ttl_seconds),
-                "expires_at": str(expires_at),
-                "dissent_target": whisper.dissent_target or "",
-            },
-        )
-        client.expire(payload_key, whisper.ttl_seconds + 5)
-        client.zadd(index_key, {whisper.whisper_id: whisper.created_at})
+        # Pipeline the three commands to prevent partial writes on network failures.
+        with client.pipeline() as pipe:
+            pipe.hset(
+                payload_key,
+                mapping={
+                    "whisper_id": whisper.whisper_id,
+                    "pipeline_id": whisper.pipeline_id or "",
+                    "from_agent": whisper.from_agent,
+                    "target": whisper.target,
+                    "whisper_type": whisper.whisper_type,
+                    "payload": whisper.payload,
+                    "confidence": str(whisper.confidence),
+                    "ref": whisper.ref or "",
+                    "created_at": str(whisper.created_at),
+                    "ttl_seconds": str(whisper.ttl_seconds),
+                    "expires_at": str(expires_at),
+                    "dissent_target": whisper.dissent_target or "",
+                },
+            )
+            pipe.expire(payload_key, whisper.ttl_seconds + 5)
+            pipe.zadd(index_key, {whisper.whisper_id: whisper.created_at})
+            pipe.execute()
 
     def peek_whispers(
         self,
@@ -146,14 +149,21 @@ class RedisCoordination:
         max_items: int = 3,
         min_confidence: float = 0.60,
     ) -> list[Whisper]:
-        whispers = self.peek_whispers(
+        """Peek whispers and claim each atomically via SETNX to prevent double-delivery."""
+        client = self._client_or_raise()
+        candidates = self.peek_whispers(
             agent_id=agent_id,
             pipeline_id=pipeline_id,
             max_items=max_items,
             min_confidence=min_confidence,
         )
-        self.acknowledge_whispers([whisper.whisper_id for whisper in whispers])
-        return whispers
+        claimed: list[Whisper] = []
+        for whisper in candidates:
+            claim_key = f"{self.stream}:claim:{whisper.whisper_id}"
+            if client.set(claim_key, "1", nx=True, ex=30):
+                claimed.append(whisper)
+        self.acknowledge_whispers([w.whisper_id for w in claimed])
+        return claimed
 
     def reset_fetch_session(self, session_id: str, *, pipeline_id: str | None = None, ttl_seconds: int = 3600) -> None:
         client = self._client_or_raise()
@@ -323,25 +333,27 @@ class AsyncRedisCoordination:
         payload_key = self._payload_key(whisper.whisper_id)
         index_key = self._target_index_key(whisper.target)
         expires_at = whisper.created_at + whisper.ttl_seconds
-        await client.hset(
-            payload_key,
-            mapping={
-                "whisper_id": whisper.whisper_id,
-                "pipeline_id": whisper.pipeline_id or "",
-                "from_agent": whisper.from_agent,
-                "target": whisper.target,
-                "whisper_type": whisper.whisper_type,
-                "payload": whisper.payload,
-                "confidence": str(whisper.confidence),
-                "ref": whisper.ref or "",
-                "created_at": str(whisper.created_at),
-                "ttl_seconds": str(whisper.ttl_seconds),
-                "expires_at": str(expires_at),
-                "dissent_target": whisper.dissent_target or "",
-            },
-        )
-        await client.expire(payload_key, whisper.ttl_seconds + 5)
-        await client.zadd(index_key, {whisper.whisper_id: whisper.created_at})
+        async with client.pipeline() as pipe:
+            await pipe.hset(
+                payload_key,
+                mapping={
+                    "whisper_id": whisper.whisper_id,
+                    "pipeline_id": whisper.pipeline_id or "",
+                    "from_agent": whisper.from_agent,
+                    "target": whisper.target,
+                    "whisper_type": whisper.whisper_type,
+                    "payload": whisper.payload,
+                    "confidence": str(whisper.confidence),
+                    "ref": whisper.ref or "",
+                    "created_at": str(whisper.created_at),
+                    "ttl_seconds": str(whisper.ttl_seconds),
+                    "expires_at": str(expires_at),
+                    "dissent_target": whisper.dissent_target or "",
+                },
+            )
+            await pipe.expire(payload_key, whisper.ttl_seconds + 5)
+            await pipe.zadd(index_key, {whisper.whisper_id: whisper.created_at})
+            await pipe.execute()
 
     async def drain_whispers(
         self,
@@ -351,14 +363,21 @@ class AsyncRedisCoordination:
         max_items: int = 3,
         min_confidence: float = 0.60,
     ) -> list[Whisper]:
-        whispers = await self._async_peek_whispers(
+        """Peek whispers and claim each atomically via SETNX to prevent double-delivery."""
+        client = await self._aclient_or_raise()
+        candidates = await self._async_peek_whispers(
             agent_id=agent_id,
             pipeline_id=pipeline_id,
             max_items=max_items,
             min_confidence=min_confidence,
         )
-        await self._async_acknowledge_whispers([w.whisper_id for w in whispers])
-        return whispers
+        claimed: list[Whisper] = []
+        for whisper in candidates:
+            claim_key = f"{self.stream}:claim:{whisper.whisper_id}"
+            if await client.set(claim_key, "1", nx=True, ex=30):
+                claimed.append(whisper)
+        await self._async_acknowledge_whispers([w.whisper_id for w in claimed])
+        return claimed
 
     async def _async_peek_whispers(
         self,

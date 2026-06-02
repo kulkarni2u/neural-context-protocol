@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+import threading
 import time
+from uuid import uuid4
 
 from ncp.adapters.base import BaseAdapter
 from ncp.adapters.local import LocalAdapter
@@ -14,6 +16,7 @@ from ncp.stores.factory import create_store
 from ncp.types import BudgetContext, ConsciousBlock, NCPResponse, SubconsciousChunk, Whisper
 
 _CONFIG: NCPConfig | None = None
+_CONFIG_LOCK = threading.Lock()
 
 
 def configure(
@@ -25,8 +28,9 @@ def configure(
     """Load and cache the active NCP configuration."""
 
     global _CONFIG
-    _CONFIG = load_config(path=path, cwd=cwd, env=env)
-    return _CONFIG
+    with _CONFIG_LOCK:
+        _CONFIG = load_config(path=path, cwd=cwd, env=env)
+        return _CONFIG
 
 
 def agent(
@@ -218,6 +222,6 @@ def _build_response(
         cost_usd=0.0,
         model=adapter.__class__.__name__.lower(),
         pipeline_id=agent.pipeline_id,
-        turn_id=f"turn_{int(time.time() * 1000)}",
+        turn_id=f"turn_{uuid4().hex[:16]}",
         latency_ms=int((time.perf_counter() - start) * 1000),
     )

@@ -30,7 +30,6 @@ WhisperType = Literal[
     "dissent",
     "world_check",
     "consolidation_ready",
-    "sensor",
 ]
 
 
@@ -275,8 +274,8 @@ class SubconsciousChunk(NCPModel):
     @field_validator("embedding")
     @classmethod
     def _embedding_dimensions(cls, value: list[float] | None) -> list[float] | None:
-        if value is not None and len(value) != 1536:
-            raise ValueError(f"embedding must have exactly 1536 dimensions, got {len(value)}")
+        if value is not None and len(value) == 0:
+            raise ValueError("embedding must not be empty when provided")
         return value
 
     @model_validator(mode="after")

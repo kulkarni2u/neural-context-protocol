@@ -39,12 +39,18 @@ class Reranker:
             for chunk, score in zip(chunks, scores):
                 sigmoid = 1.0 / (1.0 + math.exp(-float(score)))
                 chunk.relevance = max(0.0, min(1.0, sigmoid))
-        except ImportError:
-            warnings.warn(
-                "sentence-transformers not installed. Local rerank falling back to Jaccard similarity. "
-                "Install via: pip install sentence-transformers",
-                ImportWarning,
-            )
+        except (ImportError, Exception) as _rerank_exc:
+            if not isinstance(_rerank_exc, ImportError):
+                warnings.warn(
+                    f"Local rerank model failed to load: {_rerank_exc}. Falling back to Jaccard similarity.",
+                    RuntimeWarning,
+                )
+            else:
+                warnings.warn(
+                    "sentence-transformers not installed. Local rerank falling back to Jaccard similarity. "
+                    "Install via: pip install sentence-transformers",
+                    ImportWarning,
+                )
             query_set = set(query.lower().split())
             for chunk in chunks:
                 doc_set = set(chunk.content.lower().split())
@@ -67,7 +73,7 @@ class Reranker:
 
         try:
             import cohere
-            client = cohere.Client(api_key=api_key)
+            client = cohere.ClientV2(api_key=api_key)
             resp = client.rerank(
                 model=self.model or "rerank-english-v3.0",
                 query=query,

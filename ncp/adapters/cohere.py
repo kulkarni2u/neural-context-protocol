@@ -37,7 +37,7 @@ class CohereAdapter(BaseAdapter):
                 message=".*iscoroutinefunction.*",
                 category=DeprecationWarning,
             )
-            self._client = cohere.Client(
+            self._client = cohere.ClientV2(
                 api_key=self._require_api_key(resolved_key, env_var="COHERE_API_KEY"),
                 timeout=timeout,
             )
@@ -45,17 +45,16 @@ class CohereAdapter(BaseAdapter):
         self._max_tokens = max_tokens
 
     def call(self, ncp_context: str, user_turn: str) -> str:
-        from cohere.types import ChatMessage
-
         resp = self._run_provider_call(
             lambda: self._client.chat(
                 model=self._model,
                 max_tokens=self._max_tokens,
-                preamble=ncp_context,
                 messages=[
-                    ChatMessage(role="user", message=user_turn),
+                    {"role": "system", "content": ncp_context},
+                    {"role": "user", "content": user_turn},
                 ],
             ),
             provider="Cohere",
         )
-        return self._coerce_text(resp.text, provider="Cohere")
+        texts = [b.text for b in resp.message.content if b.type == "text"]
+        return self._coerce_text("".join(texts), provider="Cohere")

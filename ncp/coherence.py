@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
 
+import structlog
+
 from ncp.types import AlertPayload, ConsciousBlock, Whisper
+
+_log = structlog.get_logger(__name__)
 
 
 @dataclass(slots=True)
@@ -44,8 +47,8 @@ class CoherenceChecker:
                 agent_versions = self._load_pipeline_goal_versions(conscious)
                 goal_versions.update(agent_versions)
                 alerts.extend(self._check_goal_versions(conscious, agent_versions))
-            except Exception:
-                pass
+            except Exception as exc:
+                _log.warning("ncp.coherence.check_failed", error=str(exc))
 
         return CoherenceReport(
             alerts=alerts,
@@ -81,41 +84,30 @@ class CoherenceChecker:
         return alerts
 
     def _check_goal_versions(self, conscious: ConsciousBlock, agent_versions: dict[str, int]) -> list[Whisper]:
+        all_versions = {**agent_versions, conscious.agent_id: conscious.goal_version}
+        max_version = max(all_versions.values()) if all_versions else conscious.goal_version
         alerts: list[Whisper] = []
-        for agent_id, version in agent_versions.items():
-            if agent_id == conscious.agent_id:
-                continue
-            if version != conscious.goal_version:
-                alerts.append(
-                    Whisper(
-                        from_agent="ncp_system",
-                        target=conscious.agent_id,
-                        whisper_type="alert",
-                        payload=AlertPayload(
-                            alert_code="goal_version_mismatch",
-                            description=f"agent:{agent_id} v{version} vs v{conscious.goal_version}",
-                        ),
-                        confidence=1.0,
-                        pipeline_id=conscious.pipeline_id,
-                    )
+        if conscious.goal_version < max_version:
+            alerts.append(
+                Whisper(
+                    from_agent="ncp_system",
+                    target=conscious.agent_id,
+                    whisper_type="alert",
+                    payload=AlertPayload(
+                        alert_code="goal_version_mismatch",
+                        description=f"local:v{conscious.goal_version} pipeline_max:v{max_version}",
+                    ),
+                    confidence=1.0,
+                    pipeline_id=conscious.pipeline_id,
                 )
+            )
         return alerts
 
     def _emit_drift_sensor(self, conscious: ConsciousBlock) -> list[Whisper]:
-        sensor = Whisper(
-            from_agent="ncp_system",
-            target=conscious.agent_id,
-            whisper_type="sensor",
-            payload=json.dumps({
-                "code": "drift_score_sample",
-                "drift_score": conscious.drift_score,
-                "turn": self._turn,
-            }),
-            confidence=1.0,
-            pipeline_id=conscious.pipeline_id,
-        )
+        # Drift state is visible in the ConsciousBlock itself; no whisper needed.
+        # Only persist the time-series reading to the store.
         self._log_drift_history(conscious)
-        return [sensor]
+        return []
 
     def _log_drift_history(self, conscious: ConsciousBlock) -> None:
         store = self._store

@@ -376,9 +376,9 @@ class TestFetch:
             _call("ncp_fetch", {"query": "Paris"}, req_id=99),
             handlers,
         )
-        error = _error(resp)
-        assert error["code"] == -32603
-        assert "limit reached" in error["message"]
+        # Spec §4: limit returns a deterministic result string, not a JSON-RPC error
+        result = json.loads(json.loads(resp)["result"]["content"][0]["text"])
+        assert result["result"] == "ncp_fetch:limit_reached max:3"
 
     def test_get_context_resets_fetch_counter(self, tmp_path: Path) -> None:
         store = SQLiteStore(tmp_path / "test.db")
@@ -544,7 +544,9 @@ class TestFetch:
 
         err = _handle_request(_call("ncp_fetch", {"query": "coord", "session_id": "sess_coord"}, req_id=99), handlers)
 
-        assert _error(err)["message"] == "Tool error: ncp_fetch limit reached: max 3 per session"
+        # Spec §4: limit returns a deterministic result string, not a JSON-RPC error
+        result = json.loads(json.loads(err)["result"]["content"][0]["text"])
+        assert result["result"] == "ncp_fetch:limit_reached max:3"
 
 
 class TestErrors:

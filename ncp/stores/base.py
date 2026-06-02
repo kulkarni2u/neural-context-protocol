@@ -140,7 +140,7 @@ class BaseStore(ABC):
         """Persist raw cost telemetry without a full NCPResponse."""
 
     def log_drift_history(self, *, session_id: str, turn: int, drift_score: float) -> None:
-        """Persist a drift sensor reading for time-series tracking."""
+        """Persist a drift sensor reading for time-series tracking. Override in subclasses."""
 
     @abstractmethod
     def get_pipeline_goal_versions(
@@ -215,6 +215,7 @@ class BaseStore(ABC):
         zone: str = "working",
         retrieval_mode: str = "hybrid",
         embedding: list[float] | None = None,
+        diversity_limit: int = 2,
     ) -> list[SubconsciousChunk]:
         """Asynchronously query stored chunks by text relevance using thread pool."""
         fn = partial(
@@ -228,6 +229,7 @@ class BaseStore(ABC):
             zone=zone,
             retrieval_mode=retrieval_mode,
             embedding=embedding,
+            diversity_limit=diversity_limit,
         )
         return await anyio.to_thread.run_sync(fn)
 

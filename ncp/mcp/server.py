@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
 import sys
 import threading
 import time
@@ -116,10 +117,20 @@ MCP_TOOLS: list[dict[str, object]] = [
 
 
 def _encode_fetch_results(chunks: list[SubconsciousChunk]) -> str:
-    lines = [f"ncp_fetch:results k:{len(chunks)}"]
+    MAX_TOTAL = 800
+    header = f"ncp_fetch:results k:{len(chunks)}"
+    lines = [header]
+    remaining = MAX_TOTAL - len(header)
     for chunk in chunks:
-        lines.append(f"chunk:{chunk.chunk_id} layer:{chunk.layer} score:{chunk.relevance:.2f}")
-        lines.append(f"  {chunk.content}")
+        if remaining <= 1:
+            break
+        chunk_header = f"chunk:{chunk.chunk_id} layer:{chunk.layer} score:{chunk.relevance:.2f}"
+        indented = "\n".join(f"  {line}" for line in chunk.content.splitlines()) if chunk.content else ""
+        block = chunk_header + ("\n" + indented if indented else "")
+        if len(block) + 1 > remaining:
+            block = block[: remaining - 1]
+        lines.append(block)
+        remaining -= len(block) + 1
     return "\n".join(lines)
 
 
@@ -154,6 +165,7 @@ def _session_id_from_args(args: dict[str, object]) -> str:
 
 def make_handlers(store: BaseStore) -> dict[str, ToolHandler]:
     sessions: dict[str, FetchSession] = {}
+    _sessions_lock = threading.Lock()
     last_session_id = DEFAULT_FETCH_SESSION_ID
     coordination = getattr(store, "coordination", None)
 
@@ -165,8 +177,10 @@ def make_handlers(store: BaseStore) -> dict[str, ToolHandler]:
         if coordination is not None and hasattr(coordination, "reset_fetch_session"):
             coordination.reset_fetch_session(session_id, pipeline_id=normalized_pipeline_id)
         else:
-            sessions[session_id] = FetchSession(fetch_count=0, pipeline_id=normalized_pipeline_id)
-        last_session_id = session_id
+            with _sessions_lock:
+                sessions[session_id] = FetchSession(fetch_count=0, pipeline_id=normalized_pipeline_id)
+        with _sessions_lock:
+            last_session_id = session_id
         conscious = ConsciousBlock(
             agent_id=str(args["agent_id"]),
             role=str(args["role"]),
@@ -236,9 +250,11 @@ def make_handlers(store: BaseStore) -> dict[str, ToolHandler]:
         return {"emitted": True}
 
     def _handle_fetch(args: dict[str, object]) -> object:
+        with _sessions_lock:
+            current_last = last_session_id
         session_id = _session_id_from_args(args)
         if session_id == DEFAULT_FETCH_SESSION_ID:
-            session_id = last_session_id
+            session_id = current_last
         query_str = str(args["query"])
         layer = args.get("layer")
         if layer == "any":
@@ -248,19 +264,23 @@ def make_handlers(store: BaseStore) -> dict[str, ToolHandler]:
         pipeline_id = args.get("pipeline_id")
         effective_pipeline_id: str | None
         if coordination is not None and hasattr(coordination, "claim_fetch_slot"):
-            _, effective_pipeline_id = coordination.claim_fetch_slot(
-                session_id,
-                pipeline_id=None if pipeline_id is None else str(pipeline_id),
-                max_fetches=3,
-            )
+            try:
+                _, effective_pipeline_id = coordination.claim_fetch_slot(
+                    session_id,
+                    pipeline_id=None if pipeline_id is None else str(pipeline_id),
+                    max_fetches=3,
+                )
+            except ValueError:
+                return {"result": "ncp_fetch:limit_reached max:3"}
         else:
-            session = sessions.setdefault(session_id, FetchSession())
-            if session.fetch_count >= 3:
-                raise ValueError("ncp_fetch limit reached: max 3 per session")
-            session.fetch_count += 1
-            if pipeline_id is not None:
-                session.pipeline_id = str(pipeline_id)
-            effective_pipeline_id = session.pipeline_id
+            with _sessions_lock:
+                session = sessions.setdefault(session_id, FetchSession())
+                if session.fetch_count >= 3:
+                    return {"result": "ncp_fetch:limit_reached max:3"}
+                session.fetch_count += 1
+                if pipeline_id is not None:
+                    session.pipeline_id = str(pipeline_id)
+                effective_pipeline_id = session.pipeline_id
         try:
             k = max(1, int(args.get("k", 2)))
         except (ValueError, TypeError):
@@ -485,12 +505,26 @@ class _MCPHTTPServer(ThreadingHTTPServer):
         super().__init__(server_address, _MCPHTTPHandler)
 
 
+_HTTP_MAX_BODY = 1_048_576  # 1 MiB
+
+
+def _check_bearer_auth(auth_header: str) -> bool:
+    """Return True if NCP_MCP_SECRET is unset or the header matches it."""
+    secret = os.environ.get("NCP_MCP_SECRET", "").strip()
+    if not secret:
+        return True
+    return auth_header == f"Bearer {secret}"
+
+
 class _MCPHTTPHandler(BaseHTTPRequestHandler):
     server: _MCPHTTPServer
     protocol_version = "HTTP/1.1"
 
     def log_message(self, format: str, *args: object) -> None:
         return
+
+    def _authorized(self) -> bool:
+        return _check_bearer_auth(self.headers.get("Authorization", ""))
 
     def _send_json(self, status: HTTPStatus, payload: object) -> None:
         body = _json_bytes(payload)
@@ -541,6 +575,9 @@ class _MCPHTTPHandler(BaseHTTPRequestHandler):
                 {"ok": True, "transport": "http_sse", "rpc_path": self.server.rpc_path, "sse_path": self.server.sse_path},
             )
             return
+        if not self._authorized():
+            self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
+            return
         if self.path != self.server.sse_path:
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
             return
@@ -566,11 +603,17 @@ class _MCPHTTPHandler(BaseHTTPRequestHandler):
         if self.path not in (self.server.rpc_path, "/message"):
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
             return
+        if not self._authorized():
+            self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
+            return
 
         try:
             content_length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_content_length"})
+            return
+        if content_length > _HTTP_MAX_BODY:
+            self._send_json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": "payload_too_large"})
             return
         try:
             payload = json.loads(self.rfile.read(content_length).decode("utf-8"))

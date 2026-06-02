@@ -21,7 +21,10 @@ def _fmt_recent_list(values: Sequence[str]) -> str:
 
 
 def _indent_block(value: str) -> str:
-    return "\n".join(f"  {line}" for line in value.splitlines() or [""])
+    lines = value.splitlines()
+    if not lines:
+        return ""
+    return "\n".join(f"  {line}" for line in lines)
 
 
 class PidginEncoder:

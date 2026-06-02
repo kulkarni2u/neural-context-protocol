@@ -233,7 +233,10 @@ class Assembler:
         self.store.log_turn_record(record)
 
         updated_recent = [f"r:sub/{record.turn_id}", *conscious.recent][:5]
-        updated_conscious = conscious.model_copy(update={"recent": updated_recent})
+        intent_anchor = conscious.intent_anchor or sha256(conscious.intent.encode()).hexdigest()
+        updated_conscious = conscious.model_copy(
+            update={"recent": updated_recent, "intent_anchor": intent_anchor}
+        )
         snapshot_hash = sha256(updated_conscious.model_dump_json().encode("utf-8")).hexdigest()
         self.store.log_conscious(updated_conscious, snapshot_hash=snapshot_hash)
         self.store.log_cost(agent_id=conscious.agent_id, response=response)
@@ -263,7 +266,10 @@ class Assembler:
             result_full=result_full,
         )
         updated_recent = [f"r:sub/{record.turn_id}", *conscious.recent][:5]
-        updated_conscious = conscious.model_copy(update={"recent": updated_recent})
+        intent_anchor = conscious.intent_anchor or sha256(conscious.intent.encode()).hexdigest()
+        updated_conscious = conscious.model_copy(
+            update={"recent": updated_recent, "intent_anchor": intent_anchor}
+        )
         snapshot_hash = sha256(updated_conscious.model_dump_json().encode("utf-8")).hexdigest()
 
         async with anyio.create_task_group() as tg:
@@ -286,11 +292,15 @@ class Assembler:
             record = self.store.resolve_recent_ref(ref)
             if record is None:
                 continue
+            # Truncate to the SubconsciousChunk content limit (2000 chars)
+            content = record.result[:2000] if record.result else ""
+            if not content:
+                continue
             chunks.append(
                 SubconsciousChunk(
                     chunk_id=f"recent_{record.turn_id}",
                     layer="episodic",
-                    content=record.result,
+                    content=content,
                     src="subcon_retrieved",
                     pipeline_id=record.pipeline_id,
                     written_by=record.agent_id,
@@ -342,6 +352,10 @@ class Assembler:
             pipeline_id=conscious.pipeline_id,
             relevance=0.1,
         )
+        try:
+            self.store.write(cold_chunk)
+        except Exception:
+            pass
         return [cold_chunk]
 
     # ------------------------------------------------------------------
@@ -376,24 +390,26 @@ class Assembler:
         budget: BudgetContext,
         k: int | None,
     ) -> tuple[int, int]:
-        if k is not None:
-            return max(1, k), 3
         if budget.pressure == "critical":
-            return 2, 1
-        return 4, 3
+            chunk_cap = max(1, k) if k is not None else 2
+            return chunk_cap, 1
+        chunk_cap = max(1, k) if k is not None else 4
+        return chunk_cap, 3
 
     def _write_with_retry(self, chunk: SubconsciousChunk, *, retries: int = 2, backoff_ms: int = 50) -> None:
+        last_exc: Exception | None = None
         for attempt in range(retries + 1):
             try:
                 self.store.write(chunk)
                 return
-            except Exception:
+            except Exception as exc:
+                last_exc = exc
                 if attempt < retries:
                     time.sleep(backoff_ms / 1000)
                     continue
-                raise RuntimeError(
-                    f"Failed to persist chunk after {retries + 1} attempts: {chunk.chunk_id}"
-                ) from None
+        raise RuntimeError(
+            f"Failed to persist chunk after {retries + 1} attempts: {chunk.chunk_id}"
+        ) from last_exc
 
     # ------------------------------------------------------------------
     # Async helpers for post_turn_async
@@ -409,17 +425,19 @@ class Assembler:
         await self.store.async_log_cost(agent_id=agent_id, response=response)
 
     async def _alog_write_with_retry(self, chunk: SubconsciousChunk, *, retries: int = 2, backoff_ms: int = 50) -> None:
+        last_exc: Exception | None = None
         for attempt in range(retries + 1):
             try:
                 await self.store.async_write(chunk)
                 return
-            except Exception:
+            except Exception as exc:
+                last_exc = exc
                 if attempt < retries:
                     await anyio.sleep(backoff_ms / 1000)
                     continue
-                raise RuntimeError(
-                    f"Failed to persist chunk after {retries + 1} attempts: {chunk.chunk_id}"
-                ) from None
+        raise RuntimeError(
+            f"Failed to persist chunk after {retries + 1} attempts: {chunk.chunk_id}"
+        ) from last_exc
 
     # ------------------------------------------------------------------
     # Drift feedback loop
@@ -444,7 +462,6 @@ class Assembler:
                 detected_drift = float(data.get("detected_drift", 0.0))
                 if 0.0 <= detected_drift <= 1.0:
                     conscious = conscious.model_copy(update={"drift_score": detected_drift})
-                break
             except (json.JSONDecodeError, TypeError, ValueError):
                 continue
         return conscious

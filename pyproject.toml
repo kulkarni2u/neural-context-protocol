@@ -40,28 +40,29 @@ Changelog = "https://github.com/kulkarni2u/neural-context-protocol/blob/main/CHA
 
 [project.optional-dependencies]
 providers = [
-  "anthropic",
-  "openai",
-  "google-genai",
-  "mistralai",
-  "cohere",
+  "anthropic>=0.40",
+  "openai>=1.0",
+  "google-genai>=1.0",
+  "mistralai>=1.0",
+  "cohere>=5.0",
 ]
 tokens = ["tiktoken>=0.7"]
 http = ["aiohttp"]
-redis = ["redis"]
-pgvector = ["psycopg[binary]", "psycopg-pool", "pgvector"]
+redis = ["redis>=5.0"]
+pgvector = ["psycopg[binary]>=3.1", "psycopg-pool>=3.1", "pgvector>=0.3"]
+rerank = ["sentence-transformers>=2.0"]
 all = [
-  "anthropic",
-  "openai",
-  "google-genai",
-  "mistralai",
-  "cohere",
+  "anthropic>=0.40",
+  "openai>=1.0",
+  "google-genai>=1.0",
+  "mistralai>=1.0",
+  "cohere>=5.0",
   "tiktoken>=0.7",
 ]
 dev = [
   "build",
   "pytest",
-  "pytest-asyncio",
+  "pytest-asyncio>=0.23",
   "pytest-httpx",
   "pytest-cov",
   "ruff",
@@ -83,7 +84,16 @@ ncp = ["templates/*.example", "migrations/*.sql"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+asyncio_mode = "auto"
 
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "B", "I", "S"]
+ignore = [
+  "S101",   # assert statements in tests
+  "S603",   # subprocess without shell=True is fine
+  "S607",   # partial executable path in subprocess is fine
+]

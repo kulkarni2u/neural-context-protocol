@@ -16,6 +16,8 @@ def _token_count(text: str) -> int:
 
 
 def _chunk_words(text: str, *, max_tokens: int) -> list[str]:
+    if max_tokens <= 0:
+        raise ValueError(f"max_tokens must be > 0, got {max_tokens}")
     words = text.split()
     if not words:
         return []
@@ -116,7 +118,7 @@ def _chunk_json_value(value: Any, *, max_tokens: int, depth: int) -> list[str]:
     if isinstance(value, dict):
         chunks: list[str] = []
         for key, item in value.items():
-            serialized = json.dumps({key: item}, ensure_ascii=True, separators=(",", ":"))
+            serialized = json.dumps({key: item}, ensure_ascii=False, separators=(",", ":"))
             if _token_count(serialized) <= max_tokens or depth >= 1:
                 chunks.append(serialized)
                 continue
@@ -124,7 +126,7 @@ def _chunk_json_value(value: Any, *, max_tokens: int, depth: int) -> list[str]:
                 for child_key, child_value in item.items():
                     child_serialized = json.dumps(
                         {key: {child_key: child_value}},
-                        ensure_ascii=True,
+                        ensure_ascii=False,
                         separators=(",", ":"),
                     )
                     if _token_count(child_serialized) <= max_tokens:
@@ -141,14 +143,14 @@ def _chunk_json_value(value: Any, *, max_tokens: int, depth: int) -> list[str]:
     if isinstance(value, list):
         return _chunk_json_list("items", value, max_tokens=max_tokens)
 
-    serialized = json.dumps(value, ensure_ascii=True, separators=(",", ":"))
+    serialized = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
     return _chunk_words(serialized, max_tokens=max_tokens) or [serialized]
 
 
 def _chunk_json_list(key: str, values: list[Any], *, max_tokens: int) -> list[str]:
     chunks: list[str] = []
-    for index, item in enumerate(values):
-        serialized = json.dumps({key: [{index: item}]}, ensure_ascii=True, separators=(",", ":"))
+    for item in values:
+        serialized = json.dumps({key: [item]}, ensure_ascii=False, separators=(",", ":"))
         if _token_count(serialized) <= max_tokens:
             chunks.append(serialized)
         else:

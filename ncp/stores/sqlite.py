@@ -489,11 +489,14 @@ class SQLiteStore(BaseStore):
         if not whisper_ids:
             return 0
         with self._connect() as connection:
-            cursor = connection.executemany(
-                "DELETE FROM whispers WHERE whisper_id = ?",
-                [(whisper_id,) for whisper_id in whisper_ids],
-            )
-            return int(cursor.rowcount)
+            deleted = 0
+            for whisper_id in whisper_ids:
+                cursor = connection.execute(
+                    "DELETE FROM whispers WHERE whisper_id = ?",
+                    (whisper_id,),
+                )
+                deleted += cursor.rowcount
+            return deleted
 
     def log_turn_record(self, record: TurnRecord) -> None:
         with self._connect() as connection:
@@ -669,7 +672,6 @@ class SQLiteStore(BaseStore):
                     supersedes_json = json.dumps(loser_ids)
                     new_gen = keeper.generation + 1
                     with self._connect() as connection:
-                        connection.execute("BEGIN IMMEDIATE")
                         for loser_id in loser_ids:
                             connection.execute("DELETE FROM chunks WHERE chunk_id = ?", (loser_id,))
                             connection.execute(

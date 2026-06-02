@@ -102,14 +102,15 @@ def test_whispers_section_is_last_when_present(tmp_path: Path) -> None:
 
 # ── no-whispers case ──────────────────────────────────────────────────────────
 
-def test_sensor_whisper_in_assembly_when_queue_empty(tmp_path: Path) -> None:
+def test_no_whispers_section_when_queue_empty(tmp_path: Path) -> None:
+    # Drift state is encoded in the conscious block, not as a whisper.
+    # When the whisper queue is empty, no [NCP:WHISPERS] section is emitted.
     store = _store(tmp_path)
     assembler = Assembler(store=store)
     sections = list(assembler.assemble_incremental(conscious=_conscious(), budget=_budget()))
     labels = [s[0] for s in sections]
-    assert labels[-1] == "whispers"
-    assert "t:sensor" in sections[-1][1]
-    assert "drift_score_sample" in sections[-1][1]
+    assert "whispers" not in labels
+    assert any(label == "subconscious" for label in labels)
 
 
 # ── budget enforcement ────────────────────────────────────────────────────────

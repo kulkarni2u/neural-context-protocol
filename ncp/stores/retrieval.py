@@ -195,7 +195,7 @@ def build_lexical_candidates(text: str, documents: list[str]) -> list[LexicalCan
     if not corpus:
         return []
     bm25 = BM25Okapi(corpus)
-    raw_scores = bm25.get_scores(text.split())
+    raw_scores = bm25.get_scores(text.lower().split())
     normalized_scores = normalize_bm25_scores(list(raw_scores))
     return [
         LexicalCandidate(

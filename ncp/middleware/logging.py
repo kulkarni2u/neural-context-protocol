@@ -6,11 +6,29 @@ Emits structlog events at key assembly lifecycle points.
 from __future__ import annotations
 
 import structlog
+import structlog.processors
+import structlog.stdlib
+import structlog.dev
 
 from ncp.middleware.base import Middleware
 from ncp.types import BudgetContext, ConsciousBlock
 
 _logger = structlog.get_logger(__name__)
+
+_PRETTY_PROCESSORS = [
+    structlog.stdlib.add_log_level,
+    structlog.processors.TimeStamper(fmt="iso"),
+    structlog.processors.StackInfoRenderer(),
+    structlog.dev.ConsoleRenderer(),
+]
+
+_JSON_PROCESSORS = [
+    structlog.stdlib.add_log_level,
+    structlog.processors.TimeStamper(fmt="iso"),
+    structlog.processors.StackInfoRenderer(),
+    structlog.processors.format_exc_info,
+    structlog.processors.JSONRenderer(),
+]
 
 
 class LoggingMiddleware(Middleware):
@@ -19,17 +37,15 @@ class LoggingMiddleware(Middleware):
     Modes:
         pretty — human-friendly console output (default when attached to a TTY)
         json   — structured JSON lines for log aggregation
+
+    Note: configure() sets the process-wide structlog config. Only one
+    LoggingMiddleware should be active per process.
     """
 
     def __init__(self, mode: str = "pretty") -> None:
+        processors = _PRETTY_PROCESSORS if mode == "pretty" else _JSON_PROCESSORS
         structlog.configure(
-            processors=(
-                [
-                    structlog.dev.ConsoleRenderer()
-                ]
-                if mode == "pretty"
-                else [structlog.processors.JSONRenderer()]
-            ),
+            processors=processors,
             wrapper_class=structlog.stdlib.BoundLogger,
             context_class=dict,
             logger_factory=structlog.PrintLoggerFactory(),

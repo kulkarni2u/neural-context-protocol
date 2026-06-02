@@ -3,17 +3,25 @@ from __future__ import annotations
 from collections.abc import Iterator
 from os import environ
 
-from ncp.adapters.base import BaseAdapter
+from ncp.adapters.base import BaseAdapter, NCPAdapterError, NCPAdapterTimeoutError
 
 _MODEL_WINDOWS: dict[str, int] = {
     "gpt-4o": 128000,
     "gpt-4o-mini": 128000,
     "o1": 200000,
+    "o1-mini": 128000,
+    "o1-preview": 128000,
+    "o3": 200000,
     "o3-mini": 200000,
+    "o4-mini": 200000,
     "gpt-4.1": 1047576,
     "gpt-4.1-mini": 1047576,
     "gpt-4.1-nano": 1047576,
+    "gpt-4-turbo": 128000,
 }
+
+# Models that use max_completion_tokens instead of max_tokens
+_REASONING_MODELS: frozenset[str] = frozenset({"o1", "o1-mini", "o1-preview", "o3", "o3-mini", "o4-mini"})
 
 
 class OpenAIAdapter(BaseAdapter):
@@ -49,11 +57,15 @@ class OpenAIAdapter(BaseAdapter):
     def ctx_window(self) -> int:
         return _MODEL_WINDOWS.get(self._model, 128000)
 
+    def _token_limit_kwarg(self) -> dict:
+        key = "max_completion_tokens" if self._model in _REASONING_MODELS else "max_tokens"
+        return {key: self._max_tokens}
+
     def call(self, ncp_context: str, user_turn: str) -> str:
         resp = self._run_provider_call(
             lambda: self._client.chat.completions.create(
                 model=self._model,
-                max_tokens=self._max_tokens,
+                **self._token_limit_kwarg(),
                 messages=[
                     {"role": "system", "content": ncp_context},
                     {"role": "user", "content": user_turn},
@@ -69,7 +81,7 @@ class OpenAIAdapter(BaseAdapter):
         stream = self._run_provider_call(
             lambda: self._client.chat.completions.create(
                 model=self._model,
-                max_tokens=self._max_tokens,
+                **self._token_limit_kwarg(),
                 messages=[
                     {"role": "system", "content": ncp_context},
                     {"role": "user", "content": user_turn},
@@ -79,6 +91,11 @@ class OpenAIAdapter(BaseAdapter):
             provider="OpenAI",
             timeout_types=(self._openai.APITimeoutError, TimeoutError),
         )
-        for chunk in stream:
-            if chunk.choices and (delta := chunk.choices[0].delta.content):
-                yield delta
+        try:
+            for chunk in stream:
+                if chunk.choices and (delta := chunk.choices[0].delta.content):
+                    yield delta
+        except self._openai.APITimeoutError as exc:
+            raise NCPAdapterTimeoutError(f"OpenAI stream timed out: {exc}") from exc
+        except Exception as exc:
+            raise NCPAdapterError(f"OpenAI stream failed: {exc}") from exc

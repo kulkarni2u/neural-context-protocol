@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from os import environ
 
-from ncp.adapters.base import BaseAdapter
+from ncp.adapters.base import BaseAdapter, NCPAdapterError, NCPAdapterTimeoutError
 
 
 class AnthropicAdapter(BaseAdapter):
@@ -58,7 +58,12 @@ class AnthropicAdapter(BaseAdapter):
             provider="Anthropic",
             timeout_types=(self._anthropic.APITimeoutError, TimeoutError),
         )
-        with stream_ctx as stream:
-            for event in stream:
-                if event.type == "content_block_delta" and event.delta.type == "text_delta":
-                    yield event.delta.text
+        try:
+            with stream_ctx as stream:
+                for event in stream:
+                    if event.type == "content_block_delta" and event.delta.type == "text_delta":
+                        yield event.delta.text
+        except self._anthropic.APITimeoutError as exc:
+            raise NCPAdapterTimeoutError(f"Anthropic stream timed out: {exc}") from exc
+        except Exception as exc:
+            raise NCPAdapterError(f"Anthropic stream failed: {exc}") from exc

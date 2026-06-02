@@ -50,6 +50,7 @@ def _run_handoff_subprocess(
     cwd: Path,
     prompt: str,
     timeout_seconds: float,
+    stdin_prompt: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(
@@ -59,6 +60,7 @@ def _run_handoff_subprocess(
             text=True,
             check=False,
             timeout=timeout_seconds,
+            input=prompt if stdin_prompt else None,
         )
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(
@@ -220,23 +222,21 @@ def run_claude_partner(
     """Run the repo-bound Claude implementation-partner path."""
 
     prompt = build_claude_partner_prompt(cwd=cwd, handoffs=handoffs, instruction=instruction)
+    use_default = command is None
     completed = _run_handoff_subprocess(
         runner_name="Claude",
-        command=command
-        or [
+        command=command or [
             "claude",
             "-p",
             "--model",
             "sonnet",
-            "--dangerously-skip-permissions",
             "--add-dir",
             str(cwd),
-            "--",
-            prompt,
         ],
         cwd=cwd,
         prompt=prompt,
         timeout_seconds=timeout_seconds,
+        stdin_prompt=use_default,
     )
     if completed.returncode != 0:
         raise RuntimeError(completed.stderr.strip() or completed.stdout.strip() or "Claude partner run failed")

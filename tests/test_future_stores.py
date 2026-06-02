@@ -423,11 +423,57 @@ def _pg_connect_factory(db: _MemoryPgDB):
     return _connect
 
 
+class _FakeRedisPipeline:
+    """Buffers commands and executes them against the parent client on execute()."""
+
+    def __init__(self, client: "_FakeRedisClient") -> None:
+        self._client = client
+        self._commands: list[tuple] = []
+
+    def hset(self, key: str, mapping: dict[str, str]) -> "_FakeRedisPipeline":
+        self._commands.append(("hset", key, mapping))
+        return self
+
+    def expire(self, key: str, ttl_seconds: int) -> "_FakeRedisPipeline":
+        self._commands.append(("expire", key, ttl_seconds))
+        return self
+
+    def zadd(self, key: str, mapping: dict[str, float]) -> "_FakeRedisPipeline":
+        self._commands.append(("zadd", key, mapping))
+        return self
+
+    def execute(self) -> list:
+        results = []
+        for cmd in self._commands:
+            op = cmd[0]
+            if op == "hset":
+                self._client.hset(cmd[1], cmd[2])
+                results.append(None)
+            elif op == "expire":
+                self._client.expire(cmd[1], cmd[2])
+                results.append(None)
+            elif op == "zadd":
+                self._client.zadd(cmd[1], cmd[2])
+                results.append(None)
+        self._commands.clear()
+        return results
+
+    def __enter__(self) -> "_FakeRedisPipeline":
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        pass
+
+
 class _FakeRedisClient:
     def __init__(self) -> None:
         self.hashes: dict[str, dict[str, str]] = {}
         self.sorted_sets: dict[str, dict[str, float]] = {}
         self.expirations: dict[str, int] = {}
+        self._claim_keys: dict[str, str] = {}
+
+    def pipeline(self) -> _FakeRedisPipeline:
+        return _FakeRedisPipeline(self)
 
     def hset(self, key: str, mapping: dict[str, str]) -> None:
         self.hashes[key] = dict(mapping)
@@ -460,6 +506,12 @@ class _FakeRedisClient:
         existed = key in self.hashes
         self.hashes.pop(key, None)
         return int(existed)
+
+    def set(self, key: str, value: str, *, nx: bool = False, ex: int | None = None) -> bool:
+        if nx and key in self._claim_keys:
+            return False
+        self._claim_keys[key] = value
+        return True
 
 
 def test_pgvector_store_initializes_schema_with_fake_connection() -> None:

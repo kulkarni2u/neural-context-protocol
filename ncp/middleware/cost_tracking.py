@@ -8,7 +8,7 @@ a lightweight parallel estimate for observability.
 
 from __future__ import annotations
 
-import time
+from uuid import uuid4
 
 from ncp.middleware.base import Middleware
 from ncp.types import ConsciousBlock
@@ -39,7 +39,7 @@ class CostTrackingMiddleware(Middleware):
                 output_tokens=output_tok,
                 cost_usd=cost_usd,
                 pipeline_id=conscious.pipeline_id,
-                turn_id=f"cost_est_{int(time.time() * 1000)}_{id(self)}",
+                turn_id=f"cost_est_{uuid4().hex[:16]}",
                 latency_ms=0,
             )
         return None

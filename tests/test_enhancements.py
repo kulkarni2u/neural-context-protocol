@@ -153,11 +153,8 @@ def test_reranker_local_fallback_jaccard():
     assert results[0].relevance > results[1].relevance
 
 
-@patch("cohere.Client")
-def test_reranker_cohere_mocked(mock_client_class):
-    # Mock Cohere Client
-    mock_client = MagicMock()
-    mock_client_class.return_value = mock_client
+def test_reranker_cohere_mocked():
+    pytest.importorskip("cohere")
 
     class MockRerankResult:
         def __init__(self, index, relevance_score):
@@ -170,34 +167,37 @@ def test_reranker_cohere_mocked(mock_client_class):
             MockRerankResult(1, 0.20),
         ]
 
-    mock_client.rerank.return_value = MockCohereResponse()
+    with patch("cohere.ClientV2") as mock_client_class:
+        mock_client = MagicMock()
+        mock_client_class.return_value = mock_client
+        mock_client.rerank.return_value = MockCohereResponse()
 
-    class MockConfig:
-        rerank_enabled = True
-        rerank_provider = "cohere"
-        rerank_model = "rerank-english-v3.0"
+        class MockConfig:
+            rerank_enabled = True
+            rerank_provider = "cohere"
+            rerank_model = "rerank-english-v3.0"
 
-    cfg = MockConfig()
-    reranker = Reranker(cfg)  # type: ignore[arg-type]
-    
-    chunks = [
-        SubconsciousChunk(layer="semantic", content="chunk 1", src="tool_result"),
-        SubconsciousChunk(layer="semantic", content="chunk 2", src="tool_result"),
-    ]
+        cfg = MockConfig()
+        reranker = Reranker(cfg)  # type: ignore[arg-type]
 
-    with patch.dict("os.environ", {"COHERE_API_KEY": "fake_key"}):
-        results = reranker.rerank("test query", chunks)
+        chunks = [
+            SubconsciousChunk(layer="semantic", content="chunk 1", src="tool_result"),
+            SubconsciousChunk(layer="semantic", content="chunk 2", src="tool_result"),
+        ]
 
-    mock_client.rerank.assert_called_once_with(
-        model="rerank-english-v3.0",
-        query="test query",
-        documents=["chunk 1", "chunk 2"],
-    )
-    # Check that scores were mapped correctly and sorted descending
-    assert results[0].content == "chunk 1"
-    assert results[0].relevance == 0.95
-    assert results[1].content == "chunk 2"
-    assert results[1].relevance == 0.20
+        with patch.dict("os.environ", {"COHERE_API_KEY": "fake_key"}):
+            results = reranker.rerank("test query", chunks)
+
+        mock_client.rerank.assert_called_once_with(
+            model="rerank-english-v3.0",
+            query="test query",
+            documents=["chunk 1", "chunk 2"],
+        )
+        # Check that scores were mapped correctly and sorted descending
+        assert results[0].content == "chunk 1"
+        assert results[0].relevance == 0.95
+        assert results[1].content == "chunk 2"
+        assert results[1].relevance == 0.20
 
 
 # ==============================================================================

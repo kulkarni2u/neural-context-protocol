@@ -143,6 +143,3 @@ def test_get_context_degrades_gracefully_on_empty_store(tmp_path: Path) -> None:
     assert "[NCP:CONSCIOUS]" in context
     assert "[NCP:SUBCONSCIOUS]" in context
     assert "chunk:cold_init" in context
-    assert "[NCP:WHISPERS]" in context
-    assert "t:sensor" in context
-    assert "drift_score_sample" in context
