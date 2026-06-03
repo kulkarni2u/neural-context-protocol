@@ -108,6 +108,9 @@ class ClaudeCLIDogfoodAdapter(BaseAdapter):
     def ctx_window(self) -> int:
         return 200000
 
+    # Tools needed for unattended dogfood runs; callers may pass a narrower set.
+    DEFAULT_ALLOWED_TOOLS: list[str] = ["Bash", "Read", "Write", "Edit"]
+
     def __init__(
         self,
         *,
@@ -115,16 +118,15 @@ class ClaudeCLIDogfoodAdapter(BaseAdapter):
         command: list[str] | None = None,
         cwd: str | Path | None = None,
         timeout_seconds: float = 30.0,
-        skip_permissions: bool = True,
+        allowed_tools: list[str] | None = None,
     ) -> None:
         self._cwd = Path(cwd) if cwd is not None else Path.cwd()
         self._timeout_seconds = timeout_seconds
         if command is not None:
             self._command = command
         else:
-            base = ["claude", "-p", "--model", model]
-            if skip_permissions:
-                base.append("--dangerously-skip-permissions")
+            tools = allowed_tools if allowed_tools is not None else self.DEFAULT_ALLOWED_TOOLS
+            base = ["claude", "-p", "--model", model, "--allowedTools", ",".join(tools)]
             self._command = base + ["--add-dir", str(self._cwd), "--"]
 
     def call(self, ncp_context: str, user_turn: str) -> str:
@@ -157,7 +159,6 @@ class OpenCodeCLIDogfoodAdapter(BaseAdapter):
         command: list[str] | None = None,
         cwd: str | Path | None = None,
         timeout_seconds: float = 16.0,
-        skip_permissions: bool = True,  # reserved for future OpenCode flag support
     ) -> None:
         self._cwd = Path(cwd) if cwd is not None else Path.cwd()
         self._timeout_seconds = timeout_seconds
@@ -208,17 +209,18 @@ class CodexCLIDogfoodAdapter(BaseAdapter):
         command: list[str] | None = None,
         cwd: str | Path | None = None,
         timeout_seconds: float = 20.0,
-        skip_permissions: bool = True,
     ) -> None:
         self._cwd = Path(cwd) if cwd is not None else Path.cwd()
         self._timeout_seconds = timeout_seconds
-        if command is not None:
-            self._command = command
-        else:
-            base = ["codex", "exec", "--skip-git-repo-check"]
-            if skip_permissions:
-                base.append("--dangerously-bypass-approvals-and-sandbox")
-            self._command = base + ["-m", model]
+        # Codex has no fine-grained allowedTools equivalent; the bypass flag is required for unattended use.
+        self._command = command or [
+            "codex",
+            "exec",
+            "--skip-git-repo-check",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "-m",
+            model,
+        ]
 
     def call(self, ncp_context: str, user_turn: str) -> str:
         del ncp_context
@@ -1210,23 +1212,23 @@ def load_dogfood_adapter(
     name: str,
     *,
     timeout_seconds: float | None = None,
-    skip_permissions: bool = True,
+    allowed_tools: list[str] | None = None,
 ) -> BaseAdapter:
     normalized = name.strip().lower()
     if normalized == "local":
         return DogfoodLocalAdapter()
     if normalized == "claude-cli":
-        kwargs: dict[str, object] = {"skip_permissions": skip_permissions}
+        kwargs: dict[str, object] = {"allowed_tools": allowed_tools}
         if timeout_seconds is not None:
             kwargs["timeout_seconds"] = timeout_seconds
         return ClaudeCLIDogfoodAdapter(**kwargs)  # type: ignore[arg-type]
     if normalized == "codex-cli":
-        kwargs = {"skip_permissions": skip_permissions}
+        kwargs = {}
         if timeout_seconds is not None:
             kwargs["timeout_seconds"] = timeout_seconds
         return CodexCLIDogfoodAdapter(**kwargs)  # type: ignore[arg-type]
     if normalized == "opencode-cli":
-        kwargs = {"skip_permissions": skip_permissions}
+        kwargs = {}
         if timeout_seconds is not None:
             kwargs["timeout_seconds"] = timeout_seconds
         return OpenCodeCLIDogfoodAdapter(**kwargs)  # type: ignore[arg-type]
