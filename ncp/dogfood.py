@@ -115,19 +115,17 @@ class ClaudeCLIDogfoodAdapter(BaseAdapter):
         command: list[str] | None = None,
         cwd: str | Path | None = None,
         timeout_seconds: float = 30.0,
+        skip_permissions: bool = True,
     ) -> None:
         self._cwd = Path(cwd) if cwd is not None else Path.cwd()
         self._timeout_seconds = timeout_seconds
-        self._command = command or [
-            "claude",
-            "-p",
-            "--model",
-            model,
-            "--dangerously-skip-permissions",
-            "--add-dir",
-            str(self._cwd),
-            "--",
-        ]
+        if command is not None:
+            self._command = command
+        else:
+            base = ["claude", "-p", "--model", model]
+            if skip_permissions:
+                base.append("--dangerously-skip-permissions")
+            self._command = base + ["--add-dir", str(self._cwd), "--"]
 
     def call(self, ncp_context: str, user_turn: str) -> str:
         # Skip the full assembled context: it adds latency and may already contain
@@ -159,6 +157,7 @@ class OpenCodeCLIDogfoodAdapter(BaseAdapter):
         command: list[str] | None = None,
         cwd: str | Path | None = None,
         timeout_seconds: float = 16.0,
+        skip_permissions: bool = True,  # reserved for future OpenCode flag support
     ) -> None:
         self._cwd = Path(cwd) if cwd is not None else Path.cwd()
         self._timeout_seconds = timeout_seconds
@@ -209,17 +208,17 @@ class CodexCLIDogfoodAdapter(BaseAdapter):
         command: list[str] | None = None,
         cwd: str | Path | None = None,
         timeout_seconds: float = 20.0,
+        skip_permissions: bool = True,
     ) -> None:
         self._cwd = Path(cwd) if cwd is not None else Path.cwd()
         self._timeout_seconds = timeout_seconds
-        self._command = command or [
-            "codex",
-            "exec",
-            "--skip-git-repo-check",
-            "--dangerously-bypass-approvals-and-sandbox",
-            "-m",
-            model,
-        ]
+        if command is not None:
+            self._command = command
+        else:
+            base = ["codex", "exec", "--skip-git-repo-check"]
+            if skip_permissions:
+                base.append("--dangerously-bypass-approvals-and-sandbox")
+            self._command = base + ["-m", model]
 
     def call(self, ncp_context: str, user_turn: str) -> str:
         del ncp_context
@@ -1207,19 +1206,30 @@ def _parse_lines(response: str) -> dict[str, str]:
     return payload
 
 
-def load_dogfood_adapter(name: str, *, timeout_seconds: float | None = None) -> BaseAdapter:
+def load_dogfood_adapter(
+    name: str,
+    *,
+    timeout_seconds: float | None = None,
+    skip_permissions: bool = True,
+) -> BaseAdapter:
     normalized = name.strip().lower()
     if normalized == "local":
         return DogfoodLocalAdapter()
     if normalized == "claude-cli":
-        kwargs = {"timeout_seconds": timeout_seconds} if timeout_seconds is not None else {}
-        return ClaudeCLIDogfoodAdapter(**kwargs)
+        kwargs: dict[str, object] = {"skip_permissions": skip_permissions}
+        if timeout_seconds is not None:
+            kwargs["timeout_seconds"] = timeout_seconds
+        return ClaudeCLIDogfoodAdapter(**kwargs)  # type: ignore[arg-type]
     if normalized == "codex-cli":
-        kwargs = {"timeout_seconds": timeout_seconds} if timeout_seconds is not None else {}
-        return CodexCLIDogfoodAdapter(**kwargs)
+        kwargs = {"skip_permissions": skip_permissions}
+        if timeout_seconds is not None:
+            kwargs["timeout_seconds"] = timeout_seconds
+        return CodexCLIDogfoodAdapter(**kwargs)  # type: ignore[arg-type]
     if normalized == "opencode-cli":
-        kwargs = {"timeout_seconds": timeout_seconds} if timeout_seconds is not None else {}
-        return OpenCodeCLIDogfoodAdapter(**kwargs)
+        kwargs = {"skip_permissions": skip_permissions}
+        if timeout_seconds is not None:
+            kwargs["timeout_seconds"] = timeout_seconds
+        return OpenCodeCLIDogfoodAdapter(**kwargs)  # type: ignore[arg-type]
     if normalized == "anthropic":
         from ncp.adapters.anthropic import AnthropicAdapter
 
