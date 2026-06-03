@@ -108,8 +108,9 @@ class ClaudeCLIDogfoodAdapter(BaseAdapter):
     def ctx_window(self) -> int:
         return 200000
 
-    # Tools needed for unattended dogfood runs; callers may pass a narrower set.
-    DEFAULT_ALLOWED_TOOLS: list[str] = ["Bash", "Read", "Write", "Edit"]
+    # Tools needed for unattended dogfood runs; callers may pass a narrower set or append
+    # MCP tool names (e.g. "mcp__ncp__ncp_fetch") when --mcp-config is also passed.
+    DEFAULT_ALLOWED_TOOLS: list[str] = ["Bash", "Read", "Write", "Edit", "Glob", "Grep"]
 
     def __init__(
         self,

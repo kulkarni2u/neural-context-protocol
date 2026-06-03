@@ -60,7 +60,7 @@ def main() -> int:
         "stream-json",
         "--verbose",
         "--allowedTools",
-        "Read",
+        "Read,Glob,Grep",
         "--add-dir",
         str(args.cwd),
         "--model",
