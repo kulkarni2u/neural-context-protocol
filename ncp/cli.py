@@ -447,7 +447,7 @@ def init_command(  # noqa: C901
                     show_choices=False,
                 ).lower()
             else:
-                infra_mode = "managed"
+                infra_mode = "byo"
         resolved_infra_mode = infra_mode
 
         if infra_mode == "managed":
@@ -507,7 +507,7 @@ def init_command(  # noqa: C901
 
             # ── Step 6: start containers? ─────────────────────────────────────
             start_containers = (
-                click.confirm("Start containers now?", default=True) if is_tty else True
+                click.confirm("Start containers now?", default=True) if is_tty else False
             )
 
         else:  # byo
