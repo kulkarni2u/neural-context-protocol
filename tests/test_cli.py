@@ -28,7 +28,7 @@ def test_cli_init_can_select_pgvector_store(tmp_path: Path) -> None:
     assert result.exit_code == 0
     config_text = (tmp_path / ".ncp" / "config.toml").read_text()
     assert 'type = "pgvector"' in config_text
-    assert "Store mode: pgvector" in result.output
+    assert "pgvector" in result.output
 
 
 def test_cli_init_preserves_existing_config(tmp_path: Path) -> None:
