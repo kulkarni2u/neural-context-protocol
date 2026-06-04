@@ -9,6 +9,9 @@ import sys
 from urllib.parse import urlsplit, urlunsplit
 
 import json
+import shutil
+import subprocess
+import time
 
 import click
 from rich import box
@@ -37,9 +40,25 @@ def _load_config_template() -> str:
     return resources.files("ncp").joinpath("templates/config.toml.example").read_text()
 
 
-def _render_config_template(*, store_type: str) -> str:
+def _render_config_template(
+    *,
+    store_type: str,
+    pg_dsn: str = "postgresql://postgres:postgres@127.0.0.1:5432/ncp",
+    redis_url: str = "redis://127.0.0.1:6379/0",
+) -> str:
     template = _load_config_template()
-    return template.replace('type = "sqlite"', f'type = "{store_type}"', 1)
+    template = template.replace('type = "sqlite"', f'type = "{store_type}"', 1)
+    template = template.replace(
+        'dsn = "postgresql://postgres:postgres@127.0.0.1:5432/ncp"',
+        f'dsn = "{pg_dsn}"',
+        1,
+    )
+    template = template.replace(
+        'url = "redis://127.0.0.1:6379/0"',
+        f'url = "{redis_url}"',
+        1,
+    )
+    return template
 
 
 def _resolve_init_store_choice(*, store: str | None) -> str:
@@ -233,6 +252,119 @@ def _build_explain_payload(
     }
 
 
+# ── infra helpers ─────────────────────────────────────────────────────────────
+
+def _detect_engine() -> str | None:
+    """Return the first available container engine ('docker' or 'podman'), or None."""
+    for engine in ("podman", "docker"):
+        if shutil.which(engine):
+            try:
+                subprocess.run(
+                    [engine, "info"],
+                    capture_output=True,
+                    timeout=5,
+                    check=True,
+                )
+                return engine
+            except Exception:
+                continue
+    return None
+
+
+def _compose_yaml_content(
+    *,
+    pg_port: int,
+    redis_port: int,
+    pg_user: str,
+    pg_password: str,
+    pg_db: str,
+) -> str:
+    return (
+        "services:\n"
+        "  postgres:\n"
+        "    image: pgvector/pgvector:pg16\n"
+        "    container_name: ncp-postgres\n"
+        "    environment:\n"
+        f"      POSTGRES_DB: {pg_db}\n"
+        f"      POSTGRES_USER: {pg_user}\n"
+        f"      POSTGRES_PASSWORD: {pg_password}\n"
+        "    ports:\n"
+        f'      - "{pg_port}:5432"\n'
+        "    volumes:\n"
+        "      - ncp-postgres-data:/var/lib/postgresql/data\n"
+        "    healthcheck:\n"
+        f'      test: ["CMD-SHELL", "pg_isready -U {pg_user} -d {pg_db}"]\n'
+        "      interval: 5s\n"
+        "      timeout: 5s\n"
+        "      retries: 20\n"
+        "\n"
+        "  redis:\n"
+        "    image: redis:7-alpine\n"
+        "    container_name: ncp-redis\n"
+        "    ports:\n"
+        f'      - "{redis_port}:6379"\n'
+        "    volumes:\n"
+        "      - ncp-redis-data:/data\n"
+        '    command: ["redis-server", "--appendonly", "yes"]\n'
+        "    healthcheck:\n"
+        '      test: ["CMD", "redis-cli", "ping"]\n'
+        "      interval: 5s\n"
+        "      timeout: 5s\n"
+        "      retries: 20\n"
+        "\n"
+        "volumes:\n"
+        "  ncp-postgres-data:\n"
+        "  ncp-redis-data:\n"
+    )
+
+
+def _run_compose(cwd: Path, engine: str, compose_path: Path, args: list[str]) -> int:
+    result = subprocess.run(
+        [engine, "compose", "-f", str(compose_path)] + args,
+        cwd=str(cwd),
+    )
+    return result.returncode
+
+
+def _wait_for_pg(dsn: str, timeout: int = 60) -> bool:
+    """Poll until Postgres accepts connections or timeout (seconds) elapses."""
+    try:
+        import psycopg2  # type: ignore[import]
+    except ImportError:
+        return True  # can't verify, proceed optimistically
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            conn = psycopg2.connect(dsn, connect_timeout=3)
+            conn.close()
+            return True
+        except Exception:
+            time.sleep(2)
+    return False
+
+
+def _apply_migrations_now(cwd: Path) -> tuple[bool, list | str]:
+    """Run pending migrations. Returns (success, applied_list_or_error_string)."""
+    try:
+        import psycopg2  # type: ignore[import]
+        from ncp.config import load_config
+        from ncp.stores.migrations import MigrationRunner
+
+        config = load_config(cwd=cwd)
+        conn = psycopg2.connect(config.pgvector_dsn)
+        runner = MigrationRunner(
+            conn,
+            schema=config.pgvector_schema,
+            prefix=config.pgvector_table_prefix,
+        )
+        runner.bootstrap()
+        applied = runner.apply_all()
+        conn.close()
+        return True, applied
+    except Exception as exc:
+        return False, str(exc)
+
+
 @click.group()
 def main() -> None:
     """Neural Context Protocol CLI."""
@@ -245,32 +377,232 @@ def main() -> None:
     "store_type",
     type=click.Choice(["sqlite", "pgvector"], case_sensitive=False),
     default=None,
-    help="Store mode to initialize. Interactive terminals prompt if omitted; non-interactive runs default to sqlite.",
+    help="Store backend. Prompted interactively if omitted on a TTY.",
 )
-def init_command(cwd: Path, store_type: str | None) -> None:
-    """Initialize `.ncp/config.toml` and a minimal `CLAUDE.md`."""
+@click.option(
+    "--infra",
+    "infra_mode",
+    type=click.Choice(["managed", "byo"], case_sensitive=False),
+    default=None,
+    help="[pgvector] 'managed' = Docker/Podman containers; 'byo' = bring your own. Prompted if omitted.",
+)
+@click.option("--engine", "container_engine", type=click.Choice(["auto", "docker", "podman"]), default="auto", show_default=True, help="[managed] Container engine.")
+@click.option("--pg-port", default=None, type=int, help="[managed] Host port for Postgres. Default: 5432.")
+@click.option("--redis-port", default=None, type=int, help="[managed] Host port for Redis. Default: 6379.")
+@click.option("--pg-user", default=None, help="[managed] Postgres user. Default: postgres.")
+@click.option("--pg-password", default=None, help="[managed] Postgres password. Default: postgres.")
+@click.option("--pg-db", default=None, help="[managed] Postgres database name. Default: ncp.")
+@click.option("--pg-dsn", default=None, help="[byo] Full Postgres DSN.")
+@click.option("--redis-url", default=None, help="[byo] Redis URL.")
+def init_command(  # noqa: C901
+    cwd: Path,
+    store_type: str | None,
+    infra_mode: str | None,
+    container_engine: str,
+    pg_port: int | None,
+    redis_port: int | None,
+    pg_user: str | None,
+    pg_password: str | None,
+    pg_db: str | None,
+    pg_dsn: str | None,
+    redis_url: str | None,
+) -> None:
+    """Interactive setup wizard: store backend, infra mode, ports, credentials, and migrations."""
+
+    is_tty = sys.stdin.isatty()
+
+    # ── Step 1: store backend ─────────────────────────────────────────────────
+    if store_type is None:
+        if is_tty:
+            store_type = click.prompt(
+                "Store backend",
+                type=click.Choice(["sqlite", "pgvector"], case_sensitive=False),
+                default="sqlite",
+                show_choices=True,
+            ).lower()
+        else:
+            store_type = "sqlite"
 
     config_dir = cwd / ".ncp"
     config_dir.mkdir(parents=True, exist_ok=True)
     config_path = config_dir / "config.toml"
-    selected_store = _resolve_init_store_choice(store=store_type)
+
+    resolved_pg_dsn = "postgresql://postgres:postgres@127.0.0.1:5432/ncp"
+    resolved_redis_url = "redis://127.0.0.1:6379/0"
+    start_containers = False
+    resolved_engine: str | None = None
+    resolved_infra_mode = "none"
+
+    if store_type == "pgvector":
+        # ── Step 2: infra mode ────────────────────────────────────────────────
+        if infra_mode is None:
+            if is_tty:
+                infra_mode = click.prompt(
+                    "How will you run Postgres + Redis?\n"
+                    "  managed = Docker/Podman containers (NCP manages them)\n"
+                    "  byo     = Bring your own (existing server or cloud)\n"
+                    "Choice",
+                    type=click.Choice(["managed", "byo"], case_sensitive=False),
+                    default="managed",
+                    show_choices=False,
+                ).lower()
+            else:
+                infra_mode = "managed"
+        resolved_infra_mode = infra_mode
+
+        if infra_mode == "managed":
+            # ── Step 3: container engine ──────────────────────────────────────
+            if container_engine == "auto":
+                detected = _detect_engine()
+                if detected:
+                    resolved_engine = detected
+                    console.print(f"Auto-detected container engine: [bold]{detected}[/bold]")
+                elif is_tty:
+                    resolved_engine = click.prompt(
+                        "Container engine not auto-detected. Choose one",
+                        type=click.Choice(["docker", "podman"], case_sensitive=False),
+                    ).lower()
+                else:
+                    console.print(
+                        "[red]No container engine found. Install Docker or Podman, "
+                        "or pass --engine docker|podman.[/red]"
+                    )
+                    raise SystemExit(1)
+            else:
+                resolved_engine = container_engine
+
+            # ── Step 4: ports ─────────────────────────────────────────────────
+            if pg_port is None:
+                pg_port = int(click.prompt("Postgres host port", default=5432)) if is_tty else 5432
+            if redis_port is None:
+                redis_port = int(click.prompt("Redis host port", default=6379)) if is_tty else 6379
+
+            # ── Step 5: credentials ───────────────────────────────────────────
+            if pg_user is None:
+                pg_user = click.prompt("Postgres user", default="postgres") if is_tty else "postgres"
+            if pg_password is None:
+                pg_password = (
+                    click.prompt("Postgres password", default="postgres", hide_input=True)
+                    if is_tty
+                    else "postgres"
+                )
+            if pg_db is None:
+                pg_db = click.prompt("Postgres database", default="ncp") if is_tty else "ncp"
+
+            resolved_pg_dsn = f"postgresql://{pg_user}:{pg_password}@127.0.0.1:{pg_port}/{pg_db}"
+            resolved_redis_url = f"redis://127.0.0.1:{redis_port}/0"
+
+            # Write .ncp/compose.yaml
+            compose_path = config_dir / "compose.yaml"
+            compose_path.write_text(
+                _compose_yaml_content(
+                    pg_port=pg_port,
+                    redis_port=redis_port,
+                    pg_user=pg_user,
+                    pg_password=pg_password,
+                    pg_db=pg_db,
+                )
+            )
+            console.print(f"Wrote [bold].ncp/compose.yaml[/bold]")
+
+            # ── Step 6: start containers? ─────────────────────────────────────
+            start_containers = (
+                click.confirm("Start containers now?", default=True) if is_tty else True
+            )
+
+        else:  # byo
+            # ── Step 3 (byo): connection strings ─────────────────────────────
+            if pg_dsn is None:
+                pg_dsn = (
+                    click.prompt(
+                        "Postgres DSN",
+                        default="postgresql://postgres:postgres@127.0.0.1:5432/ncp",
+                    )
+                    if is_tty
+                    else "postgresql://postgres:postgres@127.0.0.1:5432/ncp"
+                )
+            if redis_url is None:
+                redis_url = (
+                    click.prompt("Redis URL", default="redis://127.0.0.1:6379/0")
+                    if is_tty
+                    else "redis://127.0.0.1:6379/0"
+                )
+            resolved_pg_dsn = pg_dsn
+            resolved_redis_url = redis_url
+
+    # ── Write config.toml ─────────────────────────────────────────────────────
     config_created = False
     if not config_path.exists():
-        config_path.write_text(_render_config_template(store_type=selected_store))
+        config_path.write_text(
+            _render_config_template(
+                store_type=store_type,
+                pg_dsn=resolved_pg_dsn,
+                redis_url=resolved_redis_url,
+            )
+        )
         config_created = True
+        console.print(f"Wrote [bold].ncp/config.toml[/bold] (store: {store_type})")
+    else:
+        console.print(f"Existing config preserved at {config_path}")
+
+    # ── Write CLAUDE.md ───────────────────────────────────────────────────────
     claude_path = cwd / "CLAUDE.md"
     if not claude_path.exists():
         claude_path.write_text(CLAUDE_MD_TEMPLATE)
-    console.print(f"Initialized NCP in {cwd}")
-    if config_created:
-        console.print(f"Store mode: [bold]{selected_store}[/bold]")
+
+    # ── Start containers + run migrations (managed pgvector) ──────────────────
+    if store_type == "pgvector" and resolved_infra_mode == "managed" and start_containers:
+        assert resolved_engine is not None
+        compose_path = config_dir / "compose.yaml"
+        console.print(f"Starting containers with [bold]{resolved_engine} compose[/bold]…")
+        rc = _run_compose(cwd, resolved_engine, compose_path, ["up", "-d"])
+        if rc != 0:
+            console.print(
+                "[red]Container startup failed. "
+                f"Check logs with `{resolved_engine} compose -f .ncp/compose.yaml logs`.[/red]"
+            )
+            raise SystemExit(1)
+        console.print("[green]Containers started.[/green] Waiting for Postgres to be ready…")
+        if not _wait_for_pg(resolved_pg_dsn):
+            console.print(
+                "[yellow]Postgres did not become ready within 60 s. "
+                "Run `ncp migrate apply` manually once it's up.[/yellow]"
+            )
+        else:
+            _run_migrations_and_report(cwd)
+
+    # ── Run migrations (byo pgvector) ─────────────────────────────────────────
+    if store_type == "pgvector" and resolved_infra_mode == "byo":
+        run_mig = click.confirm("Run schema migrations now?", default=True) if is_tty else True
+        if run_mig:
+            _run_migrations_and_report(cwd)
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    console.print(f"\n[green bold]NCP initialized in {cwd}[/green bold]")
+    if store_type == "sqlite":
+        console.print("Next: [bold]ncp status[/bold] then [bold]ncp serve[/bold]")
     else:
-        console.print(f"Existing config preserved at {config_path}")
-    effective_store = selected_store if config_created else "existing"
-    if effective_store == "sqlite":
-        console.print("Next: run `ncp status --cwd .` and `ncp serve --cwd .` for the local-first path.")
-    elif effective_store == "pgvector":
-        console.print("Next: run `./scripts/infra_up.sh`, then `ncp migrate apply --cwd .` and `ncp serve --cwd .`.")
+        console.print("Next: [bold]ncp status[/bold] then [bold]ncp serve[/bold]")
+        if resolved_infra_mode == "managed" and not start_containers:
+            console.print(
+                f"To start infra later: [bold]ncp infra up[/bold]  "
+                f"(or `{resolved_engine} compose -f .ncp/compose.yaml up -d`)"
+            )
+
+
+def _run_migrations_and_report(cwd: Path) -> None:
+    console.print("Running schema migrations…")
+    ok, result = _apply_migrations_now(cwd)
+    if ok:
+        applied = result  # type: ignore[assignment]
+        if applied:
+            for m in applied:
+                console.print(f"  [green]Applied v{m['version']} {m['name']}[/green]")
+        else:
+            console.print("  [dim]Schema already up to date.[/dim]")
+    else:
+        console.print(f"  [red]Migration failed: {result}[/red]")
+        console.print("  Run [bold]ncp migrate apply[/bold] once the database is ready.")
 
 
 @main.command("status")
@@ -1115,6 +1447,108 @@ def migrate_rollback(version: int, cwd: Path, dry_run: bool, migrations_dir: Pat
         console.print(result["sql"])
     else:
         console.print(f"[green]Rolled back v{result['version']} {result['name']}[/green]")
+
+
+@main.group("infra")
+def infra_group() -> None:
+    """Manage local Postgres + Redis containers (Docker or Podman)."""
+
+
+@infra_group.command("up")
+@click.option("--cwd", type=click.Path(path_type=Path), default=Path.cwd)
+@click.option(
+    "--engine",
+    type=click.Choice(["auto", "docker", "podman"], case_sensitive=False),
+    default="auto",
+    show_default=True,
+    help="Container engine to use.",
+)
+@click.option("--migrate/--no-migrate", default=True, show_default=True, help="Apply pending migrations after startup.")
+def infra_up_command(cwd: Path, engine: str, migrate: bool) -> None:
+    """Start Postgres and Redis containers defined in .ncp/compose.yaml."""
+    compose_path = cwd / ".ncp" / "compose.yaml"
+    if not compose_path.exists():
+        console.print(
+            "[red].ncp/compose.yaml not found.[/red] "
+            "Run [bold]ncp init --store pgvector --infra managed[/bold] first."
+        )
+        raise SystemExit(1)
+
+    resolved_engine: str | None = None
+    if engine == "auto":
+        resolved_engine = _detect_engine()
+        if not resolved_engine:
+            console.print(
+                "[red]No container engine found.[/red] "
+                "Install Docker or Podman, or pass --engine docker|podman."
+            )
+            raise SystemExit(1)
+        console.print(f"Using engine: [bold]{resolved_engine}[/bold]")
+    else:
+        resolved_engine = engine
+
+    rc = _run_compose(cwd, resolved_engine, compose_path, ["up", "-d"])
+    if rc != 0:
+        console.print(
+            f"[red]Startup failed.[/red] "
+            f"Check logs: [bold]{resolved_engine} compose -f .ncp/compose.yaml logs[/bold]"
+        )
+        raise SystemExit(1)
+    console.print("[green]Containers started.[/green]")
+
+    if migrate:
+        from ncp.config import load_config
+        try:
+            config = load_config(cwd=cwd)
+        except Exception:
+            console.print("[yellow]Could not read config; skipping migrations.[/yellow]")
+            return
+        if config.store_type != "pgvector":
+            return
+        console.print("Waiting for Postgres to be ready…")
+        if not _wait_for_pg(config.pgvector_dsn):
+            console.print(
+                "[yellow]Postgres did not become ready within 60 s. "
+                "Run [bold]ncp migrate apply[/bold] manually.[/yellow]"
+            )
+        else:
+            _run_migrations_and_report(cwd)
+
+
+@infra_group.command("down")
+@click.option("--cwd", type=click.Path(path_type=Path), default=Path.cwd)
+@click.option(
+    "--engine",
+    type=click.Choice(["auto", "docker", "podman"], case_sensitive=False),
+    default="auto",
+    show_default=True,
+)
+@click.option("--volumes", is_flag=True, default=False, help="Also remove named volumes (destroys all data).")
+def infra_down_command(cwd: Path, engine: str, volumes: bool) -> None:
+    """Stop Postgres and Redis containers."""
+    compose_path = cwd / ".ncp" / "compose.yaml"
+    if not compose_path.exists():
+        console.print("[red].ncp/compose.yaml not found.[/red]")
+        raise SystemExit(1)
+
+    resolved_engine: str | None = None
+    if engine == "auto":
+        resolved_engine = _detect_engine()
+        if not resolved_engine:
+            console.print("[red]No container engine found.[/red]")
+            raise SystemExit(1)
+    else:
+        resolved_engine = engine
+
+    args = ["down"]
+    if volumes:
+        args.append("--volumes")
+        console.print("[yellow]Warning: removing volumes will destroy all Postgres and Redis data.[/yellow]")
+
+    rc = _run_compose(cwd, resolved_engine, compose_path, args)
+    if rc != 0:
+        raise SystemExit(1)
+    console.print("[green]Containers stopped.[/green]")
 
 
 if __name__ == "__main__":
