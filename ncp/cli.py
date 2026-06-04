@@ -503,7 +503,7 @@ def init_command(  # noqa: C901
                     pg_db=pg_db,
                 )
             )
-            console.print(f"Wrote [bold].ncp/compose.yaml[/bold]")
+            console.print("Wrote [bold].ncp/compose.yaml[/bold]")
 
             # ── Step 6: start containers? ─────────────────────────────────────
             start_containers = (
@@ -531,7 +531,6 @@ def init_command(  # noqa: C901
             resolved_redis_url = redis_url
 
     # ── Write config.toml ─────────────────────────────────────────────────────
-    config_created = False
     if not config_path.exists():
         config_path.write_text(
             _render_config_template(
@@ -540,7 +539,6 @@ def init_command(  # noqa: C901
                 redis_url=resolved_redis_url,
             )
         )
-        config_created = True
         console.print(f"Wrote [bold].ncp/config.toml[/bold] (store: {store_type})")
     else:
         console.print(f"Existing config preserved at {config_path}")
