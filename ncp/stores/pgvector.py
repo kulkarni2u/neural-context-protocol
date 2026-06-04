@@ -218,14 +218,18 @@ class PgvectorStore(BaseStore):
         self.max_working_chunks = max_working_chunks
         self.gc_threshold = gc_threshold
         self._ivfflat_probes = ivfflat_probes
-        self.retrieval_policy = retrieval_policy or DEFAULT_RETRIEVAL_POLICY
 
         from ncp.stores.rerank import Reranker
         from ncp.config import load_config
         try:
             cfg = config or load_config()
             self.reranker = Reranker(cfg)
+            self.retrieval_policy = retrieval_policy or RetrievalPolicy(
+                generation_penalty_base=cfg.retrieval_generation_penalty_base
+            )
         except Exception:
+            self.retrieval_policy = retrieval_policy or DEFAULT_RETRIEVAL_POLICY
+
             class DummyConfig:
                 rerank_enabled = False
                 rerank_provider = "local"

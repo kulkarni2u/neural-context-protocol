@@ -146,14 +146,18 @@ class SQLiteStore(BaseStore):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.max_working_chunks = max_working_chunks
         self.gc_threshold = gc_threshold
-        self.retrieval_policy = retrieval_policy or DEFAULT_RETRIEVAL_POLICY
 
         from ncp.stores.rerank import Reranker
         from ncp.config import load_config
         try:
             cfg = config or load_config()
             self.reranker = Reranker(cfg)
+            self.retrieval_policy = retrieval_policy or RetrievalPolicy(
+                generation_penalty_base=cfg.retrieval_generation_penalty_base
+            )
         except Exception:
+            self.retrieval_policy = retrieval_policy or DEFAULT_RETRIEVAL_POLICY
+
             class DummyConfig:
                 rerank_enabled = False
                 rerank_provider = "local"
@@ -840,14 +844,21 @@ class SQLiteStore(BaseStore):
             )
 
     def status(self) -> dict[str, int | float]:
+        now = time.time()
         with self._connect() as connection:
             chunks = connection.execute("SELECT COUNT(*) AS count FROM chunks").fetchone()["count"]
             whispers = connection.execute("SELECT COUNT(*) AS count FROM whispers").fetchone()["count"]
             turns = connection.execute("SELECT COUNT(*) AS count FROM turn_records").fetchone()["count"]
             costs = connection.execute("SELECT COALESCE(SUM(cost_usd), 0.0) AS total FROM cost_log").fetchone()["total"]
+            below_conf = connection.execute(
+                "SELECT COUNT(*) AS count FROM whispers"
+                " WHERE expires_at > ? AND whisper_type NOT IN ('alert', 'world_check') AND confidence < 0.60",
+                (now,),
+            ).fetchone()["count"]
         return {
             "chunk_count": int(chunks),
             "whisper_count": int(whispers),
+            "whispers_below_min_confidence": int(below_conf),
             "turn_record_count": int(turns),
             "cost_usd_total": float(costs),
         }
@@ -872,6 +883,15 @@ class SQLiteStore(BaseStore):
                         if pipeline_id is not None
                         else "SELECT COUNT(*) AS count FROM whispers",
                         [] if pipeline_id is None else [pipeline_id],
+                    ).fetchone()["count"]
+                ),
+                "whispers_below_min_confidence": int(
+                    connection.execute(
+                        "SELECT COUNT(*) AS count FROM whispers"
+                        " WHERE expires_at > ? AND whisper_type NOT IN ('alert', 'world_check')"
+                        " AND confidence < 0.60"
+                        + (" AND pipeline_id = ?" if pipeline_id is not None else ""),
+                        (time.time(), pipeline_id) if pipeline_id is not None else (time.time(),),
                     ).fetchone()["count"]
                 ),
                 "turn_record_count": int(

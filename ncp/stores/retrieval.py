@@ -31,6 +31,7 @@ class RetrievalPolicy:
     w_recency: float = 0.3
     w_trust: float = 0.2
     recency_half_life_seconds: float = 14400.0  # 4-hour default
+    generation_penalty_base: float = 0.9  # per-generation score multiplier
 
     def __post_init__(self) -> None:
         total = self.w_lexical + self.w_recency + self.w_trust
@@ -47,6 +48,8 @@ class RetrievalPolicy:
                 raise ValueError(f"{name} must be in [0.0, 1.0], got {val}")
         if self.recency_half_life_seconds <= 0:
             raise ValueError("recency_half_life_seconds must be > 0")
+        if not 0.0 < self.generation_penalty_base <= 1.0:
+            raise ValueError("generation_penalty_base must be in (0.0, 1.0]")
 
     def score(
         self,
@@ -65,7 +68,7 @@ class RetrievalPolicy:
         discounted by (1 - written_at_drift).
         """
         recency = math.exp(-0.693 * max(0.0, age_seconds) / self.recency_half_life_seconds)
-        gen_penalty = 0.9 ** max(0, generation)
+        gen_penalty = self.generation_penalty_base ** max(0, generation)
         drift = max(0.0, min(1.0, written_at_drift))
         drift_penalty = 1.0 - drift if drift > 0.3 else 1.0
         fused = (
@@ -130,7 +133,7 @@ class RetrievalPolicy:
         discounted by (1 - written_at_drift).
         """
         recency = math.exp(-0.693 * max(0.0, age_seconds) / self.recency_half_life_seconds)
-        gen_penalty = 0.9 ** max(0, generation)
+        gen_penalty = self.generation_penalty_base ** max(0, generation)
         drift = max(0.0, min(1.0, written_at_drift))
         drift_penalty = 1.0 - drift if drift > 0.3 else 1.0
         w_sum = self.w_recency + self.w_trust
