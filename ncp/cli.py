@@ -571,7 +571,7 @@ def init_command(  # noqa: C901
 
     # ── Run migrations (byo pgvector) ─────────────────────────────────────────
     if store_type == "pgvector" and resolved_infra_mode == "byo":
-        run_mig = click.confirm("Run schema migrations now?", default=True) if is_tty else True
+        run_mig = click.confirm("Run schema migrations now?", default=True) if is_tty else False
         if run_mig:
             _run_migrations_and_report(cwd)
 
