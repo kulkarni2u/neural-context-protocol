@@ -47,6 +47,7 @@ class BaseStore(ABC):
         retrieval_mode: str = "hybrid",
         embedding: list[float] | None = None,
         diversity_limit: int = 2,
+        fallback_to_trust_recency: bool = False,
     ) -> list[SubconsciousChunk]:
         """Query stored chunks by text relevance.
 
@@ -104,6 +105,10 @@ class BaseStore(ABC):
     @abstractmethod
     def acknowledge_whispers(self, whisper_ids: Sequence[str]) -> int:
         """Delete already-processed whispers by id. Returns count deleted."""
+
+    @abstractmethod
+    def whisper_pending(self, whisper_id: str) -> bool:
+        """Return True if the whisper is still queued and not yet expired."""
 
     # ------------------------------------------------------------------
     # Turn / cost / conscious logging

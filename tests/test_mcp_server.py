@@ -598,6 +598,9 @@ class TestErrors:
             def acknowledge_whispers(self, whisper_ids):
                 raise NotImplementedError("pending backend path")
 
+            def whisper_pending(self, whisper_id):
+                raise NotImplementedError("pending backend path")
+
             def get_working_zone(self, *, pipeline_id=None, layer=None):
                 raise NotImplementedError("pending backend path")
 

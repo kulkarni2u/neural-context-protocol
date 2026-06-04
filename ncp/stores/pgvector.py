@@ -218,14 +218,18 @@ class PgvectorStore(BaseStore):
         self.max_working_chunks = max_working_chunks
         self.gc_threshold = gc_threshold
         self._ivfflat_probes = ivfflat_probes
-        self.retrieval_policy = retrieval_policy or DEFAULT_RETRIEVAL_POLICY
 
         from ncp.stores.rerank import Reranker
         from ncp.config import load_config
         try:
             cfg = config or load_config()
             self.reranker = Reranker(cfg)
+            self.retrieval_policy = retrieval_policy or RetrievalPolicy(
+                generation_penalty_base=cfg.retrieval_generation_penalty_base
+            )
         except Exception:
+            self.retrieval_policy = retrieval_policy or DEFAULT_RETRIEVAL_POLICY
+
             class DummyConfig:
                 rerank_enabled = False
                 rerank_provider = "local"
@@ -413,6 +417,7 @@ class PgvectorStore(BaseStore):
         retrieval_mode: str = "hybrid",
         embedding: list[float] | None = None,
         diversity_limit: int = 2,
+        fallback_to_trust_recency: bool = False,
     ) -> list[SubconsciousChunk]:
         _VALID_RETRIEVAL_MODES = ("hybrid", "trust_recency", "vector")
         if retrieval_mode not in _VALID_RETRIEVAL_MODES:
@@ -680,6 +685,18 @@ class PgvectorStore(BaseStore):
                 "pgvector whisper coordination requires Redis. Set NCP_REDIS_URL and ensure Redis is reachable."
             )
         return self.coordination.acknowledge_whispers(list(whisper_ids))
+
+    def whisper_pending(self, whisper_id: str) -> bool:
+        """Return True if the whisper is still queued in the local Postgres whispers table."""
+        import time as _time
+        now = _time.time()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                f"SELECT 1 FROM {self.schema}.{self.table_prefix}whispers"  # noqa: S608
+                " WHERE whisper_id = %s AND expires_at > %s",
+                (whisper_id, now),
+            )
+            return cursor.fetchone() is not None
 
     def get_working_zone(
         self,

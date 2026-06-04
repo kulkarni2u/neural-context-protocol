@@ -66,6 +66,7 @@ dev = [
   "pytest-cov",
   "ruff",
   "mypy",
+  "tiktoken>=0.7",
 ]
 
 [project.scripts]

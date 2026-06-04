@@ -14,6 +14,7 @@ import time
 import anyio
 
 from ncp.coherence import CoherenceChecker
+from ncp.config import NCPConfig
 from ncp.encoder import PidginEncoder
 from ncp.middleware.base import MiddlewarePipeline
 from ncp.stores.base import BaseStore
@@ -53,11 +54,18 @@ class Assembler:
         store: BaseStore,
         encoder: PidginEncoder | None = None,
         middleware: MiddlewarePipeline | None = None,
+        config: NCPConfig | None = None,
     ) -> None:
         self.store = store
         self.encoder = encoder or PidginEncoder()
         self.coherence = CoherenceChecker(store=store)
         self.middleware = middleware or MiddlewarePipeline()
+        self._chunk_cap_default = config.chunk_cap_default if config else 4
+        self._chunk_cap_high = config.chunk_cap_high if config else 3
+        self._chunk_cap_critical = config.chunk_cap_critical if config else 2
+        self._whisper_cap_default = config.whisper_cap_default if config else 3
+        self._whisper_cap_high = config.whisper_cap_high if config else 2
+        self._whisper_cap_critical = config.whisper_cap_critical if config else 1
 
     # ------------------------------------------------------------------
     # Step 0-5: assemble
@@ -323,6 +331,7 @@ class Assembler:
             k=k,
             pipeline_id=conscious.pipeline_id,
             zone="working",
+            fallback_to_trust_recency=True,
             **extra,
         )
 
@@ -377,10 +386,12 @@ class Assembler:
         k: int | None,
     ) -> tuple[int, int]:
         if k is not None:
-            return max(1, k), 3
+            return max(1, k), self._whisper_cap_default
         if budget.pressure == "critical":
-            return 2, 1
-        return 4, 3
+            return self._chunk_cap_critical, self._whisper_cap_critical
+        if budget.pressure == "high":
+            return self._chunk_cap_high, self._whisper_cap_high
+        return self._chunk_cap_default, self._whisper_cap_default
 
     def _write_with_retry(self, chunk: SubconsciousChunk, *, retries: int = 2, backoff_ms: int = 50) -> None:
         for attempt in range(retries + 1):

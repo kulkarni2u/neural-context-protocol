@@ -69,7 +69,7 @@ def get_context(
 
     resolved_config = config or _CONFIG or configure(cwd=Path.cwd())
     resolved_store = store or create_store(resolved_config)
-    assembler = Assembler(store=resolved_store)
+    assembler = Assembler(store=resolved_store, config=resolved_config)
     return assembler.assemble(
         conscious=agent,
         budget=budget or BudgetContext(),
@@ -97,12 +97,13 @@ def emit(
     *,
     store: BaseStore | None = None,
     config: NCPConfig | None = None,
-) -> None:
-    """Persist one whisper through the public API."""
+) -> str:
+    """Persist one whisper and return its whisper_id for delivery tracking."""
 
     resolved_config = config or _CONFIG or configure(cwd=Path.cwd())
     resolved_store = store or create_store(resolved_config)
     resolved_store.emit_whisper(whisper)
+    return whisper.whisper_id
 
 
 def run(
@@ -123,7 +124,7 @@ def run(
     resolved_store = store or create_store(resolved_config)
     resolved_budget = budget or BudgetContext()
     resolved_adapter = adapter or LocalAdapter()
-    assembler = Assembler(store=resolved_store)
+    assembler = Assembler(store=resolved_store, config=resolved_config)
 
     start = time.perf_counter()
     assembly = assembler.assemble(
@@ -170,7 +171,7 @@ def stream(
     resolved_store = store or create_store(resolved_config)
     resolved_budget = budget or BudgetContext()
     resolved_adapter = adapter or LocalAdapter()
-    assembler = Assembler(store=resolved_store)
+    assembler = Assembler(store=resolved_store, config=resolved_config)
     assembly = assembler.assemble(
         conscious=agent,
         budget=resolved_budget,

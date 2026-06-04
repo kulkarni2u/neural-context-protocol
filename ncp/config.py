@@ -37,6 +37,12 @@ DEFAULT_CONFIG = {
         "max_tokens_per_call": 4000,
         "warn_at_ratio": 0.70,
         "critical_at_ratio": 0.85,
+        "chunk_cap_default": 4,
+        "chunk_cap_high": 3,
+        "chunk_cap_critical": 2,
+        "whisper_cap_default": 3,
+        "whisper_cap_high": 2,
+        "whisper_cap_critical": 1,
     },
     "chunking": {
         "max_chunk_tokens": 200,
@@ -56,6 +62,7 @@ DEFAULT_CONFIG = {
         "rerank_enabled": False,
         "rerank_provider": "local",
         "rerank_model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
+        "generation_penalty_base": 0.9,
     },
     "embedding": {
         "enabled": False,
@@ -158,6 +165,34 @@ class NCPConfig:
         return str(val) if val else None
 
     @property
+    def retrieval_generation_penalty_base(self) -> float:
+        return float(self.values.get("retrieval", {}).get("generation_penalty_base", 0.9))
+
+    @property
+    def chunk_cap_default(self) -> int:
+        return int(self.values.get("budget", {}).get("chunk_cap_default", 4))
+
+    @property
+    def chunk_cap_high(self) -> int:
+        return int(self.values.get("budget", {}).get("chunk_cap_high", 3))
+
+    @property
+    def chunk_cap_critical(self) -> int:
+        return int(self.values.get("budget", {}).get("chunk_cap_critical", 2))
+
+    @property
+    def whisper_cap_default(self) -> int:
+        return int(self.values.get("budget", {}).get("whisper_cap_default", 3))
+
+    @property
+    def whisper_cap_high(self) -> int:
+        return int(self.values.get("budget", {}).get("whisper_cap_high", 2))
+
+    @property
+    def whisper_cap_critical(self) -> int:
+        return int(self.values.get("budget", {}).get("whisper_cap_critical", 1))
+
+    @property
     def embedding_enabled(self) -> bool:
         return bool(self.values.get("embedding", {}).get("enabled", False))
 
@@ -244,6 +279,8 @@ def _apply_env_overrides(values: dict[str, Any], env: dict[str, str]) -> None:
         values["embedding"]["provider"] = env["NCP_EMBEDDING_PROVIDER"]
     if "NCP_EMBEDDING_MODEL" in env:
         values["embedding"]["model"] = env["NCP_EMBEDDING_MODEL"]
+    if "NCP_GENERATION_PENALTY_BASE" in env:
+        values["retrieval"]["generation_penalty_base"] = float(env["NCP_GENERATION_PENALTY_BASE"])
 
 
 def _deep_merge(target: dict[str, Any], updates: dict[str, Any]) -> None:
