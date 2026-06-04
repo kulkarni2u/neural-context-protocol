@@ -108,6 +108,10 @@ class ClaudeCLIDogfoodAdapter(BaseAdapter):
     def ctx_window(self) -> int:
         return 200000
 
+    # Tools needed for unattended dogfood runs; callers may pass a narrower set or append
+    # MCP tool names (e.g. "mcp__ncp__ncp_fetch") when --mcp-config is also passed.
+    DEFAULT_ALLOWED_TOOLS: list[str] = ["Bash", "Read", "Write", "Edit", "Glob", "Grep"]
+
     def __init__(
         self,
         *,
@@ -115,19 +119,16 @@ class ClaudeCLIDogfoodAdapter(BaseAdapter):
         command: list[str] | None = None,
         cwd: str | Path | None = None,
         timeout_seconds: float = 30.0,
+        allowed_tools: list[str] | None = None,
     ) -> None:
         self._cwd = Path(cwd) if cwd is not None else Path.cwd()
         self._timeout_seconds = timeout_seconds
-        self._command = command or [
-            "claude",
-            "-p",
-            "--model",
-            model,
-            "--dangerously-skip-permissions",
-            "--add-dir",
-            str(self._cwd),
-            "--",
-        ]
+        if command is not None:
+            self._command = command
+        else:
+            tools = allowed_tools if allowed_tools is not None else self.DEFAULT_ALLOWED_TOOLS
+            base = ["claude", "-p", "--model", model, "--allowedTools", ",".join(tools)]
+            self._command = base + ["--add-dir", str(self._cwd), "--"]
 
     def call(self, ncp_context: str, user_turn: str) -> str:
         # Skip the full assembled context: it adds latency and may already contain
@@ -212,6 +213,7 @@ class CodexCLIDogfoodAdapter(BaseAdapter):
     ) -> None:
         self._cwd = Path(cwd) if cwd is not None else Path.cwd()
         self._timeout_seconds = timeout_seconds
+        # Codex has no fine-grained allowedTools equivalent; the bypass flag is required for unattended use.
         self._command = command or [
             "codex",
             "exec",
@@ -256,6 +258,56 @@ def _is_codex_cli_adapter(adapter: BaseAdapter) -> bool:
     return isinstance(adapter, CodexCLIDogfoodAdapter)
 
 
+class CursorCLIDogfoodAdapter(BaseAdapter):
+    """Live adapter backed by the installed Cursor CLI.
+
+    Runs ``cursor agent -p --force`` for unattended non-interactive use.
+    ``--force`` is Cursor's equivalent of skipping file-modification approvals.
+
+    Cursor CLI auto-loads .cursor/mcp.json from the working directory, so
+    registering NCP as an MCP server there gives Cursor access to NCP tools
+    (ncp_fetch, ncp_write_memory, ncp_get_context) without extra flags.
+    """
+
+    @property
+    def ctx_window(self) -> int:
+        return 200000
+
+    def __init__(
+        self,
+        *,
+        model: str | None = None,
+        command: list[str] | None = None,
+        cwd: str | Path | None = None,
+        timeout_seconds: float = 60.0,
+    ) -> None:
+        self._cwd = Path(cwd) if cwd is not None else Path.cwd()
+        self._timeout_seconds = timeout_seconds
+        if command is not None:
+            self._command = command
+        else:
+            base = ["cursor", "agent", "-p", "--force", "--output-format", "text"]
+            if model:
+                base.extend(["--model", model])
+            self._command = base + ["--"]
+
+    def call(self, ncp_context: str, user_turn: str) -> str:
+        prompt = f"NCP_CONTEXT:\n{ncp_context}\n\n{user_turn}"
+        completed = subprocess.run(
+            self._command + [prompt],
+            cwd=self._cwd,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=self._timeout_seconds,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(
+                completed.stderr.strip() or completed.stdout.strip() or "Cursor CLI call failed"
+            )
+        return completed.stdout.strip()
+
+
 _PROVIDER_ENV_VARS: dict[str, str | tuple[str, ...]] = {
     "anthropic": "ANTHROPIC_API_KEY",
     "openai": "OPENAI_API_KEY",
@@ -266,6 +318,8 @@ _PROVIDER_ENV_VARS: dict[str, str | tuple[str, ...]] = {
     "claude-cli": "",
     "codex-cli": "",
     "opencode-cli": "",
+    "cursor-cli": "",
+    "cursor": "CURSOR_API_KEY",
 }
 
 
@@ -1207,19 +1261,39 @@ def _parse_lines(response: str) -> dict[str, str]:
     return payload
 
 
-def load_dogfood_adapter(name: str, *, timeout_seconds: float | None = None) -> BaseAdapter:
+def load_dogfood_adapter(
+    name: str,
+    *,
+    timeout_seconds: float | None = None,
+    allowed_tools: list[str] | None = None,
+) -> BaseAdapter:
     normalized = name.strip().lower()
     if normalized == "local":
         return DogfoodLocalAdapter()
     if normalized == "claude-cli":
-        kwargs = {"timeout_seconds": timeout_seconds} if timeout_seconds is not None else {}
-        return ClaudeCLIDogfoodAdapter(**kwargs)
+        kwargs: dict[str, object] = {"allowed_tools": allowed_tools}
+        if timeout_seconds is not None:
+            kwargs["timeout_seconds"] = timeout_seconds
+        return ClaudeCLIDogfoodAdapter(**kwargs)  # type: ignore[arg-type]
     if normalized == "codex-cli":
-        kwargs = {"timeout_seconds": timeout_seconds} if timeout_seconds is not None else {}
-        return CodexCLIDogfoodAdapter(**kwargs)
+        kwargs = {}
+        if timeout_seconds is not None:
+            kwargs["timeout_seconds"] = timeout_seconds
+        return CodexCLIDogfoodAdapter(**kwargs)  # type: ignore[arg-type]
     if normalized == "opencode-cli":
-        kwargs = {"timeout_seconds": timeout_seconds} if timeout_seconds is not None else {}
-        return OpenCodeCLIDogfoodAdapter(**kwargs)
+        kwargs = {}
+        if timeout_seconds is not None:
+            kwargs["timeout_seconds"] = timeout_seconds
+        return OpenCodeCLIDogfoodAdapter(**kwargs)  # type: ignore[arg-type]
+    if normalized == "cursor-cli":
+        kwargs = {}
+        if timeout_seconds is not None:
+            kwargs["timeout_seconds"] = timeout_seconds
+        return CursorCLIDogfoodAdapter(**kwargs)  # type: ignore[arg-type]
+    if normalized == "cursor":
+        from ncp.adapters.cursor import CursorAPIAdapter
+
+        return CursorAPIAdapter()
     if normalized == "anthropic":
         from ncp.adapters.anthropic import AnthropicAdapter
 
@@ -1284,6 +1358,15 @@ def get_live_provider_readiness(name: str) -> dict[str, object]:
             "ready": installed,
             "credential_envs": [],
         }
+    if normalized == "cursor-cli":
+        installed = shutil.which("cursor") is not None
+        return {
+            "adapter_name": normalized,
+            "credentials_present": installed,
+            "dependency_installed": installed,
+            "ready": installed,
+            "credential_envs": [],
+        }
 
     try:
         _load_adapter_module(normalized)
@@ -1321,6 +1404,9 @@ def _load_adapter_module(name: str) -> None:
         return
     if name == "cohere":
         import ncp.adapters.cohere  # noqa: F401
+        return
+    if name == "cursor":
+        import ncp.adapters.cursor  # noqa: F401
         return
     raise ValueError(f"Unknown adapter module: {name}")
 

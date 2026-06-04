@@ -208,6 +208,9 @@ def emit_follow_up_whisper(
     )
 
 
+_CLAUDE_PARTNER_DEFAULT_TOOLS: list[str] = ["Bash", "Read", "Write", "Edit", "Glob", "Grep"]
+
+
 def run_claude_partner(
     *,
     cwd: Path,
@@ -215,10 +218,12 @@ def run_claude_partner(
     handoffs: list[Whisper],
     instruction: str | None = None,
     command: list[str] | None = None,
+    allowed_tools: list[str] | None = None,
     timeout_seconds: float = 90.0,
 ) -> str:
     """Run the repo-bound Claude implementation-partner path."""
 
+    tools = allowed_tools if allowed_tools is not None else _CLAUDE_PARTNER_DEFAULT_TOOLS
     prompt = build_claude_partner_prompt(cwd=cwd, handoffs=handoffs, instruction=instruction)
     completed = _run_handoff_subprocess(
         runner_name="Claude",
@@ -228,7 +233,8 @@ def run_claude_partner(
             "-p",
             "--model",
             "sonnet",
-            "--dangerously-skip-permissions",
+            "--allowedTools",
+            ",".join(tools),
             "--add-dir",
             str(cwd),
             "--",
