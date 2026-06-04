@@ -1606,6 +1606,10 @@ class AsyncPgvectorStore(BaseStore):
         self._not_implemented("acknowledge_whispers")
         return 0
 
+    def whisper_pending(self, whisper_id: str) -> bool:  # type: ignore[override]
+        self._not_implemented("whisper_pending")
+        return False
+
     def get_working_zone(self, **kwargs: Any) -> Any:  # type: ignore[override]
         self._not_implemented("get_working_zone")
 

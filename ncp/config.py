@@ -37,6 +37,12 @@ DEFAULT_CONFIG = {
         "max_tokens_per_call": 4000,
         "warn_at_ratio": 0.70,
         "critical_at_ratio": 0.85,
+        "chunk_cap_default": 4,
+        "chunk_cap_high": 3,
+        "chunk_cap_critical": 2,
+        "whisper_cap_default": 3,
+        "whisper_cap_high": 2,
+        "whisper_cap_critical": 1,
     },
     "chunking": {
         "max_chunk_tokens": 200,
@@ -161,6 +167,30 @@ class NCPConfig:
     @property
     def retrieval_generation_penalty_base(self) -> float:
         return float(self.values.get("retrieval", {}).get("generation_penalty_base", 0.9))
+
+    @property
+    def chunk_cap_default(self) -> int:
+        return int(self.values.get("budget", {}).get("chunk_cap_default", 4))
+
+    @property
+    def chunk_cap_high(self) -> int:
+        return int(self.values.get("budget", {}).get("chunk_cap_high", 3))
+
+    @property
+    def chunk_cap_critical(self) -> int:
+        return int(self.values.get("budget", {}).get("chunk_cap_critical", 2))
+
+    @property
+    def whisper_cap_default(self) -> int:
+        return int(self.values.get("budget", {}).get("whisper_cap_default", 3))
+
+    @property
+    def whisper_cap_high(self) -> int:
+        return int(self.values.get("budget", {}).get("whisper_cap_high", 2))
+
+    @property
+    def whisper_cap_critical(self) -> int:
+        return int(self.values.get("budget", {}).get("whisper_cap_critical", 1))
 
     @property
     def embedding_enabled(self) -> bool:

@@ -273,6 +273,7 @@ class SQLiteStore(BaseStore):
         retrieval_mode: str = "hybrid",
         embedding: list[float] | None = None,
         diversity_limit: int = 2,
+        fallback_to_trust_recency: bool = False,
     ) -> list[SubconsciousChunk]:
         _VALID_RETRIEVAL_MODES = ("hybrid", "trust_recency", "vector")
         if retrieval_mode not in _VALID_RETRIEVAL_MODES:
@@ -339,6 +340,31 @@ class SQLiteStore(BaseStore):
 
         ranked = sorted(candidates, key=lambda c: c.relevance, reverse=True)
         result_limit = normalize_result_limit(k)
+
+        # Two-pass fallback: when explicitly requested and the primary hybrid pass
+        # returns nothing, fall back to trust/recency-only scoring so callers get
+        # the highest-trust context rather than a silent empty result.
+        # Off by default to preserve the hybrid filtering contract.
+        if fallback_to_trust_recency and retrieval_mode == "hybrid" and len(candidates) == 0:
+            already_included = {c.chunk_id for c in candidates}
+            fallback_candidates: list[SubconsciousChunk] = []
+            for row in rows:
+                if str(row["chunk_id"]) in already_included:
+                    continue
+                age_seconds = max(0.0, now - float(row["created_at"]))
+                score = policy.score_no_bm25(
+                    age_seconds=age_seconds,
+                    base_trust=float(row["base_trust"]),
+                    generation=int(row["generation"]),
+                    written_at_drift=float(row["written_at_drift"]) if row["written_at_drift"] is not None else 0.0,
+                )
+                if score < min_score:
+                    continue
+                chunk = self._row_to_chunk(row)
+                chunk.relevance = max(0.0, min(1.0, score * 0.5))
+                fallback_candidates.append(chunk)
+            fallback_candidates.sort(key=lambda c: c.relevance, reverse=True)
+            ranked = ranked + fallback_candidates
 
         if self.reranker is not None and self.reranker.enabled:
             candidates_to_rerank = ranked[:result_limit * 4]
@@ -498,6 +524,16 @@ class SQLiteStore(BaseStore):
                 [(whisper_id,) for whisper_id in whisper_ids],
             )
             return int(cursor.rowcount)
+
+    def whisper_pending(self, whisper_id: str) -> bool:
+        """Return True if the whisper is still queued and not yet expired."""
+        now = time.time()
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM whispers WHERE whisper_id = ? AND expires_at > ?",
+                (whisper_id, now),
+            ).fetchone()
+        return row is not None
 
     def log_turn_record(self, record: TurnRecord) -> None:
         with self._connect() as connection:

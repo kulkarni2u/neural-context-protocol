@@ -102,7 +102,7 @@ def chunk_prose(content: str, *, max_tokens: int = 200) -> list[str]:
 
 
 def chunk_json(content: str, *, max_tokens: int = 200) -> list[str]:
-    """Split JSON by top-level keys, recursing one level for large values."""
+    """Split JSON by top-level keys, recursing up to two levels for large values."""
 
     try:
         payload = json.loads(content)
@@ -112,12 +112,15 @@ def chunk_json(content: str, *, max_tokens: int = 200) -> list[str]:
     return _chunk_json_value(payload, max_tokens=max_tokens, depth=0)
 
 
+_JSON_MAX_DEPTH = 2
+
+
 def _chunk_json_value(value: Any, *, max_tokens: int, depth: int) -> list[str]:
     if isinstance(value, dict):
         chunks: list[str] = []
         for key, item in value.items():
             serialized = json.dumps({key: item}, ensure_ascii=True, separators=(",", ":"))
-            if _token_count(serialized) <= max_tokens or depth >= 1:
+            if _token_count(serialized) <= max_tokens or depth >= _JSON_MAX_DEPTH:
                 chunks.append(serialized)
                 continue
             if isinstance(item, dict):
@@ -127,29 +130,31 @@ def _chunk_json_value(value: Any, *, max_tokens: int, depth: int) -> list[str]:
                         ensure_ascii=True,
                         separators=(",", ":"),
                     )
-                    if _token_count(child_serialized) <= max_tokens:
+                    if _token_count(child_serialized) <= max_tokens or depth + 1 >= _JSON_MAX_DEPTH:
                         chunks.append(child_serialized)
                     else:
-                        chunks.extend(_chunk_words(child_serialized, max_tokens=max_tokens))
+                        chunks.extend(
+                            _chunk_json_value({child_key: child_value}, max_tokens=max_tokens, depth=depth + 1)
+                        )
                 continue
             if isinstance(item, list):
-                chunks.extend(_chunk_json_list(key, item, max_tokens=max_tokens))
+                chunks.extend(_chunk_json_list(key, item, max_tokens=max_tokens, depth=depth))
                 continue
             chunks.extend(_chunk_words(serialized, max_tokens=max_tokens))
         return chunks
 
     if isinstance(value, list):
-        return _chunk_json_list("items", value, max_tokens=max_tokens)
+        return _chunk_json_list("items", value, max_tokens=max_tokens, depth=depth)
 
     serialized = json.dumps(value, ensure_ascii=True, separators=(",", ":"))
     return _chunk_words(serialized, max_tokens=max_tokens) or [serialized]
 
 
-def _chunk_json_list(key: str, values: list[Any], *, max_tokens: int) -> list[str]:
+def _chunk_json_list(key: str, values: list[Any], *, max_tokens: int, depth: int = 0) -> list[str]:
     chunks: list[str] = []
     for index, item in enumerate(values):
         serialized = json.dumps({key: [{index: item}]}, ensure_ascii=True, separators=(",", ":"))
-        if _token_count(serialized) <= max_tokens:
+        if _token_count(serialized) <= max_tokens or depth >= _JSON_MAX_DEPTH:
             chunks.append(serialized)
         else:
             chunks.extend(_chunk_words(serialized, max_tokens=max_tokens))
@@ -187,8 +192,36 @@ def chunk_code(content: str, *, max_tokens: int = 200, fallback_lines: int = 30)
         if _token_count(segment) <= max_tokens:
             chunks.append(segment)
         else:
-            chunks.extend(_chunk_code_by_lines(segment.splitlines(), fallback_lines=fallback_lines))
+            chunks.extend(_split_oversized_code_segment(segment, max_tokens=max_tokens, fallback_lines=fallback_lines))
     return chunks
+
+
+def _split_oversized_code_segment(segment: str, *, max_tokens: int, fallback_lines: int) -> list[str]:
+    """Split an oversized code segment at method boundaries before falling back to line windows.
+
+    When a class body is too large to fit in one chunk, this tries splitting at
+    indented def/class lines (one indentation level) before using fixed line windows,
+    which would otherwise break methods mid-statement.
+    """
+    lines = segment.splitlines()
+    method_boundaries = [
+        i for i, line in enumerate(lines)
+        if i > 0 and re.match(r"^[ \t]+(def |class )", line)
+    ]
+    if method_boundaries:
+        starts = [0] + method_boundaries
+        sub_chunks: list[str] = []
+        for pos, start in enumerate(starts):
+            end = starts[pos + 1] if pos + 1 < len(starts) else len(lines)
+            sub = "\n".join(lines[start:end]).strip()
+            if not sub:
+                continue
+            if _token_count(sub) <= max_tokens:
+                sub_chunks.append(sub)
+            else:
+                sub_chunks.extend(_chunk_code_by_lines(sub.splitlines(), fallback_lines=fallback_lines))
+        return sub_chunks
+    return _chunk_code_by_lines(lines, fallback_lines=fallback_lines)
 
 
 def _chunk_code_by_lines(lines: Iterable[str], *, fallback_lines: int) -> list[str]:

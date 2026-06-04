@@ -417,6 +417,7 @@ class PgvectorStore(BaseStore):
         retrieval_mode: str = "hybrid",
         embedding: list[float] | None = None,
         diversity_limit: int = 2,
+        fallback_to_trust_recency: bool = False,
     ) -> list[SubconsciousChunk]:
         _VALID_RETRIEVAL_MODES = ("hybrid", "trust_recency", "vector")
         if retrieval_mode not in _VALID_RETRIEVAL_MODES:
@@ -684,6 +685,18 @@ class PgvectorStore(BaseStore):
                 "pgvector whisper coordination requires Redis. Set NCP_REDIS_URL and ensure Redis is reachable."
             )
         return self.coordination.acknowledge_whispers(list(whisper_ids))
+
+    def whisper_pending(self, whisper_id: str) -> bool:
+        """Return True if the whisper is still queued in the local Postgres whispers table."""
+        import time as _time
+        now = _time.time()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                f"SELECT 1 FROM {self.schema}.{self.table_prefix}whispers"  # noqa: S608
+                " WHERE whisper_id = %s AND expires_at > %s",
+                (whisper_id, now),
+            )
+            return cursor.fetchone() is not None
 
     def get_working_zone(
         self,
