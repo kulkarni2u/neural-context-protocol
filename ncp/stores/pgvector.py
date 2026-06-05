@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from difflib import SequenceMatcher
+import atexit
 import json
 import math
 from pathlib import Path
@@ -209,6 +210,7 @@ class PgvectorStore(BaseStore):
                     open=True,
                 )
                 self._connect_factory = lambda _dsn: self._pool.getconn()
+                atexit.register(self.close)
             except ImportError:  # pragma: no cover - psycopg_pool not installed
                 self._pool = None
                 self._connect_factory = _default_pgvector_connect
