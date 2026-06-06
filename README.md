@@ -3,126 +3,57 @@
 [![CI](https://github.com/kulkarni2u/neural-context-protocol/actions/workflows/ci.yml/badge.svg)](https://github.com/kulkarni2u/neural-context-protocol/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
+![PyPI](https://img.shields.io/pypi/v/neural-context-protocol)
 
-Neural Context Protocol (NCP) is a bounded context and shared memory layer for
-multi-agent coding pipelines.
+-----
 
-It replaces full-history replay with a shared runtime that keeps each turn's
-working context compact, durable, and usable across agents, tools, and restarts.
-Bring your own orchestrator, agent framework, or direct host workflow.
+## Your pipeline grows. Your context shouldn't.
 
-## What It Solves
+Multi-agent pipelines compound. Every turn, the model re-reads growing history it mostly doesn't need. By turn 50 you're replaying 80,000 tokens of context to do 840 tokens of useful work.
 
-Multi-agent workflows usually break down in predictable ways:
+NCP fixes this by replacing full-history replay with a bounded, trust-weighted working memory that stays flat as your pipeline deepens.
 
-- Context grows every turn because the model keeps re-reading old history.
-- Useful state disappears between turns or after restarts.
-- Each tool keeps its own silo, so agents do not share the same working memory.
-
-NCP addresses that by giving every connected host the same bounded context and
-shared memory surface over MCP.
-
-## Why Use NCP
-
-- Keep turn context bounded as pipelines get deeper.
-- Persist useful memory across turns, agents, and restarts.
-- Retrieve relevant past state instead of replaying everything.
-- Send bounded cross-agent signals without stuffing prompts.
-- Plug into the orchestrator or agent stack you already use.
-- Work with tools you already use, including Claude Code, Codex CLI, OpenCode,
-  and other MCP hosts.
-
-## Proof
-
-**17x fewer tokens. Same pipeline depth.**
-
-Benchmarked: **17.52x** reduction at turn 40 versus raw replay in a 4-agent
-coding pipeline.
-
-```text
-Turn 10:  raw replay -> 12,000 tok    NCP -> ~840 tok
-Turn 30:  raw replay -> 45,000 tok    NCP -> ~840 tok
-Turn 50:  raw replay -> 80,000 tok    NCP -> ~840 tok  <- bounded
+```
+Turn 10:  raw replay → 12,000 tok    NCP → ~840 tok
+Turn 30:  raw replay → 45,000 tok    NCP → ~840 tok
+Turn 50:  raw replay → 80,000 tok    NCP → ~840 tok  ← bounded
 ```
 
-NCP adds overhead on short single-agent tasks. It is most useful when you have
-3+ agents, 10+ turns, and real shared state to preserve.
+**17.52x fewer tokens. Same pipeline depth. Reproducible.**
+
+-----
 
 ## Quickstart
 
-Install the base package:
-
 ```bash
 pip install neural-context-protocol
-```
-
-Initialize a project and start the MCP server:
-
-```bash
 ncp init
 ncp serve --host 127.0.0.1 --port 4242 --cwd /path/to/project
 ```
 
-`ncp init` creates `.ncp/config.toml` and a `CLAUDE.md` turn contract in the
-project root.
-
-If you want the scalable local path:
-
-```bash
-pip install 'neural-context-protocol[pgvector,redis]'
-ncp init --store pgvector
-./scripts/infra_up.sh
-ncp migrate apply --cwd /path/to/project
-ncp serve --host 127.0.0.1 --port 4242 --cwd /path/to/project
-```
-
-## Tooling Support
-
-NCP exposes one MCP surface:
-
-```text
-http://127.0.0.1:4242/mcp
-```
-
-The core tool surface is:
-
-```text
-ncp_get_context
-ncp_write_memory
-ncp_fetch
-ncp_emit_whisper
-```
-
-### Claude Code
+For Claude Code:
 
 ```bash
 cp examples/06_claude_code/mcp_servers.json .mcp.json
 ```
 
-See [`examples/06_claude_code/README.md`](./examples/06_claude_code/README.md).
+For Codex CLI, copy [`examples/07_codex_cli/mcp_servers.json`](./examples/07_codex_cli/mcp_servers.json) into your Codex MCP config location.
 
-### Codex CLI
-
-Copy [`examples/07_codex_cli/mcp_servers.json`](./examples/07_codex_cli/mcp_servers.json)
-into your Codex MCP config location.
-
-See [`examples/07_codex_cli/README.md`](./examples/07_codex_cli/README.md).
+-----
 
 ## How It Works
 
-Instead of replaying a growing transcript, NCP assembles a bounded context from
-three blocks:
+Instead of replaying a growing transcript, NCP assembles a bounded context from three blocks every turn:
 
-```text
-[NCP:CONSCIOUS]    ~120 tok  - what this agent knows right now
-[NCP:SUBCONSCIOUS] ~480 tok  - relevant past, retrieved not replayed
-[NCP:WHISPERS]     ~240 tok  - bounded signals from other agents
----------------------------------------------------------------
-Total:             ~840 tok  - stays bounded as the pipeline deepens
+```
+[NCP:CONSCIOUS]     ~120 tok  — what this agent knows right now
+[NCP:SUBCONSCIOUS]  ~480 tok  — relevant past, retrieved not replayed
+[NCP:WHISPERS]      ~240 tok  — bounded signals from other agents
+─────────────────────────────────────────────────────────────────
+Total:              ~840 tok  — stays bounded as the pipeline deepens
 ```
 
-Memory survives restarts. The same runtime can serve multiple hosts against the
-same store.
+Memory survives restarts. The same runtime serves multiple hosts against the same store. Agents coordinate through bounded whispers without stuffing prompts.
 
 ### Turn Flow
 
@@ -158,31 +89,48 @@ flowchart LR
     C --> F
 ```
 
-## Storage Tiers
+-----
 
-| Tier | When to use | Backing |
-|------|-------------|---------|
-| **SQLite** | Default local-first path, zero extra services. | `.ncp/store.db` |
-| **pgvector** | Durable semantic retrieval across machines. | Postgres + pgvector |
-| **Redis** | Cross-agent coordination, whispers, fetch-session state. | Redis 7 |
+## Context Trust
 
-Start with SQLite. Add pgvector and Redis when you need richer retrieval or
-multiple agents coordinating across processes.
+Most frameworks treat stored context as equally credible. NCP doesn't.
+
+Every memory chunk carries a `base_trust` score and a `written_at_drift` marker. Retrieval scoring discounts chunks written during high-drift periods. The `CoherenceChecker` monitors per-turn `drift_score` and fires alerts when agents start diverging. Agents emit `world_check` whispers to report detected drift back into the runtime.
+
+```
+ChunkSource:      user_verified | tool_result | agent_inferred | synthesis
+base_trust:       float (0.0–1.0) — weight applied at retrieval time
+drift_score:      float (0.0–1.0) — pipeline coherence, updated per turn
+written_at_drift: float — drift level when this memory was written
+```
+
+The effect: the model receives context ranked by how much it should believe it, not just by recency.
+
+-----
+
+## What NCP Is (and Isn't)
+
+**NCP is the memory bus, not the orchestrator.**
+
+It sits underneath your existing agent framework — LangGraph, CrewAI, AutoGen, or a custom orchestrator — and gives every connected host the same bounded, trust-weighted working memory. Bring your own orchestrator. Bring your own agents.
+
+It is not a vector database. Not a model training framework. Not an orchestrator. Not the right default for simple single-agent or very short-lived tasks.
+
+Use it when you have **3+ agents, 10+ turns, and real shared state to preserve**.
+
+-----
 
 ## Benchmarks
 
-| Scenario | Baseline | Baseline tokens | NCP tokens | Reduction |
-|----------|----------|----------------:|-----------:|----------:|
-| 4-agent coding pipeline (40 turns) | raw replay | 1,927 | 174 | **17.52x** |
-| 4-agent coding pipeline (40 turns) | rolling summary (4/4) | 1,176 | 174 | 10.69x |
-| 6-role research pipeline (36 turns) | raw replay | 1,700 | 156 | **16.35x** |
-| Efficacy - sliding-window control (Claude, 5 attempts) | window baseline | 0.0 success | 0.8 success | **+0.8** |
-| Cross-host handoff (Claude -> OpenCode, 5 attempts) | window baseline | 0.0 success | 0.8 success | **+0.8** |
+| Scenario                               | Baseline       | Baseline tokens | NCP tokens | Reduction  |
+|----------------------------------------|----------------|----------------:|-----------:|-----------:|
+| 4-agent coding pipeline (40 turns)     | raw replay     | 1,927           | 174        | **17.52x** |
+| 4-agent coding pipeline (40 turns)     | rolling summary| 1,176           | 174        | **10.69x** |
+| 6-role research pipeline (36 turns)    | raw replay     | 1,700           | 156        | **16.35x** |
+| Cross-host handoff (Claude → OpenCode) | window baseline| 0.0 success     | 0.8 success| **+0.8**   |
+| Needle recall at budget 4              | sliding window | 0.00            | 0.50       | **+0.50**  |
 
-Additional benchmark signals:
-
-- Needle recall at `--budget 4`: NCP `0.50` vs sliding window `0.00`
-- MACE multi-agent coordination score (40 turns): `0.9608`
+MACE multi-agent coordination score (40 turns): **0.9608**
 
 Benchmarks are reproducible:
 
@@ -191,19 +139,63 @@ python3 benchmarks/coding_pipeline/run.py
 python3 benchmarks/needle/run.py --turns 24 --needles 6 --budget 4
 ```
 
-## Verify Setup
+-----
 
-```bash
-ncp status --cwd /path/to/project
-ncp cost --cwd /path/to/project
-ncp explain --cwd /path/to/project
+## Core Tool Surface
+
+NCP exposes one MCP endpoint: `http://127.0.0.1:4242/mcp`
+
+```
+ncp_get_context    — assemble bounded context for this turn
+ncp_write_memory   — persist durable memory to the subconscious
+ncp_fetch          — retrieve a prior turn result by ID
+ncp_emit_whisper   — send a bounded signal to another agent
 ```
 
-What these tell you:
+-----
 
-- `ncp status` shows store and activity metrics.
-- `ncp cost` shows token and USD rollups once turns are logged.
-- `ncp explain` gives a human-readable runtime summary.
+## Storage Tiers
+
+| Tier           | When to use                                              | Backing             |
+|----------------|----------------------------------------------------------|---------------------|
+| **SQLite**     | Default. Zero extra services.                            | `.ncp/store.db`     |
+| **pgvector**   | Durable semantic retrieval across machines.              | Postgres + pgvector |
+| **Redis**      | Cross-agent coordination, whispers, fetch-session state. | Redis 7             |
+
+Start with SQLite. Add pgvector and Redis when you need richer retrieval or multiple agents coordinating across processes.
+
+```bash
+pip install 'neural-context-protocol[pgvector,redis]'
+ncp init --store pgvector
+./scripts/infra_up.sh
+ncp migrate apply --cwd /path/to/project
+ncp serve --host 127.0.0.1 --port 4242 --cwd /path/to/project
+```
+
+-----
+
+## Operator Commands
+
+```bash
+ncp status      # store and activity metrics
+ncp cost        # token and USD rollups
+ncp explain     # human-readable runtime summary
+ncp viz         # pipeline visualization
+ncp consolidate # merge and compact memory
+ncp calibrate   # recalibrate trust and retrieval weights
+ncp handoff     # cross-agent handoff coordination
+```
+
+-----
+
+## Cross-Agent Handoffs
+
+```bash
+ncp handoff claude --cwd /path/to/project --pipeline-id pipe_demo --emit-to opencode
+ncp handoff opencode --cwd /path/to/project --pipeline-id pipe_demo --emit-to claude
+```
+
+-----
 
 ## Examples
 
@@ -219,44 +211,13 @@ Tool-specific setup lives in:
 - [`examples/06_claude_code/`](./examples/06_claude_code/)
 - [`examples/07_codex_cli/`](./examples/07_codex_cli/)
 
-## Handoffs And Orchestrators
+-----
 
-NCP is the memory bus, not the orchestrator.
+## In Our Own Pipelines
 
-It is designed to sit underneath custom orchestrators, agent frameworks, or
-direct host-to-host workflows. The same runtime can be shared by any
-MCP-compatible host.
+NCP is the memory bus. In our workflows, Sarathi is one orchestrator that runs on top of it. Sarathi is an integration example, not a requirement — NCP works under any MCP-compatible host.
 
-In our own workflows, Sarathi is one orchestrator that runs on top of NCP.
-Sarathi is an integration example, not a requirement for using NCP.
-
-NCP can drive bounded whisper-based handoffs directly:
-
-```bash
-ncp handoff claude --cwd /path/to/project --pipeline-id pipe_demo --emit-to opencode
-ncp handoff opencode --cwd /path/to/project --pipeline-id pipe_demo --emit-to claude
-```
-
-This is an optional coordination pattern, not the core product definition.
-
-## What NCP Is Not
-
-- Not a vector database.
-- Not a model training framework.
-- Not a replacement for planning, orchestration, or judgment.
-- Not the right default for simple single-agent or very short-lived tasks.
-
-## Operator Commands
-
-```text
-ncp status
-ncp cost
-ncp explain
-ncp viz
-ncp consolidate
-ncp calibrate
-ncp batch
-```
+-----
 
 ## Documentation
 
@@ -270,3 +231,7 @@ ncp batch
 - [Post-V1 roadmap](./docs/NCP_POST_V1_ROADMAP.md)
 - [Active handoff packet](./docs/NCP_ACTIVE_HANDOFF_PACKET.md)
 - [CHANGELOG](./CHANGELOG.md)
+
+-----
+
+*NCP is MIT licensed. Built by [@kulkarni2u](https://github.com/kulkarni2u).*
