@@ -37,7 +37,13 @@ For Claude Code:
 cp examples/06_claude_code/mcp_servers.json .mcp.json
 ```
 
+See [`examples/06_claude_code/README.md`](./examples/06_claude_code/README.md).
+
 For Codex CLI, copy [`examples/07_codex_cli/mcp_servers.json`](./examples/07_codex_cli/mcp_servers.json) into your Codex MCP config location.
+
+See [`examples/07_codex_cli/README.md`](./examples/07_codex_cli/README.md).
+
+`ncp init` creates `.ncp/config.toml` and a `CLAUDE.md` turn contract in the project root.
 
 -----
 
@@ -184,6 +190,7 @@ ncp viz         # pipeline visualization
 ncp consolidate # merge and compact memory
 ncp calibrate   # recalibrate trust and retrieval weights
 ncp handoff     # cross-agent handoff coordination
+ncp batch       # process a JSONL file of NCP operations
 ```
 
 -----
@@ -194,6 +201,20 @@ ncp handoff     # cross-agent handoff coordination
 ncp handoff claude --cwd /path/to/project --pipeline-id pipe_demo --emit-to opencode
 ncp handoff opencode --cwd /path/to/project --pipeline-id pipe_demo --emit-to claude
 ```
+
+-----
+
+## Verify Setup
+
+```bash
+ncp status --cwd /path/to/project
+ncp cost --cwd /path/to/project
+ncp explain --cwd /path/to/project
+```
+
+- `ncp status` shows store and activity metrics.
+- `ncp cost` shows token and USD rollups once turns are logged.
+- `ncp explain` gives a human-readable runtime summary.
 
 -----
 
