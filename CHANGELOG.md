@@ -6,6 +6,64 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 No unreleased changes yet.
 
+## [1.0.4] - 2026-06-06
+
+Docs-sync release so the public install story matches the shipped CLI.
+
+### Added / Changed
+
+- **Public pgvector setup path** (`README.md`): replace the repo-only
+  `./scripts/infra_up.sh` example with the installed `ncp infra up` command
+  for managed local Postgres + Redis, and keep a separate bring-your-own
+  example for external infrastructure.
+- **Release surface coherence** (`CHANGELOG.md`,
+  `docs/NCP_V1_RELEASE_CHECKLIST.md`): add missing `1.0.2` and `1.0.3`
+  changelog entries and align the checklist with the current stable release
+  line.
+- **Version metadata alignment** (`pyproject.toml`, `ncp/version.py`,
+  `ncp/mcp/server.py`): bump package and MCP server version strings to `1.0.4`.
+
+## [1.0.3] - 2026-06-05
+
+Patch release focused on pgvector shutdown reliability.
+
+### Fixed
+
+- **Python interpreter shutdown cleanup** (`ncp/stores/pgvector.py`): register
+  `pool.close()` with `atexit` so pgvector-backed runs do not raise
+  `PythonFinalizationError` during interpreter teardown.
+- **Version metadata alignment** (`pyproject.toml`, `ncp/version.py`,
+  `ncp/mcp/server.py`): bump package and MCP server version strings to `1.0.3`.
+
+## [1.0.2] - 2026-06-04
+
+Public-install ergonomics and credibility follow-up release.
+
+### Added / Changed
+
+- **Interactive setup wizard** (`ncp/cli.py`): `ncp init` now walks users
+  through store backend, infra mode, container engine, ports, and credentials,
+  can generate `.ncp/compose.yaml`, optionally start containers, and apply
+  migrations for a working pgvector + Redis setup from the CLI.
+- **Installed infra lifecycle commands** (`ncp/cli.py`): added `ncp infra up`
+  and `ncp infra down` so packaged installs can manage the generated local
+  Postgres + Redis stack without depending on repo-only helper scripts.
+- **Safer non-interactive pgvector setup** (`ncp/cli.py`): non-TTY
+  `ncp init --store pgvector` now defaults to bring-your-own infra instead of
+  auto-starting managed containers, and BYO non-interactive setup no longer
+  auto-runs migrations.
+- **Cursor provider support** (`ncp/adapters/cursor.py`, `ncp/dogfood.py`):
+  added Cursor CLI and Cloud Agent adapters to the dogfood/provider surface.
+- **Provider permission and review-tooling cleanup** (`ncp/agent_handoff.py`,
+  `ncp/dogfood.py`, `scripts/claude_review_stream.py`): replaced broad
+  permission bypasses with narrower allowed-tool grants and made tool sets more
+  configurable for partner and review flows.
+- **Credibility and retrieval follow-ups** (`ncp/benchmarks.py`,
+  `ncp/config.py`, `ncp/assembler.py`, `ncp/chunker.py`, `ncp/stores/`):
+  improved token counting, retrieval fallback behavior, adaptive budgeting,
+  chunking stability, whisper delivery visibility, and generation-penalty
+  configurability.
+
 ## [1.0.1] - 2026-06-02
 
 Credibility-hardening patch release. No product-surface breaking changes.
