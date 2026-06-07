@@ -170,10 +170,20 @@ ncp_emit_whisper   — send a bounded signal to another agent
 
 Start with SQLite. Add pgvector and Redis when you need richer retrieval or multiple agents coordinating across processes.
 
+Managed local Postgres + Redis from an installed CLI:
+
 ```bash
 pip install 'neural-context-protocol[pgvector,redis]'
 ncp init --store pgvector
-./scripts/infra_up.sh
+ncp infra up
+ncp serve --host 127.0.0.1 --port 4242 --cwd /path/to/project
+```
+
+Bring your own Postgres + Redis:
+
+```bash
+pip install 'neural-context-protocol[pgvector,redis]'
+ncp init --store pgvector
 ncp migrate apply --cwd /path/to/project
 ncp serve --host 127.0.0.1 --port 4242 --cwd /path/to/project
 ```
