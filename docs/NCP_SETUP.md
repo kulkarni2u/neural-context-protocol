@@ -174,6 +174,16 @@ Claude / Codex / OpenCode / other MCP host
 
 The shared memory is in the runtime/store, not in the client process.
 
+### Example: Java Repo Triage Loop
+
+One practical pattern:
+
+1. `analyzer` inspects `PaymentProcessor.java`, runs the failing test, and writes a compact root-cause chunk.
+2. `fixer` retrieves that chunk from NCP, opens the file fresh, applies the fix, and writes the result.
+3. `reviewer` receives a bounded whisper with the changed file list and can send back `dissent` or `share` without forcing transcript replay.
+
+That is the point of the runtime. Shared working memory stays bounded even when the codebase is large and the pipeline runs for many turns.
+
 ## Tool-Specific Setup Examples
 
 ### Claude Code

@@ -61,6 +61,32 @@ Total:              ~840 tok  — stays bounded as the pipeline deepens
 
 Memory survives restarts. The same runtime serves multiple hosts against the same store. Agents coordinate through bounded whispers without stuffing prompts.
 
+### Concrete Example: Java Monorepo Bugfix
+
+This is where NCP starts paying for itself.
+
+Say you have a 30-module Java monorepo and a bug in `PaymentProcessor.java`. You run three agents on the same `pipeline_id`: `analyzer`, `fixer`, `reviewer`.
+
+`analyzer` reads the file, runs the affected tests, and writes one distilled chunk instead of pasting a full stack trace into the next prompt:
+
+```text
+NPE at PaymentProcessor.java:142.
+root_cause: retryCount is null when payment_method=ACH and customer.tier=trial.
+Guard missing before .intValue() call.
+```
+
+`fixer` does not receive the full transcript. It assembles bounded context, retrieves that chunk by relevance, opens `PaymentProcessor.java` fresh with its own tools, applies the null guard, runs the targeted tests, and writes the outcome:
+
+```text
+Null guard applied at PaymentProcessor.java:142.
+if (retryCount == null) retryCount = 0.
+PaymentProcessorTest.testAchTrialRetry passes.
+```
+
+`reviewer` assembles its own bounded context, sees the fix outcome, and receives a bounded whisper with the changed file list. If the fix is wrong, it can emit a `dissent` whisper back to `fixer` with the specific issue instead of forcing the whole pipeline to replay session history.
+
+By turn 20, a raw-replay workflow is dragging old stack traces, earlier tool output, and prior reasoning through every turn. The NCP workflow is still assembling a compact working set and fetching only what matters for the current task.
+
 ### Turn Flow
 
 ```mermaid
