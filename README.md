@@ -184,6 +184,8 @@ ncp_fetch          — retrieve a prior turn result by ID
 ncp_emit_whisper   — send a bounded signal to another agent
 ```
 
+`ncp_get_context` accepts `stream: true` for progressive delivery. Over HTTP the response is `application/x-ndjson` — one chunk per section, final line is the assembled JSON-RPC result. Over stdio, chunks arrive as `ncp/stream_chunk` notifications before the final response.
+
 -----
 
 ## Storage Tiers
