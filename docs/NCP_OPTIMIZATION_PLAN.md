@@ -617,7 +617,119 @@ TS orchestrators wanting `post_turn`-style control.
 
 ---
 
-## 4. Non-goals / explicitly out of scope
+## 4. Design directions: addressing the three structural limits
+
+Even with WI-1..17 and S1..S9 complete, three limits are structural to the
+architecture. They cannot be "fixed" — but each can be turned from a hidden
+gotcha into a designed-for pattern. These are design directions for v1.x;
+each reuses mechanisms that already exist in the codebase.
+
+### D1 — "NCP bounds its block, not the host session"
+
+NCP cannot shrink a host's own transcript (Claude Code / Codex keep their
+full history regardless of what an MCP server returns). The savings only
+materialize when each agent turn starts from a fresh context assembled from
+NCP. **Direction: make context resets free, and ship the fresh-context
+pattern as a product feature instead of a user burden.**
+
+1. **Reference stateless-turn runner** — `ncp run-turn --agent <id> --pipeline <id> [--host claude|codex|opencode]`:
+   assemble context → spawn one headless provider turn (`claude -p`,
+   `codex exec`) with the assembly as the entire prompt → `post_turn` the
+   result. `ncp/agent_handoff.py:214-284` already implements exactly this
+   subprocess pattern for handoffs; generalize it. This is the architecture
+   where the benchmark numbers become real-world numbers, packaged as one
+   command. (Scope note: this is a *turn executor*, not an orchestrator — no
+   DAGs, no scheduling. The non-goals section still holds.)
+2. **Claude Code lifecycle hooks** — ship an installable `SessionStart` /
+   `PreCompact` hook (via `ncp init --claude-hooks`) that calls
+   `ncp_get_context` and injects the result as additional context after every
+   `/clear`, new session, or auto-compaction. Net effect: resets and
+   compactions stop losing pipeline state, so the host can reset
+   aggressively. This — not the bare MCP server — is the actual plug-and-play
+   story for Claude Code.
+3. **Document the subagent pattern** in `examples/06_claude_code/`: Claude
+   Code subagents get fresh contexts by design; run pipeline roles as
+   subagents whose first action is `ncp_get_context` and last is
+   `ncp_post_turn`.
+4. **README framing** (one sentence, ties to WI-13): "NCP bounds the shared
+   memory layer; per-turn context stays flat when agents run as fresh-context
+   workers — see `ncp run-turn`."
+
+### D2 — "Bounded context is lossy"
+
+The honest reframe: NCP should be **lossless in storage, bounded only in
+presentation** — and every miss should be recoverable in one call.
+
+1. **Recovery, surfaced where the model can see it.** Full turn results are
+   already stored (`TurnRecord.result_full`) and `ncp_fetch` already exists.
+   Wire S7's eviction telemetry into the assembled context itself: when
+   `evicted_high_relevance` is non-empty, append one pidgin line —
+   `evicted:2 hi-rel hint:ncp_fetch` — so the model knows recovery is
+   available exactly when it matters. Cost: ~8 tokens, only on eviction.
+2. **Write-quality tooling** (garbage-in is the weakest link):
+   - Near-duplicate detection at write time: before inserting, BM25 (or
+     vector) match against existing chunks; if similarity is high, return a
+     hint in the `ncp_write_memory` result — "similar chunk `<id>` exists;
+     consider `supersedes`". The `supersedes` field already exists
+     (`ncp/types.py:200`).
+   - Distillation rubric in the generated turn contract: require chunks
+     shaped as `root_cause:` / `decision:` / `constraint:` / `dead_end:`
+     (the `conditions` field already carries these tags — the needle and
+     efficacy benchmarks use them).
+3. **Close the retrieval feedback loop automatically.** The store already
+   tracks `retrieval_count` / `last_retrieved_at` (migration 002) and
+   `ncp calibrate` already adjusts trust. Add the missing signal: on
+   `post_turn`, check whether retrieved chunk ids/content overlap the turn's
+   result and log positive/negative retrieval feedback; let calibrate consume
+   it. Retrieval then improves with use instead of staying static.
+4. **Pipeline backbone summary.** Consolidation (`ncp/stores/consolidation.py`)
+   already merges clusters; additionally maintain one rolling
+   `pipeline_summary` semantic chunk per pipeline (refreshed on consolidate)
+   so cold or off-topic queries always land on a coherent backbone rather
+   than the synthetic cold-start chunk (`ncp/assembler.py:338-354`).
+5. **Quality is gated, not assumed**: S1 runs in CI at matched token budget;
+   a release that loses task success rate fails the gate. That is the
+   strongest guarantee available for a lossy-presentation system — make it
+   explicit in the docs.
+
+### D3 — "Whispers are a polling signal bus, not a communication protocol"
+
+Right scope: stay a signal bus (orchestrators own control flow), but cut the
+latency and add the two conventions that make signals composable.
+
+1. **Push, using what's already there.** The HTTP server already holds an
+   SSE connection per host (`ncp/mcp/server.py:537-563` — currently only
+   keepalives). Emit an `ncp/whisper_pending` notification on that stream
+   when a whisper targets a connected agent, so hosts can react between
+   turns. For stdio hosts, add an optional long-poll tool
+   `ncp_wait_for_whisper {timeout_seconds}` (bounded, returns empty on
+   timeout). Either removes the worst-case "next turn" latency without
+   changing the delivery model.
+2. **Request/response correlation.** `Whisper.ref` already exists
+   (`ncp/types.py:328`). Specify in the protocol spec: a `share` answering a
+   `request` MUST set `ref` to the request's `whisper_id`; surface pending
+   unanswered requests in `whisper_stats` / `ncp status`. One validator + one
+   doc paragraph makes request/response real.
+3. **Single-writer conflict rule for shared state.** `owner` and
+   `supersedes` already exist on chunks. Specify: only `owner` (or a chunk
+   with no owner) may be superseded by another agent; conflicting writes from
+   non-owners are rejected with a hint to emit a `dissent` whisper instead.
+   Combined with the existing `escalate_to` field (`ncp/types.py:77`) and a
+   documented max-dissent-rounds convention, this gives conflict resolution
+   without consensus machinery.
+4. **Explicit non-direction:** no RPC, no task auctioning, no synchronous
+   agent-to-agent calls. Pipelines needing those should use their
+   orchestrator; NCP's job is memory plus reliable signals. State this in the
+   spec so the boundary is a decision, not an omission.
+
+A useful observation for the implementer: nearly every mechanism above
+(`ref`, `owner`, `supersedes`, `conditions`, `escalate_to`, `result_full`,
+retrieval tracking, the SSE channel, the handoff subprocess runner) already
+exists in the codebase — these items are wiring, not invention.
+
+---
+
+## 5. Non-goals / explicitly out of scope
 
 - No orchestrator features (NCP stays a memory bus).
 - No Redis Streams consumer-group rewrite (WI-5 uses the minimal design).
@@ -625,7 +737,7 @@ TS orchestrators wanting `post_turn`-style control.
   `RetrievalPolicy` parity.
 - Do not change the Python API's `drain_whispers` contract (deprecate softly).
 
-## 5. Verification matrix (run after each PR)
+## 6. Verification matrix (run after each PR)
 
 ```bash
 pip install -e . && pip install pytest
@@ -641,7 +753,7 @@ python3 examples/01_quickstart.py && python3 examples/02_multi_agent.py
 
 Plus the new regression tests named in each work item.
 
-## 6. Key file map
+## 7. Key file map
 
 | Area | Files |
 |---|---|
