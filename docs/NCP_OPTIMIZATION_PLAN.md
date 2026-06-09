@@ -64,11 +64,15 @@ python3 benchmarks/needle/run.py --turns 24 --needles 6 --budget 4
 - [ ] **WI-1** Fix recent-refs vs retrieval budget split in the assembler
 - [ ] **WI-2** Enforce a real token budget in `assemble()`; expose `max_tokens` via MCP
 - [ ] **WI-13** Refresh README + benchmark docs from current code; fix inconsistencies; pin token unit
+- [ ] **WI-14** Fix Python version floor: package imports fail on the advertised 3.10
 
 ### P1 — Plug-and-play MCP parity (the protocol must work through MCP alone)
 - [ ] **WI-3** Server-side conscious state: persist/load per `(pipeline_id, agent_id)`; add `ncp_post_turn` tool
 - [ ] **WI-4** Trust through MCP: src-derived default `base_trust`; optional `base_trust` param on `ncp_write_memory`
 - [ ] **WI-7** Raise default whisper TTL; expose `ttl_seconds` on `ncp_emit_whisper`
+- [ ] **WI-15** Fix `share`/`request` whisper payload DX through MCP (schema mismatch traps hosts)
+- [ ] **WI-16** Harden the HTTP server: optional auth token, request size cap, CORS, non-loopback warning
+- [ ] **WI-17** Single-source the version string
 
 ### P2 — Agent-to-agent reliability
 - [ ] **WI-5** Per-recipient broadcast delivery (delivery-cursor table / Redis consumer groups)
@@ -397,6 +401,85 @@ of SCANning all payload keys (or at minimum cap the scan and document).
 
 ---
 
+### WI-14 — Python version floor (P0, verified broken)
+
+`ncp/types.py:6` does `from typing import Self` — `typing.Self` exists only on
+Python **3.11+**, while `pyproject.toml:10` declares `requires-python = ">=3.10"`
+and the README badge says 3.10+. The package fails at import on 3.10.
+
+**Fix (pick one):**
+- Bump `requires-python` to `>=3.11` and update the README badge + CI matrix; or
+- Import from `typing_extensions` (adds a hard dependency) / guard with
+  `sys.version_info`.
+
+Recommend bumping to 3.11 — simplest, and 3.10 is near EOL. Add a CI job that
+runs `python -c "import ncp"` on the minimum supported version so the floor
+can never silently break again (`.github/workflows/ci.yml`).
+
+---
+
+### WI-15 — `share`/`request` whisper payload DX (P1, verified)
+
+`Whisper`'s model validator (`ncp/types.py:369-421`) requires `share`/`request`
+payloads to parse into `HandoffPayload` (JSON with a required `ask` field) and
+`dissent` into `DissentPayload`. But the MCP tool schema
+(`ncp/mcp/server.py:83-97`) describes `payload` only as
+"Whisper message (max 600 chars)". Verified: emitting a `share` whisper with a
+plain-text payload via the MCP arguments raises a validation error. An MCP
+host following the tool description cannot successfully send the two whisper
+types most useful for handoffs.
+
+**Fix (both halves):**
+1. Document the per-type payload contracts in the tool description and add a
+   `payload_schema` hint per type (e.g. enum-conditional description:
+   `share/request: JSON {"ask": str, "files": [str], "slice": str?}`;
+   `dissent: JSON {"issue": str, "alternatives": [str]}`).
+2. Be liberal in what the server accepts: in `_handle_emit_whisper`, when
+   `whisper_type` is `share`/`request` and the payload is plain text, wrap it
+   as `{"ask": payload}` (and `{"issue": payload}` for `dissent`) before
+   constructing the `Whisper`. Keep strict validation in the Python API.
+
+**Test:** MCP `tools/call ncp_emit_whisper` with `type=share` and a plain-text
+payload succeeds and round-trips through `drain_whispers`.
+
+---
+
+### WI-16 — HTTP server hardening (P1)
+
+Current state (`ncp/mcp/server.py:467-643`):
+- No authentication of any kind; any local process (or anything that can reach
+  the bind address) can read/write every pipeline's memory.
+- `Access-Control-Allow-Origin: *` on all responses — combined with no auth,
+  any web page open in the user's browser can call the RPC endpoint
+  (drive-by memory exfiltration/poisoning via `fetch` to `127.0.0.1:4242`).
+- `do_POST` reads `Content-Length` with **no upper bound** (the stdio path
+  caps at 10 MB, `server.py:380-381`); a single request can exhaust memory.
+- `serve_http(--host)` will happily bind `0.0.0.0` with no warning.
+
+**Design:**
+1. Optional bearer token: `ncp serve --auth-token <tok>` (or
+   `NCP_AUTH_TOKEN` env / config). When set, require
+   `Authorization: Bearer <tok>` on POST and SSE; 401 otherwise. Generate one
+   by default in `ncp init` and write it into the emitted `.mcp.json` /
+   `mcp_servers.json` examples so plug-and-play stays one-step.
+2. Replace wildcard CORS with a config-driven allowlist; default to **no**
+   CORS headers (MCP hosts are not browsers).
+3. Cap HTTP request bodies at the same 10 MB as stdio; return 413.
+4. Log a prominent warning when binding a non-loopback host without an auth
+   token.
+
+---
+
+### WI-17 — Single-source the version (P1, trivial)
+
+`ncp/mcp/server.py:315` hardcodes `"version": "1.0.4"` in `serverInfo`;
+`ncp/version.py` already holds `__version__`. Import it. Optionally derive
+`pyproject.toml` version from the same source (hatch/setuptools dynamic
+version) so a release bump is one edit. Check `scripts/release_preflight.sh`
+for any other hardcoded occurrences.
+
+---
+
 ### WI-13 — Honest, reproducible numbers (P0)
 
 1. **Re-run and re-publish:** after WI-1/WI-2 land, regenerate
@@ -421,7 +504,120 @@ of SCANning all payload keys (or at minimum cap the scan and document).
 
 ---
 
-## 3. Non-goals / explicitly out of scope
+## 3. Strategic recommendations (beyond the review findings)
+
+These are not regressions — they are the highest-leverage investments to make
+NCP a project people adopt and trust. Roughly ordered by expected impact.
+None block the P0–P3 work; treat them as a backlog for after PR2.
+
+### S1 — One LLM-in-the-loop benchmark with task success (credibility)
+
+Every published number today is deterministic token accounting; the only
+quality benchmark (`benchmarks/efficacy/`) is a single scripted scenario
+requiring live providers. The single biggest credibility move is one
+reproducible benchmark where a real model completes a multi-agent task and
+**success rate** is scored under three conditions: raw replay, sliding window,
+NCP — at *matched token budget*. Even 20 scripted coding tasks with a cheap
+model, run nightly in CI with a budget cap, would let the README claim
+"same success rate at Nx fewer tokens" — which is the claim users actually
+care about. Publish the artifacts JSON in-repo. Until this exists, every
+efficiency number invites the rebuttal "you cut tokens, but did the agents
+still succeed?"
+
+### S2 — `ncp demo`: sell the value in 60 seconds (adoption)
+
+A new CLI command that runs a scripted 3-agent pipeline (no API keys needed —
+deterministic agents) against a temp store and prints a live per-turn table:
+`turn | raw-replay tokens | NCP tokens | savings`, ending with the whisper
+handoff between agents. Prospective users currently have to wire NCP into a
+real host before seeing any value. The demo is also the perfect smoke test
+for the plug-and-play loop (get_context → post_turn → whispers) and can run
+in CI.
+
+### S3 — Framework recipes for the orchestrators the README names (adoption)
+
+`README.md:147` claims NCP "sits underneath LangGraph, CrewAI, AutoGen" — but
+`examples/` contains no integration for any of them. Ship one real example
+each (LangGraph is the priority: implement NCP as a checkpointer/memory
+backend in `examples/03_langgraph/`), or stop naming them. An un-evidenced
+compatibility list reads as marketing and costs trust with exactly the
+audience NCP targets.
+
+### S4 — Prompt-injection posture for cross-agent content (security)
+
+Whisper payloads and chunk contents are injected verbatim into *other agents'*
+contexts. One compromised or low-quality agent can write
+"ignore your instructions and …" into a `share` whisper or a high-relevance
+chunk, and every downstream agent receives it inside the trusted
+`[NCP:WHISPERS]` block. Mitigations to design in now, while the wire format is
+young:
+- The pidgin format already carries provenance (`from:`, `src:`, `trust:`) —
+  add one line to the turn-contract templates instructing the model to treat
+  whisper/chunk *content* as data, never as instructions.
+- Consider fencing untrusted-source content (e.g. `src:agent_inferred` from
+  another agent) in explicit delimiters the contract names.
+- Document the threat model in the spec (`docs/NCP_PROTOCOL_SPEC.md`): NCP
+  multiplies cross-agent influence by design; say what it does and doesn't
+  defend against.
+
+### S5 — Store lifecycle: NCP currently never forgets (operations)
+
+`working`-zone chunks have no default expiry (`ncp/types.py:282-286` requires
+expiry only for `proven`/`global`), consolidation is a manual CLI command, and
+turn records expire after 24h but chunks live forever. A long-running pipeline
+grows its store — and with WI-9 unfixed, its per-turn retrieval cost —
+without bound. Design a retention policy: default TTL or max-chunk-count per
+pipeline with lowest-`effective_score` eviction, plus an opt-in background
+consolidation trigger (e.g. every N writes) instead of manual-only. The
+`ncp consolidate`/`ncp calibrate` machinery already exists; it needs a
+scheduler, not new algorithms.
+
+### S6 — Unlock the embedding tier (capability)
+
+Two artificial constraints currently gate semantic retrieval:
+- `SubconsciousChunk.embedding` hard-validates **exactly 1536 dims**
+  (`ncp/types.py:275-280`), locking the protocol to OpenAI-shaped embeddings
+  even though `ncp/adapters/embedding.py` supports multiple providers. Make
+  dimensionality a store-level config validated at write time.
+- Vector mode requires Postgres+pgvector; SQLite mode raises on
+  `retrieval_mode="vector"` (`ncp/stores/sqlite.py:283-286`). `sqlite-vec` is
+  a single-file extension that would give the zero-infra default tier real
+  semantic retrieval — a big jump for the "start with SQLite" path.
+
+### S7 — Surface the telemetry NCP already computes (observability)
+
+The assembler returns `evicted_high_relevance` and `evicted_whispers` — and
+then the MCP layer throws them away. Include eviction counts (and the
+session's remaining fetch budget) in the `ncp_get_context` result so hosts
+can react ("relevant context was evicted — consider `ncp_fetch`"). Longer
+term: optional OpenTelemetry export (assembly latency, whisper queue depth,
+store size, eviction rate) — operators of 3+ agent pipelines will ask for
+this the first week.
+
+### S8 — A TypeScript client, or at least a documented HTTP contract (ecosystem)
+
+Most MCP hosts and agent frameworks are TypeScript. NCP's HTTP/JSON-RPC
+surface is simple and stable enough to document as a public contract
+(`docs/` page with curl examples for all four tools), and a ~200-line npm
+client package would remove the "Python project" ceiling on adoption. The
+MCP path partially covers this — but only for hosts, not for programmatic
+TS orchestrators wanting `post_turn`-style control.
+
+### S9 — Repo hygiene quick wins
+
+- `compose.yaml` exists for managed infra — add a `make dev` / single
+  `scripts/dev_up.sh` that boots Postgres+Redis, applies migrations, runs the
+  test suite, so contributors get a green baseline in one command.
+- Mark provider-SDK tests with `pytest.importorskip` so a clean checkout shows
+  `passed/skipped` instead of 35 confusing failures (verified: all current
+  failures are missing optional `anthropic`/`openai`/`cohere` imports).
+- Add the two benchmark gates to CI (also listed in WI-13) and a
+  `python -c "import ncp"` matrix job at the minimum supported Python
+  (WI-14) — the two cheapest ways this repo's claims stay true over time.
+
+---
+
+## 4. Non-goals / explicitly out of scope
 
 - No orchestrator features (NCP stays a memory bus).
 - No Redis Streams consumer-group rewrite (WI-5 uses the minimal design).
@@ -429,7 +625,7 @@ of SCANning all payload keys (or at minimum cap the scan and document).
   `RetrievalPolicy` parity.
 - Do not change the Python API's `drain_whispers` contract (deprecate softly).
 
-## 4. Verification matrix (run after each PR)
+## 5. Verification matrix (run after each PR)
 
 ```bash
 pip install -e . && pip install pytest
@@ -445,7 +641,7 @@ python3 examples/01_quickstart.py && python3 examples/02_multi_agent.py
 
 Plus the new regression tests named in each work item.
 
-## 5. Key file map
+## 6. Key file map
 
 | Area | Files |
 |---|---|
