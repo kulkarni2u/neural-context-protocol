@@ -9,6 +9,7 @@ from pathlib import Path
 
 import httpx
 
+from ncp.tokens import estimate_tokens
 from ncp.mcp.server import (
     MCP_TOOLS,
     StreamResponse,
@@ -135,6 +136,11 @@ class TestToolsList:
         result = _result(resp)
         assert result["tools"] == MCP_TOOLS
 
+    def test_get_context_schema_exposes_max_tokens(self) -> None:
+        get_context_tool = next(tool for tool in MCP_TOOLS if tool["name"] == "ncp_get_context")
+        schema = get_context_tool["inputSchema"]
+        assert "max_tokens" in schema["properties"]  # type: ignore[index]
+
 
 class TestGetContext:
     def test_returns_assembled_context(self, tmp_path: Path) -> None:
@@ -157,6 +163,38 @@ class TestGetContext:
         assert "[NCP:BUDGET]" in result["context"]
         assert "[NCP:CONSCIOUS]" in result["context"]
         assert "builder" in result["context"]
+
+    def test_get_context_honors_max_tokens(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "bounded.db")
+        for index in range(4):
+            store.write(SubconsciousChunk(
+                chunk_id=f"large_{index}",
+                content=" ".join(["bounded mcp context"] + [f"tokenish_{index}_{j}" for j in range(120)]),
+                layer="semantic",
+                src="tool_result",
+                pipeline_id="pipe_mcp",
+            ))
+        handlers = make_handlers(store)
+
+        resp = _handle_request(
+            _call("ncp_get_context", {
+                "agent_id": "builder",
+                "role": "build",
+                "owns": [],
+                "must_not": [],
+                "task": "bounded_mcp",
+                "slot": "context",
+                "intent": "test_bound",
+                "pipeline_id": "pipe_mcp",
+                "max_tokens": 200,
+            }),
+            handlers,
+        )
+
+        result = _content(resp)
+        assert estimate_tokens(result["context"]) <= 200
+        assert "[NCP:BUDGET]" in result["context"]
+        assert "[NCP:CONSCIOUS]" in result["context"]
 
     def test_with_pipeline_id(self, tmp_path: Path) -> None:
         store = SQLiteStore(tmp_path / "test.db")

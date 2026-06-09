@@ -1,7 +1,7 @@
 # Neural Context Protocol
 
 [![CI](https://github.com/kulkarni2u/neural-context-protocol/actions/workflows/ci.yml/badge.svg)](https://github.com/kulkarni2u/neural-context-protocol/actions/workflows/ci.yml)
-![Python](https://img.shields.io/badge/python-3.10%2B-blue)
+![Python](https://img.shields.io/badge/python-3.11%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![PyPI](https://img.shields.io/pypi/v/neural-context-protocol)
 
@@ -9,7 +9,7 @@
 
 ## Your pipeline grows. Your context shouldn't.
 
-Multi-agent pipelines compound. Every turn, the model re-reads growing history it mostly doesn't need. By turn 50 you're replaying 80,000 tokens of context to do 840 tokens of useful work.
+Multi-agent pipelines compound. Every turn, the model re-reads growing history it mostly doesn't need. In long-running pipelines, that history can grow by orders of magnitude while the useful working set stays small.
 
 NCP fixes this by replacing full-history replay with a bounded, trust-weighted working memory that stays flat as your pipeline deepens.
 
@@ -19,7 +19,7 @@ Turn 30:  raw replay → 45,000 tok    NCP → ~840 tok
 Turn 50:  raw replay → 80,000 tok    NCP → ~840 tok  ← bounded
 ```
 
-**17.52x fewer tokens. Same pipeline depth. Reproducible.**
+The table above is an illustration of the bounded-context shape. The reproducible deterministic coding benchmark below currently shows **10.81x fewer final-turn tokens vs raw replay** with a `chars_div4` token unit and an explicit 340-token benchmark context budget.
 
 -----
 
@@ -156,13 +156,16 @@ Use it when you have **3+ agents, 10+ turns, and real shared state to preserve**
 
 | Scenario                               | Baseline       | Baseline tokens | NCP tokens | Reduction  |
 |----------------------------------------|----------------|----------------:|-----------:|-----------:|
-| 4-agent coding pipeline (40 turns)     | raw replay     | 1,927           | 174        | **17.52x** |
-| 4-agent coding pipeline (40 turns)     | rolling summary| 1,176           | 174        | **10.69x** |
+| 4-agent coding pipeline (40 turns)     | raw replay     | 3,426           | 317        | **10.81x** |
+| 4-agent coding pipeline (40 turns)     | sliding window | 377             | 317        | **1.19x**  |
+| 4-agent coding pipeline (40 turns)     | rolling summary| 2,096           | 317        | **6.61x**  |
 | 6-role research pipeline (36 turns)    | raw replay     | 1,700           | 156        | **16.35x** |
 | Cross-host handoff (Claude → OpenCode) | window baseline| 0.0 success     | 0.8 success| **+0.8**   |
 | Needle recall at budget 4              | sliding window | 0.00            | 0.50       | **+0.50**  |
 
 MACE multi-agent coordination score (40 turns): **0.9608**
+
+Coding benchmark token unit: `chars_div4`; context budget: `340`; pass gate: `true`.
 
 Benchmarks are reproducible:
 

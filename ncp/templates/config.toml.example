@@ -19,8 +19,10 @@ cold_start_retry = 2
 
 [budget]
 max_tokens_per_call = 4000
+context_token_budget = 840
 warn_at_ratio = 0.70
 critical_at_ratio = 0.85
+recent_slot_budget = 2
 
 [chunking]
 max_chunk_tokens = 200

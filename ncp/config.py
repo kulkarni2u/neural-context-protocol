@@ -35,11 +35,13 @@ DEFAULT_CONFIG = {
     },
     "budget": {
         "max_tokens_per_call": 4000,
+        "context_token_budget": 840,
         "warn_at_ratio": 0.70,
         "critical_at_ratio": 0.85,
         "chunk_cap_default": 4,
         "chunk_cap_high": 3,
         "chunk_cap_critical": 2,
+        "recent_slot_budget": 2,
         "whisper_cap_default": 3,
         "whisper_cap_high": 2,
         "whisper_cap_critical": 1,
@@ -169,6 +171,10 @@ class NCPConfig:
         return float(self.values.get("retrieval", {}).get("generation_penalty_base", 0.9))
 
     @property
+    def context_token_budget(self) -> int:
+        return int(self.values.get("budget", {}).get("context_token_budget", 840))
+
+    @property
     def chunk_cap_default(self) -> int:
         return int(self.values.get("budget", {}).get("chunk_cap_default", 4))
 
@@ -179,6 +185,10 @@ class NCPConfig:
     @property
     def chunk_cap_critical(self) -> int:
         return int(self.values.get("budget", {}).get("chunk_cap_critical", 2))
+
+    @property
+    def recent_slot_budget(self) -> int:
+        return int(self.values.get("budget", {}).get("recent_slot_budget", 2))
 
     @property
     def whisper_cap_default(self) -> int:

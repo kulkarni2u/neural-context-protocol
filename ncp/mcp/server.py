@@ -59,6 +59,7 @@ MCP_TOOLS: list[dict[str, object]] = [
                 "stream": {"type": "boolean", "description": "If true, returns sections progressively as NDJSON (HTTP) or JSON-RPC notifications (stdio). Default false."},
                 "k": {"type": "integer", "description": "Number of subconscious chunks to retrieve. Overrides the default budget-pressure-based value (2 for critical, 4 otherwise)."},
                 "diversity_limit": {"type": "integer", "description": "Max chunks per author in retrieved results. Default 2. Set higher to allow more results from one author."},
+                "max_tokens": {"type": "integer", "description": "Optional estimated token ceiling for the assembled context block."},
             },
             "required": ["agent_id", "role", "task", "slot", "intent"],
         },
@@ -187,6 +188,10 @@ def make_handlers(store: BaseStore) -> dict[str, ToolHandler]:
             caller_diversity_limit: int | None = max(1, int(args["diversity_limit"])) if "diversity_limit" in args else None  # type: ignore[arg-type]
         except (ValueError, TypeError):
             caller_diversity_limit = None
+        try:
+            caller_max_tokens: int | None = max(1, int(args["max_tokens"])) if "max_tokens" in args else None  # type: ignore[arg-type]
+        except (ValueError, TypeError):
+            caller_max_tokens = None
         if stream:
             sections = list(assembler.assemble_incremental(
                 conscious=conscious,
@@ -194,6 +199,7 @@ def make_handlers(store: BaseStore) -> dict[str, ToolHandler]:
                 query_text=conscious.task + " " + conscious.slot,
                 k=caller_k,
                 diversity_limit=caller_diversity_limit,
+                max_tokens=caller_max_tokens,
             ))
             assembled = assembler.apply_post_middleware("\n\n".join(t for _, t in sections))
             return StreamResponse(
@@ -206,6 +212,7 @@ def make_handlers(store: BaseStore) -> dict[str, ToolHandler]:
             query_text=conscious.task + " " + conscious.slot,
             k=caller_k,
             diversity_limit=caller_diversity_limit,
+            max_tokens=caller_max_tokens,
         )
         return {"context": result.context, "session_id": session_id}
 

@@ -57,6 +57,18 @@ def test_coding_pipeline_benchmark_beats_naive_replay(tmp_path: Path) -> None:
     )
 
 
+def test_full_coding_pipeline_benchmark_gate_passes(tmp_path: Path) -> None:
+    artifact = run_coding_pipeline_benchmark(
+        store_path=tmp_path / "bench-full.db",
+        turns=40,
+        pipeline_id="pipe_test_full_bench",
+    )
+
+    assert artifact["context_token_budget"] == 340
+    assert artifact["summary"]["beats_sliding_window"] is True
+    assert artifact["summary"]["pass"] is True
+
+
 def test_public_package_exports_coding_pipeline_benchmark() -> None:
     import ncp
 

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import cast
 
 from ncp.bench.baselines import (
     BaselineStrategy,
@@ -16,6 +15,7 @@ from ncp.assembler import Assembler
 from ncp.api import agent
 from ncp.costs import assembly_overhead
 from ncp.stores.sqlite import SQLiteStore
+from ncp.tokens import estimate_tokens, token_unit
 from ncp.types import BudgetContext, NCPResponse, SubconsciousChunk
 
 
@@ -60,39 +60,6 @@ _RESEARCH_TOPICS: list[str] = [
 ]
 
 
-def _load_tiktoken_encoder() -> object | None:
-    try:
-        import tiktoken  # type: ignore[import-not-found]
-
-        return tiktoken.get_encoding("cl100k_base")
-    except Exception:
-        return None
-
-
-_TIKTOKEN_ENCODER = _load_tiktoken_encoder()
-
-
-def estimate_tokens(text: str) -> int:
-    """Estimate token count with a real tokenizer when available.
-
-    Falls back to the standard 4-chars-per-token heuristic (OpenAI's own
-    recommendation) rather than word-split, which underestimates code tokens
-    by 15-30% due to short identifiers and punctuation.
-    """
-    stripped = text.strip()
-    if not stripped:
-        return 0
-    if _TIKTOKEN_ENCODER is not None:
-        return len(cast(object, _TIKTOKEN_ENCODER).encode(stripped))  # type: ignore[attr-defined]
-    return max(1, len(stripped) // 4)
-
-
-def token_unit() -> str:
-    """Return the token-counting unit used by estimate_tokens()."""
-
-    return "tiktoken/cl100k_base" if _TIKTOKEN_ENCODER is not None else "chars_div4"
-
-
 def _baseline_metadata(baseline: BaselineStrategy) -> dict[str, object]:
     metadata: dict[str, object] = {"name": baseline.name}
     if isinstance(baseline, SlidingWindowBaseline):
@@ -108,6 +75,7 @@ def run_coding_pipeline_benchmark(
     store_path: str | Path,
     turns: int = 40,
     pipeline_id: str = "bench_coding_pipeline",
+    context_token_budget: int | None = 340,
 ) -> dict[str, object]:
     """Compare NCP bounded-context growth against naive full-history replay."""
 
@@ -121,6 +89,7 @@ def run_coding_pipeline_benchmark(
         turn_builder=_build_coding_turn,
         result_builder=_make_coding_result_summary,
         critical_window=5,
+        context_token_budget=context_token_budget,
     )
 
 
@@ -129,6 +98,7 @@ def run_research_pipeline_benchmark(
     store_path: str | Path,
     turns: int = 36,
     pipeline_id: str = "bench_research_pipeline",
+    context_token_budget: int | None = None,
 ) -> dict[str, object]:
     """Compare NCP bounded-context growth against naive replay for a tool-heavy research flow."""
 
@@ -142,6 +112,7 @@ def run_research_pipeline_benchmark(
         turn_builder=_build_research_turn,
         result_builder=_make_research_result_summary,
         critical_window=6,
+        context_token_budget=context_token_budget,
     )
 
 
@@ -156,6 +127,7 @@ def _run_pipeline_benchmark(
     turn_builder,
     result_builder,
     critical_window: int,
+    context_token_budget: int | None,
 ) -> dict[str, object]:
     """Run one deterministic benchmark scenario against the real assembler/store."""
 
@@ -206,6 +178,7 @@ def _run_pipeline_benchmark(
             conscious=conscious,
             budget=budget,
             query_text=f"{topic} pipeline handoff memory",
+            max_tokens=context_token_budget,
         )
 
         ncp_context_tokens = estimate_tokens(assembly.context)
@@ -302,6 +275,7 @@ def _run_pipeline_benchmark(
         "turns": turns,
         "agents": [role for role, _, _, _ in role_rotation],
         "token_unit": token_unit(),
+        "context_token_budget": context_token_budget,
         "turn_rows": turn_rows,
         "summary": {
             "ncp": {

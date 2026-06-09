@@ -7,7 +7,7 @@ name = "neural-context-protocol"
 version = "1.0.4"
 description = "Neural Context Protocol (NCP): bounded, persistent context for multi-agent pipelines."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 authors = [{ name = "kulkarni2u" }]
 license = "MIT"
 keywords = ["mcp", "agents", "multi-agent", "context", "memory", "sqlite", "llm", "protocol"]
@@ -15,7 +15,6 @@ classifiers = [
   "Development Status :: 5 - Production/Stable",
   "Intended Audience :: Developers",
   "Programming Language :: Python :: 3",
-  "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Topic :: Software Development :: Libraries :: Python Modules",
@@ -87,4 +86,4 @@ testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py310"
+target-version = "py311"

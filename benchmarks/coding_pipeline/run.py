@@ -25,6 +25,12 @@ def main() -> None:
         default=None,
         help="Optional SQLite store path. Defaults to a temporary benchmark store.",
     )
+    parser.add_argument(
+        "--context-token-budget",
+        type=int,
+        default=340,
+        help="Estimated token ceiling for each assembled NCP context block.",
+    )
     args = parser.parse_args()
 
     if args.store_path is not None:
@@ -32,6 +38,7 @@ def main() -> None:
             store_path=args.store_path,
             turns=args.turns,
             pipeline_id=args.pipeline_id,
+            context_token_budget=args.context_token_budget,
         )
         print(json.dumps(artifact, indent=2))
         return
@@ -42,6 +49,7 @@ def main() -> None:
             store_path=store_path,
             turns=args.turns,
             pipeline_id=args.pipeline_id,
+            context_token_budget=args.context_token_budget,
         )
         print(json.dumps(artifact, indent=2))
 

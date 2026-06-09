@@ -15,9 +15,11 @@ The benchmark uses:
 - a deterministic 4-role pipeline
 - a real SQLite store
 - the real assembler and post-turn persistence path
-- `word_split` token accounting in this environment
+- `chars_div4` token accounting in this environment
   - if `tiktoken` is installed, the benchmark automatically reports that
     instead
+- an explicit NCP context budget of `340` estimated tokens for this deterministic
+  coding scenario
 
 ## Command
 
@@ -29,22 +31,25 @@ python3 benchmarks/coding_pipeline/run.py --turns 40
 
 ## Current result
 
-Observed on June 1, 2026:
+Observed on June 9, 2026:
 
-- peak NCP input tokens: `174`
-- peak raw replay input tokens: `1927`
-- peak sliding-window input tokens: `212`
-- peak rolling-summary input tokens: `1176`
-- final NCP input tokens: `110`
-- final raw replay input tokens: `1927`
-- final sliding-window input tokens: `212`
-- final rolling-summary input tokens: `1176`
-- reduction factor vs raw replay at the final turn: `17.52x`
-- reduction factor vs sliding window at the final turn: `1.93x`
-- reduction factor vs rolling summary at the final turn: `10.69x`
-- final-turn savings vs raw replay: `1817`
+- token unit: `chars_div4`
+- context token budget: `340`
+- peak NCP input tokens: `370`
+- peak raw replay input tokens: `3426`
+- peak sliding-window input tokens: `383`
+- peak rolling-summary input tokens: `2096`
+- final NCP input tokens: `317`
+- final raw replay input tokens: `3426`
+- final sliding-window input tokens: `377`
+- final rolling-summary input tokens: `2096`
+- reduction factor vs raw replay at the final turn: `10.81x`
+- reduction factor vs sliding window at the final turn: `1.19x`
+- reduction factor vs rolling summary at the final turn: `6.61x`
+- final-turn savings vs raw replay: `3109`
 - estimated assembly overhead token-equivalent (total across all turns): `533.33`
-- net total token-equivalent savings vs raw replay: see artifact `economics.net_total_token_equivalent_vs_raw_replay`
+- net total token-equivalent savings vs raw replay: `55723.67`
+- benchmark pass gate: `true`
 
 ## Interpretation
 
@@ -52,8 +57,8 @@ This is a stronger bounded-context result than the earlier single-baseline
 snapshot:
 
 - NCP stays far below raw replay as turn depth grows
-- NCP still beats the simple sliding-window baseline at the same benchmark
-  checkpoint
+- NCP now beats the simple sliding-window baseline on the peak-token pass gate
+  for this benchmark budget
 - NCP substantially beats the simple rolling-summary baseline
 - the turn-40 path remains comfortably under the current `<= 2000` launch gate
 - the benchmark is deterministic and rerunnable from the repo
@@ -75,6 +80,7 @@ The JSON output includes:
 
 - per-turn token counts
 - token unit
+- context token budget
 - peak/final token counts for:
   - `ncp`
   - `raw_replay`
