@@ -234,7 +234,7 @@ Suggested next priorities:
 ## Recommended Agent Roles
 
 - **Claude**: bounded implementation/planning partner
-- **OpenCode**: bounded reviewer (`opencode/deepseek-v4-flash-free`)
+- **OpenCode**: bounded reviewer using the user's configured OpenCode default model
 - **NCP**: handoff transport and shared bounded context
 - **Task runner / host process**: task and evidence tracking
 
