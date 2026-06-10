@@ -133,6 +133,25 @@ def test_sqlite_store_whisper_drain_filters_and_deletes(tmp_path: Path) -> None:
     assert store.drain_whispers(agent_id="executor", pipeline_id="pipe_1") == []
 
 
+def test_broadcast_whisper_delivery_is_per_recipient(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "broadcast.db")
+    store.emit_whisper(
+        Whisper(
+            whisper_id="wsp_broadcast",
+            from_agent="planner",
+            target="*",
+            whisper_type="share",
+            payload='{"ask":"review"}',
+            confidence=0.9,
+            pipeline_id="pipe_1",
+        )
+    )
+
+    assert [w.whisper_id for w in store.drain_whispers(agent_id="executor", pipeline_id="pipe_1")] == ["wsp_broadcast"]
+    assert store.drain_whispers(agent_id="executor", pipeline_id="pipe_1") == []
+    assert [w.whisper_id for w in store.drain_whispers(agent_id="reviewer", pipeline_id="pipe_1")] == ["wsp_broadcast"]
+
+
 def test_sqlite_store_turn_logging_and_recent_ref_resolution(tmp_path: Path) -> None:
     store = SQLiteStore(tmp_path / "store.db")
     record = TurnRecord(

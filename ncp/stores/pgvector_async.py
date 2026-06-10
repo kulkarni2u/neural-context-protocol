@@ -709,6 +709,47 @@ class AsyncPgvectorStore(BaseStore):
                     ),
                 )
 
+    async def async_load_latest_conscious(self, *, pipeline_id: str | None, agent_id: str) -> ConsciousBlock | None:
+        """Load the latest conscious-block snapshot using native async DB I/O."""
+        async with self._aconnect() as conn:
+            async with conn.cursor() as cur:
+                if pipeline_id is None:
+                    await cur.execute(
+                        self._sql(
+                            """
+                            SELECT snapshot_json FROM {schema}.{prefix}conscious_log
+                            WHERE agent_id = %s AND pipeline_id IS NULL
+                            ORDER BY logged_at DESC
+                            LIMIT 1
+                            """
+                        ),
+                        (agent_id,),
+                    )
+                else:
+                    await cur.execute(
+                        self._sql(
+                            """
+                            SELECT snapshot_json FROM {schema}.{prefix}conscious_log
+                            WHERE agent_id = %s AND pipeline_id = %s
+                            ORDER BY logged_at DESC
+                            LIMIT 1
+                            """
+                        ),
+                        (agent_id, pipeline_id),
+                    )
+                raw = await cur.fetchone()
+                description = cur.description
+        if raw is None:
+            return None
+        row = self._normalize_row(raw, description)
+        payload = row["snapshot_json"]
+        try:
+            if isinstance(payload, str):
+                return ConsciousBlock.model_validate_json(payload)
+            return ConsciousBlock.model_validate(payload)
+        except ValueError:
+            return None
+
     async def async_log_drift_history(self, *, session_id: str, turn: int, drift_score: float) -> None:
         """Persist a drift sensor reading using native async DB I/O."""
         async with self._aconnect() as conn:
@@ -887,6 +928,20 @@ class AsyncPgvectorStore(BaseStore):
             max_items=max_items,
             min_confidence=min_confidence,
         )
+
+    async def async_acknowledge_whispers(
+        self,
+        whisper_ids: list[str],
+        *,
+        agent_id: str | None = None,
+    ) -> int:
+        """Acknowledge whispers via native async Redis coordination."""
+        if self._acoordination is None:
+            raise NCPStoreUnavailableError(
+                "AsyncPgvectorStore whisper coordination requires Redis. "
+                "Pass redis_url= or coordination= to enable whispers."
+            )
+        return await self._acoordination._async_acknowledge_whispers(list(whisper_ids), agent_id=agent_id)
 
     # ------------------------------------------------------------------
     # Chunk validation helper
@@ -1602,7 +1657,7 @@ class AsyncPgvectorStore(BaseStore):
         self._not_implemented("peek_whispers")
         return []
 
-    def acknowledge_whispers(self, whisper_ids: Any) -> int:  # type: ignore[override]
+    def acknowledge_whispers(self, whisper_ids: Any, *, agent_id: str | None = None) -> int:  # type: ignore[override]
         self._not_implemented("acknowledge_whispers")
         return 0
 
@@ -1628,6 +1683,10 @@ class AsyncPgvectorStore(BaseStore):
 
     def log_conscious(self, conscious: ConsciousBlock, *, snapshot_hash: str) -> None:
         self._not_implemented("log_conscious")
+
+    def load_latest_conscious(self, *, pipeline_id: str | None, agent_id: str) -> ConsciousBlock | None:
+        self._not_implemented("load_latest_conscious")
+        return None
 
     def get_pipeline_goal_versions(self, *, pipeline_id: str, **kwargs: Any) -> dict[str, int]:  # type: ignore[override]
         self._not_implemented("get_pipeline_goal_versions")

@@ -51,7 +51,7 @@ DEFAULT_CONFIG = {
         "default_type": "auto",
     },
     "whispers": {
-        "default_ttl_seconds": 60,
+        "default_ttl_seconds": 1800,
         "max_per_drain": 3,
         "min_confidence": 0.60,
     },
@@ -201,6 +201,10 @@ class NCPConfig:
     @property
     def whisper_cap_critical(self) -> int:
         return int(self.values.get("budget", {}).get("whisper_cap_critical", 1))
+
+    @property
+    def whisper_ttl_default(self) -> int:
+        return int(self.values.get("whispers", {}).get("default_ttl_seconds", 1800))
 
     @property
     def embedding_enabled(self) -> bool:

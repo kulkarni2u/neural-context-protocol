@@ -39,16 +39,16 @@ Observed on June 9, 2026:
 - peak raw replay input tokens: `3426`
 - peak sliding-window input tokens: `383`
 - peak rolling-summary input tokens: `2096`
-- final NCP input tokens: `317`
+- final NCP input tokens: `261`
 - final raw replay input tokens: `3426`
 - final sliding-window input tokens: `377`
 - final rolling-summary input tokens: `2096`
-- reduction factor vs raw replay at the final turn: `10.81x`
-- reduction factor vs sliding window at the final turn: `1.19x`
-- reduction factor vs rolling summary at the final turn: `6.61x`
-- final-turn savings vs raw replay: `3109`
+- reduction factor vs raw replay at the final turn: `13.13x`
+- reduction factor vs sliding window at the final turn: `1.44x`
+- reduction factor vs rolling summary at the final turn: `8.03x`
+- final-turn savings vs raw replay: `3165`
 - estimated assembly overhead token-equivalent (total across all turns): `533.33`
-- net total token-equivalent savings vs raw replay: `55723.67`
+- net total token-equivalent savings vs raw replay: `56230.67`
 - benchmark pass gate: `true`
 
 ## Interpretation

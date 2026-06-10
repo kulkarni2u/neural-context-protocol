@@ -12,45 +12,49 @@ It is stable from V1. Unknown fields are ignored (forward compatibility).
 
 ### 1.1 Full assembled context block
 
-```
-[NCP:BUDGET] ctx_used:{0.00-1.00} steps:{n}/{total|?} elapsed:{n}s pressure:{low|medium|high|critical}
-
+```text
 [NCP:CONSCIOUS]
 id:{agent_id} role:{role} ncp_v:1.0
-owns:[{cap},{cap}] must-not:[{cap},{cap}]
 task:{task_no_spaces}
-slot:{slot_no_spaces} slot_age:{n} slot_conf:{0.00-1.00}
+slot:{slot_no_spaces}
 intent:{intent_no_spaces}
-goal_version:{n}
-recent:[r:sub/{turn_id} | r:sub/{turn_id}]
-tried:[{x},{x}] failed:[{x},{x}]
-drift_score:{0.00-1.00}
+owns:[{cap},{cap}]
+must-not:[{cap},{cap}]
+slot_age:{n} slot_conf:{0.0-1.0}
+goal_version:{n}              # omitted when 1
+recent:[r:sub/{turn_id} | r:sub/{turn_id}]  # omitted when empty
+tried:[{x},{x}]                # omitted when empty
+failed:[{x},{x}]               # omitted when empty
+drift_score:{0.0-1.0}          # omitted when 0.0
 
 [NCP:SUBCONSCIOUS]
-chunk:{id} layer:{layer} score:{0.00} src:{src} trust:{0.00}
+chunk:{id} layer:{layer} score:{0.0} src:{src} trust:{0.0}
   {content — 2-space indent, max 200 tok}
-chunk:{id} layer:{layer} score:{0.00} src:{src} trust:{0.00}
+chunk:{id} layer:{layer} score:{0.0} src:{src} trust:{0.0}
   {content}
 
 [NCP:WHISPERS]
-wsp from:{agent} to:{target} t:{type} c:{0.00} age:{n}s
-  {payload — 2-space indent}
+wsp from:{agent} to:{target} t:{type} c:{0.0} age:{<1m|Nm|Nh|Nd}
+  ask:{payload field}
+  files:[path,path]
+
+[NCP:BUDGET] ctx_used:{0.0-1.0} steps:{n}/{total|?} elapsed:{n}s pressure:{low|medium|high|critical}
 ```
 
 ### 1.2 Encoding rules (normative)
 
 - All field values: no spaces (use underscores)
-- All floats: exactly 2 decimal places
+- All floats in pidgin output: one decimal place
 - Lists: comma-separated inside brackets, no spaces: `[a,b,c]`
 - Content lines: exactly 2-space indent, never inline with header
-- Whisper payload: max 600 characters (~120 tok)
+- Whisper payload: max 600 characters (~120 tok); JSON object payloads render as `key:value` pidgin lines
 - Chunk content: max 2000 characters (~400 tok)
 - Unknown fields: MUST be ignored by all versions
 - Empty blocks: MUST be omitted entirely (no empty `[NCP:WHISPERS]`)
 
 ### 1.3 Block ordering (normative)
 
-Always: BUDGET → CONSCIOUS → SUBCONSCIOUS → WHISPERS → user turn
+Always: CONSCIOUS → SUBCONSCIOUS → WHISPERS → BUDGET → user turn
 BUDGET is always present.
 CONSCIOUS is always present.
 SUBCONSCIOUS may be omitted if store is empty.
@@ -172,7 +176,7 @@ Optional fields:
   whisper_id      str         auto-generated
   ref             str?        ctx://sub/{chunk_id} — resolved via tombstone chain
   created_at      float       unix timestamp
-  ttl_seconds     int = 60
+  ttl_seconds     int = 1800
   pipeline_id     str?
   dissent_target  str?        explicit target for dissent routing
 
@@ -406,15 +410,16 @@ Step 3: Hybrid subconscious retrieval
   apply diversity cap (max 2 per written_by)
   select top 4 by effective_score
 
-Step 4: Drain whisper queue
+Step 4: Peek whisper queue
   filter: not expired, confidence >= 0.60 (except alert + world_check)
   alerts: always first
   dissent: routed to dissent_target only
   max 3 whispers injected
+  pending whisper ids are acknowledged only after post-turn
   resolve any refs via tombstone chain
 
 Step 5: Encode pidgin
-  assemble BUDGET + CONSCIOUS + SUBCONSCIOUS + WHISPERS
+  assemble CONSCIOUS + SUBCONSCIOUS + WHISPERS + BUDGET
   total target: ≤ 2000 tok (scales with ctx_window)
   at critical pressure: reduce to 2 chunks, 1 whisper
 
@@ -635,7 +640,7 @@ max_chunk_tokens = 200
 default_type = "auto"
 
 [whispers]
-default_ttl_seconds = 60
+default_ttl_seconds = 1800
 max_per_drain = 3
 min_confidence = 0.60
 
@@ -676,7 +681,7 @@ Agents do not own separate stores.
 
 Dogfood phases:
 ```
-Phase 1: base loop (ncp_get_context, ncp_write_memory, ncp_emit_whisper)
+Phase 1: base loop (ncp_get_context, ncp_write_memory, ncp_emit_whisper, ncp_post_turn)
 Phase 2: restart persistence proof
 Phase 3: ncp_fetch added to one canonical host path
 Phase 4: provider parity rotation (Claude/Codex/OpenCode assignments rotated)

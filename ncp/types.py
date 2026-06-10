@@ -327,7 +327,7 @@ class Whisper(NCPModel):
     whisper_id: str = Field(default_factory=lambda: f"wsp_{uuid4().hex[:12]}")
     ref: str | None = None
     created_at: float = Field(default_factory=time.time)
-    ttl_seconds: int = 60
+    ttl_seconds: int = 1800
     pipeline_id: str | None = None
     dissent_target: str | None = None
 

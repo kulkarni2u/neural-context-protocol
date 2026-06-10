@@ -206,6 +206,7 @@ Expected tool surface:
 - `ncp_get_context`
 - `ncp_write_memory`
 - `ncp_emit_whisper`
+- `ncp_post_turn`
 - `ncp_fetch`
 
 ### Codex CLI
@@ -223,7 +224,8 @@ Recommended loop:
 1. call `ncp_get_context`
 2. run the provider turn
 3. persist durable memory with `ncp_write_memory`
-4. use `ncp_fetch` only for bounded retrieval
+4. call `ncp_post_turn` with consumed `pending_whisper_ids`
+5. use `ncp_fetch` only for bounded retrieval
 
 ## Optional Whisper Handoff Loop
 

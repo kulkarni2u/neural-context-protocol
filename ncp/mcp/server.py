@@ -15,10 +15,11 @@ from pathlib import Path
 from typing import BinaryIO
 
 from ncp.assembler import Assembler
-from ncp.config import load_config
+from ncp.config import NCPConfig, load_config
 from ncp.stores.base import BaseStore
 from ncp.stores.factory import create_store
-from ncp.types import BudgetContext, ConsciousBlock, SubconsciousChunk, Whisper
+from ncp.types import BudgetContext, ConsciousBlock, NCPResponse, SubconsciousChunk, Whisper
+from ncp.version import __version__
 
 
 def _err(msg: str) -> None:
@@ -60,6 +61,16 @@ MCP_TOOLS: list[dict[str, object]] = [
                 "k": {"type": "integer", "description": "Number of subconscious chunks to retrieve. Overrides the default budget-pressure-based value (2 for critical, 4 otherwise)."},
                 "diversity_limit": {"type": "integer", "description": "Max chunks per author in retrieved results. Default 2. Set higher to allow more results from one author."},
                 "max_tokens": {"type": "integer", "description": "Optional estimated token ceiling for the assembled context block."},
+                "recent": {"type": "array", "items": {"type": "string"}, "description": "Optional recent refs overriding hydrated conscious state."},
+                "tried": {"type": "array", "items": {"type": "string"}, "description": "Optional attempted actions overriding hydrated conscious state."},
+                "failed": {"type": "array", "items": {"type": "string"}, "description": "Optional failed actions overriding hydrated conscious state."},
+                "slot_age": {"type": "integer", "description": "Optional slot age overriding hydrated conscious state."},
+                "slot_confidence": {"type": "number", "description": "Optional slot confidence overriding hydrated conscious state."},
+                "goal_version": {"type": "integer", "description": "Optional goal version overriding hydrated conscious state."},
+                "drift_score": {"type": "number", "description": "Optional drift score overriding hydrated conscious state."},
+                "ctx_used": {"type": "number", "description": "Context window usage ratio 0.0-1.0."},
+                "steps_completed": {"type": "integer", "description": "Completed plan steps for budget pressure."},
+                "steps_total": {"type": "integer", "description": "Total plan steps for budget pressure."},
             },
             "required": ["agent_id", "role", "task", "slot", "intent"],
         },
@@ -76,6 +87,7 @@ MCP_TOOLS: list[dict[str, object]] = [
                 "written_by": {"type": "string", "description": "Agent writing this chunk"},
                 "chunk_id": {"type": "string", "description": "Optional chunk ID (auto-generated if omitted)"},
                 "pipeline_id": {"type": "string"},
+                "base_trust": {"type": "number", "description": "Optional explicit trust score 0.0-1.0; otherwise derived from src."},
             },
             "required": ["content", "layer", "src"],
         },
@@ -89,11 +101,46 @@ MCP_TOOLS: list[dict[str, object]] = [
                 "from": {"type": "string", "description": "Sending agent ID"},
                 "target": {"type": "string", "description": "Receiving agent ID or '*' for pipeline broadcast"},
                 "type": {"type": "string", "enum": ["nudge", "alert", "share", "request", "dissent", "world_check", "consolidation_ready"]},
-                "payload": {"type": "string", "description": "Whisper message (max 600 chars)"},
+                "payload": {
+                    "type": "string",
+                    "description": (
+                        "Whisper message (max 600 chars). share/request expect JSON "
+                        "{\"ask\": str, \"files\": [str], \"slice\": str?}; dissent expects "
+                        "JSON {\"issue\": str, \"alternatives\": [str]}. Plain text is accepted "
+                        "by MCP and wrapped into the required shape."
+                    ),
+                },
                 "confidence": {"type": "number", "description": "Confidence 0.0-1.0"},
                 "pipeline_id": {"type": "string"},
+                "ttl_seconds": {"type": "integer", "description": "Seconds before expiry. Default 1800."},
             },
             "required": ["from", "target", "type", "payload", "confidence"],
+        },
+    },
+    {
+        "name": "ncp_post_turn",
+        "description": "Record the completed turn, update conscious state, log cost, and acknowledge consumed whispers.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "agent_id": {"type": "string"},
+                "role": {"type": "string"},
+                "task": {"type": "string"},
+                "slot": {"type": "string"},
+                "intent": {"type": "string"},
+                "pipeline_id": {"type": "string"},
+                "turn_id": {"type": "string"},
+                "result_summary": {"type": "string"},
+                "result_full": {"type": "string"},
+                "model": {"type": "string"},
+                "input_tokens": {"type": "integer"},
+                "output_tokens": {"type": "integer"},
+                "cache_read_tokens": {"type": "integer"},
+                "cost_usd": {"type": "number"},
+                "latency_ms": {"type": "integer"},
+                "ack_whisper_ids": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["agent_id", "role", "task", "slot", "intent", "result_summary", "result_full"],
         },
     },
     {
@@ -153,31 +200,27 @@ def _session_id_from_args(args: dict[str, object]) -> str:
     return DEFAULT_FETCH_SESSION_ID
 
 
-def make_handlers(store: BaseStore) -> dict[str, ToolHandler]:
+def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[str, ToolHandler]:
     sessions: dict[str, FetchSession] = {}
-    last_session_id = DEFAULT_FETCH_SESSION_ID
+    sessions_lock = threading.Lock()
     coordination = getattr(store, "coordination", None)
+    default_whisper_ttl = config.whisper_ttl_default if config is not None else 1800
 
     def _handle_get_context(args: dict[str, object]) -> object:
-        nonlocal last_session_id
         session_id = _session_id_from_args(args)
         pipeline_id = args.get("pipeline_id")
         normalized_pipeline_id = None if pipeline_id is None else str(pipeline_id)
         if coordination is not None and hasattr(coordination, "reset_fetch_session"):
             coordination.reset_fetch_session(session_id, pipeline_id=normalized_pipeline_id)
+            if session_id != DEFAULT_FETCH_SESSION_ID:
+                coordination.reset_fetch_session(DEFAULT_FETCH_SESSION_ID, pipeline_id=normalized_pipeline_id)
         else:
-            sessions[session_id] = FetchSession(fetch_count=0, pipeline_id=normalized_pipeline_id)
-        last_session_id = session_id
-        conscious = ConsciousBlock(
-            agent_id=str(args["agent_id"]),
-            role=str(args["role"]),
-            owns=list(args.get("owns", []) or []),
-            must_not=list(args.get("must_not", []) or []),
-            task=str(args["task"]),
-            slot=str(args["slot"]),
-            intent=str(args["intent"]),
-            pipeline_id=pipeline_id,
-        )
+            with sessions_lock:
+                sessions[session_id] = FetchSession(fetch_count=0, pipeline_id=normalized_pipeline_id)
+                if session_id != DEFAULT_FETCH_SESSION_ID:
+                    sessions[DEFAULT_FETCH_SESSION_ID] = FetchSession(fetch_count=0, pipeline_id=normalized_pipeline_id)
+        conscious = _build_conscious_from_args(store, args)
+        budget = _budget_from_args(args, conscious=conscious)
         assembler = Assembler(store=store)
         stream = bool(args.get("stream", False))
         try:
@@ -195,7 +238,7 @@ def make_handlers(store: BaseStore) -> dict[str, ToolHandler]:
         if stream:
             sections = list(assembler.assemble_incremental(
                 conscious=conscious,
-                budget=BudgetContext(),
+                budget=budget,
                 query_text=conscious.task + " " + conscious.slot,
                 k=caller_k,
                 diversity_limit=caller_diversity_limit,
@@ -204,25 +247,37 @@ def make_handlers(store: BaseStore) -> dict[str, ToolHandler]:
             assembled = assembler.apply_post_middleware("\n\n".join(t for _, t in sections))
             return StreamResponse(
                 sections=sections,
-                handler_result={"context": assembled, "session_id": session_id},
+                handler_result={"context": assembled, "session_id": session_id, "pending_whisper_ids": []},
             )
         result = assembler.assemble(
             conscious=conscious,
-            budget=BudgetContext(),
+            budget=budget,
             query_text=conscious.task + " " + conscious.slot,
             k=caller_k,
             diversity_limit=caller_diversity_limit,
             max_tokens=caller_max_tokens,
         )
-        return {"context": result.context, "session_id": session_id}
+        return {
+            "context": result.context,
+            "session_id": session_id,
+            "pending_whisper_ids": result.pending_whisper_ids,
+        }
 
     def _handle_write_memory(args: dict[str, object]) -> object:
+        written_by = str(args.get("written_by", "agent"))
+        pipeline_id = args.get("pipeline_id")
+        latest = store.load_latest_conscious(
+            pipeline_id=None if pipeline_id is None else str(pipeline_id),
+            agent_id=written_by,
+        )
         kwargs: dict = {
             "content": str(args["content"]),
             "layer": str(args["layer"]),
             "src": str(args["src"]),
-            "written_by": str(args.get("written_by", "agent")),
-            "pipeline_id": args.get("pipeline_id"),
+            "written_by": written_by,
+            "pipeline_id": pipeline_id,
+            "base_trust": _trust_from_args(args),
+            "written_at_drift": 0.0 if latest is None else latest.drift_score,
         }
         if (chunk_id := args.get("chunk_id")):
             kwargs["chunk_id"] = str(chunk_id)
@@ -231,21 +286,50 @@ def make_handlers(store: BaseStore) -> dict[str, ToolHandler]:
         return {"written": ok, "chunk_id": chunk.chunk_id}
 
     def _handle_emit_whisper(args: dict[str, object]) -> object:
+        whisper_type = str(args["type"])
+        payload = _normalize_mcp_whisper_payload(whisper_type, str(args["payload"]))
+        try:
+            ttl_seconds = max(1, int(args.get("ttl_seconds", default_whisper_ttl)))
+        except (TypeError, ValueError):
+            ttl_seconds = default_whisper_ttl
         whisper = Whisper(
             from_agent=str(args["from"]),
             target=str(args["target"]),
-            whisper_type=str(args["type"]),
-            payload=str(args["payload"]),
+            whisper_type=whisper_type,
+            payload=payload,
             confidence=float(args["confidence"]),
             pipeline_id=args.get("pipeline_id"),
+            ttl_seconds=ttl_seconds,
         )
         store.emit_whisper(whisper)
         return {"emitted": True}
 
+    def _handle_post_turn(args: dict[str, object]) -> object:
+        conscious = _build_conscious_from_args(store, args)
+        assembler = Assembler(store=store)
+        response = NCPResponse(
+            content=str(args["result_full"]),
+            turn_id=str(args.get("turn_id") or f"turn_{int(time.time() * 1000)}"),
+            pipeline_id=conscious.pipeline_id,
+            model=str(args.get("model", "unknown")),
+            input_tokens=_int_arg(args, "input_tokens", 0),
+            output_tokens=_int_arg(args, "output_tokens", 0),
+            cache_read_tokens=_int_arg(args, "cache_read_tokens", 0),
+            cost_usd=float(args.get("cost_usd", 0.0) or 0.0),
+            latency_ms=_int_arg(args, "latency_ms", 0),
+        )
+        ack_ids = [str(item) for item in list(args.get("ack_whisper_ids", []) or [])]
+        record = assembler.post_turn(
+            conscious=conscious,
+            response=response,
+            result_summary=str(args["result_summary"]),
+            result_full=str(args["result_full"]),
+            ack_whisper_ids=ack_ids,
+        )
+        return {"posted": True, "turn_id": record.turn_id, "acknowledged_whisper_ids": ack_ids}
+
     def _handle_fetch(args: dict[str, object]) -> object:
         session_id = _session_id_from_args(args)
-        if session_id == DEFAULT_FETCH_SESSION_ID:
-            session_id = last_session_id
         query_str = str(args["query"])
         layer = args.get("layer")
         if layer == "any":
@@ -261,13 +345,14 @@ def make_handlers(store: BaseStore) -> dict[str, ToolHandler]:
                 max_fetches=3,
             )
         else:
-            session = sessions.setdefault(session_id, FetchSession())
-            if session.fetch_count >= 3:
-                raise ValueError("ncp_fetch limit reached: max 3 per session")
-            session.fetch_count += 1
-            if pipeline_id is not None:
-                session.pipeline_id = str(pipeline_id)
-            effective_pipeline_id = session.pipeline_id
+            with sessions_lock:
+                session = sessions.setdefault(session_id, FetchSession())
+                if session.fetch_count >= 3:
+                    raise ValueError("ncp_fetch limit reached: max 3 per session")
+                session.fetch_count += 1
+                if pipeline_id is not None:
+                    session.pipeline_id = str(pipeline_id)
+                effective_pipeline_id = session.pipeline_id
         try:
             k = max(1, int(args.get("k", 2)))
         except (ValueError, TypeError):
@@ -288,8 +373,108 @@ def make_handlers(store: BaseStore) -> dict[str, ToolHandler]:
         "ncp_get_context": _handle_get_context,
         "ncp_write_memory": _handle_write_memory,
         "ncp_emit_whisper": _handle_emit_whisper,
+        "ncp_post_turn": _handle_post_turn,
         "ncp_fetch": _handle_fetch,
     }
+
+
+def _int_arg(args: dict[str, object], name: str, default: int) -> int:
+    try:
+        return max(0, int(args.get(name, default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _float_arg(args: dict[str, object], name: str, default: float) -> float:
+    try:
+        return float(args.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _list_arg(args: dict[str, object], name: str, default: list[str]) -> list[str]:
+    if name not in args:
+        return list(default)
+    value = args.get(name)
+    if not isinstance(value, list):
+        return list(default)
+    return [str(item) for item in value]
+
+
+def _pressure_from_ctx(ctx_used: float) -> str:
+    if ctx_used >= 0.90:
+        return "critical"
+    if ctx_used >= 0.75:
+        return "high"
+    if ctx_used >= 0.50:
+        return "medium"
+    return "low"
+
+
+def _budget_from_args(args: dict[str, object], *, conscious: ConsciousBlock) -> BudgetContext:
+    ctx_used = min(1.0, max(0.0, _float_arg(args, "ctx_used", conscious.ctx_used_ratio)))
+    steps_completed = _int_arg(args, "steps_completed", conscious.steps_completed)
+    steps_total = args.get("steps_total", conscious.steps_total)
+    try:
+        normalized_steps_total = None if steps_total is None else max(1, int(steps_total))
+    except (TypeError, ValueError):
+        normalized_steps_total = conscious.steps_total
+    return BudgetContext(
+        ctx_used=ctx_used,
+        steps_completed=steps_completed,
+        steps_total=normalized_steps_total,
+        pressure=_pressure_from_ctx(ctx_used),
+    )
+
+
+def _build_conscious_from_args(store: BaseStore, args: dict[str, object]) -> ConsciousBlock:
+    pipeline_value = args.get("pipeline_id")
+    pipeline_id = None if pipeline_value is None else str(pipeline_value)
+    agent_id = str(args["agent_id"])
+    latest = store.load_latest_conscious(pipeline_id=pipeline_id, agent_id=agent_id)
+    return ConsciousBlock(
+        agent_id=agent_id,
+        role=str(args["role"]),
+        owns=_list_arg(args, "owns", [] if latest is None else latest.owns),
+        must_not=_list_arg(args, "must_not", [] if latest is None else latest.must_not),
+        task=str(args["task"]),
+        slot=str(args["slot"]),
+        intent=str(args["intent"]),
+        pipeline_id=pipeline_id,
+        recent=_list_arg(args, "recent", [] if latest is None else latest.recent),
+        tried=_list_arg(args, "tried", [] if latest is None else latest.tried),
+        failed=_list_arg(args, "failed", [] if latest is None else latest.failed),
+        slot_age=_int_arg(args, "slot_age", 0 if latest is None else latest.slot_age),
+        slot_confidence=min(1.0, max(0.0, _float_arg(args, "slot_confidence", 1.0 if latest is None else latest.slot_confidence))),
+        goal_version=max(1, _int_arg(args, "goal_version", 1 if latest is None else latest.goal_version)),
+        drift_score=min(1.0, max(0.0, _float_arg(args, "drift_score", 0.0 if latest is None else latest.drift_score))),
+        ctx_used_ratio=min(1.0, max(0.0, _float_arg(args, "ctx_used", 0.0 if latest is None else latest.ctx_used_ratio))),
+        steps_completed=_int_arg(args, "steps_completed", 0 if latest is None else latest.steps_completed),
+        steps_total=(None if latest is None else latest.steps_total),
+    )
+
+
+def _trust_from_args(args: dict[str, object]) -> float:
+    if "base_trust" in args:
+        return min(1.0, max(0.0, _float_arg(args, "base_trust", 0.7)))
+    return {
+        "user_verified": 0.95,
+        "tool_result": 0.80,
+        "synthesis": 0.70,
+        "agent_inferred": 0.60,
+        "subcon_retrieved": 0.55,
+    }.get(str(args.get("src", "")), 0.70)
+
+
+def _normalize_mcp_whisper_payload(whisper_type: str, payload: str) -> str:
+    trimmed = payload.strip()
+    if trimmed.startswith("{") and trimmed.endswith("}"):
+        return payload
+    if whisper_type in {"share", "request"}:
+        return json.dumps({"ask": payload})
+    if whisper_type == "dissent":
+        return json.dumps({"issue": payload})
+    return payload
 
 
 _SUPPORTED_VERSIONS = {"2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"}
@@ -319,7 +504,7 @@ def _handle_request(req: dict[str, object], handlers: dict[str, ToolHandler]) ->
             req_id,
             {
                 "protocolVersion": _negotiate_version(client_version),
-                "serverInfo": {"name": "ncp", "version": "1.0.4"},
+                "serverInfo": {"name": "ncp", "version": __version__},
                 "capabilities": {"tools": {"listChanged": False}},
             },
         )
@@ -412,7 +597,7 @@ def _create_handlers(
     else:
         config = load_config(cwd=cwd or Path.cwd())
     store = create_store(config)
-    return make_handlers(store)
+    return make_handlers(store, config=config)
 
 
 def serve_streams(
@@ -483,11 +668,17 @@ class _MCPHTTPServer(ThreadingHTTPServer):
         sse_path: str,
         rpc_path: str,
         keepalive_seconds: float,
+        auth_token: str | None,
+        cors_allowed_origins: list[str],
+        max_body_bytes: int,
     ) -> None:
         self.handlers = handlers
         self.sse_path = sse_path
         self.rpc_path = rpc_path
         self.keepalive_seconds = keepalive_seconds
+        self.auth_token = auth_token
+        self.cors_allowed_origins = cors_allowed_origins
+        self.max_body_bytes = max_body_bytes
         self._shutdown_event = threading.Event()
         super().__init__(server_address, _MCPHTTPHandler)
 
@@ -499,12 +690,37 @@ class _MCPHTTPHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: object) -> None:
         return
 
+    def _cors_origin(self) -> str | None:
+        origin = self.headers.get("Origin")
+        if not origin:
+            return None
+        allowed = self.server.cors_allowed_origins
+        if "*" in allowed:
+            return "*"
+        if origin in allowed:
+            return origin
+        return None
+
+    def _send_cors_headers(self) -> None:
+        origin = self._cors_origin()
+        if origin is not None:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+
+    def _authorized(self) -> bool:
+        token = self.server.auth_token
+        if not token:
+            return True
+        auth = self.headers.get("Authorization", "")
+        return auth == f"Bearer {token}"
+
     def _send_json(self, status: HTTPStatus, payload: object) -> None:
         body = _json_bytes(payload)
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self._send_cors_headers()
         self.end_headers()
         self.wfile.write(body)
         self.wfile.flush()
@@ -513,6 +729,7 @@ class _MCPHTTPHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Length", "0")
         self.send_header("Cache-Control", "no-store")
+        self._send_cors_headers()
         self.end_headers()
 
     def _stream_ndjson(self, sr: StreamResponse) -> None:
@@ -520,7 +737,7 @@ class _MCPHTTPHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/x-ndjson")
         self.send_header("Cache-Control", "no-store")
         self.send_header("Connection", "close")
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self._send_cors_headers()
         self.end_headers()
         try:
             for i, (label, text) in enumerate(sr.sections):
@@ -535,8 +752,9 @@ class _MCPHTTPHandler(BaseHTTPRequestHandler):
 
     def do_OPTIONS(self) -> None:
         self.send_response(HTTPStatus.NO_CONTENT)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self._send_cors_headers()
+        allowed_headers = "Content-Type, Authorization" if self.server.auth_token else "Content-Type"
+        self.send_header("Access-Control-Allow-Headers", allowed_headers)
         self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
         self.send_header("Content-Length", "0")
         self.end_headers()
@@ -551,12 +769,15 @@ class _MCPHTTPHandler(BaseHTTPRequestHandler):
         if self.path != self.server.sse_path:
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
             return
+        if not self._authorized():
+            self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
+            return
 
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "keep-alive")
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self._send_cors_headers()
         self.end_headers()
         try:
             endpoint_event = f"event: endpoint\ndata: {self.server.rpc_path}\n\n".encode("utf-8")
@@ -573,11 +794,18 @@ class _MCPHTTPHandler(BaseHTTPRequestHandler):
         if self.path not in (self.server.rpc_path, "/message"):
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
             return
+        if not self._authorized():
+            self.close_connection = True
+            self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
+            return
 
         try:
             content_length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_content_length"})
+            return
+        if content_length > self.server.max_body_bytes:
+            self._send_json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": "request_too_large"})
             return
         try:
             payload = json.loads(self.rfile.read(content_length).decode("utf-8"))
@@ -606,6 +834,9 @@ def create_http_server(
     sse_path: str = "/sse",
     rpc_path: str = "/mcp",
     keepalive_seconds: float = 15.0,
+    auth_token: str | None = None,
+    cors_allowed_origins: list[str] | None = None,
+    max_body_bytes: int = 10_485_760,
 ) -> _MCPHTTPServer:
     handlers = _create_handlers(store_path=store_path, cwd=cwd)
     return _MCPHTTPServer(
@@ -614,6 +845,9 @@ def create_http_server(
         sse_path=sse_path,
         rpc_path=rpc_path,
         keepalive_seconds=keepalive_seconds,
+        auth_token=auth_token,
+        cors_allowed_origins=list(cors_allowed_origins or []),
+        max_body_bytes=max(1, max_body_bytes),
     )
 
 
@@ -626,8 +860,16 @@ def serve_http(
     sse_path: str = "/sse",
     rpc_path: str = "/mcp",
     keepalive_seconds: float = 15.0,
+    auth_token: str | None = None,
+    cors_allowed_origins: list[str] | None = None,
+    max_body_bytes: int = 10_485_760,
 ) -> None:
     """Run the MCP server over HTTP POST plus an SSE discovery stream."""
+    if host not in {"127.0.0.1", "localhost", "::1"} and not auth_token:
+        _err(
+            "WARNING: NCP HTTP server is bound to a non-loopback host without auth_token. "
+            "Set an auth token before exposing this endpoint."
+        )
     try:
         server = create_http_server(
             host=host,
@@ -637,6 +879,9 @@ def serve_http(
             sse_path=sse_path,
             rpc_path=rpc_path,
             keepalive_seconds=keepalive_seconds,
+            auth_token=auth_token,
+            cors_allowed_origins=cors_allowed_origins,
+            max_body_bytes=max_body_bytes,
         )
     except Exception as exc:
         _err(f"NCP HTTP server failed to start: {exc}\n{traceback.format_exc()}")

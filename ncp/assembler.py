@@ -30,6 +30,7 @@ class AssemblyResult:
     conscious: ConsciousBlock
     chunks: list[SubconsciousChunk]
     whispers: list[Whisper]
+    pending_whisper_ids: list[str]
     evicted_high_relevance: list[tuple[str, float]]
     evicted_whispers: list[tuple[str, float]]
 
@@ -95,7 +96,6 @@ class Assembler:
         conscious, budget = self.middleware.pre_assemble(conscious, budget)
         coherence_report = self.coherence.check(conscious)
         coherence_alerts = coherence_report.alerts
-        coherence_sensors = coherence_report.sensors
         hydrated = conscious if ctx_window is None else conscious.model_copy(update={"ctx_window": ctx_window})
         chunk_cap, whisper_cap = self._assembly_caps(budget=budget, k=k)
         recent_chunks = self._resolve_recent_refs(hydrated)
@@ -120,18 +120,17 @@ class Assembler:
             for chunk in deduped_chunks
             if chunk.chunk_id not in combined_ids and float(chunk.relevance) >= 0.5
         ]
-        drain_cap = max(0, whisper_cap - len(coherence_alerts))
-        drained_whispers = (
-            [] if drain_cap == 0 else self._drain_whispers(hydrated, max_items=drain_cap)
-        )
-        hydrated = self._apply_drift_feedback(hydrated, drained_whispers)
-        all_whispers: list[Whisper] = [*coherence_alerts, *coherence_sensors, *drained_whispers]
+        alert_cap = self._alert_cap(budget=budget)
+        queue_whispers = self._peek_whispers(hydrated, max_items=whisper_cap)
+        hydrated = self._apply_drift_feedback(hydrated, queue_whispers)
+        external_alerts = coherence_alerts[:alert_cap]
+        all_whispers: list[Whisper] = [*external_alerts, *queue_whispers]
         evicted_whispers = [
             (whisper.whisper_id, float(whisper.confidence))
-            for whisper in all_whispers[whisper_cap:]
+            for whisper in [*coherence_alerts[alert_cap:], *queue_whispers[whisper_cap:]]
             if float(whisper.confidence) >= 0.6
         ]
-        combined_whispers = all_whispers[:whisper_cap]
+        combined_whispers = all_whispers
         effective_max_tokens = max_tokens if max_tokens is not None else self._context_token_budget
         if effective_max_tokens is not None:
             pre_budget_chunks = combined_chunks
@@ -195,6 +194,11 @@ class Assembler:
             conscious=hydrated,
             chunks=combined_chunks,
             whispers=combined_whispers,
+            pending_whisper_ids=[
+                whisper.whisper_id
+                for whisper in combined_whispers
+                if whisper.whisper_type not in {"alert", "world_check", "sensor"}
+            ],
             evicted_high_relevance=evicted_high_relevance,
             evicted_whispers=evicted_whispers,
         )
@@ -212,8 +216,8 @@ class Assembler:
     ) -> Iterator[tuple[str, str]]:
         """Yield (label, section_text) in priority order, enforcing max_tokens.
 
-        Labels in order: ``budget_header``, ``conscious``, ``subconscious`` (one
-        per chunk), ``whispers``. Budget and conscious sections are always emitted.
+        Labels in order: ``conscious``, ``subconscious`` (one per chunk),
+        ``whispers``, ``budget_header``. Conscious and budget sections are always emitted.
         Subconscious chunks stop yielding once max_tokens would be exceeded.
         Token count is estimated via ``ncp.tokens.estimate_tokens``.
 
@@ -231,9 +235,6 @@ class Assembler:
             max_tokens=max_tokens,
         )
 
-        budget_text = self.encoder._encode_budget(budget)
-        yield "budget_header", budget_text
-
         conscious_text = self.encoder._encode_conscious(hydrated)
         yield "conscious", conscious_text
 
@@ -242,6 +243,9 @@ class Assembler:
 
         if combined_whispers:
             yield "whispers", self.encoder._encode_whispers(combined_whispers, now=None)
+
+        budget_text = self.encoder._encode_budget(budget)
+        yield "budget_header", budget_text
 
     def apply_post_middleware(self, text: str) -> str:
         return self.middleware.post_assemble(text)
@@ -258,6 +262,7 @@ class Assembler:
         result_summary: str,
         result_full: str,
         memory_chunks: list[SubconsciousChunk] | None = None,
+        ack_whisper_ids: list[str] | None = None,
     ) -> TurnRecord:
         record = TurnRecord(
             turn_id=response.turn_id,
@@ -275,6 +280,8 @@ class Assembler:
         snapshot_hash = sha256(updated_conscious.model_dump_json().encode("utf-8")).hexdigest()
         self.store.log_conscious(updated_conscious, snapshot_hash=snapshot_hash)
         self.store.log_cost(agent_id=conscious.agent_id, response=response)
+        if ack_whisper_ids:
+            self.store.acknowledge_whispers(ack_whisper_ids, agent_id=conscious.agent_id)
 
         for chunk in memory_chunks or []:
             chunk = self.middleware.pre_write(chunk)
@@ -290,6 +297,7 @@ class Assembler:
         result_summary: str,
         result_full: str,
         memory_chunks: list[SubconsciousChunk] | None = None,
+        ack_whisper_ids: list[str] | None = None,
     ) -> TurnRecord:
         record = TurnRecord(
             turn_id=response.turn_id,
@@ -308,6 +316,8 @@ class Assembler:
             tg.start_soon(self._alog_turn_record, record)
             tg.start_soon(self._alog_conscious, updated_conscious, snapshot_hash)
             tg.start_soon(self._alog_cost, conscious.agent_id, response)
+            if ack_whisper_ids:
+                tg.start_soon(self._aacknowledge_whispers, ack_whisper_ids, conscious.agent_id)
             for chunk in memory_chunks or []:
                 chunk = self.middleware.pre_write(chunk)
                 tg.start_soon(self._alog_write_with_retry, chunk)
@@ -387,8 +397,8 @@ class Assembler:
     # Step 4: drain whisper queue
     # ------------------------------------------------------------------
 
-    def _drain_whispers(self, conscious: ConsciousBlock, *, max_items: int = 3) -> list[Whisper]:
-        return self.store.drain_whispers(
+    def _peek_whispers(self, conscious: ConsciousBlock, *, max_items: int = 3) -> list[Whisper]:
+        return self.store.peek_whispers(
             agent_id=conscious.agent_id,
             pipeline_id=conscious.pipeline_id,
             max_items=max_items,
@@ -493,6 +503,11 @@ class Assembler:
             return self._chunk_cap_high, self._whisper_cap_high
         return self._chunk_cap_default, self._whisper_cap_default
 
+    def _alert_cap(self, *, budget: BudgetContext) -> int:
+        if budget.pressure == "critical":
+            return 1
+        return 2
+
     def _write_with_retry(self, chunk: SubconsciousChunk, *, retries: int = 2, backoff_ms: int = 50) -> None:
         for attempt in range(retries + 1):
             try:
@@ -518,6 +533,9 @@ class Assembler:
 
     async def _alog_cost(self, agent_id: str, response: NCPResponse) -> None:
         await self.store.async_log_cost(agent_id=agent_id, response=response)
+
+    async def _aacknowledge_whispers(self, whisper_ids: list[str], agent_id: str) -> None:
+        await self.store.async_acknowledge_whispers(whisper_ids, agent_id=agent_id)
 
     async def _alog_write_with_retry(self, chunk: SubconsciousChunk, *, retries: int = 2, backoff_ms: int = 50) -> None:
         for attempt in range(retries + 1):

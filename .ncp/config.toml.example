@@ -18,7 +18,7 @@ max_chunk_tokens = 200
 default_type = "auto"
 
 [whispers]
-default_ttl_seconds = 60
+default_ttl_seconds = 1800
 max_per_drain = 3
 min_confidence = 0.60
 

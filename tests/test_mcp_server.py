@@ -9,6 +9,8 @@ from pathlib import Path
 
 import httpx
 
+from ncp.version import __version__
+from ncp.config import load_config
 from ncp.tokens import estimate_tokens
 from ncp.mcp.server import (
     MCP_TOOLS,
@@ -21,7 +23,7 @@ from ncp.mcp.server import (
 )
 from ncp.stores.base import BaseStore
 from ncp.stores.sqlite import SQLiteStore
-from ncp.types import SubconsciousChunk
+from ncp.types import ConsciousBlock, SubconsciousChunk, Whisper
 
 
 def _req(method: str, params: object | None = None, req_id: int = 1) -> dict:
@@ -68,6 +70,7 @@ class TestInitialize:
         result = json.loads(resp)["result"]
         assert result["protocolVersion"] == "2024-11-05"
         assert result["serverInfo"]["name"] == "ncp"
+        assert result["serverInfo"]["version"] == __version__
         assert result["capabilities"]["tools"] == {"listChanged": False}
 
     def test_initialize_accepts_latest_claude_protocol(self) -> None:
@@ -123,13 +126,72 @@ class TestInitialize:
             server.shutdown()
             thread.join(timeout=5)
 
+    def test_http_transport_enforces_auth_when_token_configured(self, tmp_path: Path) -> None:
+        port = _free_port()
+        server = create_http_server(host="127.0.0.1", port=port, cwd=tmp_path, auth_token="secret")
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with httpx.Client(base_url=f"http://127.0.0.1:{port}", timeout=5.0) as client:
+                denied = client.post("/mcp", json=_req("tools/list"))
+                assert denied.status_code == 401
+
+                allowed = client.post(
+                    "/mcp",
+                    json=_req("tools/list"),
+                    headers={"Authorization": "Bearer secret"},
+                )
+                assert allowed.status_code == 200
+                assert allowed.json()["result"]["tools"]
+        finally:
+            server._shutdown_event.set()
+            server.shutdown()
+            thread.join(timeout=5)
+
+    def test_http_transport_rejects_oversized_body(self, tmp_path: Path) -> None:
+        port = _free_port()
+        server = create_http_server(host="127.0.0.1", port=port, cwd=tmp_path, max_body_bytes=8)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with httpx.Client(base_url=f"http://127.0.0.1:{port}", timeout=5.0) as client:
+                response = client.post("/mcp", content=b"0123456789")
+                assert response.status_code == 413
+                assert response.json()["error"] == "request_too_large"
+        finally:
+            server._shutdown_event.set()
+            server.shutdown()
+            thread.join(timeout=5)
+
+    def test_http_transport_cors_is_allowlist_only(self, tmp_path: Path) -> None:
+        port = _free_port()
+        server = create_http_server(
+            host="127.0.0.1",
+            port=port,
+            cwd=tmp_path,
+            cors_allowed_origins=["https://allowed.example"],
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with httpx.Client(base_url=f"http://127.0.0.1:{port}", timeout=5.0) as client:
+                allowed = client.options("/mcp", headers={"Origin": "https://allowed.example"})
+                assert allowed.headers["access-control-allow-origin"] == "https://allowed.example"
+
+                denied = client.options("/mcp", headers={"Origin": "https://other.example"})
+                assert "access-control-allow-origin" not in denied.headers
+        finally:
+            server._shutdown_event.set()
+            server.shutdown()
+            thread.join(timeout=5)
+
 
 class TestToolsList:
     def test_lists_all_tools(self) -> None:
         resp = _handle_request(_req("tools/list"), {})
         result = _result(resp)
         names = [t["name"] for t in result["tools"]]
-        assert names == ["ncp_get_context", "ncp_write_memory", "ncp_emit_whisper", "ncp_fetch"]
+        assert names == ["ncp_get_context", "ncp_write_memory", "ncp_emit_whisper", "ncp_post_turn", "ncp_fetch"]
 
     def test_tool_names_match_constants(self) -> None:
         resp = _handle_request(_req("tools/list"), {})
@@ -140,6 +202,14 @@ class TestToolsList:
         get_context_tool = next(tool for tool in MCP_TOOLS if tool["name"] == "ncp_get_context")
         schema = get_context_tool["inputSchema"]
         assert "max_tokens" in schema["properties"]  # type: ignore[index]
+
+    def test_emit_whisper_schema_exposes_ttl_and_payload_contracts(self) -> None:
+        emit_tool = next(tool for tool in MCP_TOOLS if tool["name"] == "ncp_emit_whisper")
+        schema = emit_tool["inputSchema"]
+        properties = schema["properties"]  # type: ignore[index]
+        assert "ttl_seconds" in properties
+        assert "share/request" in properties["payload"]["description"]
+        assert "dissent" in properties["payload"]["description"]
 
 
 class TestGetContext:
@@ -215,6 +285,65 @@ class TestGetContext:
         result = _content(resp)
         assert "pipe_1" in result["context"]
 
+    def test_post_turn_hydrates_next_context_and_acknowledges_whispers(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "test.db")
+        store.emit_whisper(
+            Whisper(
+                whisper_id="wsp_pending",
+                from_agent="planner",
+                target="builder",
+                whisper_type="share",
+                payload='{"ask":"use this"}',
+                confidence=0.9,
+                pipeline_id="pipe_1",
+            )
+        )
+        handlers = make_handlers(store)
+
+        first = _content(_handle_request(
+            _call("ncp_get_context", {
+                "agent_id": "builder",
+                "role": "build",
+                "task": "test",
+                "slot": "test",
+                "intent": "test",
+                "pipeline_id": "pipe_1",
+            }),
+            handlers,
+        ))
+        assert first["pending_whisper_ids"] == ["wsp_pending"]
+
+        posted = _content(_handle_request(
+            _call("ncp_post_turn", {
+                "agent_id": "builder",
+                "role": "build",
+                "task": "test",
+                "slot": "test",
+                "intent": "test",
+                "pipeline_id": "pipe_1",
+                "turn_id": "turn_builder",
+                "result_summary": "summary",
+                "result_full": "full result",
+                "ack_whisper_ids": ["wsp_pending"],
+            }),
+            handlers,
+        ))
+        assert posted["posted"] is True
+        assert store.peek_whispers(agent_id="builder", pipeline_id="pipe_1") == []
+
+        second = _content(_handle_request(
+            _call("ncp_get_context", {
+                "agent_id": "builder",
+                "role": "build",
+                "task": "test",
+                "slot": "next",
+                "intent": "test",
+                "pipeline_id": "pipe_1",
+            }),
+            handlers,
+        ))
+        assert "recent:[r:sub/turn_builder]" in second["context"]
+
     def test_rejects_newline_in_structural_field(self, tmp_path: Path) -> None:
         store = SQLiteStore(tmp_path / "test.db")
         handlers = make_handlers(store)
@@ -250,6 +379,39 @@ class TestWriteMemory:
         result = _content(resp)
         assert result["written"] is True
         assert result["chunk_id"].startswith("sub_")
+
+    def test_write_memory_derives_trust_and_drift_from_conscious_state(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "test.db")
+        store.log_conscious(
+            ConsciousBlock(
+                agent_id="executor",
+                role="build",
+                owns=[],
+                must_not=[],
+                task="task",
+                slot="slot",
+                intent="intent",
+                pipeline_id="pipe_1",
+                drift_score=0.42,
+            ),
+            snapshot_hash="hash_executor",
+        )
+        handlers = make_handlers(store)
+
+        result = _content(_handle_request(
+            _call("ncp_write_memory", {
+                "content": "trusted tool result",
+                "layer": "semantic",
+                "src": "tool_result",
+                "written_by": "executor",
+                "pipeline_id": "pipe_1",
+            }),
+            handlers,
+        ))
+
+        chunk = next(chunk for chunk in store.get_working_zone(pipeline_id="pipe_1") if chunk.chunk_id == result["chunk_id"])
+        assert chunk.base_trust == 0.8
+        assert chunk.written_at_drift == 0.42
 
     def test_round_trip_via_fetch(self, tmp_path: Path) -> None:
         store = SQLiteStore(tmp_path / "test.db")
@@ -319,6 +481,108 @@ class TestEmitWhisper:
         )
         result = _content(resp)
         assert result["emitted"] is True
+
+    def test_emit_honors_ttl_seconds(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "test.db")
+        handlers = make_handlers(store)
+        resp = _handle_request(
+            _call("ncp_emit_whisper", {
+                "from": "builder",
+                "target": "executor",
+                "type": "nudge",
+                "payload": "check this",
+                "confidence": 0.9,
+                "ttl_seconds": 42,
+            }),
+            handlers,
+        )
+
+        result = _content(resp)
+        assert result["emitted"] is True
+        drained = store.drain_whispers(agent_id="executor", max_items=1)
+        assert drained[0].ttl_seconds == 42
+
+    def test_emit_uses_configured_default_ttl(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "test.db")
+        config = load_config(cwd=tmp_path)
+        config.values["whispers"]["default_ttl_seconds"] = 77
+        handlers = make_handlers(store, config=config)
+        resp = _handle_request(
+            _call("ncp_emit_whisper", {
+                "from": "builder",
+                "target": "executor",
+                "type": "nudge",
+                "payload": "check this",
+                "confidence": 0.9,
+            }),
+            handlers,
+        )
+
+        result = _content(resp)
+        assert result["emitted"] is True
+        drained = store.drain_whispers(agent_id="executor", max_items=1)
+        assert drained[0].ttl_seconds == 77
+
+    def test_emit_wraps_plain_text_share_payload(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "test.db")
+        handlers = make_handlers(store)
+        resp = _handle_request(
+            _call("ncp_emit_whisper", {
+                "from": "builder",
+                "target": "executor",
+                "type": "share",
+                "payload": "please review the retry slice",
+                "confidence": 0.9,
+            }),
+            handlers,
+        )
+
+        result = _content(resp)
+        assert result["emitted"] is True
+        drained = store.drain_whispers(agent_id="executor", max_items=1)
+        payload = json.loads(drained[0].payload)
+        assert payload["ask"] == "please review the retry slice"
+
+    def test_emit_preserves_valid_json_share_payload(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "test.db")
+        handlers = make_handlers(store)
+        resp = _handle_request(
+            _call("ncp_emit_whisper", {
+                "from": "builder",
+                "target": "executor",
+                "type": "share",
+                "payload": '{"ask":"review retry slice","files":["ncp/mcp/server.py"]}',
+                "confidence": 0.9,
+            }),
+            handlers,
+        )
+
+        result = _content(resp)
+        assert result["emitted"] is True
+        drained = store.drain_whispers(agent_id="executor", max_items=1)
+        payload = json.loads(drained[0].payload)
+        assert payload["ask"] == "review retry slice"
+        assert payload["files"] == ["ncp/mcp/server.py"]
+
+    def test_emit_wraps_plain_text_dissent_payload(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "test.db")
+        handlers = make_handlers(store)
+        resp = _handle_request(
+            _call("ncp_emit_whisper", {
+                "from": "reviewer",
+                "target": "builder",
+                "type": "dissent",
+                "payload": "missing rollback path",
+                "confidence": 0.9,
+            }),
+            handlers,
+        )
+
+        result = _content(resp)
+        assert result["emitted"] is True
+        drained = store.drain_whispers(agent_id="builder", max_items=1)
+        payload = json.loads(drained[0].payload)
+        assert payload["issue"] == "missing rollback path"
 
     def test_rejects_dissent_broadcast(self, tmp_path: Path) -> None:
         store = SQLiteStore(tmp_path / "test.db")
@@ -706,9 +970,9 @@ class TestStreamingGetContext:
         )
         assert isinstance(result, StreamResponse)
         assert len(result.sections) >= 2
-        assert result.sections[0][0] == "budget_header"
-        assert result.sections[1][0] == "conscious"
-        assert "stream_task" in result.sections[1][1]
+        assert result.sections[0][0] == "conscious"
+        assert "stream_task" in result.sections[0][1]
+        assert result.sections[-1][0] == "budget_header"
         assert result.handler_result["context"]
         assert "[NCP:BUDGET]" in result.handler_result["context"]
         assert result.handler_result["session_id"] == "streamer"

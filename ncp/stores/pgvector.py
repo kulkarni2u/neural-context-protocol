@@ -681,12 +681,12 @@ class PgvectorStore(BaseStore):
             min_confidence=min_confidence,
         )
 
-    def acknowledge_whispers(self, whisper_ids: Sequence[str]) -> int:
+    def acknowledge_whispers(self, whisper_ids: Sequence[str], *, agent_id: str | None = None) -> int:
         if self.coordination is None:
             raise NCPStoreUnavailableError(
                 "pgvector whisper coordination requires Redis. Set NCP_REDIS_URL and ensure Redis is reachable."
             )
-        return self.coordination.acknowledge_whispers(list(whisper_ids))
+        return self.coordination.acknowledge_whispers(list(whisper_ids), agent_id=agent_id)
 
     def whisper_pending(self, whisper_id: str) -> bool:
         """Return True if the whisper is still queued in the local Postgres whispers table."""
@@ -868,6 +868,47 @@ class PgvectorStore(BaseStore):
                 )
             finally:
                 self._close_cursor(cursor)
+
+    def load_latest_conscious(self, *, pipeline_id: str | None, agent_id: str) -> ConsciousBlock | None:
+        with self._connect() as connection:
+            cursor = connection.cursor()
+            try:
+                if pipeline_id is None:
+                    cursor.execute(
+                        self._sql(
+                            """
+                            SELECT snapshot_json FROM {schema}.{prefix}conscious_log
+                            WHERE agent_id = %s AND pipeline_id IS NULL
+                            ORDER BY logged_at DESC
+                            LIMIT 1
+                            """
+                        ),
+                        (agent_id,),
+                    )
+                else:
+                    cursor.execute(
+                        self._sql(
+                            """
+                            SELECT snapshot_json FROM {schema}.{prefix}conscious_log
+                            WHERE agent_id = %s AND pipeline_id = %s
+                            ORDER BY logged_at DESC
+                            LIMIT 1
+                            """
+                        ),
+                        (agent_id, pipeline_id),
+                    )
+                row = self._fetchone(cursor)
+            finally:
+                self._close_cursor(cursor)
+        if row is None:
+            return None
+        payload = row["snapshot_json"]
+        try:
+            if isinstance(payload, str):
+                return ConsciousBlock.model_validate_json(payload)
+            return ConsciousBlock.model_validate(payload)
+        except ValueError:
+            return None
 
     def get_pipeline_goal_versions(
         self,

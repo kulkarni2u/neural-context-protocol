@@ -15,7 +15,7 @@ The benchmark uses:
 - a deterministic 6-role research pipeline
 - a real SQLite store
 - the real assembler and post-turn persistence path
-- `word_split` token accounting in this environment
+- `chars_div4` token accounting in this environment
   - if `tiktoken` is installed, the benchmark automatically reports that
     instead
 
@@ -29,22 +29,22 @@ python3 benchmarks/research_pipeline/run.py --turns 36
 
 ## Current result
 
-Observed on June 1, 2026:
+Observed on June 9, 2026:
 
-- peak NCP input tokens: `156`
-- peak raw replay input tokens: `1700`
-- peak sliding-window input tokens: `212`
-- peak rolling-summary input tokens: `950`
-- final NCP input tokens: `104`
-- final raw replay input tokens: `1700`
-- final sliding-window input tokens: `212`
-- final rolling-summary input tokens: `950`
-- reduction factor vs raw replay at the final turn: `16.35x`
-- reduction factor vs sliding window at the final turn: `2.04x`
-- reduction factor vs rolling summary at the final turn: `9.13x`
-- final-turn savings vs raw replay: `1596`
+- peak NCP input tokens: `388`
+- peak raw replay input tokens: `3277`
+- peak sliding-window input tokens: `412`
+- peak rolling-summary input tokens: `1912`
+- final NCP input tokens: `267`
+- final raw replay input tokens: `3277`
+- final sliding-window input tokens: `409`
+- final rolling-summary input tokens: `1912`
+- reduction factor vs raw replay at the final turn: `12.27x`
+- reduction factor vs sliding window at the final turn: `1.53x`
+- reduction factor vs rolling summary at the final turn: `7.16x`
+- final-turn savings vs raw replay: `3010`
 - estimated assembly overhead token-equivalent (total across all turns): `480.0`
-- net total token-equivalent savings vs raw replay: see artifact `economics.net_total_token_equivalent_vs_raw_replay`
+- net total token-equivalent savings vs raw replay: `48236.0`
 
 ## Interpretation
 

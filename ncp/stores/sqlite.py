@@ -18,6 +18,7 @@ from ncp.stores.retrieval import (
     RetrievalPolicy,
     apply_diversity_limit,
     build_lexical_candidates,
+    normalize_query_terms,
     normalize_result_limit,
 )
 from ncp.types import CalibrationReport, ConsolidationReport, ConsciousBlock, NCPResponse, SubconsciousChunk, TurnRecord, Whisper
@@ -56,6 +57,26 @@ CREATE TABLE IF NOT EXISTS chunks (
     written_at_drift REAL DEFAULT 0.0
 );
 
+CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+    chunk_id UNINDEXED,
+    content,
+    content='chunks',
+    content_rowid='rowid'
+);
+
+CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN
+    INSERT INTO chunks_fts(rowid, chunk_id, content) VALUES (new.rowid, new.chunk_id, new.content);
+END;
+
+CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON chunks BEGIN
+    INSERT INTO chunks_fts(chunks_fts, rowid, chunk_id, content) VALUES ('delete', old.rowid, old.chunk_id, old.content);
+END;
+
+CREATE TRIGGER IF NOT EXISTS chunks_au AFTER UPDATE ON chunks BEGIN
+    INSERT INTO chunks_fts(chunks_fts, rowid, chunk_id, content) VALUES ('delete', old.rowid, old.chunk_id, old.content);
+    INSERT INTO chunks_fts(rowid, chunk_id, content) VALUES (new.rowid, new.chunk_id, new.content);
+END;
+
 CREATE TABLE IF NOT EXISTS tombstones (
     chunk_id TEXT PRIMARY KEY,
     forward_ref TEXT,
@@ -74,6 +95,13 @@ CREATE TABLE IF NOT EXISTS whispers (
     ref TEXT,
     created_at REAL NOT NULL,
     expires_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS whisper_deliveries (
+    whisper_id TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    delivered_at REAL NOT NULL,
+    PRIMARY KEY (whisper_id, agent_id)
 );
 
 CREATE TABLE IF NOT EXISTS turn_records (
@@ -115,8 +143,10 @@ CREATE INDEX IF NOT EXISTS idx_chunks_layer ON chunks(layer);
 CREATE INDEX IF NOT EXISTS idx_chunks_created ON chunks(created_at);
 CREATE INDEX IF NOT EXISTS idx_whispers_target ON whispers(target, expires_at);
 CREATE INDEX IF NOT EXISTS idx_whispers_pipeline ON whispers(pipeline_id, expires_at);
+CREATE INDEX IF NOT EXISTS idx_whisper_deliveries_agent ON whisper_deliveries(agent_id, whisper_id);
 CREATE INDEX IF NOT EXISTS idx_turns_agent ON turn_records(agent_id, pipeline_id);
 CREATE INDEX IF NOT EXISTS idx_conscious_agent ON conscious_log(agent_id, logged_at);
+CREATE INDEX IF NOT EXISTS idx_conscious_pipeline_agent ON conscious_log(pipeline_id, agent_id, logged_at);
 CREATE INDEX IF NOT EXISTS idx_cost_pipeline ON cost_log(pipeline_id, logged_at);
 
 CREATE TABLE IF NOT EXISTS drift_history (
@@ -204,6 +234,7 @@ class SQLiteStore(BaseStore):
                 "ALTER TABLE chunks ADD COLUMN written_at_drift REAL DEFAULT 0.0",
                 "CREATE TABLE IF NOT EXISTS drift_history (session_id TEXT NOT NULL, turn INTEGER NOT NULL, drift_score REAL NOT NULL, ts REAL NOT NULL)",
                 "CREATE INDEX IF NOT EXISTS idx_drift_session ON drift_history(session_id, turn)",
+                "INSERT INTO chunks_fts(chunks_fts) VALUES ('rebuild')",
             ):
                 try:
                     connection.execute(ddl)
@@ -315,18 +346,17 @@ class SQLiteStore(BaseStore):
                 chunk.relevance = max(0.0, min(1.0, score))
                 candidates.append(chunk)
         else:
-            lexical_candidates = build_lexical_candidates(
-                text,
-                [str(row["content"]) for row in rows],
-            )
-
-            for row, lexical_candidate in zip(rows, lexical_candidates, strict=True):
-                if lexical_candidate.lexical_signal is None:
-                    continue
-
+            for row, lexical_signal in self._fts_lexical_candidates(
+                connection_rows=rows,
+                text=text,
+                layer=layer,
+                pipeline_id=pipeline_id,
+                scope=scope,
+                zone=zone,
+            ):
                 age_seconds = max(0.0, now - float(row["created_at"]))
                 hybrid_score = policy.score(
-                    bm25_normalized=lexical_candidate.lexical_signal,
+                    bm25_normalized=lexical_signal,
                     age_seconds=age_seconds,
                     base_trust=float(row["base_trust"]),
                     generation=int(row["generation"]),
@@ -486,10 +516,7 @@ class SQLiteStore(BaseStore):
             )
 
             if drained:
-                connection.executemany(
-                    "DELETE FROM whispers WHERE whisper_id = ?",
-                    [(whisper.whisper_id,) for whisper in drained],
-                )
+                self._acknowledge_whispers(connection, drained, agent_id=agent_id)
             return drained
 
     def peek_whispers(
@@ -513,17 +540,21 @@ class SQLiteStore(BaseStore):
                 min_confidence=min_confidence,
             )
 
-    def acknowledge_whispers(self, whisper_ids: Sequence[str]) -> int:
+    def acknowledge_whispers(self, whisper_ids: Sequence[str], *, agent_id: str | None = None) -> int:
         """Delete already-processed whispers by id."""
 
         if not whisper_ids:
             return 0
         with self._connect() as connection:
-            cursor = connection.executemany(
-                "DELETE FROM whispers WHERE whisper_id = ?",
-                [(whisper_id,) for whisper_id in whisper_ids],
+            rows = connection.execute(
+                f"SELECT * FROM whispers WHERE whisper_id IN ({','.join('?' for _ in whisper_ids)})",
+                tuple(whisper_ids),
+            ).fetchall()
+            return self._acknowledge_whispers(
+                connection,
+                [self._row_to_whisper(row) for row in rows],
+                agent_id=agent_id,
             )
-            return int(cursor.rowcount)
 
     def whisper_pending(self, whisper_id: str) -> bool:
         """Return True if the whisper is still queued and not yet expired."""
@@ -579,6 +610,35 @@ class SQLiteStore(BaseStore):
                     time.time(),
                 ),
             )
+
+    def load_latest_conscious(self, *, pipeline_id: str | None, agent_id: str) -> ConsciousBlock | None:
+        with self._connect() as connection:
+            if pipeline_id is None:
+                row = connection.execute(
+                    """
+                    SELECT snapshot_json FROM conscious_log
+                    WHERE agent_id = ? AND pipeline_id IS NULL
+                    ORDER BY logged_at DESC
+                    LIMIT 1
+                    """,
+                    (agent_id,),
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    """
+                    SELECT snapshot_json FROM conscious_log
+                    WHERE agent_id = ? AND pipeline_id = ?
+                    ORDER BY logged_at DESC
+                    LIMIT 1
+                    """,
+                    (agent_id, pipeline_id),
+                ).fetchone()
+        if row is None:
+            return None
+        try:
+            return ConsciousBlock.model_validate_json(str(row["snapshot_json"]))
+        except ValueError:
+            return None
 
     def log_cost(self, *, agent_id: str, response: NCPResponse) -> None:
         with self._connect() as connection:
@@ -1384,6 +1444,72 @@ class SQLiteStore(BaseStore):
             params,
         ).fetchall()
 
+    def _fts_lexical_candidates(
+        self,
+        *,
+        connection_rows: list[sqlite3.Row],
+        text: str,
+        layer: str | None,
+        pipeline_id: str | None,
+        scope: str | None,
+        zone: str,
+    ) -> list[tuple[sqlite3.Row, float]]:
+        terms = sorted(normalize_query_terms(text))
+        if not terms:
+            return [(row, 1.0) for row in connection_rows]
+
+        quoted_terms = []
+        for term in terms:
+            escaped = term.replace('"', '""')
+            quoted_terms.append(f'"{escaped}"')
+        match_query = " OR ".join(quoted_terms)
+        clauses = ["chunks.zone = ?", "chunks_fts MATCH ?"]
+        params: list[object] = [zone, match_query]
+        if layer is not None:
+            clauses.append("chunks.layer = ?")
+            params.append(layer)
+        if pipeline_id is None:
+            clauses.append("(chunks.pipeline_id IS NULL OR chunks.scope = 'global')")
+        else:
+            clauses.append("(chunks.pipeline_id = ? OR chunks.scope = 'global')")
+            params.append(pipeline_id)
+        if scope is not None:
+            clauses.append("chunks.scope = ?")
+            params.append(scope)
+
+        try:
+            with self._connect() as connection:
+                fts_rows = connection.execute(
+                    f"""
+                    SELECT chunks.*, bm25(chunks_fts) AS fts_rank
+                    FROM chunks_fts
+                    JOIN chunks ON chunks_fts.rowid = chunks.rowid
+                    WHERE {' AND '.join(clauses)}
+                    ORDER BY fts_rank ASC
+                    """,
+                    params,
+                ).fetchall()
+        except NCPStoreUnavailableError:
+            lexical_candidates = build_lexical_candidates(
+                text,
+                [str(row["content"]) for row in connection_rows],
+            )
+            return [
+                (row, float(candidate.lexical_signal))
+                for row, candidate in zip(connection_rows, lexical_candidates, strict=True)
+                if candidate.lexical_signal is not None
+            ]
+
+        if not fts_rows:
+            return []
+        raw_scores = [max(0.0, -float(row["fts_rank"])) for row in fts_rows]
+        max_score = max(raw_scores)
+        if max_score <= 0.0:
+            normalized = [0.0] * len(raw_scores)
+        else:
+            normalized = [score / max_score for score in raw_scores]
+        return [(row, score) for row, score in zip(fts_rows, normalized, strict=True)]
+
     def _row_to_chunk(self, row: sqlite3.Row) -> SubconsciousChunk:
         created_at = float(row["created_at"])
         chunk = SubconsciousChunk(
@@ -1441,8 +1567,12 @@ class SQLiteStore(BaseStore):
         max_items: int,
         min_confidence: float,
     ) -> list[Whisper]:
-        clauses = ["expires_at > ?", "target IN (?, '*')"]
-        params: list[object] = [time.time(), agent_id]
+        clauses = [
+            "expires_at > ?",
+            "target IN (?, '*')",
+            "NOT (target = '*' AND EXISTS (SELECT 1 FROM whisper_deliveries d WHERE d.whisper_id = whispers.whisper_id AND d.agent_id = ?))",
+        ]
+        params: list[object] = [time.time(), agent_id, agent_id]
         if pipeline_id is None:
             clauses.append("pipeline_id IS NULL")
         else:
@@ -1466,6 +1596,34 @@ class SQLiteStore(BaseStore):
             if len(selected) >= max_items:
                 break
         return selected
+
+    def _acknowledge_whispers(
+        self,
+        connection: sqlite3.Connection,
+        whispers: Sequence[Whisper],
+        *,
+        agent_id: str | None,
+    ) -> int:
+        acknowledged = 0
+        now = time.time()
+        for whisper in whispers:
+            if whisper.target == "*" and agent_id is not None:
+                cursor = connection.execute(
+                    """
+                    INSERT OR IGNORE INTO whisper_deliveries (whisper_id, agent_id, delivered_at)
+                    VALUES (?, ?, ?)
+                    """,
+                    (whisper.whisper_id, agent_id, now),
+                )
+                acknowledged += int(cursor.rowcount > 0)
+                continue
+            cursor = connection.execute(
+                "DELETE FROM whispers WHERE whisper_id = ?",
+                (whisper.whisper_id,),
+            )
+            acknowledged += int(cursor.rowcount > 0)
+            connection.execute("DELETE FROM whisper_deliveries WHERE whisper_id = ?", (whisper.whisper_id,))
+        return acknowledged
 
     def _with_runtime_age(self, chunk: SubconsciousChunk) -> SubconsciousChunk:
         return chunk.model_copy(update={"age_seconds": max(0.0, chunk.age_seconds)})

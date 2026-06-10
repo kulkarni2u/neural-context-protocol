@@ -108,9 +108,11 @@ def test_assembler_resolves_recent_refs_and_reduces_critical_pressure(tmp_path: 
     )
 
     assert len(result.chunks) == 2
-    assert len(result.whispers) == 1
+    assert len(result.whispers) == 2
     assert any(chunk.chunk_id.startswith("recent_") for chunk in result.chunks)
     assert result.whispers[0].whisper_type == "alert"
+    assert result.whispers[1].whisper_type == "nudge"
+    assert result.pending_whisper_ids == [result.whispers[1].whisper_id]
 
 
 def test_recent_refs_do_not_crowd_out_matching_retrieved_chunk(tmp_path: Path) -> None:
@@ -380,8 +382,10 @@ def test_assembler_reports_evicted_whispers_without_draining_queue(tmp_path: Pat
         budget=BudgetContext(pressure="critical"),
     )
 
-    assert len(result.whispers) == 1
+    assert len(result.whispers) == 2
     assert result.whispers[0].whisper_type == "alert"
+    assert result.whispers[1].payload == "follow_up_review"
+    assert result.pending_whisper_ids == [result.whispers[1].whisper_id]
     assert result.evicted_whispers
     assert any(confidence >= 0.6 for _, confidence in result.evicted_whispers)
 
