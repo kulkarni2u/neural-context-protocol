@@ -41,12 +41,16 @@ what you'd hand to the model.
 ## Run it
 
 ```bash
+# Zero-dependency version (no LangGraph install needed):
+python3 examples/03_langgraph/run.py
+
+# Full LangGraph integration (requires `pip install langgraph`):
 pip install langgraph
 python3 examples/03_langgraph/pipeline.py
 ```
 
-`main()` returns a dict with `rounds`, `final_context_tokens` (per node), and
-`whisper_delivered`, used by `tests/test_langgraph_example.py`.
+Both versions return the same payload shape: `mode`, `nodes`, per-node
+context checks, and `pending_whispers_acknowledged`.
 
 ## Mapping to MCP tools
 

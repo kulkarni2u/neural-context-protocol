@@ -146,6 +146,8 @@ The effect: the model receives context ranked by how much it should believe it, 
 
 It sits underneath your existing agent framework — LangGraph ([runnable example](./examples/03_langgraph/)), CrewAI, AutoGen, or a custom orchestrator — and gives every connected host the same bounded, trust-weighted working memory. Bring your own orchestrator. Bring your own agents.
 
+For a runnable framework recipe, see `examples/03_langgraph/`.
+
 It is not a vector database. Not a model training framework. Not an orchestrator. Not the right default for simple single-agent or very short-lived tasks.
 
 Use it when you have **3+ agents, 10+ turns, and real shared state to preserve**.
