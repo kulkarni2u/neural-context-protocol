@@ -189,6 +189,7 @@ class PgvectorStore(BaseStore):
         coordination: RedisCoordination | None = None,
         max_working_chunks: int = 500,
         gc_threshold: int = 400,
+        max_working_chunks_per_pipeline: int = 0,
         ivfflat_probes: int = 10,
         retrieval_policy: RetrievalPolicy | None = None,
         config: NCPConfig | None = None,
@@ -219,6 +220,8 @@ class PgvectorStore(BaseStore):
         )
         self.max_working_chunks = max_working_chunks
         self.gc_threshold = gc_threshold
+        self.max_working_chunks_per_pipeline = max_working_chunks_per_pipeline
+        self.retention_evictions = 0
         self._ivfflat_probes = ivfflat_probes
 
         from ncp.stores.rerank import Reranker
@@ -404,6 +407,8 @@ class PgvectorStore(BaseStore):
             finally:
                 self._close_cursor(cursor)
             self._hard_gc(connection, pipeline_id=chunk.pipeline_id)
+            if self.max_working_chunks_per_pipeline > 0 and chunk.zone == "working":
+                self._enforce_retention(connection, pipeline_id=chunk.pipeline_id)
             return True
 
     def query(
@@ -1905,6 +1910,67 @@ class PgvectorStore(BaseStore):
             )
         finally:
             self._close_cursor(delete_cursor)
+
+    def _enforce_retention(self, connection: Any, *, pipeline_id: str | None) -> None:
+        cap = self.max_working_chunks_per_pipeline
+        if pipeline_id is None:
+            clause = "pipeline_id IS NULL AND zone = 'working'"
+            params: tuple[object, ...] = ()
+        else:
+            clause = "pipeline_id = %s AND zone = 'working'"
+            params = (pipeline_id,)
+        count_cursor = connection.cursor()
+        try:
+            count_cursor.execute(
+                self._sql(f"SELECT COUNT(*) AS count FROM {{schema}}.{{prefix}}chunks WHERE {clause}"),
+                params,
+            )
+            row = self._fetchone(count_cursor)
+        finally:
+            self._close_cursor(count_cursor)
+        count = int(row["count"]) if row is not None else 0
+        if count <= cap:
+            return
+        candidates_cursor = connection.cursor()
+        try:
+            candidates_cursor.execute(
+                self._sql(
+                    f"""
+                    SELECT chunk_id, created_at, base_trust, generation, written_at_drift
+                    FROM {{schema}}.{{prefix}}chunks
+                    WHERE {clause}
+                    """
+                ),
+                params,
+            )
+            rows = self._fetchall(candidates_cursor)
+        finally:
+            self._close_cursor(candidates_cursor)
+        now = time.time()
+        scored = sorted(
+            rows,
+            key=lambda row: score_trust_recency_candidate(
+                self.retrieval_policy,
+                created_at=float(row["created_at"]),
+                now=now,
+                base_trust=float(row["base_trust"]),
+                generation=int(row["generation"]),
+                written_at_drift=float(row["written_at_drift"]) if row["written_at_drift"] is not None else 0.0,
+            ),
+        )
+        overflow = count - cap
+        evict_ids = [str(row["chunk_id"]) for row in scored[:overflow]]
+        if not evict_ids:
+            return
+        delete_cursor = connection.cursor()
+        try:
+            delete_cursor.executemany(
+                self._sql("DELETE FROM {schema}.{prefix}chunks WHERE chunk_id = %s"),
+                [(chunk_id,) for chunk_id in evict_ids],
+            )
+        finally:
+            self._close_cursor(delete_cursor)
+        self.retention_evictions += len(evict_ids)
 
     def _close_cursor(self, cursor: Any) -> None:
         close = getattr(cursor, "close", None)

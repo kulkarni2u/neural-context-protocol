@@ -78,6 +78,9 @@ DEFAULT_CONFIG = {
         "model_provider": None,
         "model": None,
     },
+    "retention": {
+        "max_working_chunks_per_pipeline": 0,
+    },
     "server": {
         "auth_token": "",
     },
@@ -225,6 +228,10 @@ class NCPConfig:
     def server_auth_token(self) -> str | None:
         val = self.values.get("server", {}).get("auth_token")
         return str(val) if val else None
+
+    @property
+    def retention_max_working_chunks_per_pipeline(self) -> int:
+        return int(self.values.get("retention", {}).get("max_working_chunks_per_pipeline", 0))
 
 def load_config(
     path: str | Path | None = None,

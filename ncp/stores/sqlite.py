@@ -20,6 +20,7 @@ from ncp.stores.retrieval import (
     build_lexical_candidates,
     normalize_query_terms,
     normalize_result_limit,
+    score_trust_recency_candidate,
 )
 from ncp.types import CalibrationReport, ConsolidationReport, ConsciousBlock, NCPResponse, SubconsciousChunk, TurnRecord, Whisper
 
@@ -169,6 +170,7 @@ class SQLiteStore(BaseStore):
         *,
         max_working_chunks: int = 500,
         gc_threshold: int = 400,
+        max_working_chunks_per_pipeline: int = 0,
         retrieval_policy: RetrievalPolicy | None = None,
         config: NCPConfig | None = None,
     ) -> None:
@@ -176,6 +178,8 @@ class SQLiteStore(BaseStore):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.max_working_chunks = max_working_chunks
         self.gc_threshold = gc_threshold
+        self.max_working_chunks_per_pipeline = max_working_chunks_per_pipeline
+        self.retention_evictions = 0
 
         from ncp.stores.rerank import Reranker
         from ncp.config import load_config
@@ -289,6 +293,8 @@ class SQLiteStore(BaseStore):
                 ),
             )
             self._hard_gc(connection, pipeline_id=chunk.pipeline_id)
+            if self.max_working_chunks_per_pipeline > 0 and chunk.zone == "working":
+                self._enforce_retention(connection, pipeline_id=chunk.pipeline_id)
             return True
 
     def query(
@@ -957,6 +963,7 @@ class SQLiteStore(BaseStore):
             "whispers_below_min_confidence": int(below_conf),
             "turn_record_count": int(turns),
             "cost_usd_total": float(costs),
+            "retention_evictions": int(self.retention_evictions),
         }
 
     def status_detail(self, *, pipeline_id: str | None = None) -> dict[str, object]:
@@ -1693,3 +1700,43 @@ class SQLiteStore(BaseStore):
                 "DELETE FROM chunks WHERE chunk_id = ?",
                 [(row["chunk_id"],) for row in delete_rows],
             )
+
+    def _enforce_retention(self, connection: sqlite3.Connection, *, pipeline_id: str | None) -> None:
+        cap = self.max_working_chunks_per_pipeline
+        if pipeline_id is None:
+            clause = "pipeline_id IS NULL AND zone = 'working'"
+            params: list[object] = []
+        else:
+            clause = "pipeline_id = ? AND zone = 'working'"
+            params = [pipeline_id]
+        count = connection.execute(
+            f"SELECT COUNT(*) AS count FROM chunks WHERE {clause}",
+            params,
+        ).fetchone()["count"]
+        if int(count) <= cap:
+            return
+        rows = connection.execute(
+            f"SELECT chunk_id, created_at, base_trust, generation, written_at_drift"
+            f" FROM chunks WHERE {clause}",
+            params,
+        ).fetchall()
+        now = time.time()
+        scored = sorted(
+            rows,
+            key=lambda row: score_trust_recency_candidate(
+                self.retrieval_policy,
+                created_at=float(row["created_at"]),
+                now=now,
+                base_trust=float(row["base_trust"]),
+                generation=int(row["generation"]),
+                written_at_drift=float(row["written_at_drift"]) if row["written_at_drift"] is not None else 0.0,
+            ),
+        )
+        overflow = int(count) - cap
+        evict_ids = [str(row["chunk_id"]) for row in scored[:overflow]]
+        if evict_ids:
+            connection.executemany(
+                "DELETE FROM chunks WHERE chunk_id = ?",
+                [(chunk_id,) for chunk_id in evict_ids],
+            )
+            self.retention_evictions += len(evict_ids)

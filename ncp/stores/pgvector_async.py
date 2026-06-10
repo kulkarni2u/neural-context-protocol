@@ -66,6 +66,7 @@ class AsyncPgvectorStore(BaseStore):
         open_pool: bool = False,
         max_working_chunks: int = 500,
         gc_threshold: int = 400,
+        max_working_chunks_per_pipeline: int = 0,
         redis_url: str | None = None,
         coordination: AsyncRedisCoordination | None = None,
         embedding_adapter: object | None = None,
@@ -78,6 +79,8 @@ class AsyncPgvectorStore(BaseStore):
         self._max_pool = max_pool_connections
         self.max_working_chunks = max_working_chunks
         self.gc_threshold = gc_threshold
+        self.max_working_chunks_per_pipeline = max_working_chunks_per_pipeline
+        self.retention_evictions = 0
         self._embedding_adapter: object | None = embedding_adapter
         self._ivfflat_probes = ivfflat_probes
         self._apool: Any = None
@@ -288,6 +291,8 @@ class AsyncPgvectorStore(BaseStore):
                     ),
                 )
             await self._async_hard_gc(conn, pipeline_id=chunk.pipeline_id)
+            if self.max_working_chunks_per_pipeline > 0 and chunk.zone == "working":
+                await self._async_enforce_retention(conn, pipeline_id=chunk.pipeline_id)
         return True
 
     # ------------------------------------------------------------------
@@ -396,6 +401,65 @@ class AsyncPgvectorStore(BaseStore):
                 self._sql("DELETE FROM {schema}.{prefix}chunks WHERE chunk_id = %s"),
                 [(str(row["chunk_id"]),) for row in stale],
             )
+
+    async def _async_enforce_retention(self, conn: Any, *, pipeline_id: str | None) -> None:
+        cap = self.max_working_chunks_per_pipeline
+        if pipeline_id is None:
+            clause = "pipeline_id IS NULL AND zone = 'working'"
+            params: tuple[object, ...] = ()
+        else:
+            clause = "pipeline_id = %s AND zone = 'working'"
+            params = (pipeline_id,)
+
+        async with conn.cursor() as cur:
+            await cur.execute(
+                self._sql(f"SELECT COUNT(*) AS count FROM {{schema}}.{{prefix}}chunks WHERE {clause}"),
+                params,
+            )
+            raw = await cur.fetchone()
+            description = cur.description
+        row = self._normalize_row(raw, description) if raw is not None else None
+        count = int(row["count"]) if row is not None else 0
+        if count <= cap:
+            return
+
+        async with conn.cursor() as cur:
+            await cur.execute(
+                self._sql(
+                    f"""
+                    SELECT chunk_id, created_at, base_trust, generation, written_at_drift
+                    FROM {{schema}}.{{prefix}}chunks
+                    WHERE {clause}
+                    """
+                ),
+                params,
+            )
+            raw_rows = await cur.fetchall()
+            description = cur.description
+        rows = [self._normalize_row(r, description) for r in raw_rows]
+
+        now = time.time()
+        scored = sorted(
+            rows,
+            key=lambda row: score_trust_recency_candidate(
+                DEFAULT_RETRIEVAL_POLICY,
+                created_at=float(row["created_at"]),
+                now=now,
+                base_trust=float(row["base_trust"]),
+                generation=int(row["generation"]),
+                written_at_drift=float(row["written_at_drift"]) if row["written_at_drift"] is not None else 0.0,
+            ),
+        )
+        overflow = count - cap
+        evict_ids = [str(row["chunk_id"]) for row in scored[:overflow]]
+        if not evict_ids:
+            return
+        async with conn.cursor() as cur:
+            await cur.executemany(
+                self._sql("DELETE FROM {schema}.{prefix}chunks WHERE chunk_id = %s"),
+                [(chunk_id,) for chunk_id in evict_ids],
+            )
+        self.retention_evictions += len(evict_ids)
 
     async def _async_query_vector(
         self,

@@ -21,7 +21,11 @@ def create_store(config: NCPConfig) -> BaseStore:
     """Create the configured NCP store implementation."""
 
     if config.store_type == "sqlite":
-        return SQLiteStore(config.store_path, config=config)
+        return SQLiteStore(
+            config.store_path,
+            config=config,
+            max_working_chunks_per_pipeline=config.retention_max_working_chunks_per_pipeline,
+        )
     if config.store_type == "pgvector":
         return PgvectorStore(
             config.pgvector_dsn,
@@ -31,6 +35,7 @@ def create_store(config: NCPConfig) -> BaseStore:
             redis_stream=config.redis_stream,
             config=config,
             embedding_adapter=_build_embedding_adapter(config),
+            max_working_chunks_per_pipeline=config.retention_max_working_chunks_per_pipeline,
         )
     raise NotImplementedError(
         f"Store type '{config.store_type}' is not implemented yet."

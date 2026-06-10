@@ -144,7 +144,7 @@ The effect: the model receives context ranked by how much it should believe it, 
 
 **NCP is the memory bus, not the orchestrator.**
 
-It sits underneath your existing agent framework — LangGraph, CrewAI, AutoGen, or a custom orchestrator — and gives every connected host the same bounded, trust-weighted working memory. Bring your own orchestrator. Bring your own agents.
+It sits underneath your existing agent framework — LangGraph ([runnable example](./examples/03_langgraph/)), CrewAI, AutoGen, or a custom orchestrator — and gives every connected host the same bounded, trust-weighted working memory. Bring your own orchestrator. Bring your own agents.
 
 It is not a vector database. Not a model training framework. Not an orchestrator. Not the right default for simple single-agent or very short-lived tasks.
 
@@ -162,17 +162,20 @@ Use it when you have **3+ agents, 10+ turns, and real shared state to preserve**
 | 6-role research pipeline (36 turns)    | raw replay     | 3,277           | 267        | **12.27x** |
 | Cross-host handoff (Claude → OpenCode) | window baseline| 0.0 success     | 0.8 success| **+0.8**   |
 | Needle recall at budget 4              | sliding window | 0.00            | 0.50       | **+0.50**  |
+| Task success at matched budget 400 (12 tasks, mock) | sliding window | 0.00 | 1.00 | **+1.00** |
 
 MACE multi-agent coordination score (40 turns): **0.9608**
 
 Coding benchmark token unit: `chars_div4`; context budget: `340`; pass gate: `true`.
-These are deterministic token-accounting benchmarks; quality-at-matched-budget evaluation lives in `benchmarks/efficacy/` and requires a live provider.
+These are deterministic token-accounting benchmarks. The task-success row measures context adequacy at a matched token budget with a deterministic mock provider — whether the needed fact survives into a budget-bounded context (see [the benchmark doc](./docs/NCP_BENCHMARK_TASK_SUCCESS.md)); run it with a live provider to measure real model task success. Quality-at-matched-budget evaluation also lives in `benchmarks/efficacy/`.
 
 Benchmarks are reproducible:
 
 ```bash
 python3 benchmarks/coding_pipeline/run.py
 python3 benchmarks/needle/run.py --turns 24 --needles 6 --budget 4
+python3 benchmarks/task_success/run.py            # mock provider, no keys needed
+python3 benchmarks/task_success/run.py --provider anthropic   # live task success
 ```
 
 -----
@@ -268,6 +271,7 @@ Runnable examples in the repo:
 ```bash
 python3 examples/01_quickstart.py
 python3 examples/02_multi_agent.py
+python3 examples/03_langgraph/pipeline.py   # requires: pip install langgraph
 ```
 
 Tool-specific setup lives in:
@@ -287,6 +291,8 @@ NCP is the memory bus. In our workflows, Sarathi is one orchestrator that runs o
 
 - [Setup guide](./docs/NCP_SETUP.md)
 - [Protocol spec](./docs/NCP_PROTOCOL_SPEC.md)
+- [HTTP API contract](./docs/NCP_HTTP_API.md)
+- [Benchmark: task success at matched budget](./docs/NCP_BENCHMARK_TASK_SUCCESS.md)
 - [Benchmark: coding pipeline](./docs/NCP_BENCHMARK_CODING_PIPELINE.md)
 - [Benchmark: needle recall](./docs/NCP_BENCHMARK_NEEDLE_RECALL.md)
 - [Benchmark: matched-budget efficacy](./docs/NCP_BENCHMARK_MATCHED_BUDGET_EFFICACY.md)

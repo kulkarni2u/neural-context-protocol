@@ -38,6 +38,12 @@ log_level = "info"
 log_format = "pretty"
 cost_tracking = true
 
+# [retention]
+# Cap on `working`-zone chunks retained per pipeline. When exceeded, the
+# lowest trust/recency-scored chunks are evicted on write. 0 disables
+# retention enforcement (default, backward compatible).
+# max_working_chunks_per_pipeline = 5000
+
 # [server]
 # Bearer token required for HTTP requests when set. The server requires no
 # token on loopback (127.0.0.1/localhost/::1) by default, but you must set
