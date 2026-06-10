@@ -249,6 +249,29 @@ class Assembler:
         budget_text = self.encoder._encode_budget(budget)
         yield "budget_header", budget_text
 
+    def sections_from_result(
+        self,
+        *,
+        result: AssemblyResult,
+        budget: BudgetContext,
+    ) -> list[tuple[str, str]]:
+        """Derive labeled sections from an existing ``AssemblyResult``.
+
+        Mirrors ``assemble_incremental``'s label order (``conscious``,
+        ``subconscious``, ``whispers``, ``budget_header``), reusing the
+        encoder against already-assembled data with no store access.
+        """
+        sections: list[tuple[str, str]] = [("conscious", self.encoder._encode_conscious(result.conscious))]
+
+        if result.chunks:
+            sections.append(("subconscious", self.encoder._encode_subconscious(result.chunks)))
+
+        if result.whispers:
+            sections.append(("whispers", self.encoder._encode_whispers(result.whispers, now=None)))
+
+        sections.append(("budget_header", self.encoder._encode_budget(budget)))
+        return sections
+
     def apply_post_middleware(self, text: str) -> str:
         return self.middleware.post_assemble(text)
 

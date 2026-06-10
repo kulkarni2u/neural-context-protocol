@@ -272,19 +272,11 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
                 diversity_limit=caller_diversity_limit,
                 max_tokens=caller_max_tokens,
             )
-            sections = list(assembler.assemble_incremental(
-                conscious=conscious,
-                budget=budget,
-                query_text=conscious.task + " " + conscious.slot,
-                k=caller_k,
-                diversity_limit=caller_diversity_limit,
-                max_tokens=caller_max_tokens,
-            ))
-            assembled = assembler.apply_post_middleware("\n\n".join(t for _, t in sections))
+            sections = assembler.sections_from_result(result=stream_result, budget=budget)
             return StreamResponse(
                 sections=sections,
                 handler_result={
-                    "context": assembled,
+                    "context": stream_result.context,
                     "session_id": session_id,
                     "pending_whisper_ids": stream_result.pending_whisper_ids,
                     "telemetry": _context_telemetry(stream_result, session_id=session_id),

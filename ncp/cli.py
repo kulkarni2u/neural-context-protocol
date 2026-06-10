@@ -9,6 +9,8 @@ import sys
 from urllib.parse import urlsplit, urlunsplit
 
 import json
+import os
+import secrets
 import shutil
 import subprocess
 import time
@@ -45,6 +47,7 @@ def _render_config_template(
     store_type: str,
     pg_dsn: str = "postgresql://postgres:postgres@127.0.0.1:5432/ncp",
     redis_url: str = "redis://127.0.0.1:6379/0",
+    auth_token: str | None = None,
 ) -> str:
     template = _load_config_template()
     template = template.replace('type = "sqlite"', f'type = "{store_type}"', 1)
@@ -58,6 +61,17 @@ def _render_config_template(
         f'url = "{redis_url}"',
         1,
     )
+    if auth_token:
+        template = template.replace(
+            '# [server]\n'
+            '# Bearer token required for HTTP requests when set. The server requires no\n'
+            '# token on loopback (127.0.0.1/localhost/::1) by default, but you must set\n'
+            '# this (or NCP_AUTH_TOKEN, or `ncp serve --auth-token`) before binding to a\n'
+            '# non-loopback host. `ncp init` generates a random token here automatically.\n'
+            '# auth_token = ""',
+            f'[server]\nauth_token = "{auth_token}"',
+            1,
+        )
     return template
 
 
@@ -537,6 +551,7 @@ def init_command(  # noqa: C901
                 store_type=store_type,
                 pg_dsn=resolved_pg_dsn,
                 redis_url=resolved_redis_url,
+                auth_token=secrets.token_urlsafe(32),
             )
         )
         console.print(f"Wrote [bold].ncp/config.toml[/bold] (store: {store_type})")
@@ -872,17 +887,37 @@ def demo_command(
               help="Host interface for HTTP/SSE mode.")
 @click.option("--port", default=4242, show_default=True, type=int,
               help="Port for HTTP/SSE mode.")
+@click.option("--auth-token", default=None,
+              help="Bearer token required for HTTP requests. Defaults to NCP_AUTH_TOKEN or "
+                   "[server].auth_token from config.toml. Required when binding to a non-loopback host.")
+@click.option("--cors-origin", "cors_origins", multiple=True,
+              help="Allowed CORS origin for HTTP requests. May be passed multiple times.")
 def serve_command(
     cwd: Path | None,
     store_path: Path | None,
     host: str,
     port: int,
+    auth_token: str | None,
+    cors_origins: tuple[str, ...],
 ) -> None:
     """Start the MCP server over HTTP POST plus SSE discovery."""
 
+    from ncp.config import load_config
     from ncp.mcp.server import serve_http
 
-    serve_http(host=host, port=port, store_path=store_path, cwd=cwd)
+    if auth_token is None:
+        auth_token = os.environ.get("NCP_AUTH_TOKEN")
+    if auth_token is None:
+        auth_token = load_config(cwd=cwd).server_auth_token
+
+    serve_http(
+        host=host,
+        port=port,
+        store_path=store_path,
+        cwd=cwd,
+        auth_token=auth_token,
+        cors_allowed_origins=list(cors_origins) or None,
+    )
 
 
 @main.command("serve-stdio", hidden=True)

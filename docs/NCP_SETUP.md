@@ -145,6 +145,8 @@ Preferred host endpoint:
 
 - `http://127.0.0.1:4242/mcp`
 
+By default the server requires no token on loopback (`127.0.0.1`/`localhost`/`::1`). Set `[server].auth_token` in `.ncp/config.toml` (generated automatically by `ncp init`), the `NCP_AUTH_TOKEN` env var, or `--auth-token` on `ncp serve` to require an `Authorization: Bearer <token>` header on `/mcp` and `/sse`. Never bind `ncp serve` to a non-loopback host without one of these set.
+
 ## Common Validation Commands
 
 ```bash

@@ -1115,3 +1115,103 @@ class TestStreamingGetContext:
         payload = json.loads(final["result"]["content"][0]["text"])
         assert "[NCP:BUDGET]" in payload["context"]
         assert payload["session_id"] == "stdio_streamer"
+
+    def test_stream_true_does_a_single_assembly_pass(self, tmp_path: Path) -> None:
+        class _CountingStore(SQLiteStore):
+            def __init__(self, path: Path) -> None:
+                super().__init__(path)
+                self.query_calls = 0
+                self.peek_whispers_calls = 0
+
+            def query(self, *args, **kwargs):
+                self.query_calls += 1
+                return super().query(*args, **kwargs)
+
+            def peek_whispers(self, *args, **kwargs):
+                self.peek_whispers_calls += 1
+                return super().peek_whispers(*args, **kwargs)
+
+        store = _CountingStore(tmp_path / "counting.db")
+        store.write(
+            SubconsciousChunk(
+                chunk_id="sub_count",
+                layer="semantic",
+                content="counting store chunk",
+                src="tool_result",
+                pipeline_id="pipe_count",
+            )
+        )
+        store.emit_whisper(
+            Whisper(
+                from_agent="builder",
+                target="streamer",
+                whisper_type="nudge",
+                payload="check the counting chunk",
+                confidence=0.9,
+                pipeline_id="pipe_count",
+            )
+        )
+        handlers = make_handlers(store)
+
+        args = {
+            "agent_id": "streamer",
+            "role": "tester",
+            "task": "stream_task",
+            "slot": "stream_slot",
+            "intent": "stream_intent",
+            "pipeline_id": "pipe_count",
+            "stream": True,
+        }
+
+        result = _handle_request(_call("ncp_get_context", args), handlers)
+
+        assert isinstance(result, StreamResponse)
+        assert store.query_calls == 1
+        assert store.peek_whispers_calls == 1
+
+    def test_stream_sections_match_non_streaming_context(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "match.db")
+        store.write(
+            SubconsciousChunk(
+                chunk_id="sub_match",
+                layer="semantic",
+                content="matching store chunk",
+                src="tool_result",
+                pipeline_id="pipe_match",
+            )
+        )
+        store.emit_whisper(
+            Whisper(
+                from_agent="builder",
+                target="streamer",
+                whisper_type="nudge",
+                payload="check the matching chunk",
+                confidence=0.9,
+                pipeline_id="pipe_match",
+            )
+        )
+
+        args = {
+            "agent_id": "streamer",
+            "role": "tester",
+            "task": "stream_task",
+            "slot": "stream_slot",
+            "intent": "stream_intent",
+            "pipeline_id": "pipe_match",
+        }
+
+        non_stream_handlers = make_handlers(SQLiteStore(tmp_path / "match.db"))
+        non_stream_resp = _handle_request(_call("ncp_get_context", {**args, "stream": False}), non_stream_handlers)
+        non_stream_context = _content(non_stream_resp)["context"]
+
+        stream_handlers = make_handlers(SQLiteStore(tmp_path / "match.db"))
+        stream_result = _handle_request(_call("ncp_get_context", {**args, "stream": True}), stream_handlers)
+
+        assert isinstance(stream_result, StreamResponse)
+        from ncp.assembler import Assembler
+
+        assembled_from_sections = Assembler(store=store).apply_post_middleware(
+            "\n\n".join(text for _, text in stream_result.sections)
+        )
+        assert assembled_from_sections == non_stream_context
+        assert stream_result.handler_result["context"] == non_stream_context

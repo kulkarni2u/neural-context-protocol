@@ -78,6 +78,9 @@ DEFAULT_CONFIG = {
         "model_provider": None,
         "model": None,
     },
+    "server": {
+        "auth_token": "",
+    },
     "providers": {
         "pricing": {
             "claude-sonnet-4-20250514": {"input": 3.00, "output": 15.00, "cache_read": 0.30},
@@ -218,6 +221,11 @@ class NCPConfig:
     def embedding_model(self) -> str:
         return str(self.values.get("embedding", {}).get("model", "sentence-transformers/all-MiniLM-L6-v2"))
 
+    @property
+    def server_auth_token(self) -> str | None:
+        val = self.values.get("server", {}).get("auth_token")
+        return str(val) if val else None
+
 def load_config(
     path: str | Path | None = None,
     *,
@@ -295,6 +303,8 @@ def _apply_env_overrides(values: dict[str, Any], env: dict[str, str]) -> None:
         values["embedding"]["model"] = env["NCP_EMBEDDING_MODEL"]
     if "NCP_GENERATION_PENALTY_BASE" in env:
         values["retrieval"]["generation_penalty_base"] = float(env["NCP_GENERATION_PENALTY_BASE"])
+    if "NCP_AUTH_TOKEN" in env:
+        values["server"]["auth_token"] = env["NCP_AUTH_TOKEN"]
 
 
 def _deep_merge(target: dict[str, Any], updates: dict[str, Any]) -> None:
