@@ -266,6 +266,41 @@ class TestGetContext:
         assert "[NCP:BUDGET]" in result["context"]
         assert "[NCP:CONSCIOUS]" in result["context"]
 
+    def test_get_context_surfaces_eviction_telemetry_and_fetch_hint(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "telemetry.db")
+        for index in range(2):
+            store.write(SubconsciousChunk(
+                chunk_id=f"telemetry_large_{index}",
+                content=" ".join(["telemetry_probe relevant fact"] + [f"detail_{index}_{j}" for j in range(160)]),
+                layer="semantic",
+                src="tool_result",
+                pipeline_id="pipe_mcp",
+                relevance=0.95,
+            ))
+        handlers = make_handlers(store)
+
+        resp = _handle_request(
+            _call("ncp_get_context", {
+                "agent_id": "builder",
+                "role": "build",
+                "owns": [],
+                "must_not": [],
+                "task": "telemetry_probe",
+                "slot": "context",
+                "intent": "test_telemetry",
+                "pipeline_id": "pipe_mcp",
+                "max_tokens": 160,
+            }),
+            handlers,
+        )
+
+        result = _content(resp)
+        telemetry = result["telemetry"]
+        assert telemetry["evicted_high_relevance_count"] >= 1
+        assert telemetry["fetch_budget_remaining"] == 3
+        assert telemetry["fetch_hint"] == "ncp_fetch"
+        assert telemetry["evicted_high_relevance"]
+
     def test_with_pipeline_id(self, tmp_path: Path) -> None:
         store = SQLiteStore(tmp_path / "test.db")
         handlers = make_handlers(store)

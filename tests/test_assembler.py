@@ -3,7 +3,7 @@ from pathlib import Path
 from ncp.assembler import Assembler
 from ncp.tokens import estimate_tokens
 from ncp.stores.sqlite import SQLiteStore
-from ncp.types import BudgetContext, ConsciousBlock, NCPResponse, SubconsciousChunk, Whisper
+from ncp.types import BudgetContext, ConsciousBlock, NCPResponse, SubconsciousChunk, TurnRecord, Whisper
 
 
 def _make_conscious(**overrides: object) -> ConsciousBlock:
@@ -159,6 +159,66 @@ def test_recent_refs_do_not_crowd_out_matching_retrieved_chunk(tmp_path: Path) -
     assert any(chunk.chunk_id == "golden_fact" for chunk in result.chunks)
 
 
+def test_stale_recent_refs_lose_to_higher_scored_retrieved_chunks(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "recent-policy.db")
+    assembler = Assembler(store=store)
+    store.log_turn_record(
+        TurnRecord(
+            turn_id="turn_stale_a",
+            agent_id="executor",
+            pipeline_id="pipe_1",
+            task="implement_store",
+            slot="assemble_context",
+            result="old own-turn summary without policy retrieval keywords",
+            result_full="old own-turn summary without policy retrieval keywords",
+            created_at=1.0,
+        )
+    )
+    store.log_turn_record(
+        TurnRecord(
+            turn_id="turn_stale_b",
+            agent_id="executor",
+            pipeline_id="pipe_1",
+            task="implement_store",
+            slot="assemble_context",
+            result="another old summary with unrelated status notes",
+            result_full="another old summary with unrelated status notes",
+            created_at=2.0,
+        )
+    )
+
+    def _query(*args: object, **kwargs: object) -> list[SubconsciousChunk]:
+        return [
+            SubconsciousChunk(
+                chunk_id="retrieved_policy_fact",
+                layer="semantic",
+                content="retrieval policy should score recent refs instead of reserving slots",
+                src="user_verified",
+                pipeline_id="pipe_1",
+                relevance=0.9,
+            ),
+            SubconsciousChunk(
+                chunk_id="retrieved_budget_fact",
+                layer="semantic",
+                content="recent slot budget is a cap when retrieved chunks are stronger",
+                src="tool_result",
+                pipeline_id="pipe_1",
+                relevance=0.8,
+            ),
+        ]
+
+    store.query = _query  # type: ignore[method-assign]
+
+    result = assembler.assemble(
+        conscious=_make_conscious(recent=["r:sub/turn_stale_a", "r:sub/turn_stale_b"]),
+        budget=BudgetContext(pressure="medium"),
+        query_text="retrieval policy score recent refs budget",
+        k=2,
+    )
+
+    assert [chunk.chunk_id for chunk in result.chunks] == ["retrieved_policy_fact", "retrieved_budget_fact"]
+
+
 def test_assembler_reports_evicted_high_relevance_chunks(tmp_path: Path) -> None:
     store = SQLiteStore(tmp_path / "evict.db")
     assembler = Assembler(store=store)
@@ -184,6 +244,7 @@ def test_assembler_reports_evicted_high_relevance_chunks(tmp_path: Path) -> None
     result = assembler.assemble(
         conscious=_make_conscious(recent=recent_refs),
         budget=BudgetContext(pressure="medium"),
+        query_text="needle constraint preserve exact benchmark fact",
         k=1,
     )
 
@@ -208,23 +269,22 @@ def test_eviction_telemetry_reports_retrieved_chunk_evicted_by_tight_recent_budg
         )
     )
     recent_refs: list[str] = []
-    for index in range(2):
-        record = assembler.post_turn(
-            conscious=_make_conscious(),
-            response=NCPResponse(
-                content=f"recent {index}",
-                input_tokens=5,
-                output_tokens=5,
-                cost_usd=0.0,
-                model="benchmark_local",
-                pipeline_id="pipe_1",
-                turn_id=f"turn_evicted_retrieved_{index}",
-                latency_ms=1,
-            ),
-            result_summary=f"recent summary {index}",
-            result_full=f"recent summary {index}",
-        )
-        recent_refs.insert(0, f"r:sub/{record.turn_id}")
+    record = assembler.post_turn(
+        conscious=_make_conscious(),
+        response=NCPResponse(
+            content="recent",
+            input_tokens=5,
+            output_tokens=5,
+            cost_usd=0.0,
+            model="benchmark_local",
+            pipeline_id="pipe_1",
+            turn_id="turn_evicted_retrieved",
+            latency_ms=1,
+        ),
+        result_summary="retrieved_high_relevance retention telemetry golden keyword unique_recent_signal",
+        result_full="retrieved_high_relevance retention telemetry golden keyword unique_recent_signal",
+    )
+    recent_refs.insert(0, f"r:sub/{record.turn_id}")
 
     def _query(*args: object, **kwargs: object) -> list[SubconsciousChunk]:
         return [
@@ -234,7 +294,7 @@ def test_eviction_telemetry_reports_retrieved_chunk_evicted_by_tight_recent_budg
                 content="retrieved_high_relevance retention telemetry golden keyword",
                 src="user_verified",
                 pipeline_id="pipe_1",
-                relevance=0.95,
+                relevance=0.8,
             )
         ]
 
@@ -243,8 +303,8 @@ def test_eviction_telemetry_reports_retrieved_chunk_evicted_by_tight_recent_budg
     result = assembler.assemble(
         conscious=_make_conscious(recent=recent_refs),
         budget=BudgetContext(pressure="medium"),
-        query_text="retrieved_high_relevance golden keyword",
-        k=2,
+        query_text="unique_recent_signal",
+        k=1,
     )
 
     evicted_ids = {chunk_id for chunk_id, _ in result.evicted_high_relevance}

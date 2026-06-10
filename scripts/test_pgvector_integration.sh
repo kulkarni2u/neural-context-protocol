@@ -51,8 +51,8 @@ python3 - <<'PY'
 import importlib.util
 import sys
 
-if importlib.util.find_spec("psycopg2") is None:
-    print("psycopg2 is not installed. Install neural-context-protocol[pgvector] or psycopg2-binary first.", file=sys.stderr)
+if importlib.util.find_spec("psycopg") is None:
+    print("psycopg is not installed. Install neural-context-protocol[pgvector] first.", file=sys.stderr)
     raise SystemExit(1)
 PY
 
@@ -66,7 +66,7 @@ import os
 import sys
 import time
 
-import psycopg2
+import psycopg
 import redis
 
 dsn = os.environ.get("NCP_PGVECTOR_DSN", "postgresql://postgres:postgres@127.0.0.1:5432/ncp")
@@ -75,7 +75,7 @@ deadline = time.time() + 45
 last_errors: list[str] = []
 while time.time() < deadline:
     try:
-        conn = psycopg2.connect(dsn)
+        conn = psycopg.connect(dsn)
         conn.close()
         redis.from_url(redis_url, decode_responses=True).ping()
         print("pgvector + redis integration targets are ready.")

@@ -206,6 +206,34 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
     coordination = getattr(store, "coordination", None)
     default_whisper_ttl = config.whisper_ttl_default if config is not None else 1800
 
+    def _fetch_budget_remaining(session_id: str) -> int:
+        if coordination is not None:
+            return 3
+        with sessions_lock:
+            session = sessions.get(session_id, FetchSession())
+            return max(0, 3 - session.fetch_count)
+
+    def _context_telemetry(result: object, *, session_id: str) -> dict[str, object]:
+        evicted_high_relevance = [
+            {"chunk_id": chunk_id, "relevance": relevance}
+            for chunk_id, relevance in getattr(result, "evicted_high_relevance", [])
+        ]
+        evicted_whispers = [
+            {"whisper_id": whisper_id, "confidence": confidence}
+            for whisper_id, confidence in getattr(result, "evicted_whispers", [])
+        ]
+        pending_whisper_ids = list(getattr(result, "pending_whisper_ids", []))
+        fetch_budget_remaining = _fetch_budget_remaining(session_id)
+        return {
+            "evicted_high_relevance": evicted_high_relevance,
+            "evicted_high_relevance_count": len(evicted_high_relevance),
+            "evicted_whispers": evicted_whispers,
+            "evicted_whispers_count": len(evicted_whispers),
+            "pending_whisper_ids": pending_whisper_ids,
+            "fetch_budget_remaining": fetch_budget_remaining,
+            "fetch_hint": "ncp_fetch" if evicted_high_relevance and fetch_budget_remaining > 0 else None,
+        }
+
     def _handle_get_context(args: dict[str, object]) -> object:
         session_id = _session_id_from_args(args)
         pipeline_id = args.get("pipeline_id")
@@ -236,6 +264,14 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         except (ValueError, TypeError):
             caller_max_tokens = None
         if stream:
+            stream_result = assembler.assemble(
+                conscious=conscious,
+                budget=budget,
+                query_text=conscious.task + " " + conscious.slot,
+                k=caller_k,
+                diversity_limit=caller_diversity_limit,
+                max_tokens=caller_max_tokens,
+            )
             sections = list(assembler.assemble_incremental(
                 conscious=conscious,
                 budget=budget,
@@ -247,7 +283,12 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             assembled = assembler.apply_post_middleware("\n\n".join(t for _, t in sections))
             return StreamResponse(
                 sections=sections,
-                handler_result={"context": assembled, "session_id": session_id, "pending_whisper_ids": []},
+                handler_result={
+                    "context": assembled,
+                    "session_id": session_id,
+                    "pending_whisper_ids": stream_result.pending_whisper_ids,
+                    "telemetry": _context_telemetry(stream_result, session_id=session_id),
+                },
             )
         result = assembler.assemble(
             conscious=conscious,
@@ -261,6 +302,7 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             "context": result.context,
             "session_id": session_id,
             "pending_whisper_ids": result.pending_whisper_ids,
+            "telemetry": _context_telemetry(result, session_id=session_id),
         }
 
     def _handle_write_memory(args: dict[str, object]) -> object:

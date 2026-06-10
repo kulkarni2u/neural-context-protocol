@@ -818,6 +818,51 @@ def explain_command(cwd: Path, pipeline_id: str | None, limit: int, json_output:
         console.print("- none")
 
 
+@main.command("demo")
+@click.option("--cwd", type=click.Path(path_type=Path), default=Path.cwd,
+              help="Project root used for command consistency; the demo uses a temporary store by default.")
+@click.option("--pipeline-id", default="demo_pipeline", show_default=True)
+@click.option("--store-path", type=click.Path(path_type=Path), default=None,
+              help="Optional SQLite store path to keep the demo artifacts instead of using a temporary store.")
+@click.option("--json-output", is_flag=True, help="Emit machine-readable JSON instead of the demo table.")
+def demo_command(
+    cwd: Path,
+    pipeline_id: str,
+    store_path: Path | None,
+    json_output: bool,
+) -> None:
+    """Run a deterministic 3-agent NCP demo with no API keys."""
+
+    from ncp.demo import run_demo
+
+    cwd.mkdir(parents=True, exist_ok=True)
+    payload = run_demo(pipeline_id=pipeline_id, store_path=store_path)
+    if json_output:
+        console.print_json(data=payload)
+        return
+
+    table = Table(title="NCP Demo", box=box.MINIMAL_DOUBLE_HEAD)
+    table.add_column("Turn", justify="right")
+    table.add_column("Agent")
+    table.add_column("Raw Replay", justify="right")
+    table.add_column("NCP", justify="right")
+    table.add_column("Savings", justify="right")
+    for row in payload["turn_rows"]:  # type: ignore[index]
+        table.add_row(
+            str(row["turn"]),
+            str(row["agent_id"]),
+            str(row["raw_replay_tokens"]),
+            str(row["ncp_tokens"]),
+            str(row["savings_tokens"]),
+        )
+    console.print(table)
+    summary = payload["summary"]  # type: ignore[index]
+    console.print(
+        f"Final savings: {summary['final_savings_tokens']} tokens; "
+        f"whisper handoff delivered: {summary['whisper_handoff_delivered']}"
+    )
+
+
 @main.command("serve")
 @click.option("--cwd", type=click.Path(path_type=Path), default=None,
               help="Project root used to resolve .ncp/config.toml when the MCP host launches from another directory.")

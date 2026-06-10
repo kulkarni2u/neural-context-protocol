@@ -5,6 +5,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+pytest.importorskip("anthropic", reason="anthropic provider extra not installed")
+pytest.importorskip("openai", reason="openai provider extra not installed")
+pytest.importorskip("cohere", reason="cohere provider extra not installed")
+pytest.importorskip("google.genai", reason="google-genai provider extra not installed")
+pytest.importorskip("mistralai.client", reason="mistralai provider extra not installed")
+
 from ncp.adapters.anthropic import AnthropicAdapter
 from ncp.adapters.base import (
     NCPAdapterConfigurationError,

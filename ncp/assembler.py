@@ -18,6 +18,7 @@ from ncp.config import NCPConfig
 from ncp.encoder import PidginEncoder
 from ncp.middleware.base import MiddlewarePipeline
 from ncp.stores.base import BaseStore
+from ncp.stores.retrieval import DEFAULT_RETRIEVAL_POLICY, build_lexical_candidates, normalize_query_terms
 from ncp.tokens import estimate_tokens
 from ncp.types import BudgetContext, ConsciousBlock, NCPResponse, SubconsciousChunk, TurnRecord, Whisper
 
@@ -98,7 +99,8 @@ class Assembler:
         coherence_alerts = coherence_report.alerts
         hydrated = conscious if ctx_window is None else conscious.model_copy(update={"ctx_window": ctx_window})
         chunk_cap, whisper_cap = self._assembly_caps(budget=budget, k=k)
-        recent_chunks = self._resolve_recent_refs(hydrated)
+        search_text = query_text or f"{hydrated.task} {hydrated.slot}"
+        recent_chunks = self._resolve_recent_refs(hydrated, query_text=search_text)
         subconscious = self._retrieve_chunks(
             hydrated,
             query_text=query_text,
@@ -328,12 +330,33 @@ class Assembler:
     # Step 2: resolve recent refs
     # ------------------------------------------------------------------
 
-    def _resolve_recent_refs(self, conscious: ConsciousBlock) -> list[SubconsciousChunk]:
-        chunks: list[SubconsciousChunk] = []
+    def _resolve_recent_refs(self, conscious: ConsciousBlock, *, query_text: str | None = None) -> list[SubconsciousChunk]:
+        records: list[TurnRecord] = []
         for ref in conscious.recent:
             record = self.store.resolve_recent_ref(ref)
             if record is None:
                 continue
+            records.append(record)
+        if not records:
+            return []
+
+        policy = getattr(self.store, "retrieval_policy", DEFAULT_RETRIEVAL_POLICY)
+        lexical_candidates = build_lexical_candidates(query_text or "", [record.result for record in records])
+        query_terms = normalize_query_terms(query_text or "")
+        now = time.time()
+        chunks: list[SubconsciousChunk] = []
+        for record, lexical_candidate in zip(records, lexical_candidates, strict=True):
+            age_seconds = max(0.0, now - record.created_at)
+            lexical_signal = lexical_candidate.lexical_signal
+            if lexical_signal is not None and lexical_signal <= 0.0 and query_terms:
+                matched_terms = query_terms.intersection(set(lexical_candidate.doc_tokens))
+                lexical_signal = len(matched_terms) / len(query_terms)
+            relevance = policy.score(
+                bm25_normalized=0.0 if lexical_signal is None else lexical_signal,
+                age_seconds=age_seconds,
+                base_trust=0.7,
+                generation=0,
+            )
             chunks.append(
                 SubconsciousChunk(
                     chunk_id=f"recent_{record.turn_id}",
@@ -342,7 +365,8 @@ class Assembler:
                     src="subcon_retrieved",
                     pipeline_id=record.pipeline_id,
                     written_by=record.agent_id,
-                    relevance=1.0,
+                    relevance=max(0.0, min(1.0, relevance)),
+                    age_seconds=age_seconds,
                 )
             )
         return chunks
@@ -430,11 +454,26 @@ class Assembler:
         recent_budget = min(self._recent_slot_budget, chunk_cap)
         if budget.pressure == "critical" and chunk_cap > 1:
             recent_budget = min(recent_budget, 1)
-        recent_kept = recent_chunks[:recent_budget]
-        kept_ids = {chunk.chunk_id for chunk in recent_kept}
-        retrieved_kept = [chunk for chunk in retrieved_chunks if chunk.chunk_id not in kept_ids]
-        retrieved_slots = max(0, chunk_cap - len(recent_kept))
-        return [*recent_kept, *retrieved_kept[:retrieved_slots]]
+        candidates: list[tuple[str, int, SubconsciousChunk]] = [
+            ("recent", index, chunk) for index, chunk in enumerate(recent_chunks)
+        ]
+        candidates.extend(("retrieved", index, chunk) for index, chunk in enumerate(retrieved_chunks))
+        ranked = sorted(candidates, key=lambda item: (-float(item[2].relevance), 0 if item[0] == "recent" else 1, item[1]))
+        selected: list[SubconsciousChunk] = []
+        seen_ids: set[str] = set()
+        recent_count = 0
+        for source, _, chunk in ranked:
+            if chunk.chunk_id in seen_ids:
+                continue
+            if source == "recent":
+                if recent_count >= recent_budget:
+                    continue
+                recent_count += 1
+            selected.append(chunk)
+            seen_ids.add(chunk.chunk_id)
+            if len(selected) >= chunk_cap:
+                break
+        return selected
 
     def _fit_token_budget(
         self,

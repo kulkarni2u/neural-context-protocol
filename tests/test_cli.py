@@ -147,6 +147,22 @@ def test_cli_explain_renders_narrative_and_json(tmp_path: Path) -> None:
     assert payload["cost"]["summary"]["cost_usd_total"] == 0.015
 
 
+def test_cli_demo_runs_deterministic_pipeline_and_reports_savings(tmp_path: Path) -> None:
+    runner = CliRunner()
+
+    result = runner.invoke(main, ["demo", "--cwd", str(tmp_path), "--json-output"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["mode"] == "deterministic_demo"
+    assert payload["pipeline_id"] == "demo_pipeline"
+    assert payload["summary"]["turns"] == 6
+    assert payload["summary"]["final_savings_tokens"] > 0
+    assert payload["summary"]["whisper_handoff_delivered"] is True
+    assert payload["turn_rows"][0]["agent_id"] == "planner"
+    assert {"turn", "agent_id", "raw_replay_tokens", "ncp_tokens", "savings_tokens"} <= set(payload["turn_rows"][0])
+
+
 def test_cli_serve_passes_explicit_cwd(monkeypatch: object, tmp_path: Path) -> None:
     called: dict[str, object] = {}
 
