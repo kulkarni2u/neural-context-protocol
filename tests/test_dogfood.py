@@ -349,6 +349,8 @@ def test_opencode_cli_adapter_default_command_sets_dir(
     assert isinstance(command, list)
     assert "--dir" in command
     assert command[command.index("--dir") + 1] == str(tmp_path)
+    assert "-m" not in command
+    assert "--model" not in command
     assert captured["cwd"] == tmp_path
 
 
