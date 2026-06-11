@@ -824,21 +824,43 @@ class _MCPHTTPHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             return
 
+    def _drain_request_body(self) -> None:
+        """Consume the request body before an early error response.
+
+        Responding and closing while unread body bytes sit on the socket can
+        trigger a TCP reset that discards the response before the client reads
+        it. Bodies too large to drain force the connection closed instead.
+        """
+        try:
+            content_length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self.close_connection = True
+            return
+        if content_length <= 0:
+            return
+        if content_length > self.server.max_body_bytes:
+            self.close_connection = True
+            return
+        self.rfile.read(content_length)
+
     def do_POST(self) -> None:
         if self.path not in (self.server.rpc_path, "/message"):
+            self._drain_request_body()
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
             return
         if not self._authorized():
-            self.close_connection = True
+            self._drain_request_body()
             self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
             return
 
         try:
             content_length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
+            self.close_connection = True
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_content_length"})
             return
         if content_length > self.server.max_body_bytes:
+            self.close_connection = True
             self._send_json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": "request_too_large"})
             return
         try:
