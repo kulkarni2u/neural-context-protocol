@@ -1,9 +1,32 @@
 # 03 - LangGraph integration
 
 This example shows NCP "sitting underneath LangGraph": a 3-node
-`planner -> executor -> reviewer` `StateGraph` that runs for two full
-rounds, where all cross-agent memory lives in an NCP `SQLiteStore` instead
-of in the LangGraph state.
+`planner -> executor -> reviewer` pipeline that runs for two full rounds,
+where all cross-agent memory lives in an NCP `SQLiteStore` instead of in the
+graph state. There are two runnable variants.
+
+## Variant A: real StateGraph (`pipeline.py`, requires langgraph)
+
+A genuine `StateGraph` wired through LangGraph's graph runtime. Use this when
+you want to see NCP integrated into an actual LangGraph application.
+
+```bash
+pip install langgraph
+python3 examples/03_langgraph/pipeline.py
+```
+
+## Variant B: zero-dependency recipe (`run.py`, runs in the default test suite)
+
+The same 3-node pipeline expressed as plain Python node functions, with no
+LangGraph dependency. Use this to understand or copy the pattern without
+installing anything — it's also what the default test suite runs.
+
+```bash
+python3 examples/03_langgraph/run.py
+```
+
+Both variants return the same payload shape: `mode`, `nodes`, per-node
+context checks, and `pending_whispers_acknowledged`.
 
 ## What it shows
 
@@ -37,20 +60,6 @@ with:
 Swap that line for e.g. `llm.invoke(assembly.context + "\n\n" + prompt)` to
 wire in a real provider - the assembled `assembly.context` string is exactly
 what you'd hand to the model.
-
-## Run it
-
-```bash
-# Zero-dependency version (no LangGraph install needed):
-python3 examples/03_langgraph/run.py
-
-# Full LangGraph integration (requires `pip install langgraph`):
-pip install langgraph
-python3 examples/03_langgraph/pipeline.py
-```
-
-Both versions return the same payload shape: `mode`, `nodes`, per-node
-context checks, and `pending_whispers_acknowledged`.
 
 ## Mapping to MCP tools
 
