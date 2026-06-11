@@ -15,9 +15,9 @@ The benchmark uses:
 - a deterministic 4-role pipeline
 - a real SQLite store
 - the real assembler and post-turn persistence path
-- `chars_div4` token accounting in this environment
-  - if `tiktoken` is installed, the benchmark automatically reports that
-    instead
+- `chars_div4` token accounting (deterministic default across environments)
+  - set `NCP_TOKEN_UNIT=tiktoken` to count with cl100k_base when tiktoken and
+    its encoding data are available; the artifact reports the active unit
 - an explicit NCP context budget of `340` estimated tokens for this deterministic
   coding scenario
 
