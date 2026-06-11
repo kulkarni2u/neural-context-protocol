@@ -4,7 +4,72 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [Unreleased]
 
-No unreleased changes yet.
+Correctness, MCP-parity, and credibility overhaul from the protocol review
+(`docs/NCP_OPTIMIZATION_PLAN.md`). Suggested next release: `1.1.0` (behavior
+changes below).
+
+### Changed (behavior)
+
+- **Python floor raised to 3.11** (`pyproject.toml`): the package already used
+  `typing.Self` and could not import on 3.10. CI now verifies importability at
+  the minimum supported version.
+- **Token counting is deterministic by default** (`ncp/tokens.py`): chars/4
+  everywhere; set `NCP_TOKEN_UNIT=tiktoken` to opt in to cl100k_base counting.
+  Benchmark verdicts no longer depend on whether tiktoken's encoding could be
+  downloaded.
+- **Whisper TTL default raised 60s → 1800s** (`ncp/types.py`); `ttl_seconds`
+  exposed on `ncp_emit_whisper` and configurable via `[whispers]`.
+- **Whisper delivery is at-least-once** (`ncp/assembler.py`): assembly peeks
+  instead of draining; whispers are acknowledged in `post_turn` via
+  `ack_whisper_ids`. Unacked whispers redeliver. `acknowledge_whispers` gains
+  an `agent_id` keyword.
+- **Broadcast whispers reach every pipeline agent** (`ncp/stores/sqlite.py`,
+  `redis_coordination.py`): per-recipient delivery tracking replaces
+  delete-on-first-drain.
+- **Recent refs no longer crowd out retrieval** (`ncp/assembler.py`): recent
+  turn refs are scored through the retrieval policy and capped at
+  `recent_slot_budget` (default 2) so retrieved chunks keep their slots.
+- **Pidgin wire format** (`ncp/encoder.py`, spec §1): `[NCP:BUDGET]` moved to
+  the end for prompt-cache-friendly ordering; empty conscious fields omitted;
+  whisper ages bucketed; JSON whisper payloads rendered as `key:value` lines.
+
+### Added
+
+- **Token budgets enforced at assembly** (`ncp/assembler.py`): `max_tokens`
+  on `assemble()`/`ncp_get_context`; `context_token_budget` config (840).
+- **`ncp_post_turn` MCP tool + server-side conscious state**
+  (`ncp/mcp/server.py`): recent-ref continuity, drift tracking, cost logging,
+  and budget pressure now work through MCP alone; `ncp_get_context` returns
+  `pending_whisper_ids` and eviction/fetch telemetry.
+- **Trust through MCP**: `base_trust` param on `ncp_write_memory` with
+  src-derived defaults; `written_at_drift` stamped from the latest conscious
+  snapshot.
+- **HTTP server hardening** (`ncp/mcp/server.py`, `ncp/cli.py`): bearer-token
+  auth (`--auth-token` / `NCP_AUTH_TOKEN` / `[server].auth_token`, generated
+  by `ncp init`), CORS allowlist, 10 MB body cap, non-loopback warning.
+- **SQLite FTS5 retrieval** (`ncp/stores/sqlite.py`): persistent BM25 index
+  replaces per-query corpus rebuild.
+- **Store retention** (`[retention] max_working_chunks_per_pipeline`):
+  optional write-time eviction of lowest trust/recency-scored working-zone
+  chunks; disabled by default.
+- **Task-success benchmark** (`benchmarks/task_success/`): 12 tasks scored at
+  a matched token budget; keyless mock mode measures context adequacy
+  (NCP 1.00 vs sliding window 0.00 at budget 400); live-provider mode for
+  real task success. CI gates on the coding-pipeline and needle benchmarks.
+- **`ncp demo`**: deterministic 3-agent pipeline showing per-turn savings.
+- **LangGraph example** (`examples/03_langgraph/`), **HTTP API contract doc**
+  (`docs/NCP_HTTP_API.md`), **prompt-injection threat model** (spec §5.1 and
+  generated turn contracts), `AGENTS.md` conventions.
+
+### Fixed
+
+- README/benchmark numbers regenerated from the current code and made
+  internally consistent; the coding benchmark's pass gate is green again
+  (13.13x vs raw replay at the final turn, `chars_div4`).
+- Fetch-session state race in the threaded HTTP server; hardcoded MCP
+  serverInfo version; hardcoded OpenCode reviewer model; early HTTP error
+  responses no longer lose the response to a TCP reset on unread bodies;
+  Redis whisper reads pipelined and stats scan bounded.
 
 ## [1.0.4] - 2026-06-06
 

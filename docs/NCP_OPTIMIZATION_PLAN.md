@@ -1,6 +1,7 @@
 # NCP Optimization Plan — Make the MCP Plug-and-Play and Honest
 
-**Status:** Ready for implementation
+**Status:** Implemented — all WI items complete (PR #14); S6 and the D1–D3
+design directions remain open for follow-up work
 **Source:** Expert code review of `main` (commit `54488d6`), 2026-06-09
 **Goal:** Close the gap between what the README boasts and what the code delivers,
 so that a host connecting over MCP gets bounded, trust-weighted, multi-agent
@@ -61,29 +62,29 @@ python3 benchmarks/needle/run.py --turns 24 --needles 6 --budget 4
 ## 1. TODO checklist (priority order)
 
 ### P0 — Correctness: make the core claim true again
-- [ ] **WI-1** Fix recent-refs vs retrieval budget split in the assembler
-- [ ] **WI-2** Enforce a real token budget in `assemble()`; expose `max_tokens` via MCP
-- [ ] **WI-13** Refresh README + benchmark docs from current code; fix inconsistencies; pin token unit
-- [ ] **WI-14** Fix Python version floor: package imports fail on the advertised 3.10
+- [x] **WI-1** Fix recent-refs vs retrieval budget split in the assembler
+- [x] **WI-2** Enforce a real token budget in `assemble()`; expose `max_tokens` via MCP
+- [x] **WI-13** Refresh README + benchmark docs from current code; fix inconsistencies; pin token unit
+- [x] **WI-14** Fix Python version floor: package imports fail on the advertised 3.10
 
 ### P1 — Plug-and-play MCP parity (the protocol must work through MCP alone)
-- [ ] **WI-3** Server-side conscious state: persist/load per `(pipeline_id, agent_id)`; add `ncp_post_turn` tool
-- [ ] **WI-4** Trust through MCP: src-derived default `base_trust`; optional `base_trust` param on `ncp_write_memory`
-- [ ] **WI-7** Raise default whisper TTL; expose `ttl_seconds` on `ncp_emit_whisper`
-- [ ] **WI-15** Fix `share`/`request` whisper payload DX through MCP (schema mismatch traps hosts)
-- [ ] **WI-16** Harden the HTTP server: optional auth token, request size cap, CORS, non-loopback warning
-- [ ] **WI-17** Single-source the version string
+- [x] **WI-3** Server-side conscious state: persist/load per `(pipeline_id, agent_id)`; add `ncp_post_turn` tool
+- [x] **WI-4** Trust through MCP: src-derived default `base_trust`; optional `base_trust` param on `ncp_write_memory`
+- [x] **WI-7** Raise default whisper TTL; expose `ttl_seconds` on `ncp_emit_whisper`
+- [x] **WI-15** Fix `share`/`request` whisper payload DX through MCP (schema mismatch traps hosts)
+- [x] **WI-16** Harden the HTTP server: optional auth token, request size cap, CORS, non-loopback warning
+- [x] **WI-17** Single-source the version string
 
 ### P2 — Agent-to-agent reliability
-- [ ] **WI-5** Per-recipient broadcast delivery (delivery-cursor table / Redis consumer groups)
-- [ ] **WI-6** At-least-once whispers: peek at assemble, acknowledge at post-turn
-- [ ] **WI-8** Separate slot budget for system alerts vs agent whispers
-- [ ] **WI-11** Thread-safety for MCP session state
-- [ ] **WI-12** Pipeline Redis whisper reads; fix `whisper_stats` scan
+- [x] **WI-5** Per-recipient broadcast delivery (delivery-cursor table / Redis consumer groups)
+- [x] **WI-6** At-least-once whispers: peek at assemble, acknowledge at post-turn
+- [x] **WI-8** Separate slot budget for system alerts vs agent whispers
+- [x] **WI-11** Thread-safety for MCP session state
+- [x] **WI-12** Pipeline Redis whisper reads; fix `whisper_stats` scan
 
 ### P3 — Efficiency polish
-- [ ] **WI-9** SQLite FTS5-backed retrieval (replace per-query BM25Okapi rebuild)
-- [ ] **WI-10** Pidgin trimming + cache-friendly block ordering
+- [x] **WI-9** SQLite FTS5-backed retrieval (replace per-query BM25Okapi rebuild)
+- [x] **WI-10** Pidgin trimming + cache-friendly block ordering
 
 Suggested PR slicing: PR1 = WI-1 + WI-2 + WI-13 (flips the benchmark gate back
 to `pass: true` and makes docs honest). PR2 = WI-3 + WI-4 + WI-7. PR3 = WI-5 +
