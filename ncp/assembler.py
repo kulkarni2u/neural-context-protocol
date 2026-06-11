@@ -18,6 +18,8 @@ from ncp.config import NCPConfig
 from ncp.encoder import PidginEncoder
 from ncp.middleware.base import MiddlewarePipeline
 from ncp.stores.base import BaseStore
+from ncp.stores.retrieval import DEFAULT_RETRIEVAL_POLICY, build_lexical_candidates, normalize_query_terms
+from ncp.tokens import estimate_tokens
 from ncp.types import BudgetContext, ConsciousBlock, NCPResponse, SubconsciousChunk, TurnRecord, Whisper
 
 
@@ -29,6 +31,7 @@ class AssemblyResult:
     conscious: ConsciousBlock
     chunks: list[SubconsciousChunk]
     whispers: list[Whisper]
+    pending_whisper_ids: list[str]
     evicted_high_relevance: list[tuple[str, float]]
     evicted_whispers: list[tuple[str, float]]
 
@@ -63,6 +66,8 @@ class Assembler:
         self._chunk_cap_default = config.chunk_cap_default if config else 4
         self._chunk_cap_high = config.chunk_cap_high if config else 3
         self._chunk_cap_critical = config.chunk_cap_critical if config else 2
+        self._recent_slot_budget = config.recent_slot_budget if config else 2
+        self._context_token_budget = config.context_token_budget if config else None
         self._whisper_cap_default = config.whisper_cap_default if config else 3
         self._whisper_cap_high = config.whisper_cap_high if config else 2
         self._whisper_cap_critical = config.whisper_cap_critical if config else 1
@@ -80,6 +85,7 @@ class Assembler:
         ctx_window: int | None = None,
         k: int | None = None,
         diversity_limit: int | None = None,
+        max_tokens: int | None = None,
     ) -> tuple[
         ConsciousBlock,
         BudgetContext,
@@ -91,10 +97,10 @@ class Assembler:
         conscious, budget = self.middleware.pre_assemble(conscious, budget)
         coherence_report = self.coherence.check(conscious)
         coherence_alerts = coherence_report.alerts
-        coherence_sensors = coherence_report.sensors
         hydrated = conscious if ctx_window is None else conscious.model_copy(update={"ctx_window": ctx_window})
         chunk_cap, whisper_cap = self._assembly_caps(budget=budget, k=k)
-        recent_chunks = self._resolve_recent_refs(hydrated)
+        search_text = query_text or f"{hydrated.task} {hydrated.slot}"
+        recent_chunks = self._resolve_recent_refs(hydrated, query_text=search_text)
         subconscious = self._retrieve_chunks(
             hydrated,
             query_text=query_text,
@@ -104,24 +110,58 @@ class Assembler:
         )
         subconscious = self._cold_start_bootstrap(hydrated, subconscious)
         deduped_chunks = self._dedupe_chunks([*recent_chunks, *subconscious])
+        combined_chunks = self._split_recent_and_retrieved_chunks(
+            recent_chunks=recent_chunks,
+            retrieved_chunks=subconscious,
+            chunk_cap=chunk_cap,
+            budget=budget,
+        )
+        combined_ids = {chunk.chunk_id for chunk in combined_chunks}
         evicted_high_relevance = [
             (chunk.chunk_id, float(chunk.relevance))
-            for chunk in deduped_chunks[chunk_cap:]
-            if float(chunk.relevance) >= 0.5
+            for chunk in deduped_chunks
+            if chunk.chunk_id not in combined_ids and float(chunk.relevance) >= 0.5
         ]
-        combined_chunks = deduped_chunks[:chunk_cap]
-        drain_cap = max(0, whisper_cap - len(coherence_alerts))
-        drained_whispers = (
-            [] if drain_cap == 0 else self._drain_whispers(hydrated, max_items=drain_cap)
-        )
-        hydrated = self._apply_drift_feedback(hydrated, drained_whispers)
-        all_whispers: list[Whisper] = [*coherence_alerts, *coherence_sensors, *drained_whispers]
+        alert_cap = self._alert_cap(budget=budget)
+        queue_whispers = self._peek_whispers(hydrated, max_items=whisper_cap)
+        hydrated = self._apply_drift_feedback(hydrated, queue_whispers)
+        external_alerts = coherence_alerts[:alert_cap]
+        all_whispers: list[Whisper] = [*external_alerts, *queue_whispers]
         evicted_whispers = [
             (whisper.whisper_id, float(whisper.confidence))
-            for whisper in all_whispers[whisper_cap:]
+            for whisper in [*coherence_alerts[alert_cap:], *queue_whispers[whisper_cap:]]
             if float(whisper.confidence) >= 0.6
         ]
-        combined_whispers = all_whispers[:whisper_cap]
+        combined_whispers = all_whispers
+        effective_max_tokens = max_tokens if max_tokens is not None else self._context_token_budget
+        if effective_max_tokens is not None:
+            pre_budget_chunks = combined_chunks
+            pre_budget_whispers = combined_whispers
+            combined_chunks, combined_whispers = self._fit_token_budget(
+                conscious=hydrated,
+                budget=budget,
+                chunks=combined_chunks,
+                whispers=combined_whispers,
+                max_tokens=max(1, effective_max_tokens),
+            )
+            kept_chunk_ids = {chunk.chunk_id for chunk in combined_chunks}
+            evicted_ids = {chunk_id for chunk_id, _ in evicted_high_relevance}
+            evicted_high_relevance.extend(
+                (chunk.chunk_id, float(chunk.relevance))
+                for chunk in pre_budget_chunks
+                if chunk.chunk_id not in kept_chunk_ids
+                and chunk.chunk_id not in evicted_ids
+                and float(chunk.relevance) >= 0.5
+            )
+            kept_whisper_ids = {whisper.whisper_id for whisper in combined_whispers}
+            evicted_whisper_ids = {whisper_id for whisper_id, _ in evicted_whispers}
+            evicted_whispers.extend(
+                (whisper.whisper_id, float(whisper.confidence))
+                for whisper in pre_budget_whispers
+                if whisper.whisper_id not in kept_whisper_ids
+                and whisper.whisper_id not in evicted_whisper_ids
+                and float(whisper.confidence) >= 0.6
+            )
         return hydrated, budget, combined_chunks, combined_whispers, evicted_high_relevance, evicted_whispers
 
     def assemble(
@@ -133,6 +173,7 @@ class Assembler:
         ctx_window: int | None = None,
         k: int | None = None,
         diversity_limit: int | None = None,
+        max_tokens: int | None = None,
     ) -> AssemblyResult:
         hydrated, budget, combined_chunks, combined_whispers, evicted_high_relevance, evicted_whispers = self._prepare_assembly(
             conscious=conscious,
@@ -141,6 +182,7 @@ class Assembler:
             ctx_window=ctx_window,
             k=k,
             diversity_limit=diversity_limit,
+            max_tokens=max_tokens,
         )
         context = self.encoder.assemble(
             conscious=hydrated,
@@ -154,6 +196,11 @@ class Assembler:
             conscious=hydrated,
             chunks=combined_chunks,
             whispers=combined_whispers,
+            pending_whisper_ids=[
+                whisper.whisper_id
+                for whisper in combined_whispers
+                if whisper.whisper_type not in {"alert", "world_check", "sensor"}
+            ],
             evicted_high_relevance=evicted_high_relevance,
             evicted_whispers=evicted_whispers,
         )
@@ -171,10 +218,10 @@ class Assembler:
     ) -> Iterator[tuple[str, str]]:
         """Yield (label, section_text) in priority order, enforcing max_tokens.
 
-        Labels in order: ``budget_header``, ``conscious``, ``subconscious`` (one
-        per chunk), ``whispers``. Budget and conscious sections are always emitted.
+        Labels in order: ``conscious``, ``subconscious`` (one per chunk),
+        ``whispers``, ``budget_header``. Conscious and budget sections are always emitted.
         Subconscious chunks stop yielding once max_tokens would be exceeded.
-        Token count is estimated via word-split proxy (len(text.split())).
+        Token count is estimated via ``ncp.tokens.estimate_tokens``.
 
         Note: ``middleware.post_assemble`` is NOT called on yielded sections.
         Callers that use post_assemble middleware should apply it to the
@@ -187,31 +234,43 @@ class Assembler:
             ctx_window=ctx_window,
             k=k,
             diversity_limit=diversity_limit,
+            max_tokens=max_tokens,
         )
 
-        tokens_used = 0
-
-        budget_text = self.encoder._encode_budget(budget)
-        tokens_used += len(budget_text.split())
-        yield "budget_header", budget_text
-
         conscious_text = self.encoder._encode_conscious(hydrated)
-        tokens_used += len(conscious_text.split())
         yield "conscious", conscious_text
 
-        fitting_chunks: list[SubconsciousChunk] = []
-        for chunk in combined_chunks:
-            chunk_tokens = len(self.encoder._encode_subconscious([chunk]).split())
-            if max_tokens is not None and tokens_used + chunk_tokens > max_tokens:
-                break
-            tokens_used += chunk_tokens
-            fitting_chunks.append(chunk)
-
-        if fitting_chunks:
-            yield "subconscious", self.encoder._encode_subconscious(fitting_chunks)
+        if combined_chunks:
+            yield "subconscious", self.encoder._encode_subconscious(combined_chunks)
 
         if combined_whispers:
             yield "whispers", self.encoder._encode_whispers(combined_whispers, now=None)
+
+        budget_text = self.encoder._encode_budget(budget)
+        yield "budget_header", budget_text
+
+    def sections_from_result(
+        self,
+        *,
+        result: AssemblyResult,
+        budget: BudgetContext,
+    ) -> list[tuple[str, str]]:
+        """Derive labeled sections from an existing ``AssemblyResult``.
+
+        Mirrors ``assemble_incremental``'s label order (``conscious``,
+        ``subconscious``, ``whispers``, ``budget_header``), reusing the
+        encoder against already-assembled data with no store access.
+        """
+        sections: list[tuple[str, str]] = [("conscious", self.encoder._encode_conscious(result.conscious))]
+
+        if result.chunks:
+            sections.append(("subconscious", self.encoder._encode_subconscious(result.chunks)))
+
+        if result.whispers:
+            sections.append(("whispers", self.encoder._encode_whispers(result.whispers, now=None)))
+
+        sections.append(("budget_header", self.encoder._encode_budget(budget)))
+        return sections
 
     def apply_post_middleware(self, text: str) -> str:
         return self.middleware.post_assemble(text)
@@ -228,6 +287,7 @@ class Assembler:
         result_summary: str,
         result_full: str,
         memory_chunks: list[SubconsciousChunk] | None = None,
+        ack_whisper_ids: list[str] | None = None,
     ) -> TurnRecord:
         record = TurnRecord(
             turn_id=response.turn_id,
@@ -245,6 +305,8 @@ class Assembler:
         snapshot_hash = sha256(updated_conscious.model_dump_json().encode("utf-8")).hexdigest()
         self.store.log_conscious(updated_conscious, snapshot_hash=snapshot_hash)
         self.store.log_cost(agent_id=conscious.agent_id, response=response)
+        if ack_whisper_ids:
+            self.store.acknowledge_whispers(ack_whisper_ids, agent_id=conscious.agent_id)
 
         for chunk in memory_chunks or []:
             chunk = self.middleware.pre_write(chunk)
@@ -260,6 +322,7 @@ class Assembler:
         result_summary: str,
         result_full: str,
         memory_chunks: list[SubconsciousChunk] | None = None,
+        ack_whisper_ids: list[str] | None = None,
     ) -> TurnRecord:
         record = TurnRecord(
             turn_id=response.turn_id,
@@ -278,6 +341,8 @@ class Assembler:
             tg.start_soon(self._alog_turn_record, record)
             tg.start_soon(self._alog_conscious, updated_conscious, snapshot_hash)
             tg.start_soon(self._alog_cost, conscious.agent_id, response)
+            if ack_whisper_ids:
+                tg.start_soon(self._aacknowledge_whispers, ack_whisper_ids, conscious.agent_id)
             for chunk in memory_chunks or []:
                 chunk = self.middleware.pre_write(chunk)
                 tg.start_soon(self._alog_write_with_retry, chunk)
@@ -288,12 +353,33 @@ class Assembler:
     # Step 2: resolve recent refs
     # ------------------------------------------------------------------
 
-    def _resolve_recent_refs(self, conscious: ConsciousBlock) -> list[SubconsciousChunk]:
-        chunks: list[SubconsciousChunk] = []
+    def _resolve_recent_refs(self, conscious: ConsciousBlock, *, query_text: str | None = None) -> list[SubconsciousChunk]:
+        records: list[TurnRecord] = []
         for ref in conscious.recent:
             record = self.store.resolve_recent_ref(ref)
             if record is None:
                 continue
+            records.append(record)
+        if not records:
+            return []
+
+        policy = getattr(self.store, "retrieval_policy", DEFAULT_RETRIEVAL_POLICY)
+        lexical_candidates = build_lexical_candidates(query_text or "", [record.result for record in records])
+        query_terms = normalize_query_terms(query_text or "")
+        now = time.time()
+        chunks: list[SubconsciousChunk] = []
+        for record, lexical_candidate in zip(records, lexical_candidates, strict=True):
+            age_seconds = max(0.0, now - record.created_at)
+            lexical_signal = lexical_candidate.lexical_signal
+            if lexical_signal is not None and lexical_signal <= 0.0 and query_terms:
+                matched_terms = query_terms.intersection(set(lexical_candidate.doc_tokens))
+                lexical_signal = len(matched_terms) / len(query_terms)
+            relevance = policy.score(
+                bm25_normalized=0.0 if lexical_signal is None else lexical_signal,
+                age_seconds=age_seconds,
+                base_trust=0.7,
+                generation=0,
+            )
             chunks.append(
                 SubconsciousChunk(
                     chunk_id=f"recent_{record.turn_id}",
@@ -302,7 +388,8 @@ class Assembler:
                     src="subcon_retrieved",
                     pipeline_id=record.pipeline_id,
                     written_by=record.agent_id,
-                    relevance=1.0,
+                    relevance=max(0.0, min(1.0, relevance)),
+                    age_seconds=age_seconds,
                 )
             )
         return chunks
@@ -357,8 +444,8 @@ class Assembler:
     # Step 4: drain whisper queue
     # ------------------------------------------------------------------
 
-    def _drain_whispers(self, conscious: ConsciousBlock, *, max_items: int = 3) -> list[Whisper]:
-        return self.store.drain_whispers(
+    def _peek_whispers(self, conscious: ConsciousBlock, *, max_items: int = 3) -> list[Whisper]:
+        return self.store.peek_whispers(
             agent_id=conscious.agent_id,
             pipeline_id=conscious.pipeline_id,
             max_items=max_items,
@@ -379,6 +466,91 @@ class Assembler:
             deduped.append(chunk)
         return deduped
 
+    def _split_recent_and_retrieved_chunks(
+        self,
+        *,
+        recent_chunks: list[SubconsciousChunk],
+        retrieved_chunks: list[SubconsciousChunk],
+        chunk_cap: int,
+        budget: BudgetContext,
+    ) -> list[SubconsciousChunk]:
+        recent_budget = min(self._recent_slot_budget, chunk_cap)
+        if budget.pressure == "critical" and chunk_cap > 1:
+            recent_budget = min(recent_budget, 1)
+        candidates: list[tuple[str, int, SubconsciousChunk]] = [
+            ("recent", index, chunk) for index, chunk in enumerate(recent_chunks)
+        ]
+        candidates.extend(("retrieved", index, chunk) for index, chunk in enumerate(retrieved_chunks))
+        ranked = sorted(candidates, key=lambda item: (-float(item[2].relevance), 0 if item[0] == "recent" else 1, item[1]))
+        selected: list[SubconsciousChunk] = []
+        seen_ids: set[str] = set()
+        recent_count = 0
+        for source, _, chunk in ranked:
+            if chunk.chunk_id in seen_ids:
+                continue
+            if source == "recent":
+                if recent_count >= recent_budget:
+                    continue
+                recent_count += 1
+            selected.append(chunk)
+            seen_ids.add(chunk.chunk_id)
+            if len(selected) >= chunk_cap:
+                break
+        return selected
+
+    def _fit_token_budget(
+        self,
+        *,
+        conscious: ConsciousBlock,
+        budget: BudgetContext,
+        chunks: list[SubconsciousChunk],
+        whispers: list[Whisper],
+        max_tokens: int,
+    ) -> tuple[list[SubconsciousChunk], list[Whisper]]:
+        fitted_whispers = self._fit_whispers_to_budget(
+            conscious=conscious,
+            budget=budget,
+            whispers=whispers,
+            max_tokens=max_tokens,
+        )
+        fitted_chunks: list[SubconsciousChunk] = []
+        for chunk in chunks:
+            candidate_chunks = [*fitted_chunks, chunk]
+            candidate = self.encoder.assemble(
+                conscious=conscious,
+                chunks=candidate_chunks,
+                whispers=fitted_whispers,
+                budget=budget,
+            )
+            if estimate_tokens(candidate) <= max_tokens:
+                fitted_chunks.append(chunk)
+        return fitted_chunks, fitted_whispers
+
+    def _fit_whispers_to_budget(
+        self,
+        *,
+        conscious: ConsciousBlock,
+        budget: BudgetContext,
+        whispers: list[Whisper],
+        max_tokens: int,
+    ) -> list[Whisper]:
+        if not whispers:
+            return []
+        fitted: list[Whisper] = []
+        reserve = max(1, max_tokens // 4)
+        for whisper in whispers:
+            candidate = [*fitted, whisper]
+            whisper_text = self.encoder._encode_whispers(candidate, now=None)
+            full_context = self.encoder.assemble(
+                conscious=conscious,
+                chunks=[],
+                whispers=candidate,
+                budget=budget,
+            )
+            if estimate_tokens(whisper_text) <= reserve and estimate_tokens(full_context) <= max_tokens:
+                fitted.append(whisper)
+        return fitted
+
     def _assembly_caps(
         self,
         *,
@@ -392,6 +564,11 @@ class Assembler:
         if budget.pressure == "high":
             return self._chunk_cap_high, self._whisper_cap_high
         return self._chunk_cap_default, self._whisper_cap_default
+
+    def _alert_cap(self, *, budget: BudgetContext) -> int:
+        if budget.pressure == "critical":
+            return 1
+        return 2
 
     def _write_with_retry(self, chunk: SubconsciousChunk, *, retries: int = 2, backoff_ms: int = 50) -> None:
         for attempt in range(retries + 1):
@@ -418,6 +595,9 @@ class Assembler:
 
     async def _alog_cost(self, agent_id: str, response: NCPResponse) -> None:
         await self.store.async_log_cost(agent_id=agent_id, response=response)
+
+    async def _aacknowledge_whispers(self, whisper_ids: list[str], agent_id: str) -> None:
+        await self.store.async_acknowledge_whispers(whisper_ids, agent_id=agent_id)
 
     async def _alog_write_with_retry(self, chunk: SubconsciousChunk, *, retries: int = 2, backoff_ms: int = 50) -> None:
         for attempt in range(retries + 1):

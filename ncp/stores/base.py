@@ -103,7 +103,7 @@ class BaseStore(ABC):
         """Return eligible whispers without consuming them."""
 
     @abstractmethod
-    def acknowledge_whispers(self, whisper_ids: Sequence[str]) -> int:
+    def acknowledge_whispers(self, whisper_ids: Sequence[str], *, agent_id: str | None = None) -> int:
         """Delete already-processed whispers by id. Returns count deleted."""
 
     @abstractmethod
@@ -124,6 +124,10 @@ class BaseStore(ABC):
     @abstractmethod
     def log_conscious(self, conscious: ConsciousBlock, *, snapshot_hash: str) -> None:
         """Persist a conscious-block snapshot for audit and goal-version tracking."""
+
+    def load_latest_conscious(self, *, pipeline_id: str | None, agent_id: str) -> ConsciousBlock | None:
+        """Return the latest conscious snapshot for an agent in a pipeline, if present."""
+        return None
 
     @abstractmethod
     def log_cost(self, *, agent_id: str, response: NCPResponse) -> None:
@@ -258,6 +262,16 @@ class BaseStore(ABC):
         )
         return await anyio.to_thread.run_sync(fn)
 
+    async def async_acknowledge_whispers(
+        self,
+        whisper_ids: Sequence[str],
+        *,
+        agent_id: str | None = None,
+    ) -> int:
+        """Asynchronously acknowledge queued whispers using thread pool."""
+        fn = partial(self.acknowledge_whispers, whisper_ids, agent_id=agent_id)
+        return await anyio.to_thread.run_sync(fn)
+
     async def async_log_turn_record(self, record: TurnRecord) -> None:
         """Asynchronously persist a turn record using thread pool."""
         await anyio.to_thread.run_sync(self.log_turn_record, record)
@@ -275,6 +289,11 @@ class BaseStore(ABC):
         """Asynchronously persist a conscious-block snapshot using thread pool."""
         fn = partial(self.log_conscious, conscious, snapshot_hash=snapshot_hash)
         await anyio.to_thread.run_sync(fn)
+
+    async def async_load_latest_conscious(self, *, pipeline_id: str | None, agent_id: str) -> ConsciousBlock | None:
+        """Asynchronously load the latest conscious snapshot using thread pool."""
+        fn = partial(self.load_latest_conscious, pipeline_id=pipeline_id, agent_id=agent_id)
+        return await anyio.to_thread.run_sync(fn)
 
     async def async_log_cost(self, *, agent_id: str, response: NCPResponse) -> None:
         """Asynchronously persist cost telemetry using thread pool."""

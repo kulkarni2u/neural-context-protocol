@@ -1,8 +1,9 @@
 from pathlib import Path
 
 from ncp.assembler import Assembler
+from ncp.tokens import estimate_tokens
 from ncp.stores.sqlite import SQLiteStore
-from ncp.types import BudgetContext, ConsciousBlock, NCPResponse, SubconsciousChunk, Whisper
+from ncp.types import BudgetContext, ConsciousBlock, NCPResponse, SubconsciousChunk, TurnRecord, Whisper
 
 
 def _make_conscious(**overrides: object) -> ConsciousBlock:
@@ -107,9 +108,115 @@ def test_assembler_resolves_recent_refs_and_reduces_critical_pressure(tmp_path: 
     )
 
     assert len(result.chunks) == 2
-    assert len(result.whispers) == 1
+    assert len(result.whispers) == 2
     assert any(chunk.chunk_id.startswith("recent_") for chunk in result.chunks)
     assert result.whispers[0].whisper_type == "alert"
+    assert result.whispers[1].whisper_type == "nudge"
+    assert result.pending_whisper_ids == [result.whispers[1].whisper_id]
+
+
+def test_recent_refs_do_not_crowd_out_matching_retrieved_chunk(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "recent-budget.db")
+    assembler = Assembler(store=store)
+    store.write(
+        SubconsciousChunk(
+            chunk_id="golden_fact",
+            layer="semantic",
+            content="golden_fact async vector mode uses ivfflat_probes and cosine ordering",
+            src="user_verified",
+            pipeline_id="pipe_1",
+            written_by="reviewer",
+            relevance=0.95,
+        )
+    )
+    recent_refs: list[str] = []
+    for index in range(5):
+        record = assembler.post_turn(
+            conscious=_make_conscious(),
+            response=NCPResponse(
+                content=f"recent summary {index}",
+                input_tokens=10,
+                output_tokens=5,
+                cost_usd=0.0,
+                model="benchmark_local",
+                pipeline_id="pipe_1",
+                turn_id=f"turn_recent_budget_{index}",
+                latency_ms=1,
+            ),
+            result_summary=f"recent own-turn summary {index} without the golden retrieval terms",
+            result_full=f"recent own-turn summary {index} without the golden retrieval terms",
+        )
+        recent_refs.insert(0, f"r:sub/{record.turn_id}")
+
+    result = assembler.assemble(
+        conscious=_make_conscious(recent=recent_refs),
+        budget=BudgetContext(pressure="medium"),
+        query_text="golden_fact ivfflat_probes cosine ordering",
+    )
+
+    assert len(result.chunks) <= 4
+    assert sum(chunk.chunk_id.startswith("recent_") for chunk in result.chunks) <= 2
+    assert any(chunk.chunk_id == "golden_fact" for chunk in result.chunks)
+
+
+def test_stale_recent_refs_lose_to_higher_scored_retrieved_chunks(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "recent-policy.db")
+    assembler = Assembler(store=store)
+    store.log_turn_record(
+        TurnRecord(
+            turn_id="turn_stale_a",
+            agent_id="executor",
+            pipeline_id="pipe_1",
+            task="implement_store",
+            slot="assemble_context",
+            result="old own-turn summary without policy retrieval keywords",
+            result_full="old own-turn summary without policy retrieval keywords",
+            created_at=1.0,
+        )
+    )
+    store.log_turn_record(
+        TurnRecord(
+            turn_id="turn_stale_b",
+            agent_id="executor",
+            pipeline_id="pipe_1",
+            task="implement_store",
+            slot="assemble_context",
+            result="another old summary with unrelated status notes",
+            result_full="another old summary with unrelated status notes",
+            created_at=2.0,
+        )
+    )
+
+    def _query(*args: object, **kwargs: object) -> list[SubconsciousChunk]:
+        return [
+            SubconsciousChunk(
+                chunk_id="retrieved_policy_fact",
+                layer="semantic",
+                content="retrieval policy should score recent refs instead of reserving slots",
+                src="user_verified",
+                pipeline_id="pipe_1",
+                relevance=0.9,
+            ),
+            SubconsciousChunk(
+                chunk_id="retrieved_budget_fact",
+                layer="semantic",
+                content="recent slot budget is a cap when retrieved chunks are stronger",
+                src="tool_result",
+                pipeline_id="pipe_1",
+                relevance=0.8,
+            ),
+        ]
+
+    store.query = _query  # type: ignore[method-assign]
+
+    result = assembler.assemble(
+        conscious=_make_conscious(recent=["r:sub/turn_stale_a", "r:sub/turn_stale_b"]),
+        budget=BudgetContext(pressure="medium"),
+        query_text="retrieval policy score recent refs budget",
+        k=2,
+    )
+
+    assert [chunk.chunk_id for chunk in result.chunks] == ["retrieved_policy_fact", "retrieved_budget_fact"]
 
 
 def test_assembler_reports_evicted_high_relevance_chunks(tmp_path: Path) -> None:
@@ -137,6 +244,7 @@ def test_assembler_reports_evicted_high_relevance_chunks(tmp_path: Path) -> None
     result = assembler.assemble(
         conscious=_make_conscious(recent=recent_refs),
         budget=BudgetContext(pressure="medium"),
+        query_text="needle constraint preserve exact benchmark fact",
         k=1,
     )
 
@@ -145,6 +253,62 @@ def test_assembler_reports_evicted_high_relevance_chunks(tmp_path: Path) -> None
     evicted_ids = {chunk_id for chunk_id, _ in result.evicted_high_relevance}
     assert evicted_ids
     assert all(relevance >= 0.5 for _, relevance in result.evicted_high_relevance)
+
+
+def test_eviction_telemetry_reports_retrieved_chunk_evicted_by_tight_recent_budget(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "retrieved-evicted.db")
+    assembler = Assembler(store=store)
+    store.write(
+        SubconsciousChunk(
+            chunk_id="retrieved_high_relevance",
+            layer="semantic",
+            content="retrieved_high_relevance retention telemetry golden keyword",
+            src="user_verified",
+            pipeline_id="pipe_1",
+            relevance=0.95,
+        )
+    )
+    recent_refs: list[str] = []
+    record = assembler.post_turn(
+        conscious=_make_conscious(),
+        response=NCPResponse(
+            content="recent",
+            input_tokens=5,
+            output_tokens=5,
+            cost_usd=0.0,
+            model="benchmark_local",
+            pipeline_id="pipe_1",
+            turn_id="turn_evicted_retrieved",
+            latency_ms=1,
+        ),
+        result_summary="retrieved_high_relevance retention telemetry golden keyword unique_recent_signal",
+        result_full="retrieved_high_relevance retention telemetry golden keyword unique_recent_signal",
+    )
+    recent_refs.insert(0, f"r:sub/{record.turn_id}")
+
+    def _query(*args: object, **kwargs: object) -> list[SubconsciousChunk]:
+        return [
+            SubconsciousChunk(
+                chunk_id="retrieved_high_relevance",
+                layer="semantic",
+                content="retrieved_high_relevance retention telemetry golden keyword",
+                src="user_verified",
+                pipeline_id="pipe_1",
+                relevance=0.8,
+            )
+        ]
+
+    store.query = _query  # type: ignore[method-assign]
+
+    result = assembler.assemble(
+        conscious=_make_conscious(recent=recent_refs),
+        budget=BudgetContext(pressure="medium"),
+        query_text="unique_recent_signal",
+        k=1,
+    )
+
+    evicted_ids = {chunk_id for chunk_id, _ in result.evicted_high_relevance}
+    assert "retrieved_high_relevance" in evicted_ids
 
 
 def test_assembler_does_not_report_low_relevance_chunks_as_evicted(tmp_path: Path) -> None:
@@ -202,6 +366,63 @@ def test_assembler_reports_empty_evicted_whispers_when_nothing_dropped(tmp_path:
     assert result.evicted_whispers == []
 
 
+def test_assemble_max_tokens_bounds_rendered_context(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "token-budget.db")
+    for index in range(4):
+        store.write(
+            SubconsciousChunk(
+                chunk_id=f"large_{index}",
+                layer="semantic",
+                content=" ".join(["implement_store assemble_context"] + [f"term_{index}_{j}" for j in range(120)]),
+                src="tool_result",
+                pipeline_id="pipe_1",
+            )
+        )
+    assembler = Assembler(store=store)
+
+    result = assembler.assemble(
+        conscious=_make_conscious(),
+        budget=BudgetContext(pressure="medium"),
+        query_text="implement_store assemble_context",
+        max_tokens=200,
+    )
+
+    assert estimate_tokens(result.context) <= 200
+    assert "[NCP:BUDGET]" in result.context
+    assert "[NCP:CONSCIOUS]" in result.context
+
+
+def test_token_budget_reports_high_relevance_chunks_it_drops(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "token-budget-eviction.db")
+    chunks = [
+            SubconsciousChunk(
+                chunk_id=f"large_high_rel_{index}",
+                layer="semantic",
+                content=" ".join(["implement_store assemble_context"] + [f"term_{index}_{j}" for j in range(160)]),
+                src="tool_result",
+                pipeline_id="pipe_1",
+                relevance=0.95,
+            )
+        for index in range(2)
+    ]
+
+    def _query(*args: object, **kwargs: object) -> list[SubconsciousChunk]:
+        return chunks
+
+    store.query = _query  # type: ignore[method-assign]
+    assembler = Assembler(store=store)
+
+    result = assembler.assemble(
+        conscious=_make_conscious(),
+        budget=BudgetContext(pressure="medium"),
+        query_text="implement_store assemble_context",
+        max_tokens=200,
+    )
+
+    evicted_ids = {chunk_id for chunk_id, _ in result.evicted_high_relevance}
+    assert evicted_ids
+
+
 def test_assembler_reports_evicted_whispers_without_draining_queue(tmp_path: Path) -> None:
     store = SQLiteStore(tmp_path / "whispers.db")
     store.emit_whisper(
@@ -221,8 +442,10 @@ def test_assembler_reports_evicted_whispers_without_draining_queue(tmp_path: Pat
         budget=BudgetContext(pressure="critical"),
     )
 
-    assert len(result.whispers) == 1
+    assert len(result.whispers) == 2
     assert result.whispers[0].whisper_type == "alert"
+    assert result.whispers[1].payload == "follow_up_review"
+    assert result.pending_whisper_ids == [result.whispers[1].whisper_id]
     assert result.evicted_whispers
     assert any(confidence >= 0.6 for _, confidence in result.evicted_whispers)
 

@@ -19,6 +19,10 @@ Then Claude Code connects to:
 
 - `http://127.0.0.1:4242/mcp`
 
+If `.ncp/config.toml` has `[server].auth_token` set (or `ncp serve` was started
+with `NCP_AUTH_TOKEN`/`--auth-token`), add an `Authorization: Bearer <token>`
+header to the `ncp` entry in `mcp_servers.json`, e.g. `"headers": {"Authorization": "Bearer <token>"}`.
+
 ## Expected tools
 
 Once the MCP server is registered, Claude Code should see:

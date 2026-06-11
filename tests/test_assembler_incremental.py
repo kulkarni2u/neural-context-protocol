@@ -45,20 +45,20 @@ def _chunk(content: str, chunk_id: str = "c1") -> SubconsciousChunk:
 
 # ── label ordering ────────────────────────────────────────────────────────────
 
-def test_first_section_is_budget_header(tmp_path: Path) -> None:
+def test_first_section_is_conscious(tmp_path: Path) -> None:
     store = _store(tmp_path)
     assembler = Assembler(store=store)
     sections = list(assembler.assemble_incremental(conscious=_conscious(), budget=_budget()))
-    assert sections[0][0] == "budget_header"
-    assert "[NCP:BUDGET]" in sections[0][1]
+    assert sections[0][0] == "conscious"
+    assert "[NCP:CONSCIOUS]" in sections[0][1]
 
 
-def test_second_section_is_conscious(tmp_path: Path) -> None:
+def test_budget_section_is_last(tmp_path: Path) -> None:
     store = _store(tmp_path)
     assembler = Assembler(store=store)
     sections = list(assembler.assemble_incremental(conscious=_conscious(), budget=_budget()))
-    assert sections[1][0] == "conscious"
-    assert "[NCP:CONSCIOUS]" in sections[1][1]
+    assert sections[-1][0] == "budget_header"
+    assert "[NCP:BUDGET]" in sections[-1][1]
 
 
 def test_subconscious_sections_come_before_whispers(tmp_path: Path) -> None:
@@ -81,7 +81,7 @@ def test_subconscious_sections_come_before_whispers(tmp_path: Path) -> None:
         assert labels.index("subconscious") < labels.index("whispers")
 
 
-def test_whispers_section_is_last_when_present(tmp_path: Path) -> None:
+def test_whispers_section_precedes_budget_when_present(tmp_path: Path) -> None:
     store = _store(tmp_path)
     store.emit_whisper(
         Whisper(
@@ -96,20 +96,19 @@ def test_whispers_section_is_last_when_present(tmp_path: Path) -> None:
     assembler = Assembler(store=store)
     sections = list(assembler.assemble_incremental(conscious=_conscious(), budget=_budget()))
     labels = [s[0] for s in sections]
-    assert labels[-1] == "whispers"
-    assert "[NCP:WHISPERS]" in sections[-1][1]
+    assert labels[-2] == "whispers"
+    assert labels[-1] == "budget_header"
+    assert "[NCP:WHISPERS]" in sections[-2][1]
 
 
 # ── no-whispers case ──────────────────────────────────────────────────────────
 
-def test_sensor_whisper_in_assembly_when_queue_empty(tmp_path: Path) -> None:
+def test_sensor_whisper_is_not_rendered_when_queue_empty(tmp_path: Path) -> None:
     store = _store(tmp_path)
     assembler = Assembler(store=store)
     sections = list(assembler.assemble_incremental(conscious=_conscious(), budget=_budget()))
     labels = [s[0] for s in sections]
-    assert labels[-1] == "whispers"
-    assert "t:sensor" in sections[-1][1]
-    assert "drift_score_sample" in sections[-1][1]
+    assert "whispers" not in labels
 
 
 # ── budget enforcement ────────────────────────────────────────────────────────

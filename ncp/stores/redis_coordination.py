@@ -49,6 +49,10 @@ class RedisCoordination:
     def fetch_prefix(self) -> str:
         return f"{self.stream}:fetch"
 
+    @property
+    def whisper_delivery_prefix(self) -> str:
+        return f"{self.stream}:delivered"
+
     def emit_whisper(self, whisper: Whisper) -> None:
         client = self._client_or_raise()
         whisper = Whisper.model_validate(whisper.model_dump())
@@ -86,10 +90,19 @@ class RedisCoordination:
         client = self._client_or_raise()
         loaded: dict[str, Whisper] = {}
         for target in (agent_id, "*"):
-            for whisper_id in client.zrange(self._target_index_key(target), 0, -1):
+            indexed_ids = list(client.zrange(self._target_index_key(target), 0, -1))
+            if target == "*":
+                delivered = self._hgetall_many(client, [self._delivery_key(whisper_id) for whisper_id in indexed_ids])
+                indexed_ids = [
+                    whisper_id
+                    for whisper_id, delivered_payload in zip(indexed_ids, delivered, strict=True)
+                    if agent_id not in delivered_payload
+                ]
+            payloads = self._hgetall_many(client, [self._payload_key(whisper_id) for whisper_id in indexed_ids])
+            for whisper_id, payload in zip(indexed_ids, payloads, strict=True):
                 if whisper_id in loaded:
                     continue
-                whisper = self._load_whisper(client, whisper_id)
+                whisper = self._whisper_from_payload(payload)
                 if whisper is None:
                     client.zrem(self._target_index_key(target), whisper_id)
                     continue
@@ -108,7 +121,7 @@ class RedisCoordination:
         )
         return ordered[:max_items]
 
-    def acknowledge_whispers(self, whisper_ids: list[str]) -> int:
+    def acknowledge_whispers(self, whisper_ids: list[str], *, agent_id: str | None = None) -> int:
         if not whisper_ids:
             return 0
         client = self._client_or_raise()
@@ -117,6 +130,10 @@ class RedisCoordination:
             payload = client.hgetall(self._payload_key(whisper_id))
             if payload:
                 target = payload.get("target", "")
+                if target == "*" and agent_id is not None:
+                    client.hset(self._delivery_key(whisper_id), mapping={agent_id: str(time.time())})
+                    deleted += 1
+                    continue
                 if target:
                     client.zrem(self._target_index_key(target), whisper_id)
             deleted += int(bool(client.delete(self._payload_key(whisper_id))))
@@ -127,8 +144,10 @@ class RedisCoordination:
         count = 0
         latest: float | None = None
         by_type: dict[str, int] = {}
-        for whisper_id in self._iter_whisper_ids(client):
-            whisper = self._load_whisper(client, whisper_id)
+        whisper_ids = self._iter_whisper_ids(client)[:1000]
+        payloads = self._hgetall_many(client, [self._payload_key(whisper_id) for whisper_id in whisper_ids])
+        for payload in payloads:
+            whisper = self._whisper_from_payload(payload)
             if whisper is None:
                 continue
             if pipeline_id is not None and whisper.pipeline_id != pipeline_id:
@@ -152,7 +171,7 @@ class RedisCoordination:
             max_items=max_items,
             min_confidence=min_confidence,
         )
-        self.acknowledge_whispers([whisper.whisper_id for whisper in whispers])
+        self.acknowledge_whispers([whisper.whisper_id for whisper in whispers], agent_id=agent_id)
         return whispers
 
     def reset_fetch_session(self, session_id: str, *, pipeline_id: str | None = None, ttl_seconds: int = 3600) -> None:
@@ -198,8 +217,27 @@ class RedisCoordination:
     def _fetch_key(self, session_id: str) -> str:
         return f"{self.fetch_prefix}:{session_id}"
 
+    def _delivery_key(self, whisper_id: str) -> str:
+        return f"{self.whisper_delivery_prefix}:{whisper_id}"
+
+    def _is_delivered(self, client: Any, whisper_id: str, agent_id: str) -> bool:
+        return agent_id in client.hgetall(self._delivery_key(whisper_id))
+
     def _load_whisper(self, client: Any, whisper_id: str) -> Whisper | None:
         payload = client.hgetall(self._payload_key(whisper_id))
+        return self._whisper_from_payload(payload)
+
+    def _hgetall_many(self, client: Any, keys: list[str]) -> list[dict[str, str]]:
+        if not keys:
+            return []
+        if hasattr(client, "pipeline"):
+            pipe = client.pipeline()
+            for key in keys:
+                pipe.hgetall(key)
+            return [dict(payload) for payload in pipe.execute()]
+        return [dict(client.hgetall(key)) for key in keys]
+
+    def _whisper_from_payload(self, payload: dict[str, str]) -> Whisper | None:
         if not payload:
             return None
         whisper = Whisper(
@@ -212,7 +250,7 @@ class RedisCoordination:
             confidence=float(payload["confidence"]),
             ref=str(payload.get("ref") or "") or None,
             created_at=float(payload["created_at"]),
-            ttl_seconds=int(payload.get("ttl_seconds", 60)),
+            ttl_seconds=int(payload.get("ttl_seconds", 1800)),
             dissent_target=str(payload.get("dissent_target") or "") or None,
         )
         return whisper
@@ -293,11 +331,18 @@ class AsyncRedisCoordination:
     def fetch_prefix(self) -> str:
         return f"{self.stream}:fetch"
 
+    @property
+    def whisper_delivery_prefix(self) -> str:
+        return f"{self.stream}:delivered"
+
     def _payload_key(self, whisper_id: str) -> str:
         return f"{self.whisper_payload_prefix}:{whisper_id}"
 
     def _target_index_key(self, target: str) -> str:
         return f"{self.whisper_index_prefix}:{target}"
+
+    def _delivery_key(self, whisper_id: str) -> str:
+        return f"{self.whisper_delivery_prefix}:{whisper_id}"
 
     async def _aclient_or_raise(self, *, attempts: int = 2, delay_seconds: float = 0.1) -> Any:
         if self._client is not None:
@@ -357,7 +402,7 @@ class AsyncRedisCoordination:
             max_items=max_items,
             min_confidence=min_confidence,
         )
-        await self._async_acknowledge_whispers([w.whisper_id for w in whispers])
+        await self._async_acknowledge_whispers([w.whisper_id for w in whispers], agent_id=agent_id)
         return whispers
 
     async def _async_peek_whispers(
@@ -373,6 +418,8 @@ class AsyncRedisCoordination:
         for target in (agent_id, "*"):
             for whisper_id in await client.zrange(self._target_index_key(target), 0, -1):
                 if whisper_id in loaded:
+                    continue
+                if target == "*" and await self._async_is_delivered(client, whisper_id, agent_id):
                     continue
                 whisper = await self._async_load_whisper(client, whisper_id)
                 if whisper is None:
@@ -392,7 +439,7 @@ class AsyncRedisCoordination:
         )
         return ordered[:max_items]
 
-    async def _async_acknowledge_whispers(self, whisper_ids: list[str]) -> int:
+    async def _async_acknowledge_whispers(self, whisper_ids: list[str], *, agent_id: str | None = None) -> int:
         if not whisper_ids:
             return 0
         client = await self._aclient_or_raise()
@@ -401,10 +448,17 @@ class AsyncRedisCoordination:
             payload = await client.hgetall(self._payload_key(whisper_id))
             if payload:
                 target = payload.get("target", "")
+                if target == "*" and agent_id is not None:
+                    await client.hset(self._delivery_key(whisper_id), mapping={agent_id: str(time.time())})
+                    deleted += 1
+                    continue
                 if target:
                     await client.zrem(self._target_index_key(target), whisper_id)
             deleted += int(bool(await client.delete(self._payload_key(whisper_id))))
         return deleted
+
+    async def _async_is_delivered(self, client: Any, whisper_id: str, agent_id: str) -> bool:
+        return agent_id in await client.hgetall(self._delivery_key(whisper_id))
 
     async def _async_load_whisper(self, client: Any, whisper_id: str) -> Whisper | None:
         payload = await client.hgetall(self._payload_key(whisper_id))
@@ -420,7 +474,7 @@ class AsyncRedisCoordination:
             confidence=float(payload["confidence"]),
             ref=str(payload.get("ref") or "") or None,
             created_at=float(payload["created_at"]),
-            ttl_seconds=int(payload.get("ttl_seconds", 60)),
+            ttl_seconds=int(payload.get("ttl_seconds", 1800)),
             dissent_target=str(payload.get("dissent_target") or "") or None,
         )
 

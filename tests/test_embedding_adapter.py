@@ -36,11 +36,13 @@ def test_base_adapter_rejects_wrong_dims() -> None:
 
 
 def test_openai_adapter_raises_on_missing_key() -> None:
+    pytest.importorskip("openai", reason="openai provider extra not installed")
     with pytest.raises(NCPAdapterConfigurationError, match="OPENAI_API_KEY"):
         OpenAIEmbeddingAdapter(api_key="")
 
 
 def test_openai_adapter_embed() -> None:
+    pytest.importorskip("openai", reason="openai provider extra not installed")
     adapter = OpenAIEmbeddingAdapter(api_key="sk-test")
     mock_resp = MagicMock()
     mock_resp.data = [MagicMock(embedding=[0.5] * _DIM)]
@@ -51,6 +53,7 @@ def test_openai_adapter_embed() -> None:
 
 
 def test_openai_adapter_rejects_wrong_dims() -> None:
+    pytest.importorskip("openai", reason="openai provider extra not installed")
     adapter = OpenAIEmbeddingAdapter(api_key="sk-test")
     mock_resp = MagicMock()
     mock_resp.data = [MagicMock(embedding=[0.5] * 512)]

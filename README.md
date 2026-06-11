@@ -1,7 +1,7 @@
 # Neural Context Protocol
 
 [![CI](https://github.com/kulkarni2u/neural-context-protocol/actions/workflows/ci.yml/badge.svg)](https://github.com/kulkarni2u/neural-context-protocol/actions/workflows/ci.yml)
-![Python](https://img.shields.io/badge/python-3.10%2B-blue)
+![Python](https://img.shields.io/badge/python-3.11%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![PyPI](https://img.shields.io/pypi/v/neural-context-protocol)
 
@@ -9,7 +9,7 @@
 
 ## Your pipeline grows. Your context shouldn't.
 
-Multi-agent pipelines compound. Every turn, the model re-reads growing history it mostly doesn't need. By turn 50 you're replaying 80,000 tokens of context to do 840 tokens of useful work.
+Multi-agent pipelines compound. Every turn, the model re-reads growing history it mostly doesn't need. In long-running pipelines, that history can grow by orders of magnitude while the useful working set stays small.
 
 NCP fixes this by replacing full-history replay with a bounded, trust-weighted working memory that stays flat as your pipeline deepens.
 
@@ -19,7 +19,7 @@ Turn 30:  raw replay → 45,000 tok    NCP → ~840 tok
 Turn 50:  raw replay → 80,000 tok    NCP → ~840 tok  ← bounded
 ```
 
-**17.52x fewer tokens. Same pipeline depth. Reproducible.**
+The table above is an illustration of the bounded-context shape. The reproducible deterministic coding benchmark below currently shows **13.13x fewer final-turn tokens vs raw replay** with a `chars_div4` token unit and an explicit 340-token benchmark context budget.
 
 -----
 
@@ -144,7 +144,7 @@ The effect: the model receives context ranked by how much it should believe it, 
 
 **NCP is the memory bus, not the orchestrator.**
 
-It sits underneath your existing agent framework — LangGraph, CrewAI, AutoGen, or a custom orchestrator — and gives every connected host the same bounded, trust-weighted working memory. Bring your own orchestrator. Bring your own agents.
+It sits underneath your existing agent framework — LangGraph ([runnable example](./examples/03_langgraph/)), CrewAI, AutoGen, or a custom orchestrator — and gives every connected host the same bounded, trust-weighted working memory. Bring your own orchestrator. Bring your own agents.
 
 It is not a vector database. Not a model training framework. Not an orchestrator. Not the right default for simple single-agent or very short-lived tasks.
 
@@ -156,19 +156,26 @@ Use it when you have **3+ agents, 10+ turns, and real shared state to preserve**
 
 | Scenario                               | Baseline       | Baseline tokens | NCP tokens | Reduction  |
 |----------------------------------------|----------------|----------------:|-----------:|-----------:|
-| 4-agent coding pipeline (40 turns)     | raw replay     | 1,927           | 174        | **17.52x** |
-| 4-agent coding pipeline (40 turns)     | rolling summary| 1,176           | 174        | **10.69x** |
-| 6-role research pipeline (36 turns)    | raw replay     | 1,700           | 156        | **16.35x** |
+| 4-agent coding pipeline (40 turns)     | raw replay     | 3,426           | 261        | **13.13x** |
+| 4-agent coding pipeline (40 turns)     | sliding window | 377             | 261        | **1.44x**  |
+| 4-agent coding pipeline (40 turns)     | rolling summary| 2,096           | 261        | **8.03x**  |
+| 6-role research pipeline (36 turns)    | raw replay     | 3,277           | 267        | **12.27x** |
 | Cross-host handoff (Claude → OpenCode) | window baseline| 0.0 success     | 0.8 success| **+0.8**   |
 | Needle recall at budget 4              | sliding window | 0.00            | 0.50       | **+0.50**  |
+| Task success at matched budget 400 (12 tasks, mock) | sliding window | 0.00 | 1.00 | **+1.00** |
 
 MACE multi-agent coordination score (40 turns): **0.9608**
+
+Coding benchmark token unit: `chars_div4`; context budget: `340`; pass gate: `true`.
+These are deterministic token-accounting benchmarks. The task-success row measures context adequacy at a matched token budget with a deterministic mock provider — whether the needed fact survives into a budget-bounded context (see [the benchmark doc](./docs/NCP_BENCHMARK_TASK_SUCCESS.md)); run it with a live provider to measure real model task success. Quality-at-matched-budget evaluation also lives in `benchmarks/efficacy/`.
 
 Benchmarks are reproducible:
 
 ```bash
 python3 benchmarks/coding_pipeline/run.py
 python3 benchmarks/needle/run.py --turns 24 --needles 6 --budget 4
+python3 benchmarks/task_success/run.py            # mock provider, no keys needed
+python3 benchmarks/task_success/run.py --provider anthropic   # live task success
 ```
 
 -----
@@ -180,9 +187,12 @@ NCP exposes one MCP endpoint: `http://127.0.0.1:4242/mcp`
 ```
 ncp_get_context    — assemble bounded context for this turn
 ncp_write_memory   — persist durable memory to the subconscious
-ncp_fetch          — retrieve a prior turn result by ID
 ncp_emit_whisper   — send a bounded signal to another agent
+ncp_post_turn      — persist the turn result and acknowledge consumed whispers
+ncp_fetch          — retrieve additional bounded context mid-turn
 ```
+
+By default the server requires no token on loopback (`127.0.0.1`/`localhost`/`::1`). Set `[server].auth_token` in `.ncp/config.toml` (generated by `ncp init`), the `NCP_AUTH_TOKEN` env var, or `--auth-token` on `ncp serve` to require an `Authorization: Bearer <token>` header on `/mcp` and `/sse`. Never bind `ncp serve` to a non-loopback host without one of these set.
 
 -----
 
@@ -261,6 +271,7 @@ Runnable examples in the repo:
 ```bash
 python3 examples/01_quickstart.py
 python3 examples/02_multi_agent.py
+python3 examples/03_langgraph/pipeline.py   # requires: pip install langgraph
 ```
 
 Tool-specific setup lives in:
@@ -280,6 +291,8 @@ NCP is the memory bus. In our workflows, Sarathi is one orchestrator that runs o
 
 - [Setup guide](./docs/NCP_SETUP.md)
 - [Protocol spec](./docs/NCP_PROTOCOL_SPEC.md)
+- [HTTP API contract](./docs/NCP_HTTP_API.md)
+- [Benchmark: task success at matched budget](./docs/NCP_BENCHMARK_TASK_SUCCESS.md)
 - [Benchmark: coding pipeline](./docs/NCP_BENCHMARK_CODING_PIPELINE.md)
 - [Benchmark: needle recall](./docs/NCP_BENCHMARK_NEEDLE_RECALL.md)
 - [Benchmark: matched-budget efficacy](./docs/NCP_BENCHMARK_MATCHED_BUDGET_EFFICACY.md)

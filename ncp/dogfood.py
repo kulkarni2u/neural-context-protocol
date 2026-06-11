@@ -156,23 +156,19 @@ class OpenCodeCLIDogfoodAdapter(BaseAdapter):
     def __init__(
         self,
         *,
-        model: str = "opencode/deepseek-v4-flash-free",
+        model: str | None = None,
         command: list[str] | None = None,
         cwd: str | Path | None = None,
         timeout_seconds: float = 16.0,
     ) -> None:
         self._cwd = Path(cwd) if cwd is not None else Path.cwd()
         self._timeout_seconds = timeout_seconds
-        self._command = command or [
-            "opencode",
-            "run",
-            "-m",
-            model,
-            "--format",
-            "json",
-            "--dir",
-            str(self._cwd),
-        ]
+        if command is not None:
+            self._command = command
+        else:
+            self._command = ["opencode", "run", "--format", "json", "--dir", str(self._cwd)]
+            if model:
+                self._command[2:2] = ["-m", model]
 
     def call(self, ncp_context: str, user_turn: str) -> str:
         prompt = f"NCP_CONTEXT:\n{ncp_context}\n\n{user_turn}"

@@ -64,6 +64,7 @@ def get_context(
     config: NCPConfig | None = None,
     k: int | None = None,
     diversity_limit: int | None = None,
+    max_tokens: int | None = None,
 ) -> str:
     """Assemble raw pidgin context for one agent turn."""
 
@@ -76,6 +77,7 @@ def get_context(
         query_text=query_text,
         k=k,
         diversity_limit=diversity_limit,
+        max_tokens=max_tokens,
     ).context
 
 
@@ -117,6 +119,7 @@ def run(
     config: NCPConfig | None = None,
     k: int | None = None,
     diversity_limit: int | None = None,
+    max_tokens: int | None = None,
 ) -> NCPResponse:
     """Run one blocking local-runtime call through an adapter."""
 
@@ -134,6 +137,7 @@ def run(
         ctx_window=resolved_adapter.ctx_window,
         k=k,
         diversity_limit=diversity_limit,
+        max_tokens=max_tokens,
     )
     content = resolved_adapter.call(assembly.context, turn)
     response = _build_response(
@@ -164,6 +168,7 @@ def stream(
     config: NCPConfig | None = None,
     k: int | None = None,
     diversity_limit: int | None = None,
+    max_tokens: int | None = None,
 ):
     """Yield a streamed response through the adapter."""
 
@@ -179,6 +184,7 @@ def stream(
         ctx_window=resolved_adapter.ctx_window,
         k=k,
         diversity_limit=diversity_limit,
+        max_tokens=max_tokens,
     )
     start = time.perf_counter()
     chunks: list[str] = []

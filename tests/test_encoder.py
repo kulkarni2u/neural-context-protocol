@@ -18,17 +18,14 @@ def test_pidgin_encoder_omits_empty_optional_blocks() -> None:
     rendered = encoder.assemble(conscious=conscious, chunks=[], whispers=[], budget=budget)
 
     assert rendered == (
-        "[NCP:BUDGET] ctx_used:0.25 steps:1/4 elapsed:12s pressure:low\n\n"
         "[NCP:CONSCIOUS]\n"
         "id:planner role:decompose ncp_v:1.0\n"
-        "owns:[planning] must-not:[shipping]\n"
         "task:refactor_auth\n"
-        "slot:identify_dead_code slot_age:0 slot_conf:1.00\n"
+        "slot:identify_dead_code\n"
         "intent:reduce_complexity\n"
-        "goal_version:1\n"
-        "recent:[]\n"
-        "tried:[] failed:[]\n"
-        "drift_score:0.00"
+        "owns:[planning]\n"
+        "must-not:[shipping]\n\n"
+        "[NCP:BUDGET] ctx_used:0.2 steps:1/4 elapsed:12s pressure:low"
     )
     assert "[NCP:SUBCONSCIOUS]" not in rendered
     assert "[NCP:WHISPERS]" not in rendered
@@ -86,22 +83,25 @@ def test_pidgin_encoder_renders_all_blocks_in_order() -> None:
     )
 
     assert rendered == (
-        "[NCP:BUDGET] ctx_used:0.67 steps:3/? elapsed:18s pressure:medium\n\n"
         "[NCP:CONSCIOUS]\n"
         "id:executor role:build ncp_v:1.0\n"
-        "owns:[implementation,tests] must-not:[planning]\n"
         "task:implement_encoder\n"
-        "slot:wire_pidgin_blocks slot_age:2 slot_conf:0.85\n"
+        "slot:wire_pidgin_blocks\n"
         "intent:assemble_context\n"
+        "owns:[implementation,tests]\n"
+        "must-not:[planning]\n"
+        "slot_age:2 slot_conf:0.8\n"
         "goal_version:3\n"
         "recent:[r:sub/turn_a | r:sub/turn_b]\n"
-        "tried:[draft_encoder] failed:[inline_payload]\n"
-        "drift_score:0.10\n\n"
+        "tried:[draft_encoder]\n"
+        "failed:[inline_payload]\n"
+        "drift_score:0.1\n\n"
         "[NCP:SUBCONSCIOUS]\n"
-        "chunk:sub_encoder layer:procedural score:0.72 src:tool_result trust:0.90\n"
+        "chunk:sub_encoder layer:procedural score:0.7 src:tool_result trust:0.9\n"
         "  line_one\n"
         "  line_two\n\n"
         "[NCP:WHISPERS]\n"
-        "wsp from:critic to:executor t:nudge c:0.75 age:30s\n"
-        "  verify_golden_fixture"
+        "wsp from:critic to:executor t:nudge c:0.8 age:<1m\n"
+        "  verify_golden_fixture\n\n"
+        "[NCP:BUDGET] ctx_used:0.7 steps:3/? elapsed:18s pressure:medium"
     )

@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+import subprocess
 import sys
 
 import pytest
@@ -177,6 +178,50 @@ def test_opencode_review_parses_json_text_payload(tmp_path: Path) -> None:
 
     assert payload["verdict"] == "pass"
     assert payload["summary"] == "clean slice"
+
+
+def test_opencode_reviewer_default_command_uses_user_default_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = CliRunner()
+    runner.invoke(main, ["init", "--cwd", str(tmp_path)])
+    store = SQLiteStore(tmp_path / ".ncp" / "store.db")
+    _seed_whisper(store, target="opencode", payload="review the handoff")
+    _, handoffs = load_handoffs(cwd=tmp_path, agent_id="opencode", pipeline_id="pipe_handoff")
+    captured: dict[str, object] = {}
+
+    def _fake_run_handoff_subprocess(*, runner_name, command, cwd, prompt, timeout_seconds):
+        captured["command"] = command
+        captured["cwd"] = cwd
+        review_text = json.dumps(
+            {
+                "type": "text",
+                "part": {
+                    "text": json.dumps(
+                        {
+                            "verdict": "pass",
+                            "findings": [],
+                            "recommended_next_steps": [],
+                            "summary": "default model",
+                        }
+                    )
+                },
+            }
+        )
+        return subprocess.CompletedProcess(command, 0, stdout=review_text, stderr="")
+
+    monkeypatch.setattr("ncp.agent_handoff._run_handoff_subprocess", _fake_run_handoff_subprocess)
+
+    response = run_opencode_reviewer(cwd=tmp_path, agent_id="opencode", handoffs=handoffs)
+
+    assert parse_json_review(response)["summary"] == "default model"
+    command = captured["command"]
+    assert isinstance(command, list)
+    assert "-m" not in command
+    assert "--model" not in command
+    assert command[command.index("--dir") + 1] == str(tmp_path)
+    assert captured["cwd"] == tmp_path
 
 
 def test_parse_json_review_accepts_fenced_json() -> None:

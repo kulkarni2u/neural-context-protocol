@@ -22,6 +22,30 @@ def test_token_unit_is_explicit() -> None:
     assert token_unit() in _VALID_TOKEN_UNITS
 
 
+def test_token_unit_defaults_to_chars_div4(monkeypatch) -> None:
+    from ncp import tokens
+
+    monkeypatch.delenv("NCP_TOKEN_UNIT", raising=False)
+    tokens.reset_encoder_cache()
+    try:
+        assert tokens.token_unit() == "chars_div4"
+        assert tokens.estimate_tokens("alpha beta gamma") == 4
+    finally:
+        tokens.reset_encoder_cache()
+
+
+def test_token_unit_tiktoken_opt_in(monkeypatch) -> None:
+    from ncp import tokens
+
+    monkeypatch.setenv("NCP_TOKEN_UNIT", "tiktoken")
+    tokens.reset_encoder_cache()
+    try:
+        assert tokens.token_unit() in _VALID_TOKEN_UNITS
+        assert tokens.estimate_tokens("alpha beta gamma") > 0
+    finally:
+        tokens.reset_encoder_cache()
+
+
 def test_estimate_tokens_chars_div4_fallback_when_no_tiktoken() -> None:
     if token_unit() == "chars_div4":
         # chars_div4: len("alpha beta gamma") == 16, 16 // 4 == 4
@@ -55,6 +79,18 @@ def test_coding_pipeline_benchmark_beats_naive_replay(tmp_path: Path) -> None:
         int(artifact["summary"]["baselines"]["raw_replay"]["final_tokens"])
         >= int(artifact["summary"]["ncp"]["final_tokens"])
     )
+
+
+def test_full_coding_pipeline_benchmark_gate_passes(tmp_path: Path) -> None:
+    artifact = run_coding_pipeline_benchmark(
+        store_path=tmp_path / "bench-full.db",
+        turns=40,
+        pipeline_id="pipe_test_full_bench",
+    )
+
+    assert artifact["context_token_budget"] == 340
+    assert artifact["summary"]["beats_sliding_window"] is True
+    assert artifact["summary"]["pass"] is True
 
 
 def test_public_package_exports_coding_pipeline_benchmark() -> None:

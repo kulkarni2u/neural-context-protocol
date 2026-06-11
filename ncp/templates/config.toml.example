@@ -19,15 +19,17 @@ cold_start_retry = 2
 
 [budget]
 max_tokens_per_call = 4000
+context_token_budget = 840
 warn_at_ratio = 0.70
 critical_at_ratio = 0.85
+recent_slot_budget = 2
 
 [chunking]
 max_chunk_tokens = 200
 default_type = "auto"
 
 [whispers]
-default_ttl_seconds = 60
+default_ttl_seconds = 1800
 max_per_drain = 3
 min_confidence = 0.60
 
@@ -35,3 +37,16 @@ min_confidence = 0.60
 log_level = "info"
 log_format = "pretty"
 cost_tracking = true
+
+# [retention]
+# Cap on `working`-zone chunks retained per pipeline. When exceeded, the
+# lowest trust/recency-scored chunks are evicted on write. 0 disables
+# retention enforcement (default, backward compatible).
+# max_working_chunks_per_pipeline = 5000
+
+# [server]
+# Bearer token required for HTTP requests when set. The server requires no
+# token on loopback (127.0.0.1/localhost/::1) by default, but you must set
+# this (or NCP_AUTH_TOKEN, or `ncp serve --auth-token`) before binding to a
+# non-loopback host. `ncp init` generates a random token here automatically.
+# auth_token = ""

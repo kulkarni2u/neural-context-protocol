@@ -189,6 +189,26 @@ def test_whisper_dissent_cannot_broadcast() -> None:
         )
 
 
+def test_structured_whispers_require_structured_payloads_in_python_api() -> None:
+    with pytest.raises(ValidationError, match="payload for whisper_type 'share'"):
+        Whisper(
+            from_agent="planner",
+            target="executor",
+            whisper_type="share",
+            payload="plain text is only wrapped by MCP",
+            confidence=0.8,
+        )
+
+    with pytest.raises(ValidationError, match="payload for whisper_type 'dissent'"):
+        Whisper(
+            from_agent="critic",
+            target="executor",
+            whisper_type="dissent",
+            payload="plain text is only wrapped by MCP",
+            confidence=0.8,
+        )
+
+
 def test_whisper_valid_defaults() -> None:
     whisper = Whisper(
         from_agent="planner",
@@ -199,7 +219,7 @@ def test_whisper_valid_defaults() -> None:
     )
 
     assert whisper.whisper_id.startswith("wsp_")
-    assert whisper.ttl_seconds == 60
+    assert whisper.ttl_seconds == 1800
 
 
 def test_turn_record_sets_default_expiry() -> None:

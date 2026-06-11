@@ -51,16 +51,16 @@ def _store_spy(tmp_path: Path) -> tuple[SQLiteStore, list[int]]:
 
 
 def _store_spy_with_whispers(tmp_path: Path) -> tuple[SQLiteStore, list[int], list[int]]:
-    """Return a SQLiteStore plus captured query k values and whisper drain max_items."""
+    """Return a SQLiteStore plus captured query k values and whisper peek max_items."""
     store, captured_k = _store_spy(tmp_path)
     captured_whisper_caps: list[int] = []
-    original_drain = store.drain_whispers
+    original_peek = store.peek_whispers
 
-    def spy_drain_whispers(*, max_items: int = 3, **kwargs: Any):
+    def spy_peek_whispers(*, max_items: int = 3, **kwargs: Any):
         captured_whisper_caps.append(max_items)
-        return original_drain(max_items=max_items, **kwargs)
+        return original_peek(max_items=max_items, **kwargs)
 
-    store.drain_whispers = spy_drain_whispers  # type: ignore[method-assign]
+    store.peek_whispers = spy_peek_whispers  # type: ignore[method-assign]
     return store, captured_k, captured_whisper_caps
 
 
@@ -92,16 +92,16 @@ def test_assemble_default_k_uses_pressure_logic(tmp_path: Path) -> None:
 
 
 def test_assemble_default_whisper_cap_uses_pressure_logic(tmp_path: Path) -> None:
-    """When k is None, whisper drain cap must follow the same pressure policy."""
+    """When k is None, whisper peek cap must follow the same pressure policy."""
     store_n, _, whisper_cap_n = _store_spy_with_whispers(tmp_path / "normal_whispers")
     store_c, _, whisper_cap_c = _store_spy_with_whispers(tmp_path / "critical_whispers")
 
     Assembler(store=store_n).assemble(conscious=_conscious(), budget=_budget("low"))
     Assembler(store=store_c).assemble(conscious=_conscious(), budget=_budget("critical"))
 
-    assert whisper_cap_n[0] == 3, f"low pressure should drain up to 3 whispers, got {whisper_cap_n[0]}"
+    assert whisper_cap_n[0] == 3, f"low pressure should peek up to 3 whispers, got {whisper_cap_n[0]}"
     assert whisper_cap_c[0] == 1, (
-        f"critical pressure should drain only 1 whisper, got {whisper_cap_c[0]}"
+        f"critical pressure should peek only 1 whisper, got {whisper_cap_c[0]}"
     )
 
 
@@ -116,7 +116,7 @@ def test_assemble_k_overrides_pressure_default(tmp_path: Path) -> None:
 
 
 def test_assemble_explicit_k_keeps_default_whisper_cap(tmp_path: Path) -> None:
-    """Explicit k widens chunk retrieval but should not widen whisper drain above 3."""
+    """Explicit k widens chunk retrieval but should not widen whisper peek above 3."""
     store, _, whisper_caps = _store_spy_with_whispers(tmp_path)
     assembler = Assembler(store=store)
 

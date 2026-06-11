@@ -378,8 +378,10 @@ def test_assembler_keeps_queued_whispers_when_coherence_alert_consumes_cap(tmp_p
         budget=BudgetContext(pressure="critical"),
     )
 
-    assert len(result.whispers) == 1
+    assert len(result.whispers) == 2
     assert "goal_version_mismatch" in result.whispers[0].payload
+    assert result.whispers[1].payload == "queued_follow_up"
+    assert result.pending_whisper_ids == [result.whispers[1].whisper_id]
 
     pending = store.peek_whispers(agent_id="executor", pipeline_id="pipe_1", max_items=3)
     assert any(whisper.payload == "queued_follow_up" for whisper in pending)

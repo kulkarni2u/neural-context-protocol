@@ -267,8 +267,6 @@ def run_opencode_reviewer(
         or [
             "opencode",
             "run",
-            "-m",
-            "opencode/deepseek-v4-flash-free",
             "--format",
             "json",
             "--dir",

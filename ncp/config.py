@@ -35,11 +35,13 @@ DEFAULT_CONFIG = {
     },
     "budget": {
         "max_tokens_per_call": 4000,
+        "context_token_budget": 840,
         "warn_at_ratio": 0.70,
         "critical_at_ratio": 0.85,
         "chunk_cap_default": 4,
         "chunk_cap_high": 3,
         "chunk_cap_critical": 2,
+        "recent_slot_budget": 2,
         "whisper_cap_default": 3,
         "whisper_cap_high": 2,
         "whisper_cap_critical": 1,
@@ -49,7 +51,7 @@ DEFAULT_CONFIG = {
         "default_type": "auto",
     },
     "whispers": {
-        "default_ttl_seconds": 60,
+        "default_ttl_seconds": 1800,
         "max_per_drain": 3,
         "min_confidence": 0.60,
     },
@@ -75,6 +77,12 @@ DEFAULT_CONFIG = {
         "trust_floor": 0.10,
         "model_provider": None,
         "model": None,
+    },
+    "retention": {
+        "max_working_chunks_per_pipeline": 0,
+    },
+    "server": {
+        "auth_token": "",
     },
     "providers": {
         "pricing": {
@@ -169,6 +177,10 @@ class NCPConfig:
         return float(self.values.get("retrieval", {}).get("generation_penalty_base", 0.9))
 
     @property
+    def context_token_budget(self) -> int:
+        return int(self.values.get("budget", {}).get("context_token_budget", 840))
+
+    @property
     def chunk_cap_default(self) -> int:
         return int(self.values.get("budget", {}).get("chunk_cap_default", 4))
 
@@ -179,6 +191,10 @@ class NCPConfig:
     @property
     def chunk_cap_critical(self) -> int:
         return int(self.values.get("budget", {}).get("chunk_cap_critical", 2))
+
+    @property
+    def recent_slot_budget(self) -> int:
+        return int(self.values.get("budget", {}).get("recent_slot_budget", 2))
 
     @property
     def whisper_cap_default(self) -> int:
@@ -193,6 +209,10 @@ class NCPConfig:
         return int(self.values.get("budget", {}).get("whisper_cap_critical", 1))
 
     @property
+    def whisper_ttl_default(self) -> int:
+        return int(self.values.get("whispers", {}).get("default_ttl_seconds", 1800))
+
+    @property
     def embedding_enabled(self) -> bool:
         return bool(self.values.get("embedding", {}).get("enabled", False))
 
@@ -203,6 +223,15 @@ class NCPConfig:
     @property
     def embedding_model(self) -> str:
         return str(self.values.get("embedding", {}).get("model", "sentence-transformers/all-MiniLM-L6-v2"))
+
+    @property
+    def server_auth_token(self) -> str | None:
+        val = self.values.get("server", {}).get("auth_token")
+        return str(val) if val else None
+
+    @property
+    def retention_max_working_chunks_per_pipeline(self) -> int:
+        return int(self.values.get("retention", {}).get("max_working_chunks_per_pipeline", 0))
 
 def load_config(
     path: str | Path | None = None,
@@ -281,6 +310,8 @@ def _apply_env_overrides(values: dict[str, Any], env: dict[str, str]) -> None:
         values["embedding"]["model"] = env["NCP_EMBEDDING_MODEL"]
     if "NCP_GENERATION_PENALTY_BASE" in env:
         values["retrieval"]["generation_penalty_base"] = float(env["NCP_GENERATION_PENALTY_BASE"])
+    if "NCP_AUTH_TOKEN" in env:
+        values["server"]["auth_token"] = env["NCP_AUTH_TOKEN"]
 
 
 def _deep_merge(target: dict[str, Any], updates: dict[str, Any]) -> None:
