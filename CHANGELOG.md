@@ -4,9 +4,13 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [Unreleased]
 
+No unreleased changes yet.
+
+## [1.1.0] - 2026-06-11
+
 Correctness, MCP-parity, and credibility overhaul from the protocol review
-(`docs/NCP_OPTIMIZATION_PLAN.md`). Suggested next release: `1.1.0` (behavior
-changes below).
+(`docs/NCP_OPTIMIZATION_PLAN.md`). Minor version bump for the behavior changes
+below.
 
 ### Changed (behavior)
 

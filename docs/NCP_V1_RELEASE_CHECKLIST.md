@@ -3,7 +3,7 @@
 ## Target
 
 - package: `neural-context-protocol`
-- current version: `1.0.4`
+- current version: `1.1.0`
 - release posture: stable public release line (see CHANGELOG.md for full history)
 
 ## Proven already
