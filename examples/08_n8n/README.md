@@ -38,15 +38,17 @@ If you're calling NCP from a browser-based n8n node and hit CORS errors, add
 
 ## Two ways to integrate
 
-### a) MCP Client Tool node (agentic) — unverified
+### a) MCP Client Tool node (agentic)
 
-n8n's `@n8n/n8n-nodes-langchain.mcpClientTool` node can in principle connect
-to an MCP server's SSE endpoint and let an AI Agent node pick tools itself:
+n8n's `@n8n/n8n-nodes-langchain.mcpClientTool` node can connect to NCP's
+`/mcp` endpoint and let an AI Agent node pick tools itself. Use the
+**HTTP Streamable** connection type (not the legacy SSE endpoint type):
 
 ```json
 {
   "parameters": {
-    "sseEndpoint": "http://<ncp-host>:4242/sse",
+    "endpointUrl": "http://<ncp-host>:4242/mcp",
+    "serverTransport": "httpStreamable",
     "authentication": "headerAuth"
   },
   "type": "@n8n/n8n-nodes-langchain.mcpClientTool",
@@ -61,23 +63,22 @@ to an MCP server's SSE endpoint and let an AI Agent node pick tools itself:
 }
 ```
 
-**This path is not guaranteed to work with NCP today.** NCP's `/sse` +
-`/mcp` pair implements the older HTTP+SSE MCP transport, where `POST /mcp`
-returns the JSON-RPC result directly in the HTTP response body (there is no
-`Mcp-Session-Id` header, no session-routed SSE delivery, no session
-`DELETE`). n8n's MCP Client node is built on the official MCP SDK, whose SSE
-client may instead expect tool-call responses to arrive as `message` events
-on the `/sse` stream after a POST. Whether it tolerates NCP's synchronous
-response shape depends on the SDK version n8n bundles — treat this as
-"try it, it may just work," not a supported path. If it doesn't connect,
-use path (b).
+NCP serves `/mcp` as a stateless Streamable HTTP MCP endpoint: a `POST`
+carrying a JSON-RPC request gets the response back on the same request,
+content-negotiated by the `Accept` header. Clients that accept
+`application/json` (the default the MCP SDK sends) get a JSON body; clients
+that request `text/event-stream` get the response as an SSE `message` event.
+This is the same transport Claude Code and Codex CLI use.
 
-Even where it connects, the agent decides when to call `ncp_get_context` /
+Do **not** point the node at the legacy `/sse` discovery endpoint — that
+stream only advertises the RPC path and does not carry responses.
+
+Even on this path, the agent decides when to call `ncp_get_context` /
 `ncp_post_turn` / `ncp_write_memory` / `ncp_emit_whisper` / `ncp_fetch` — and
 how often, and in what order — which works against NCP's turn-lifecycle
 contract (see below).
 
-### b) HTTP Request nodes (explicit turn lifecycle) — recommended, verified
+### b) HTTP Request nodes (explicit turn lifecycle) — recommended
 
 NCP's turn contract (`ncp_get_context` at the start of a turn,
 `ncp_post_turn` at the end, with `pending_whisper_ids` flowing between them)

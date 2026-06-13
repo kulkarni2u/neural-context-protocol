@@ -161,6 +161,23 @@ terminated by the standard JSON-RPC result line. All sections derive from a
 single assembly pass, so the concatenated stream matches the non-streaming
 `context` exactly.
 
+## Content negotiation (SSE responses)
+
+`POST /mcp` honors the `Accept` header so the endpoint behaves as a stateless
+[Streamable HTTP](https://modelcontextprotocol.io) MCP server:
+
+- `Accept: application/json` (or any value that includes it) — the JSON-RPC
+  result is returned in the response body. This is the default and matches
+  what the MCP SDK sends, so MCP hosts work without extra configuration.
+- `Accept: text/event-stream` (without `application/json`) — the response is
+  an SSE stream. A normal call yields a single `event: message` carrying the
+  JSON-RPC result; a `"stream": true` call yields one `event: ncp_chunk` per
+  section followed by the `event: message` result.
+
+There is no `Mcp-Session-Id` header: each `POST /mcp` is self-contained. The
+`GET /sse` endpoint is discovery-only — it advertises the RPC path and emits
+keepalives, but does not carry JSON-RPC responses.
+
 ## Errors
 
 | Condition              | Response                                          |

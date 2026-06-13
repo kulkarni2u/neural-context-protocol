@@ -784,6 +784,39 @@ class _MCPHTTPHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             return
 
+    def _prefers_event_stream(self) -> bool:
+        accept = self.headers.get("Accept", "")
+        return "text/event-stream" in accept and "application/json" not in accept
+
+    def _begin_event_stream(self) -> None:
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self._send_cors_headers()
+        self.end_headers()
+
+    def _send_sse_message(self, rpc_json: str) -> None:
+        self._begin_event_stream()
+        try:
+            self.wfile.write(f"event: message\ndata: {rpc_json}\n\n".encode("utf-8"))
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            return
+
+    def _stream_sse(self, sr: StreamResponse) -> None:
+        self._begin_event_stream()
+        try:
+            for i, (label, text) in enumerate(sr.sections):
+                chunk = json.dumps({"type": "ncp_chunk", "section": label, "index": i, "text": text})
+                self.wfile.write(f"event: ncp_chunk\ndata: {chunk}\n\n".encode("utf-8"))
+                self.wfile.flush()
+            final = _ok(sr.request_id, {"content": [{"type": "text", "text": json.dumps(sr.handler_result)}]})
+            self.wfile.write(f"event: message\ndata: {final}\n\n".encode("utf-8"))
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            return
+
     def do_OPTIONS(self) -> None:
         self.send_response(HTTPStatus.NO_CONTENT)
         self._send_cors_headers()
@@ -873,10 +906,17 @@ class _MCPHTTPHandler(BaseHTTPRequestHandler):
             return
 
         response = _handle_request(payload, self.server.handlers)
+        prefers_sse = self._prefers_event_stream()
         if isinstance(response, StreamResponse):
-            self._stream_ndjson(response)
+            if prefers_sse:
+                self._stream_sse(response)
+            else:
+                self._stream_ndjson(response)
         elif response:
-            self._send_json(HTTPStatus.OK, json.loads(response))
+            if prefers_sse:
+                self._send_sse_message(response)
+            else:
+                self._send_json(HTTPStatus.OK, json.loads(response))
         else:
             self._send_empty(HTTPStatus.ACCEPTED)
 

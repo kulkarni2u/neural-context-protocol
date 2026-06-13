@@ -1071,6 +1071,96 @@ class TestStreamingGetContext:
             server.shutdown()
             thread.join(timeout=5)
 
+    def test_http_post_sse_accept_returns_event_stream_message(self, tmp_path: Path) -> None:
+        port = _free_port()
+        server = create_http_server(host="127.0.0.1", port=port, cwd=tmp_path)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with httpx.Client(base_url=f"http://127.0.0.1:{port}", timeout=5.0) as client:
+                response = client.post(
+                    "/mcp",
+                    headers={"Accept": "text/event-stream"},
+                    json=_call("ncp_get_context", {
+                        "agent_id": "sse_caller",
+                        "role": "tester",
+                        "task": "sse_task",
+                        "slot": "slot",
+                        "intent": "intent",
+                    }),
+                )
+                assert response.status_code == 200
+                assert "text/event-stream" in response.headers["content-type"]
+                assert "event: message" in response.text
+                data_line = next(
+                    ln for ln in response.text.splitlines() if ln.startswith("data: ")
+                )
+                rpc = json.loads(data_line[len("data: "):])
+                assert rpc["jsonrpc"] == "2.0"
+                assert rpc["id"] == 1
+                payload = json.loads(rpc["result"]["content"][0]["text"])
+                assert payload["session_id"] == "sse_caller"
+        finally:
+            server._shutdown_event.set()
+            server.shutdown()
+            thread.join(timeout=5)
+
+    def test_http_post_json_accept_still_returns_json(self, tmp_path: Path) -> None:
+        port = _free_port()
+        server = create_http_server(host="127.0.0.1", port=port, cwd=tmp_path)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with httpx.Client(base_url=f"http://127.0.0.1:{port}", timeout=5.0) as client:
+                response = client.post(
+                    "/mcp",
+                    headers={"Accept": "application/json, text/event-stream"},
+                    json=_req("tools/list"),
+                )
+                assert response.status_code == 200
+                assert "application/json" in response.headers["content-type"]
+                assert response.json()["result"]["tools"]
+        finally:
+            server._shutdown_event.set()
+            server.shutdown()
+            thread.join(timeout=5)
+
+    def test_http_post_sse_accept_streams_event_stream(self, tmp_path: Path) -> None:
+        port = _free_port()
+        server = create_http_server(host="127.0.0.1", port=port, cwd=tmp_path)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with httpx.Client(base_url=f"http://127.0.0.1:{port}", timeout=5.0) as client:
+                response = client.post(
+                    "/mcp",
+                    headers={"Accept": "text/event-stream"},
+                    json=_call("ncp_get_context", {
+                        "agent_id": "sse_streamer",
+                        "role": "tester",
+                        "task": "sse_stream_task",
+                        "slot": "slot",
+                        "intent": "intent",
+                        "stream": True,
+                    }),
+                )
+                assert response.status_code == 200
+                assert "text/event-stream" in response.headers["content-type"]
+                assert "event: ncp_chunk" in response.text
+                assert "event: message" in response.text
+                message_data = next(
+                    ln[len("data: "):]
+                    for ln in response.text.splitlines()
+                    if ln.startswith("data: ") and '"jsonrpc"' in ln
+                )
+                rpc = json.loads(message_data)
+                payload = json.loads(rpc["result"]["content"][0]["text"])
+                assert payload["session_id"] == "sse_streamer"
+        finally:
+            server._shutdown_event.set()
+            server.shutdown()
+            thread.join(timeout=5)
+
     def test_stdio_stream_true_emits_notifications_then_final_response(self, tmp_path: Path) -> None:
         project = tmp_path / "repo"
         (project / ".git").mkdir(parents=True)
