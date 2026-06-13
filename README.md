@@ -43,6 +43,8 @@ For Codex CLI, copy [`examples/07_codex_cli/mcp_servers.json`](./examples/07_cod
 
 See [`examples/07_codex_cli/README.md`](./examples/07_codex_cli/README.md).
 
+For n8n, NCP's MCP server must be reachable from your n8n instance with an auth token configured — see [`examples/08_n8n/README.md`](./examples/08_n8n/README.md).
+
 `ncp init` creates `.ncp/config.toml` and a `CLAUDE.md` turn contract in the project root.
 
 -----
@@ -107,7 +109,7 @@ flowchart TD
 
 ```mermaid
 flowchart LR
-    A["Claude / Codex / OpenCode / other MCP hosts"]
+    A["Claude / Codex / OpenCode / n8n / other MCP hosts"]
     B["ncp serve<br/>HTTP/SSE MCP runtime"]
     C["Assembler<br/>bounded context + retrieval"]
     D["SQLite mode<br/>local-first store"]
@@ -278,6 +280,7 @@ Tool-specific setup lives in:
 
 - [`examples/06_claude_code/`](./examples/06_claude_code/)
 - [`examples/07_codex_cli/`](./examples/07_codex_cli/)
+- [`examples/08_n8n/`](./examples/08_n8n/)
 
 -----
 

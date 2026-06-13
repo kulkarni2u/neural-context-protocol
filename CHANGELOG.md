@@ -4,7 +4,9 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [Unreleased]
 
-No unreleased changes yet.
+### Added
+
+- Add n8n integration example (`examples/08_n8n/`) showing MCP Client Tool and HTTP Request node setups.
 
 ## [1.1.0] - 2026-06-11
 
