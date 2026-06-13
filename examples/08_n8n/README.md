@@ -38,10 +38,10 @@ If you're calling NCP from a browser-based n8n node and hit CORS errors, add
 
 ## Two ways to integrate
 
-### a) MCP Client Tool node (agentic)
+### a) MCP Client Tool node (agentic) — unverified
 
-n8n's `@n8n/n8n-nodes-langchain.mcpClientTool` node can connect to NCP's SSE
-endpoint and let an AI Agent node pick tools itself:
+n8n's `@n8n/n8n-nodes-langchain.mcpClientTool` node can in principle connect
+to an MCP server's SSE endpoint and let an AI Agent node pick tools itself:
 
 ```json
 {
@@ -61,12 +61,23 @@ endpoint and let an AI Agent node pick tools itself:
 }
 ```
 
-This is the quickest way to get NCP's tools in front of an AI Agent node, but
-the agent decides when to call `ncp_get_context` / `ncp_post_turn` /
-`ncp_write_memory` / `ncp_emit_whisper` / `ncp_fetch` — and how often, and in
-what order.
+**This path is not guaranteed to work with NCP today.** NCP's `/sse` +
+`/mcp` pair implements the older HTTP+SSE MCP transport, where `POST /mcp`
+returns the JSON-RPC result directly in the HTTP response body (there is no
+`Mcp-Session-Id` header, no session-routed SSE delivery, no session
+`DELETE`). n8n's MCP Client node is built on the official MCP SDK, whose SSE
+client may instead expect tool-call responses to arrive as `message` events
+on the `/sse` stream after a POST. Whether it tolerates NCP's synchronous
+response shape depends on the SDK version n8n bundles — treat this as
+"try it, it may just work," not a supported path. If it doesn't connect,
+use path (b).
 
-### b) HTTP Request nodes (explicit turn lifecycle) — recommended
+Even where it connects, the agent decides when to call `ncp_get_context` /
+`ncp_post_turn` / `ncp_write_memory` / `ncp_emit_whisper` / `ncp_fetch` — and
+how often, and in what order — which works against NCP's turn-lifecycle
+contract (see below).
+
+### b) HTTP Request nodes (explicit turn lifecycle) — recommended, verified
 
 NCP's turn contract (`ncp_get_context` at the start of a turn,
 `ncp_post_turn` at the end, with `pending_whisper_ids` flowing between them)

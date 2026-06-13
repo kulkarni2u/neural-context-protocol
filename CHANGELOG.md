@@ -6,7 +6,7 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ### Added
 
-- Add n8n integration example (`examples/08_n8n/`) showing MCP Client Tool and HTTP Request node setups.
+- Add n8n integration example (`examples/08_n8n/`) with a verified HTTP Request node turn-lifecycle workflow; documents an unverified MCP Client Tool node path against NCP's HTTP+SSE transport.
 
 ## [1.1.0] - 2026-06-11
 
