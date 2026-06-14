@@ -4,7 +4,10 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [Unreleased]
 
-No unreleased changes yet.
+### Added
+
+- `POST /mcp` now content-negotiates responses via the `Accept` header: clients requesting `text/event-stream` get the JSON-RPC result as an SSE `message` event (with `ncp_chunk` events when `stream: true`), making `/mcp` a spec-compliant stateless Streamable HTTP MCP endpoint. JSON responses remain the default.
+- Add n8n integration example (`examples/08_n8n/`) with an HTTP Request node turn-lifecycle workflow and MCP Client Tool node setup over the Streamable HTTP transport.
 
 ## [1.1.0] - 2026-06-11
 

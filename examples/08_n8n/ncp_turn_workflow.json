@@ -1,0 +1,234 @@
+{
+  "name": "NCP Turn Lifecycle (n8n)",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "1f6f0e1a-0001-4a9e-8b1a-000000000001",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [-200, 0]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a1",
+              "name": "baseUrl",
+              "type": "string",
+              "value": "http://localhost:4242"
+            },
+            {
+              "id": "a2",
+              "name": "authToken",
+              "type": "string",
+              "value": "REPLACE_WITH_NCP_AUTH_TOKEN"
+            },
+            {
+              "id": "a3",
+              "name": "pipelineId",
+              "type": "string",
+              "value": "pipe_n8n_demo"
+            },
+            {
+              "id": "a4",
+              "name": "agentId",
+              "type": "string",
+              "value": "n8n_worker"
+            },
+            {
+              "id": "a5",
+              "name": "task",
+              "type": "string",
+              "value": "summarize_ticket_queue"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "1f6f0e1a-0002-4a9e-8b1a-000000000002",
+      "name": "Set Workflow Variables",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [20, 0]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.baseUrl }}/mcp",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $json.authToken }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  jsonrpc: \"2.0\",\n  id: 1,\n  method: \"tools/call\",\n  params: {\n    name: \"ncp_get_context\",\n    arguments: {\n      agent_id: $json.agentId,\n      role: \"build\",\n      task: $json.task,\n      slot: \"queue_summary\",\n      intent: \"advance\",\n      pipeline_id: $json.pipelineId,\n      max_tokens: 1200,\n      ctx_used: 0.0\n    }\n  }\n}) }}",
+        "options": {}
+      },
+      "id": "1f6f0e1a-0003-4a9e-8b1a-000000000003",
+      "name": "ncp_get_context",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [240, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "const rpcResult = $input.first().json;\nconst rawText = rpcResult.result.content[0].text;\nconst toolResult = JSON.parse(rawText);\n\nreturn [{\n  json: {\n    baseUrl: $('Set Workflow Variables').first().json.baseUrl,\n    authToken: $('Set Workflow Variables').first().json.authToken,\n    pipelineId: $('Set Workflow Variables').first().json.pipelineId,\n    agentId: $('Set Workflow Variables').first().json.agentId,\n    task: $('Set Workflow Variables').first().json.task,\n    context: toolResult.context,\n    session_id: toolResult.session_id,\n    pending_whisper_ids: toolResult.pending_whisper_ids || [],\n    telemetry: toolResult.telemetry || {}\n  }\n}];"
+      },
+      "id": "1f6f0e1a-0004-4a9e-8b1a-000000000004",
+      "name": "Extract Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 0]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.example-llm-provider.com/v1/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $json.llmApiKey }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  model: \"replace-with-your-model\",\n  messages: [\n    { role: \"system\", content: $json.context },\n    { role: \"user\", content: \"Summarize the open ticket queue and propose next actions.\" }\n  ]\n}) }}",
+        "options": {}
+      },
+      "id": "1f6f0e1a-0005-4a9e-8b1a-000000000005",
+      "name": "LLM Call (placeholder)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [680, 0],
+      "notes": "Stand-in for whatever model call your workflow uses. Replace url/body with your provider; keep $json.context as the system prompt and pass through pipelineId/agentId/task/session_id/pending_whisper_ids to the next node."
+    },
+    {
+      "parameters": {
+        "jsCode": "const prev = $('Extract Context').first().json;\nconst llmResponse = $input.first().json;\n\nconst resultText = llmResponse.choices && llmResponse.choices[0]\n  ? llmResponse.choices[0].message.content\n  : \"REPLACE_WITH_LLM_OUTPUT\";\n\nreturn [{\n  json: {\n    baseUrl: prev.baseUrl,\n    authToken: prev.authToken,\n    pipelineId: prev.pipelineId,\n    agentId: prev.agentId,\n    task: prev.task,\n    pending_whisper_ids: prev.pending_whisper_ids,\n    result_summary: resultText.slice(0, 120),\n    result_full: resultText\n  }\n}];"
+      },
+      "id": "1f6f0e1a-0006-4a9e-8b1a-000000000006",
+      "name": "Prepare Turn Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 0]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.baseUrl }}/mcp",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $json.authToken }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  jsonrpc: \"2.0\",\n  id: 2,\n  method: \"tools/call\",\n  params: {\n    name: \"ncp_post_turn\",\n    arguments: {\n      agent_id: $json.agentId,\n      role: \"build\",\n      task: $json.task,\n      slot: \"queue_summary\",\n      intent: \"advance\",\n      pipeline_id: $json.pipelineId,\n      result_summary: $json.result_summary,\n      result_full: $json.result_full,\n      ack_whisper_ids: $json.pending_whisper_ids\n    }\n  }\n}) }}",
+        "options": {}
+      },
+      "id": "1f6f0e1a-0007-4a9e-8b1a-000000000007",
+      "name": "ncp_post_turn",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1120, 0]
+    }
+  ],
+  "connections": {
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Set Workflow Variables",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set Workflow Variables": {
+      "main": [
+        [
+          {
+            "node": "ncp_get_context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "ncp_get_context": {
+      "main": [
+        [
+          {
+            "node": "Extract Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Context": {
+      "main": [
+        [
+          {
+            "node": "LLM Call (placeholder)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "LLM Call (placeholder)": {
+      "main": [
+        [
+          {
+            "node": "Prepare Turn Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Turn Result": {
+      "main": [
+        [
+          {
+            "node": "ncp_post_turn",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "meta": {
+    "instanceId": "ncp-example-08-n8n"
+  }
+}
