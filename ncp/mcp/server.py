@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import BinaryIO
 
 from ncp.assembler import Assembler
+from ncp.chunker import filter_content
 from ncp.config import NCPConfig, load_config
 from ncp.stores.base import BaseStore
 from ncp.stores.factory import create_store
@@ -77,7 +78,13 @@ MCP_TOOLS: list[dict[str, object]] = [
     },
     {
         "name": "ncp_write_memory",
-        "description": "Write a durable subconscious chunk to the store. Use at the end of each turn to persist results.",
+        "description": (
+            "Write a durable subconscious chunk to the store. Content is automatically "
+            "filtered at ingestion (ANSI codes, duplicate lines, boilerplate stripped). "
+            "If filtering reduced the content, the response includes filtered=true, "
+            "reduction_ratio, and a raw_ref chunk ID you can retrieve via ncp_fetch "
+            "to recover the original."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -166,7 +173,10 @@ MCP_TOOLS: list[dict[str, object]] = [
 def _encode_fetch_results(chunks: list[SubconsciousChunk]) -> str:
     lines = [f"ncp_fetch:results k:{len(chunks)}"]
     for chunk in chunks:
-        lines.append(f"chunk:{chunk.chunk_id} layer:{chunk.layer} score:{chunk.relevance:.2f}")
+        header = f"chunk:{chunk.chunk_id} layer:{chunk.layer} score:{chunk.relevance:.2f}"
+        if chunk.raw_ref:
+            header += f" raw_ref:{chunk.raw_ref}"
+        lines.append(header)
         lines.append(f"  {chunk.content}")
     return "\n".join(lines)
 
@@ -304,8 +314,12 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             pipeline_id=None if pipeline_id is None else str(pipeline_id),
             agent_id=written_by,
         )
+        raw_content = str(args["content"])
+        fr = filter_content(raw_content)
+        content = fr.filtered
+
         kwargs: dict = {
-            "content": str(args["content"]),
+            "content": content,
             "layer": str(args["layer"]),
             "src": str(args["src"]),
             "written_by": written_by,
@@ -315,9 +329,32 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         }
         if (chunk_id := args.get("chunk_id")):
             kwargs["chunk_id"] = str(chunk_id)
+
+        raw_ref: str | None = None
+        if fr.was_filtered and len(raw_content) <= 2000:
+            raw_chunk = SubconsciousChunk(
+                chunk_id=f"raw_{kwargs.get('chunk_id', '')}_{int(time.time() * 1000)}",
+                layer=str(args["layer"]),
+                content=raw_content,
+                src="tool_result",
+                written_by=written_by,
+                pipeline_id=pipeline_id,
+                base_trust=0.1,
+                zone="working",
+            )
+            store.write(raw_chunk)
+            raw_ref = raw_chunk.chunk_id
+            kwargs["raw_ref"] = raw_ref
+
         chunk = SubconsciousChunk(**kwargs)
         ok = store.write(chunk)
-        return {"written": ok, "chunk_id": chunk.chunk_id}
+        result: dict[str, object] = {"written": ok, "chunk_id": chunk.chunk_id}
+        if fr.was_filtered:
+            result["filtered"] = True
+            result["reduction_ratio"] = round(fr.reduction_ratio, 3)
+            if raw_ref is not None:
+                result["raw_ref"] = raw_ref
+        return result
 
     def _handle_emit_whisper(args: dict[str, object]) -> object:
         whisper_type = str(args["type"])

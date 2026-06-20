@@ -288,7 +288,7 @@ class SQLiteStore(BaseStore):
                     chunk.valid_while,
                     chunk.expiry,
                     chunk.owner,
-                    json.dumps({}),
+                    json.dumps({"raw_ref": chunk.raw_ref} if chunk.raw_ref else {}),
                     chunk.written_at_drift,
                 ),
             )
@@ -1519,6 +1519,7 @@ class SQLiteStore(BaseStore):
 
     def _row_to_chunk(self, row: sqlite3.Row) -> SubconsciousChunk:
         created_at = float(row["created_at"])
+        meta = json.loads(row["meta"]) if row["meta"] else {}
         chunk = SubconsciousChunk(
             chunk_id=str(row["chunk_id"]),
             layer=str(row["layer"]),
@@ -1544,6 +1545,7 @@ class SQLiteStore(BaseStore):
             schema_version=int(row["schema_version"]),
             supersedes=row["supersedes"],
             source_refs=json.loads(row["source_refs"]),
+            raw_ref=meta.get("raw_ref"),
             age_seconds=max(0.0, time.time() - created_at),
             retrieval_count=int(row["retrieval_count"]) if row["retrieval_count"] is not None else 0,
             last_retrieved_at=float(row["last_retrieved_at"]) if row["last_retrieved_at"] is not None else None,

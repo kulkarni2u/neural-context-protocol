@@ -112,17 +112,16 @@ class PidginEncoder:
     def _encode_subconscious(self, chunks: Sequence[SubconsciousChunk]) -> str:
         lines = ["[NCP:SUBCONSCIOUS]"]
         for chunk in chunks:
-            lines.append(
-                " ".join(
-                    [
-                        f"chunk:{chunk.chunk_id}",
-                        f"layer:{chunk.layer}",
-                        f"score:{_fmt_float(chunk.effective_score)}",
-                        f"src:{chunk.src}",
-                        f"trust:{_fmt_float(chunk.base_trust)}",
-                    ]
-                )
-            )
+            parts = [
+                f"chunk:{chunk.chunk_id}",
+                f"layer:{chunk.layer}",
+                f"score:{_fmt_float(chunk.effective_score)}",
+                f"src:{chunk.src}",
+                f"trust:{_fmt_float(chunk.base_trust)}",
+            ]
+            if chunk.raw_ref:
+                parts.append(f"raw_ref:{chunk.raw_ref}")
+            lines.append(" ".join(parts))
             lines.append(_indent_block(chunk.content))
         return "\n".join(lines)
 

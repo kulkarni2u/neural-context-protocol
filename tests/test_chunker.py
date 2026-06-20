@@ -1,6 +1,19 @@
 import json
 
-from ncp.chunker import chunk_code, chunk_content, chunk_json, chunk_prose, chunk_table, detect_type
+from ncp.chunker import (
+    chunk_code,
+    chunk_content,
+    chunk_json,
+    chunk_prose,
+    chunk_table,
+    collapse_blank_lines,
+    dedup_consecutive_lines,
+    detect_type,
+    filter_content,
+    filter_json_noise,
+    strip_ansi,
+    strip_boilerplate,
+)
 
 
 def test_detect_type_auto_paths() -> None:
@@ -98,3 +111,93 @@ def test_chunk_content_auto_dispatches_large_structured_payload() -> None:
 
     assert len(chunks) <= 20
     assert all(chunk.strip() for chunk in chunks)
+
+
+# ---------------------------------------------------------------------------
+# Ingestion-time filtering tests
+# ---------------------------------------------------------------------------
+
+
+def test_strip_ansi_removes_escape_sequences() -> None:
+    raw = "\x1b[32mPASSED\x1b[0m test_foo.py::test_bar"
+    assert strip_ansi(raw) == "PASSED test_foo.py::test_bar"
+
+
+def test_strip_ansi_noop_on_clean_text() -> None:
+    clean = "no colors here"
+    assert strip_ansi(clean) == clean
+
+
+def test_collapse_blank_lines_reduces_runs() -> None:
+    text = "line1\n\n\n\n\nline2\n\n\nline3"
+    result = collapse_blank_lines(text)
+    assert result == "line1\n\nline2\n\nline3"
+
+
+def test_collapse_blank_lines_preserves_single_blanks() -> None:
+    text = "a\n\nb"
+    assert collapse_blank_lines(text) == "a\n\nb"
+
+
+def test_dedup_consecutive_lines_collapses_repeats() -> None:
+    text = "ok\nok\nok\nok\ndone"
+    result = dedup_consecutive_lines(text)
+    assert result == "ok  (×4)\ndone"
+
+
+def test_dedup_consecutive_lines_preserves_unique() -> None:
+    text = "a\nb\nc"
+    assert dedup_consecutive_lines(text) == text
+
+
+def test_strip_boilerplate_removes_progress_bars() -> None:
+    text = "  45% |████        |\nBuilding...\n100% |████████████|"
+    result = strip_boilerplate(text)
+    assert "45%" not in result
+    assert "Building..." in result
+
+
+def test_strip_boilerplate_removes_timing_lines() -> None:
+    text = "real\t0m1.234s\nuser\t0m0.890s\nsys\t0m0.120s\nDone."
+    result = strip_boilerplate(text)
+    assert "real" not in result
+    assert "Done." in result
+
+
+def test_filter_json_noise_prunes_null_and_empty() -> None:
+    raw = json.dumps({"key": "value", "empty": "", "null_val": None, "list": []})
+    result = filter_json_noise(raw)
+    parsed = json.loads(result)
+    assert parsed == {"key": "value"}
+
+
+def test_filter_json_noise_passthrough_non_json() -> None:
+    text = "not json at all"
+    assert filter_json_noise(text) == text
+
+
+def test_filter_content_combines_all_filters() -> None:
+    raw = "\x1b[31mERROR\x1b[0m: fail\nERROR: fail\nERROR: fail\n\n\n\n\nresult: ok"
+    result = filter_content(raw, content_type="prose")
+    assert result.was_filtered
+    assert "\x1b[" not in result.filtered
+    assert "(×3)" in result.filtered
+    assert result.reduction_ratio > 0.0
+
+
+def test_filter_content_no_change_for_clean_input() -> None:
+    clean = "NPE at PaymentProcessor.java:142. root_cause: retryCount is null."
+    result = filter_content(clean)
+    assert not result.was_filtered
+    assert result.filtered == clean
+    assert result.reduction_ratio == 0.0
+
+
+def test_filter_content_json_prunes_nulls() -> None:
+    raw = json.dumps({"status": "ok", "error": None, "warnings": []})
+    result = filter_content(raw, content_type="json")
+    assert result.was_filtered
+    parsed = json.loads(result.filtered)
+    assert "error" not in parsed
+    assert "warnings" not in parsed
+    assert parsed["status"] == "ok"

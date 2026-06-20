@@ -199,6 +199,7 @@ class SubconsciousChunk(NCPModel):
     schema_version: int = 1
     supersedes: str | None = None
     source_refs: list[str] = Field(default_factory=list)
+    raw_ref: str | None = None
 
     relevance: float = 0.0
     age_seconds: float = 0.0

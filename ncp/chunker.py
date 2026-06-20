@@ -1,14 +1,128 @@
-"""Type-aware chunker for prose, JSON, code, and table content."""
+"""Type-aware chunker and ingestion-time content filter for NCP.
+
+The chunker splits content into bounded pieces for embedding and retrieval.
+The filter applies deterministic noise-reduction (inspired by rtk/Headroom-style
+payload compression) *before* chunking so that stored chunks contain signal,
+not framing.
+"""
 
 from __future__ import annotations
 
 import json
 import re
 from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import Any, Literal
 
 
 ChunkTypeHint = Literal["auto", "prose", "json", "code", "table"]
+
+
+# ---------------------------------------------------------------------------
+# Ingestion-time content filtering
+# ---------------------------------------------------------------------------
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+_PROGRESS_RE = re.compile(r"^\s*\d{1,3}%\s*[|█▓▒░#\-=>\s]*", re.MULTILINE)
+_TIMING_RE = re.compile(r"^\s*(real|user|sys)\s+\d+m[\d.]+s\s*$", re.MULTILINE)
+_BLANK_RUN_RE = re.compile(r"\n{3,}")
+
+
+@dataclass(slots=True)
+class FilterResult:
+    """Outcome of ingestion-time content filtering."""
+
+    filtered: str
+    raw_len: int
+    filtered_len: int
+    was_filtered: bool
+
+    @property
+    def reduction_ratio(self) -> float:
+        if self.raw_len == 0:
+            return 0.0
+        return 1.0 - (self.filtered_len / self.raw_len)
+
+
+def strip_ansi(text: str) -> str:
+    """Remove ANSI escape sequences."""
+    return _ANSI_RE.sub("", text)
+
+
+def collapse_blank_lines(text: str) -> str:
+    """Collapse runs of 3+ blank lines into a single blank line."""
+    return _BLANK_RUN_RE.sub("\n\n", text)
+
+
+def dedup_consecutive_lines(text: str) -> str:
+    """Collapse consecutive duplicate lines with a count annotation."""
+    lines = text.splitlines()
+    if not lines:
+        return text
+    result: list[str] = []
+    prev = lines[0]
+    count = 1
+    for line in lines[1:]:
+        if line == prev:
+            count += 1
+        else:
+            result.append(prev if count == 1 else f"{prev}  (×{count})")
+            prev = line
+            count = 1
+    result.append(prev if count == 1 else f"{prev}  (×{count})")
+    return "\n".join(result)
+
+
+def strip_boilerplate(text: str) -> str:
+    """Strip common tool-output boilerplate (progress bars, timing lines)."""
+    text = _PROGRESS_RE.sub("", text)
+    text = _TIMING_RE.sub("", text)
+    return text
+
+
+def filter_json_noise(text: str) -> str:
+    """Prune null/empty values from top-level JSON to reduce noise."""
+    stripped = text.strip()
+    if not stripped or stripped[0] not in "{[":
+        return text
+    try:
+        payload = json.loads(stripped)
+    except json.JSONDecodeError:
+        return text
+    if isinstance(payload, dict):
+        pruned = {k: v for k, v in payload.items() if v is not None and v != "" and v != []}
+        if pruned != payload:
+            return json.dumps(pruned, ensure_ascii=True, separators=(",", ":"))
+    return text
+
+
+def filter_content(content: str, *, content_type: ChunkTypeHint = "auto") -> FilterResult:
+    """Apply deterministic noise-reduction filters before chunking.
+
+    Returns a FilterResult with the cleaned content and metadata about
+    what changed. Filtering is always lossless in intent — no semantic
+    information is removed, only framing noise.
+    """
+    raw_len = len(content)
+    resolved = detect_type(content) if content_type == "auto" else content_type
+
+    text = strip_ansi(content)
+    text = collapse_blank_lines(text)
+    text = dedup_consecutive_lines(text)
+
+    if resolved in ("prose", "code"):
+        text = strip_boilerplate(text)
+    elif resolved == "json":
+        text = filter_json_noise(text)
+
+    text = text.strip()
+    filtered_len = len(text)
+    return FilterResult(
+        filtered=text,
+        raw_len=raw_len,
+        filtered_len=filtered_len,
+        was_filtered=(text != content.strip()),
+    )
 
 
 def _token_count(text: str) -> int:
