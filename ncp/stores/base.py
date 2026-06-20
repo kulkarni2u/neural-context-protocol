@@ -73,6 +73,15 @@ class BaseStore(ABC):
     ) -> Sequence[SubconsciousChunk]:
         """Return working-zone chunks, optionally filtered."""
 
+    def get_chunks_by_ids(self, ids: Sequence[str]) -> list[SubconsciousChunk]:
+        """Fetch live (non-tombstoned) chunks by exact ids, any order.
+
+        Used for 1-hop edge expansion over chunk relationships
+        (``caused_by``, etc.). Backends that do not implement this return
+        an empty list, which disables edge expansion gracefully.
+        """
+        return []
+
     # ------------------------------------------------------------------
     # Whisper queue
 

@@ -477,6 +477,19 @@ class SQLiteStore(BaseStore):
             )
         return [self._row_to_chunk(row) for row in rows]
 
+    def get_chunks_by_ids(self, ids: Sequence[str]) -> list[SubconsciousChunk]:
+        unique_ids = [cid for cid in dict.fromkeys(ids) if cid]
+        if not unique_ids:
+            return []
+        placeholders = ",".join("?" * len(unique_ids))
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM chunks WHERE chunk_id IN ({placeholders})"
+                " AND chunk_id NOT IN (SELECT chunk_id FROM tombstones)",
+                unique_ids,
+            ).fetchall()
+        return [self._row_to_chunk(row) for row in rows]
+
     def emit_whisper(self, whisper: Whisper) -> None:
         whisper = Whisper.model_validate(whisper.model_dump())
         with self._connect() as connection:

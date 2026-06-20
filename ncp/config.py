@@ -65,6 +65,8 @@ DEFAULT_CONFIG = {
         "rerank_provider": "local",
         "rerank_model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
         "generation_penalty_base": 0.9,
+        "edge_expansion": True,
+        "edge_expansion_decay": 0.7,
     },
     "embedding": {
         "enabled": False,
@@ -175,6 +177,14 @@ class NCPConfig:
     @property
     def retrieval_generation_penalty_base(self) -> float:
         return float(self.values.get("retrieval", {}).get("generation_penalty_base", 0.9))
+
+    @property
+    def edge_expansion_enabled(self) -> bool:
+        return bool(self.values.get("retrieval", {}).get("edge_expansion", True))
+
+    @property
+    def edge_expansion_decay(self) -> float:
+        return float(self.values.get("retrieval", {}).get("edge_expansion_decay", 0.7))
 
     @property
     def context_token_budget(self) -> int:
@@ -310,6 +320,9 @@ def _apply_env_overrides(values: dict[str, Any], env: dict[str, str]) -> None:
         values["embedding"]["model"] = env["NCP_EMBEDDING_MODEL"]
     if "NCP_GENERATION_PENALTY_BASE" in env:
         values["retrieval"]["generation_penalty_base"] = float(env["NCP_GENERATION_PENALTY_BASE"])
+    if "NCP_EDGE_EXPANSION" in env:
+        val = env["NCP_EDGE_EXPANSION"].lower()
+        values["retrieval"]["edge_expansion"] = val in {"true", "1", "yes"}
     if "NCP_AUTH_TOKEN" in env:
         values["server"]["auth_token"] = env["NCP_AUTH_TOKEN"]
 
