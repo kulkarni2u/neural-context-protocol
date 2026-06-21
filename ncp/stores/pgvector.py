@@ -649,6 +649,23 @@ class PgvectorStore(BaseStore):
             )
         self.coordination.emit_whisper(whisper)
 
+    def record_dissent(self, chunk_id: str) -> bool:
+        normalized = chunk_id.removeprefix("ctx://sub/")
+        with self._connect() as connection:
+            cursor = connection.cursor()
+            try:
+                cursor.execute(
+                    self._sql(
+                        "UPDATE {schema}.{prefix}chunks"
+                        " SET dissent_count = dissent_count + 1 WHERE chunk_id = %s"
+                    ),
+                    (normalized,),
+                )
+                connection.commit()
+                return cursor.rowcount > 0
+            finally:
+                self._close_cursor(cursor)
+
     def drain_whispers(
         self,
         *,
@@ -1067,13 +1084,15 @@ class PgvectorStore(BaseStore):
         feedback_mode: bool = False,
         feedback_weight: float = 0.15,
         propagation_factor: float = 0.5,
+        dissent_weight: float = 0.2,
     ) -> CalibrationReport:
         """Re-score base_trust on live chunks.
 
         Manual mode: chunk_id + trust sets a specific chunk's base_trust directly.
         Batch mode: pipeline_id applies decay to eligible chunks.
-        Feedback mode: boosts retrieved chunks and propagates a fraction
-        (``propagation_factor``) of that boost one hop along ``caused_by`` edges.
+        Feedback mode: applies a net trust delta per chunk (retrieval boost minus
+        dissent penalty) and propagates a fraction (``propagation_factor``) of it
+        one hop along ``caused_by`` edges.
         """
         started = time.monotonic()
         report = CalibrationReport(dry_run=dry_run, pipeline_id=pipeline_id)
@@ -1135,7 +1154,7 @@ class PgvectorStore(BaseStore):
                         cursor.execute(
                             self._sql(
                                 "SELECT chunk_id, base_trust, src, generation, created_at,"
-                                " retrieval_count, caused_by FROM {schema}.{prefix}chunks"
+                                " retrieval_count, caused_by, dissent_count FROM {schema}.{prefix}chunks"
                                 " WHERE chunk_id NOT IN (SELECT chunk_id FROM {schema}.{prefix}tombstones)"
                                 " AND pipeline_id = %s"
                             ),
@@ -1145,7 +1164,7 @@ class PgvectorStore(BaseStore):
                         cursor.execute(
                             self._sql(
                                 "SELECT chunk_id, base_trust, src, generation, created_at,"
-                                " retrieval_count, caused_by FROM {schema}.{prefix}chunks"
+                                " retrieval_count, caused_by, dissent_count FROM {schema}.{prefix}chunks"
                                 " WHERE chunk_id NOT IN (SELECT chunk_id FROM {schema}.{prefix}tombstones)"
                             )
                         )
@@ -1185,6 +1204,7 @@ class PgvectorStore(BaseStore):
                                 base_trust=base_trust,
                                 retrieval_count=rc,
                                 caused_by=row["caused_by"],
+                                dissent_count=int(row["dissent_count"]) if row["dissent_count"] is not None else 0,
                             )
                         )
 
@@ -1193,6 +1213,7 @@ class PgvectorStore(BaseStore):
                         feedback_rows,
                         feedback_weight=feedback_weight,
                         propagation_factor=propagation_factor,
+                        dissent_weight=dissent_weight,
                     )
                     updates.extend(fb.updates)
                     report.change_log.extend(fb.change_log)
@@ -1767,6 +1788,7 @@ class PgvectorStore(BaseStore):
             supersedes=row["supersedes"],
             source_refs=self._decode_json_list(row["source_refs"]),
             age_seconds=max(0.0, time.time() - created_at),
+            dissent_count=int(row["dissent_count"]) if row.get("dissent_count") is not None else 0,
         )
 
     def _decode_json_list(self, value: Any) -> list[str]:

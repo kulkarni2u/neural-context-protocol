@@ -82,6 +82,15 @@ class BaseStore(ABC):
         """
         return []
 
+    def record_dissent(self, chunk_id: str) -> bool:
+        """Record that ``chunk_id`` was disputed (e.g. by a dissent whisper).
+
+        Increments the chunk's dissent counter so feedback calibration can apply
+        a trust penalty and propagate it along ``caused_by`` edges. Best-effort:
+        backends that do not implement this return False.
+        """
+        return False
+
     # ------------------------------------------------------------------
     # Whisper queue
 
@@ -193,6 +202,7 @@ class BaseStore(ABC):
         feedback_mode: bool = False,
         feedback_weight: float = 0.15,
         propagation_factor: float = 0.5,
+        dissent_weight: float = 0.2,
     ) -> CalibrationReport:
         """Re-score base_trust on existing chunks.
 
@@ -201,8 +211,9 @@ class BaseStore(ABC):
         - Batch decay: provide pipeline_id to apply decay to eligible chunks (age >
           recency_half_life_seconds, base_trust > 0.5, generation == 0). Chunks with
           src == "user_verified" are always protected.
-        - Feedback: boost retrieved chunks and propagate a fraction
-          (``propagation_factor``) of that boost one hop along ``caused_by`` edges.
+        - Feedback: apply a net trust delta per chunk (retrieval boost minus dissent
+          penalty) and propagate a fraction (``propagation_factor``) of it one hop
+          along ``caused_by`` edges.
         """
 
     @abstractmethod
@@ -255,6 +266,10 @@ class BaseStore(ABC):
     async def async_emit_whisper(self, whisper: Whisper) -> None:
         """Asynchronously persist a whisper using thread pool."""
         await anyio.to_thread.run_sync(self.emit_whisper, whisper)
+
+    async def async_record_dissent(self, chunk_id: str) -> bool:
+        """Asynchronously record a dissent against a chunk using thread pool."""
+        return await anyio.to_thread.run_sync(self.record_dissent, chunk_id)
 
     async def async_drain_whispers(
         self,

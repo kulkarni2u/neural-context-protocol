@@ -157,6 +157,10 @@ Runtime (set at retrieval):
   relevance       float = 0.0
   age_seconds     float = 0.0
 
+Feedback counters (drive calibration):
+  retrieval_count int = 0    incremented on each retrieval (positive signal)
+  dissent_count   int = 0    incremented by record_dissent / dissent whispers (negative signal)
+
 Derived property:
   effective_score = relevance × exp(-0.693 × age_seconds / 14400)
                     × base_trust × (0.9 ^ generation)

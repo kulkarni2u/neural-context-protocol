@@ -205,6 +205,7 @@ class SubconsciousChunk(NCPModel):
     age_seconds: float = 0.0
     retrieval_count: int = 0
     last_retrieved_at: float | None = None
+    dissent_count: int = 0
 
     embedding: list[float] | None = None
 
@@ -241,7 +242,7 @@ class SubconsciousChunk(NCPModel):
             raise ValueError("content must be <= 2000 characters")
         return value
 
-    @field_validator("generation", "schema_version")
+    @field_validator("generation", "schema_version", "dissent_count")
     @classmethod
     def _chunk_non_negative_ints(cls, value: int, info: object) -> int:
         field_name = getattr(info, "field_name", "field")

@@ -56,7 +56,8 @@ CREATE TABLE IF NOT EXISTS chunks (
     meta TEXT DEFAULT '{}',
     retrieval_count INTEGER DEFAULT 0,
     last_retrieved_at REAL,
-    written_at_drift REAL DEFAULT 0.0
+    written_at_drift REAL DEFAULT 0.0,
+    dissent_count INTEGER DEFAULT 0
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
@@ -237,6 +238,7 @@ class SQLiteStore(BaseStore):
                 "ALTER TABLE chunks ADD COLUMN retrieval_count INTEGER DEFAULT 0",
                 "ALTER TABLE chunks ADD COLUMN last_retrieved_at REAL",
                 "ALTER TABLE chunks ADD COLUMN written_at_drift REAL DEFAULT 0.0",
+                "ALTER TABLE chunks ADD COLUMN dissent_count INTEGER DEFAULT 0",
                 "CREATE TABLE IF NOT EXISTS drift_history (session_id TEXT NOT NULL, turn INTEGER NOT NULL, drift_score REAL NOT NULL, ts REAL NOT NULL)",
                 "CREATE INDEX IF NOT EXISTS idx_drift_session ON drift_history(session_id, turn)",
                 "INSERT INTO chunks_fts(chunks_fts) VALUES ('rebuild')",
@@ -477,6 +479,15 @@ class SQLiteStore(BaseStore):
                 zone="working",
             )
         return [self._row_to_chunk(row) for row in rows]
+
+    def record_dissent(self, chunk_id: str) -> bool:
+        normalized = chunk_id.removeprefix("ctx://sub/")
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE chunks SET dissent_count = dissent_count + 1 WHERE chunk_id = ?",
+                (normalized,),
+            )
+            return cursor.rowcount > 0
 
     def get_chunks_by_ids(self, ids: Sequence[str]) -> list[SubconsciousChunk]:
         unique_ids = [cid for cid in dict.fromkeys(ids) if cid]
@@ -830,13 +841,15 @@ class SQLiteStore(BaseStore):
         feedback_mode: bool = False,
         feedback_weight: float = 0.15,
         propagation_factor: float = 0.5,
+        dissent_weight: float = 0.2,
     ) -> CalibrationReport:
         """Re-score base_trust on live chunks.
 
         Manual mode: chunk_id + trust sets a specific chunk's base_trust directly.
         Batch mode: pipeline_id applies decay to eligible chunks.
-        Feedback mode: boosts retrieved chunks and propagates a fraction of that
-        boost (``propagation_factor``) one hop along ``caused_by`` edges.
+        Feedback mode: applies a net trust delta per chunk (retrieval boost minus
+        dissent penalty) and propagates a fraction (``propagation_factor``) of it
+        one hop along ``caused_by`` edges.
         """
         started = time.monotonic()
         report = CalibrationReport(dry_run=dry_run, pipeline_id=pipeline_id)
@@ -877,7 +890,7 @@ class SQLiteStore(BaseStore):
 
             query = (
                 "SELECT chunk_id, base_trust, src, generation, created_at,"
-                " retrieval_count, caused_by FROM chunks"
+                " retrieval_count, caused_by, dissent_count FROM chunks"
                 " WHERE chunk_id NOT IN (SELECT chunk_id FROM tombstones)"
             )
             params: list = []
@@ -924,6 +937,7 @@ class SQLiteStore(BaseStore):
                                 base_trust=base_trust,
                                 retrieval_count=rc,
                                 caused_by=row["caused_by"],
+                                dissent_count=int(row["dissent_count"]) if row["dissent_count"] is not None else 0,
                             )
                         )
 
@@ -932,6 +946,7 @@ class SQLiteStore(BaseStore):
                         feedback_rows,
                         feedback_weight=feedback_weight,
                         propagation_factor=propagation_factor,
+                        dissent_weight=dissent_weight,
                     )
                     updates.extend(fb.updates)
                     report.change_log.extend(fb.change_log)
@@ -1574,6 +1589,7 @@ class SQLiteStore(BaseStore):
             age_seconds=max(0.0, time.time() - created_at),
             retrieval_count=int(row["retrieval_count"]) if row["retrieval_count"] is not None else 0,
             last_retrieved_at=float(row["last_retrieved_at"]) if row["last_retrieved_at"] is not None else None,
+            dissent_count=int(row["dissent_count"]) if row["dissent_count"] is not None else 0,
         )
         return chunk
 

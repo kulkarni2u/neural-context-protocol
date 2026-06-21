@@ -120,6 +120,14 @@ MCP_TOOLS: list[dict[str, object]] = [
                 "confidence": {"type": "number", "description": "Confidence 0.0-1.0"},
                 "pipeline_id": {"type": "string"},
                 "ttl_seconds": {"type": "integer", "description": "Seconds before expiry. Default 1800."},
+                "ref": {
+                    "type": "string",
+                    "description": (
+                        "Optional chunk_id this whisper refers to. For a dissent whisper, set this "
+                        "to the disputed chunk_id: it debits that chunk's trust and propagates the "
+                        "penalty along its caused_by edge during feedback calibration."
+                    ),
+                },
             },
             "required": ["from", "target", "type", "payload", "confidence"],
         },
@@ -363,6 +371,7 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             ttl_seconds = max(1, int(args.get("ttl_seconds", default_whisper_ttl)))
         except (TypeError, ValueError):
             ttl_seconds = default_whisper_ttl
+        ref = args.get("ref")
         whisper = Whisper(
             from_agent=str(args["from"]),
             target=str(args["target"]),
@@ -371,9 +380,13 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             confidence=float(args["confidence"]),
             pipeline_id=args.get("pipeline_id"),
             ttl_seconds=ttl_seconds,
+            ref=None if ref is None else str(ref),
         )
         store.emit_whisper(whisper)
-        return {"emitted": True}
+        result: dict[str, object] = {"emitted": True}
+        if whisper_type == "dissent" and ref:
+            result["dissent_recorded"] = store.record_dissent(str(ref))
+        return result
 
     def _handle_post_turn(args: dict[str, object]) -> object:
         conscious = _build_conscious_from_args(store, args)
