@@ -216,6 +216,24 @@ class BaseStore(ABC):
           along ``caused_by`` edges.
         """
 
+    def trust_drift_data(
+        self,
+        *,
+        pipeline_id: str | None = None,
+        top_k: int = 10,
+    ) -> dict[str, object]:
+        """Return structured trust-drift observability data.
+
+        Returns a dict with:
+        - trust_distribution: list of {band, count, avg_trust}
+        - rising: top_k chunks ordered by retrieval_count DESC
+        - falling: top_k chunks ordered by dissent_count DESC
+        - feedback_summary: {total_chunks, with_retrievals, with_dissents,
+          net_positive, net_negative, untouched}
+        - drift_timeline: recent drift_history readings (if available)
+        """
+        raise NotImplementedError("trust_drift_data not implemented for this backend")
+
     @abstractmethod
     def viz_data(self, *, pipeline_id: str | None = None) -> dict[str, object]:
         """Return structured data for the operator viz view.
@@ -326,6 +344,16 @@ class BaseStore(ABC):
         """Asynchronously persist cost telemetry using thread pool."""
         fn = partial(self.log_cost, agent_id=agent_id, response=response)
         await anyio.to_thread.run_sync(fn)
+
+    async def async_trust_drift_data(
+        self,
+        *,
+        pipeline_id: str | None = None,
+        top_k: int = 10,
+    ) -> dict[str, object]:
+        """Asynchronously build trust-drift data using thread pool."""
+        fn = partial(self.trust_drift_data, pipeline_id=pipeline_id, top_k=top_k)
+        return await anyio.to_thread.run_sync(fn)
 
     async def async_viz_data(self, *, pipeline_id: str | None = None) -> dict[str, object]:
         """Asynchronously build operator viz data using thread pool."""

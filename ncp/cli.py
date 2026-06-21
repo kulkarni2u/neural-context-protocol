@@ -1388,6 +1388,114 @@ def calibrate_command(
         console.print(f"[green]Calibrated {total_changed} chunk(s).[/green]")
 
 
+@main.command("trust-drift")
+@click.option("--cwd", type=click.Path(path_type=Path), default=Path.cwd)
+@click.option("--pipeline-id", default=None, help="Optional pipeline scope filter.")
+@click.option("--top-k", default=10, show_default=True, type=click.IntRange(1, 50), help="Number of top rising/falling chunks to show.")
+@click.option("--json-output", is_flag=True, help="Emit machine-readable JSON instead of tables.")
+def trust_drift_command(cwd: Path, pipeline_id: str | None, top_k: int, json_output: bool) -> None:
+    """Show trust-drift observability: which chunks are gaining or losing trust."""
+
+    from rich.panel import Panel
+
+    try:
+        config = ncp.configure(cwd=cwd)
+        store = _resolve_reporting_store(config, "trust-drift", "trust_drift_data")
+        data = store.trust_drift_data(pipeline_id=pipeline_id, top_k=top_k)
+    except NCPStoreUnavailableError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    if json_output:
+        console.print_json(data={
+            "store_path": _store_display(config),
+            "pipeline_id": pipeline_id,
+            **data,
+        })
+        return
+
+    console.print(f"[bold]NCP Trust Drift[/bold]  store={_store_display(config)}"
+                  + (f"  pipeline={pipeline_id}" if pipeline_id else ""))
+
+    # Feedback summary panel
+    fs = data["feedback_summary"]
+    summary_lines = [
+        f"Total chunks: {fs['total_chunks']}",
+        f"With retrievals: {fs['with_retrievals']}  |  With dissents: {fs['with_dissents']}",
+        f"Net positive: {fs['net_positive']}  |  Net negative: {fs['net_negative']}  |  Untouched: {fs['untouched']}",
+    ]
+    console.print(Panel("\n".join(summary_lines), title="Feedback Summary", expand=False))
+
+    # Trust distribution
+    dist_table = Table(title="Trust Distribution", box=box.SIMPLE_HEAVY)
+    dist_table.add_column("Band")
+    dist_table.add_column("Count", justify="right")
+    dist_table.add_column("Avg Trust", justify="right")
+    for row in data["trust_distribution"]:
+        dist_table.add_row(str(row["band"]), str(row["count"]), f"{float(row['avg_trust']):.4f}")
+    if not data["trust_distribution"]:
+        dist_table.add_row("[dim]-[/dim]", "[dim]0[/dim]", "[dim]-[/dim]")
+    console.print(dist_table)
+
+    # Rising chunks
+    rising_table = Table(title="Rising (most retrieved)", box=box.MINIMAL_DOUBLE_HEAD)
+    rising_table.add_column("ID (16)")
+    rising_table.add_column("Layer")
+    rising_table.add_column("Trust", justify="right")
+    rising_table.add_column("Retrievals", justify="right")
+    rising_table.add_column("Dissents", justify="right")
+    rising_table.add_column("Age (s)", justify="right")
+    for row in data["rising"]:
+        rising_table.add_row(
+            str(row["chunk_id"]),
+            str(row["layer"]),
+            f"{float(row['base_trust']):.3f}",
+            str(row["retrieval_count"]),
+            str(row["dissent_count"]),
+            str(row["age_seconds"]),
+        )
+    if not data["rising"]:
+        rising_table.add_row("[dim]-[/dim]", "[dim]-[/dim]", "[dim]-[/dim]", "[dim]0[/dim]", "[dim]0[/dim]", "[dim]-[/dim]")
+    console.print(rising_table)
+
+    # Falling chunks
+    falling_table = Table(title="Falling (most dissented)", box=box.MINIMAL_DOUBLE_HEAD)
+    falling_table.add_column("ID (16)")
+    falling_table.add_column("Layer")
+    falling_table.add_column("Trust", justify="right")
+    falling_table.add_column("Retrievals", justify="right")
+    falling_table.add_column("Dissents", justify="right")
+    falling_table.add_column("Age (s)", justify="right")
+    for row in data["falling"]:
+        falling_table.add_row(
+            str(row["chunk_id"]),
+            str(row["layer"]),
+            f"{float(row['base_trust']):.3f}",
+            str(row["retrieval_count"]),
+            str(row["dissent_count"]),
+            str(row["age_seconds"]),
+        )
+    if not data["falling"]:
+        falling_table.add_row("[dim]-[/dim]", "[dim]-[/dim]", "[dim]-[/dim]", "[dim]0[/dim]", "[dim]0[/dim]", "[dim]-[/dim]")
+    console.print(falling_table)
+
+    # Drift timeline (if present)
+    drift_timeline = data["drift_timeline"]
+    if drift_timeline:
+        drift_table = Table(title="Recent Drift Readings", box=box.MINIMAL_DOUBLE_HEAD)
+        drift_table.add_column("Session")
+        drift_table.add_column("Turn", justify="right")
+        drift_table.add_column("Drift Score", justify="right")
+        drift_table.add_column("Timestamp")
+        for row in drift_timeline[:10]:
+            drift_table.add_row(
+                str(row["session_id"])[:16],
+                str(row["turn"]),
+                f"{float(row['drift_score']):.4f}",
+                _format_ts(float(row["ts"])),
+            )
+        console.print(drift_table)
+
+
 @main.command("batch")
 @click.argument("input_file", type=click.Path(path_type=Path), required=False)
 @click.option("--output", type=click.Path(path_type=Path), default=None, help="Write results to file instead of stdout.")

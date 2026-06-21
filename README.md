@@ -235,6 +235,7 @@ ncp status      # store and activity metrics
 ncp cost        # token and USD rollups
 ncp explain     # human-readable runtime summary
 ncp viz         # pipeline visualization
+ncp trust-drift # trust-drift observability: rising, falling, and feedback summary
 ncp consolidate # merge and compact memory
 ncp calibrate   # recalibrate trust (add --feedback for the self-improvement pass)
 ncp handoff     # cross-agent handoff coordination

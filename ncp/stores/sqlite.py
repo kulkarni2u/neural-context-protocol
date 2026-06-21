@@ -1282,6 +1282,138 @@ class SQLiteStore(BaseStore):
             ],
         }
 
+    def trust_drift_data(
+        self,
+        *,
+        pipeline_id: str | None = None,
+        top_k: int = 10,
+    ) -> dict[str, object]:
+        now = time.time()
+        live_clause = "chunk_id NOT IN (SELECT chunk_id FROM tombstones)"
+        pipe_filter = " AND pipeline_id = ?" if pipeline_id is not None else ""
+        params: list[object] = [pipeline_id] if pipeline_id is not None else []
+
+        with self._connect() as connection:
+            band_rows = connection.execute(
+                f"""
+                SELECT
+                    CASE
+                        WHEN base_trust < 0.3 THEN 'low (0-0.3)'
+                        WHEN base_trust < 0.6 THEN 'mid (0.3-0.6)'
+                        WHEN base_trust < 0.8 THEN 'good (0.6-0.8)'
+                        ELSE 'high (0.8-1.0)'
+                    END AS band,
+                    COUNT(*) AS count,
+                    AVG(base_trust) AS avg_trust
+                FROM chunks
+                WHERE {live_clause}{pipe_filter}
+                GROUP BY band
+                ORDER BY band
+                """,
+                params,
+            ).fetchall()
+            trust_distribution = [
+                {
+                    "band": str(r["band"]),
+                    "count": int(r["count"]),
+                    "avg_trust": round(float(r["avg_trust"]), 4),
+                }
+                for r in band_rows
+            ]
+
+            rising_rows = connection.execute(
+                f"""
+                SELECT chunk_id, layer, pipeline_id, base_trust, retrieval_count,
+                       dissent_count, created_at
+                FROM chunks
+                WHERE {live_clause}{pipe_filter} AND retrieval_count > 0
+                ORDER BY retrieval_count DESC, base_trust DESC
+                LIMIT ?
+                """,
+                [*params, top_k],
+            ).fetchall()
+            rising = [
+                {
+                    "chunk_id": str(r["chunk_id"])[:16],
+                    "layer": str(r["layer"]),
+                    "pipeline_id": r["pipeline_id"],
+                    "base_trust": float(r["base_trust"]),
+                    "retrieval_count": int(r["retrieval_count"]),
+                    "dissent_count": int(r["dissent_count"]) if r["dissent_count"] else 0,
+                    "age_seconds": round(now - float(r["created_at"]), 1),
+                }
+                for r in rising_rows
+            ]
+
+            falling_rows = connection.execute(
+                f"""
+                SELECT chunk_id, layer, pipeline_id, base_trust, retrieval_count,
+                       dissent_count, created_at
+                FROM chunks
+                WHERE {live_clause}{pipe_filter} AND dissent_count > 0
+                ORDER BY dissent_count DESC, base_trust ASC
+                LIMIT ?
+                """,
+                [*params, top_k],
+            ).fetchall()
+            falling = [
+                {
+                    "chunk_id": str(r["chunk_id"])[:16],
+                    "layer": str(r["layer"]),
+                    "pipeline_id": r["pipeline_id"],
+                    "base_trust": float(r["base_trust"]),
+                    "retrieval_count": int(r["retrieval_count"]) if r["retrieval_count"] else 0,
+                    "dissent_count": int(r["dissent_count"]),
+                    "age_seconds": round(now - float(r["created_at"]), 1),
+                }
+                for r in falling_rows
+            ]
+
+            summary_row = connection.execute(
+                f"""
+                SELECT
+                    COUNT(*) AS total_chunks,
+                    SUM(CASE WHEN retrieval_count > 0 THEN 1 ELSE 0 END) AS with_retrievals,
+                    SUM(CASE WHEN dissent_count > 0 THEN 1 ELSE 0 END) AS with_dissents,
+                    SUM(CASE WHEN retrieval_count > dissent_count AND retrieval_count > 0 THEN 1 ELSE 0 END) AS net_positive,
+                    SUM(CASE WHEN dissent_count > retrieval_count AND dissent_count > 0 THEN 1 ELSE 0 END) AS net_negative,
+                    SUM(CASE WHEN retrieval_count = 0 AND dissent_count = 0 THEN 1 ELSE 0 END) AS untouched
+                FROM chunks
+                WHERE {live_clause}{pipe_filter}
+                """,
+                params,
+            ).fetchone()
+            feedback_summary = {
+                "total_chunks": int(summary_row["total_chunks"] or 0),
+                "with_retrievals": int(summary_row["with_retrievals"] or 0),
+                "with_dissents": int(summary_row["with_dissents"] or 0),
+                "net_positive": int(summary_row["net_positive"] or 0),
+                "net_negative": int(summary_row["net_negative"] or 0),
+                "untouched": int(summary_row["untouched"] or 0),
+            }
+
+            drift_rows = connection.execute(
+                "SELECT session_id, turn, drift_score, ts FROM drift_history"
+                " ORDER BY ts DESC LIMIT 20"
+            ).fetchall()
+            drift_timeline = [
+                {
+                    "session_id": str(r["session_id"]),
+                    "turn": int(r["turn"]),
+                    "drift_score": float(r["drift_score"]),
+                    "ts": float(r["ts"]),
+                }
+                for r in drift_rows
+            ]
+
+        return {
+            "trust_distribution": trust_distribution,
+            "rising": rising,
+            "falling": falling,
+            "feedback_summary": feedback_summary,
+            "drift_timeline": drift_timeline,
+        }
+
     def viz_data(self, *, pipeline_id: str | None = None) -> dict[str, object]:
         """Return structured data for the operator viz view."""
         now = time.time()
