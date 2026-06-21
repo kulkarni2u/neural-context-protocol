@@ -142,6 +142,25 @@ The effect: the model receives context ranked by how much it should believe it, 
 
 -----
 
+## Ingestion-Time Compression
+
+Bounded-context assembly keeps the *retrieved* working set small. Ingestion-time compression is the complementary axis: it keeps the *stored* content lean. The idea is simple — stored chunks should contain signal, not framing.
+
+When you call `ncp_write_memory`, NCP runs deterministic noise reduction before storing: it strips ANSI codes, collapses blank-line runs, dedups consecutive duplicate lines, removes tool-output boilerplate (progress bars, timing lines), and prunes null/empty JSON fields. This is reversible — the unfiltered original is preserved as a low-trust `raw_ref` chunk and retrievable on demand via `ncp_fetch`, so compression is lossless-in-intent.
+
+The filter is conservative, so savings are large where there is structural redundancy and modest where content is already dense. On a fixed corpus of representative noisy agent payloads (`chars_div4` token unit), aggregate token reduction is **33%** (537 → 360 tokens), with per-category results:
+
+| Payload category                          | Token reduction |
+|-------------------------------------------|----------------:|
+| Duplicate-heavy logs                      | **68%**         |
+| Null/empty-heavy JSON tool results        | **59%**         |
+| CLI output (ANSI + progress + timing)     | **5%**          |
+| Stack-trace-style blobs                   | **2%**          |
+
+This is deterministic noise reduction, not a model-quality change. See [the compression benchmark doc](./docs/NCP_BENCHMARK_COMPRESSION.md).
+
+-----
+
 ## What NCP Is (and Isn't)
 
 **NCP is the memory bus, not the orchestrator.**
@@ -171,6 +190,8 @@ MACE multi-agent coordination score (40 turns): **0.9608**
 Coding benchmark token unit: `chars_div4`; context budget: `340`; pass gate: `true`.
 These are deterministic token-accounting benchmarks. The task-success row measures context adequacy at a matched token budget with a deterministic mock provider — whether the needed fact survives into a budget-bounded context (see [the benchmark doc](./docs/NCP_BENCHMARK_TASK_SUCCESS.md)); run it with a live provider to measure real model task success. Quality-at-matched-budget evaluation also lives in `benchmarks/efficacy/`.
 
+A separate, complementary compression benchmark measures ingestion-time noise reduction on a fixed noisy-payload corpus: **33% aggregate token reduction** (537 → 360, `chars_div4`, pass gate aggregate >= 0.20), ranging from **68%** on duplicate-heavy logs down to **2%** on already-dense stack traces (see [the compression benchmark doc](./docs/NCP_BENCHMARK_COMPRESSION.md)).
+
 Benchmarks are reproducible:
 
 ```bash
@@ -178,6 +199,7 @@ python3 benchmarks/coding_pipeline/run.py
 python3 benchmarks/needle/run.py --turns 24 --needles 6 --budget 4
 python3 benchmarks/task_success/run.py            # mock provider, no keys needed
 python3 benchmarks/task_success/run.py --provider anthropic   # live task success
+python3 benchmarks/compression/run.py             # ingestion-time compression
 ```
 
 -----
@@ -188,7 +210,7 @@ NCP exposes one MCP endpoint: `http://127.0.0.1:4242/mcp`
 
 ```
 ncp_get_context      — assemble bounded context for this turn
-ncp_write_memory     — persist durable memory to the subconscious
+ncp_write_memory     — persist durable memory; filters ingestion noise and keeps a reversible raw_ref
 ncp_emit_whisper     — send a bounded signal to another agent
 ncp_post_turn        — persist the turn result and acknowledge consumed whispers
 ncp_fetch            — retrieve additional bounded context mid-turn
@@ -308,6 +330,7 @@ NCP is the memory bus. In our workflows, Sarathi is one orchestrator that runs o
 - [Benchmark: needle recall](./docs/NCP_BENCHMARK_NEEDLE_RECALL.md)
 - [Benchmark: matched-budget efficacy](./docs/NCP_BENCHMARK_MATCHED_BUDGET_EFFICACY.md)
 - [Benchmark: research pipeline](./docs/NCP_BENCHMARK_RESEARCH_PIPELINE.md)
+- [Benchmark: ingestion-time compression](./docs/NCP_BENCHMARK_COMPRESSION.md)
 - [MACE multi-agent eval](./benchmarks/mace/README.md)
 - [Post-V1 roadmap](./docs/NCP_POST_V1_ROADMAP.md)
 - [Active handoff packet](./docs/NCP_ACTIVE_HANDOFF_PACKET.md)
