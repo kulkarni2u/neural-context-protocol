@@ -216,6 +216,23 @@ class BaseStore(ABC):
           along ``caused_by`` edges.
         """
 
+    def query_precedents(
+        self,
+        query: str,
+        *,
+        pipeline_id: str | None = None,
+        k: int = 5,
+        tags: list[str] | None = None,
+        outcome: str | None = None,
+    ) -> list[dict[str, object]]:
+        """Query past decision traces by relevance, optionally filtered by tags and outcome.
+
+        Returns a list of dicts with: chunk_id, decision, rationale, alternatives,
+        outcome, evidence_refs, tags, base_trust, created_at, caused_by,
+        retrieval_count, dissent_count.
+        """
+        raise NotImplementedError("query_precedents not implemented for this backend")
+
     def trust_drift_data(
         self,
         *,
@@ -344,6 +361,26 @@ class BaseStore(ABC):
         """Asynchronously persist cost telemetry using thread pool."""
         fn = partial(self.log_cost, agent_id=agent_id, response=response)
         await anyio.to_thread.run_sync(fn)
+
+    async def async_query_precedents(
+        self,
+        query: str,
+        *,
+        pipeline_id: str | None = None,
+        k: int = 5,
+        tags: list[str] | None = None,
+        outcome: str | None = None,
+    ) -> list[dict[str, object]]:
+        """Asynchronously query precedents using thread pool."""
+        fn = partial(
+            self.query_precedents,
+            query,
+            pipeline_id=pipeline_id,
+            k=k,
+            tags=tags,
+            outcome=outcome,
+        )
+        return await anyio.to_thread.run_sync(fn)
 
     async def async_trust_drift_data(
         self,

@@ -175,6 +175,46 @@ MCP_TOOLS: list[dict[str, object]] = [
             "required": ["query"],
         },
     },
+    {
+        "name": "ncp_record_decision",
+        "description": (
+            "Record a structured decision trace: what was decided, what alternatives "
+            "were considered, and what evidence supported it. Stored as a reasoning_trace "
+            "chunk with caused_by edges for graph traversal and precedent queries."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "decision": {"type": "string", "description": "What was decided (concise statement)"},
+                "alternatives": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Other options that were considered",
+                },
+                "rationale": {"type": "string", "description": "Why this alternative was chosen over others"},
+                "evidence_refs": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Chunk IDs or turn refs that informed this decision",
+                },
+                "outcome": {
+                    "type": "string",
+                    "enum": ["pending", "succeeded", "failed", "superseded"],
+                    "description": "Current outcome status. Default 'pending'.",
+                },
+                "confidence": {"type": "number", "description": "Decision confidence 0.0-1.0"},
+                "agent_id": {"type": "string", "description": "Agent making this decision"},
+                "pipeline_id": {"type": "string", "description": "Pipeline scope"},
+                "caused_by": {"type": "string", "description": "Chunk ID that prompted this decision (causal parent)"},
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Searchable tags for precedent queries (e.g. 'architecture', 'null-guard', 'retry-logic')",
+                },
+            },
+            "required": ["decision", "rationale", "agent_id"],
+        },
+    },
 ]
 
 
@@ -453,12 +493,65 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             return {"result": "ncp_fetch:no_results query_too_specific_or_layer_empty"}
         return {"result": _encode_fetch_results(chunks)}
 
+    def _handle_record_decision(args: dict[str, object]) -> object:
+        decision = str(args["decision"])
+        rationale = str(args["rationale"])
+        agent_id = str(args["agent_id"])
+        alternatives = [str(a) for a in (args.get("alternatives") or [])]
+        evidence_refs = [str(r) for r in (args.get("evidence_refs") or [])]
+        outcome = str(args.get("outcome", "pending"))
+        confidence = float(args.get("confidence", 0.8) or 0.8)
+        pipeline_id = args.get("pipeline_id")
+        caused_by = args.get("caused_by")
+        tags = [str(t) for t in (args.get("tags") or [])]
+
+        alt_section = ""
+        if alternatives:
+            alt_section = "\nalternatives: " + " | ".join(alternatives)
+        evidence_section = ""
+        if evidence_refs:
+            evidence_section = "\nevidence: " + " ".join(evidence_refs)
+        tag_section = ""
+        if tags:
+            tag_section = "\ntags: " + " ".join(tags)
+
+        content = (
+            f"decision: {decision}\n"
+            f"rationale: {rationale}"
+            f"{alt_section}"
+            f"\noutcome: {outcome}"
+            f"{evidence_section}"
+            f"{tag_section}"
+        )
+        if len(content) > 2000:
+            content = content[:1997] + "..."
+
+        chunk = SubconsciousChunk(
+            layer="reasoning_trace",
+            content=content,
+            src="agent_inferred",
+            written_by=agent_id,
+            pipeline_id=pipeline_id,
+            caused_by=None if caused_by is None else str(caused_by),
+            base_trust=min(1.0, max(0.0, confidence)),
+            source_refs=evidence_refs,
+        )
+        ok = store.write(chunk)
+        return {
+            "recorded": ok,
+            "chunk_id": chunk.chunk_id,
+            "outcome": outcome,
+            "tag_count": len(tags),
+            "evidence_count": len(evidence_refs),
+        }
+
     return {
         "ncp_get_context": _handle_get_context,
         "ncp_write_memory": _handle_write_memory,
         "ncp_emit_whisper": _handle_emit_whisper,
         "ncp_post_turn": _handle_post_turn,
         "ncp_fetch": _handle_fetch,
+        "ncp_record_decision": _handle_record_decision,
     }
 
 

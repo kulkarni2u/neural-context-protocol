@@ -191,7 +191,7 @@ class TestToolsList:
         resp = _handle_request(_req("tools/list"), {})
         result = _result(resp)
         names = [t["name"] for t in result["tools"]]
-        assert names == ["ncp_get_context", "ncp_write_memory", "ncp_emit_whisper", "ncp_post_turn", "ncp_fetch"]
+        assert names == ["ncp_get_context", "ncp_write_memory", "ncp_emit_whisper", "ncp_post_turn", "ncp_fetch", "ncp_record_decision"]
 
     def test_tool_names_match_constants(self) -> None:
         resp = _handle_request(_req("tools/list"), {})

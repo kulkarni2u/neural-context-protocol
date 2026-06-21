@@ -1388,6 +1388,80 @@ def calibrate_command(
         console.print(f"[green]Calibrated {total_changed} chunk(s).[/green]")
 
 
+@main.command("precedents")
+@click.argument("query")
+@click.option("--cwd", type=click.Path(path_type=Path), default=Path.cwd)
+@click.option("--pipeline-id", default=None, help="Optional pipeline scope filter.")
+@click.option("--k", default=5, show_default=True, type=click.IntRange(1, 20), help="Number of precedents to return.")
+@click.option("--tag", "tags", multiple=True, help="Filter by tag (may be repeated).")
+@click.option("--outcome", default=None, type=click.Choice(["pending", "succeeded", "failed", "superseded"]), help="Filter by outcome.")
+@click.option("--json-output", is_flag=True, help="Emit machine-readable JSON instead of tables.")
+def precedents_command(
+    query: str,
+    cwd: Path,
+    pipeline_id: str | None,
+    k: int,
+    tags: tuple[str, ...],
+    outcome: str | None,
+    json_output: bool,
+) -> None:
+    """Query past decisions: 'show me decisions like this one and how they turned out.'"""
+
+    try:
+        config = ncp.configure(cwd=cwd)
+        store = _resolve_reporting_store(config, "precedents", "query_precedents")
+        results = store.query_precedents(
+            query,
+            pipeline_id=pipeline_id,
+            k=k,
+            tags=list(tags) if tags else None,
+            outcome=outcome,
+        )
+    except NCPStoreUnavailableError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    if json_output:
+        console.print_json(data={
+            "query": query,
+            "pipeline_id": pipeline_id,
+            "count": len(results),
+            "precedents": results,
+        })
+        return
+
+    console.print(f"[bold]NCP Precedents[/bold]  query=\"{query}\""
+                  + (f"  pipeline={pipeline_id}" if pipeline_id else ""))
+
+    if not results:
+        console.print("[dim]No matching decision traces found.[/dim]")
+        return
+
+    for i, row in enumerate(results, 1):
+        prec_table = Table(title=f"Precedent {i}", box=box.MINIMAL_DOUBLE_HEAD)
+        prec_table.add_column("Field")
+        prec_table.add_column("Value")
+        prec_table.add_row("Chunk ID", str(row["chunk_id"])[:16])
+        prec_table.add_row("Decision", str(row["decision"]))
+        prec_table.add_row("Rationale", str(row["rationale"]))
+        alts = row.get("alternatives", [])
+        if alts:
+            prec_table.add_row("Alternatives", " | ".join(str(a) for a in alts))
+        prec_table.add_row("Outcome", str(row["outcome"]))
+        prec_table.add_row("Trust", f"{float(row['base_trust']):.3f}")
+        prec_table.add_row("Relevance", f"{float(row['relevance']):.3f}")
+        tags_val = row.get("tags", [])
+        if tags_val:
+            prec_table.add_row("Tags", " ".join(str(t) for t in tags_val))
+        evidence = row.get("evidence_refs", [])
+        if evidence:
+            prec_table.add_row("Evidence", " ".join(str(e) for e in evidence))
+        if row.get("caused_by"):
+            prec_table.add_row("Caused by", str(row["caused_by"]))
+        prec_table.add_row("Retrievals", str(row["retrieval_count"]))
+        prec_table.add_row("Dissents", str(row["dissent_count"]))
+        console.print(prec_table)
+
+
 @main.command("trust-drift")
 @click.option("--cwd", type=click.Path(path_type=Path), default=Path.cwd)
 @click.option("--pipeline-id", default=None, help="Optional pipeline scope filter.")

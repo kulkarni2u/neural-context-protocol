@@ -1282,6 +1282,71 @@ class SQLiteStore(BaseStore):
             ],
         }
 
+    def query_precedents(
+        self,
+        query: str,
+        *,
+        pipeline_id: str | None = None,
+        k: int = 5,
+        tags: list[str] | None = None,
+        outcome: str | None = None,
+    ) -> list[dict[str, object]]:
+        chunks = self.query(
+            text=query,
+            k=k * 3,
+            min_score=0.0,
+            layer="reasoning_trace",
+            pipeline_id=pipeline_id,
+            fallback_to_trust_recency=True,
+        )
+        results: list[dict[str, object]] = []
+        for chunk in chunks:
+            content = chunk.content
+            parsed = self._parse_decision_content(content)
+            if outcome is not None and parsed.get("outcome") != outcome:
+                continue
+            if tags:
+                chunk_tags = parsed.get("tags", [])
+                if not any(t in chunk_tags for t in tags):
+                    continue
+            results.append({
+                "chunk_id": chunk.chunk_id,
+                "decision": parsed.get("decision", ""),
+                "rationale": parsed.get("rationale", ""),
+                "alternatives": parsed.get("alternatives", []),
+                "outcome": parsed.get("outcome", "unknown"),
+                "evidence_refs": chunk.source_refs,
+                "tags": parsed.get("tags", []),
+                "base_trust": chunk.base_trust,
+                "relevance": chunk.relevance,
+                "created_at": chunk.age_seconds,
+                "caused_by": chunk.caused_by,
+                "retrieval_count": chunk.retrieval_count,
+                "dissent_count": chunk.dissent_count,
+            })
+            if len(results) >= k:
+                break
+        return results
+
+    @staticmethod
+    def _parse_decision_content(content: str) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for line in content.split("\n"):
+            line = line.strip()
+            if line.startswith("decision: "):
+                result["decision"] = line[len("decision: "):]
+            elif line.startswith("rationale: "):
+                result["rationale"] = line[len("rationale: "):]
+            elif line.startswith("alternatives: "):
+                result["alternatives"] = [a.strip() for a in line[len("alternatives: "):].split("|")]
+            elif line.startswith("outcome: "):
+                result["outcome"] = line[len("outcome: "):]
+            elif line.startswith("evidence: "):
+                result["evidence_refs"] = line[len("evidence: "):].split()
+            elif line.startswith("tags: "):
+                result["tags"] = line[len("tags: "):].split()
+        return result
+
     def trust_drift_data(
         self,
         *,
