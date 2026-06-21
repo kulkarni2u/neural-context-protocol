@@ -135,6 +135,83 @@ def test_cli_status_json_and_cost_command(tmp_path: Path) -> None:
     assert cost_payload["recent_entries"][0]["turn_id"] == "turn_cost_cli"
 
 
+def test_cli_calibrate_feedback_runs_self_improvement_pass(tmp_path: Path) -> None:
+    runner = CliRunner()
+    runner.invoke(main, ["init", "--cwd", str(tmp_path)])
+    store = SQLiteStore(tmp_path / ".ncp" / "store.db")
+    store.write(
+        SubconsciousChunk(
+            chunk_id="cause_chunk",
+            layer="episodic",
+            content="root analysis content",
+            src="agent_inferred",
+            base_trust=0.6,
+            pipeline_id="pipe_fb",
+        )
+    )
+    store.write(
+        SubconsciousChunk(
+            chunk_id="effect_chunk",
+            layer="episodic",
+            content="frequently retrieved fix",
+            src="agent_inferred",
+            base_trust=0.6,
+            caused_by="cause_chunk",
+            pipeline_id="pipe_fb",
+        )
+    )
+    for _ in range(10):
+        store.query("frequently retrieved fix", k=4, min_score=0.0, pipeline_id="pipe_fb")
+
+    result = runner.invoke(main, ["calibrate", "--cwd", str(tmp_path), "--feedback"])
+
+    assert result.exit_code == 0
+    assert "feedback" in result.output
+    assert "Feedback adjusted" in result.output
+
+    zone = {c.chunk_id: c for c in store.get_working_zone(pipeline_id="pipe_fb")}
+    assert zone["effect_chunk"].base_trust > 0.6  # boosted by retrieval
+    assert zone["cause_chunk"].base_trust > 0.6   # credited via propagation
+
+
+def test_cli_calibrate_feedback_dry_run_makes_no_changes(tmp_path: Path) -> None:
+    runner = CliRunner()
+    runner.invoke(main, ["init", "--cwd", str(tmp_path)])
+    store = SQLiteStore(tmp_path / ".ncp" / "store.db")
+    store.write(
+        SubconsciousChunk(
+            chunk_id="c1",
+            layer="episodic",
+            content="retrieved content here",
+            src="agent_inferred",
+            base_trust=0.6,
+            pipeline_id="pipe_fb",
+        )
+    )
+    for _ in range(5):
+        store.query("retrieved content", k=4, min_score=0.0, pipeline_id="pipe_fb")
+
+    result = runner.invoke(main, ["calibrate", "--cwd", str(tmp_path), "--feedback", "--dry-run"])
+
+    assert result.exit_code == 0
+    assert "Dry run" in result.output
+    zone = {c.chunk_id: c for c in store.get_working_zone(pipeline_id="pipe_fb")}
+    assert zone["c1"].base_trust == 0.6  # unchanged
+
+
+def test_cli_calibrate_feedback_rejects_chunk_id(tmp_path: Path) -> None:
+    runner = CliRunner()
+    runner.invoke(main, ["init", "--cwd", str(tmp_path)])
+
+    result = runner.invoke(
+        main,
+        ["calibrate", "--cwd", str(tmp_path), "--feedback", "--chunk-id", "x", "--trust", "0.5"],
+    )
+
+    assert result.exit_code != 0
+    assert "cannot be combined" in result.output
+
+
 def test_cli_explain_renders_narrative_and_json(tmp_path: Path) -> None:
     runner = CliRunner()
     runner.invoke(main, ["init", "--cwd", str(tmp_path)])

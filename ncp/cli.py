@@ -1310,6 +1310,10 @@ def consolidate_command(
 @click.option("--chunk-id", default=None, help="Pinpoint chunk to override (manual mode).")
 @click.option("--trust", default=None, type=float, help="Explicit trust value for manual override (required with --chunk-id).")
 @click.option("--decay-factor", default=0.85, show_default=True, type=float, help="Multiplicative decay applied in batch mode.")
+@click.option("--feedback", is_flag=True, default=False, help="Run the self-improvement pass: boost retrieved chunks, penalize disputed ones, and propagate net trust along caused_by edges.")
+@click.option("--feedback-weight", default=None, type=float, help="Max retrieval boost (default from config, 0.15).")
+@click.option("--propagation-factor", default=None, type=float, help="Fraction of a chunk's net delta propagated to its caused_by parent (default from config, 0.5).")
+@click.option("--dissent-weight", default=None, type=float, help="Max dissent penalty (default from config, 0.2).")
 @click.option("--dry-run", is_flag=True, default=False, help="Preview changes without writing.")
 def calibrate_command(
     cwd: Path | None,
@@ -1317,6 +1321,10 @@ def calibrate_command(
     chunk_id: str | None,
     trust: float | None,
     decay_factor: float,
+    feedback: bool,
+    feedback_weight: float | None,
+    propagation_factor: float | None,
+    dissent_weight: float | None,
     dry_run: bool,
 ) -> None:
     """Re-score base_trust on existing chunks without touching the database manually."""
@@ -1324,6 +1332,8 @@ def calibrate_command(
 
     if chunk_id is not None and trust is None:
         raise click.UsageError("--trust is required when --chunk-id is provided.")
+    if feedback and chunk_id is not None:
+        raise click.UsageError("--feedback cannot be combined with --chunk-id (manual override).")
 
     config = load_config(cwd=cwd or Path.cwd())
 
@@ -1332,34 +1342,50 @@ def calibrate_command(
     except NCPStoreUnavailableError as exc:
         raise click.ClickException(str(exc)) from exc
 
-    try:
-        report = store.calibrate(
-            pipeline_id=pipeline_id,
-            chunk_id=chunk_id,
-            trust=trust,
-            dry_run=dry_run,
-            decay_factor=decay_factor,
+    calibrate_kwargs: dict = {
+        "pipeline_id": pipeline_id,
+        "chunk_id": chunk_id,
+        "trust": trust,
+        "dry_run": dry_run,
+        "decay_factor": decay_factor,
+    }
+    if feedback:
+        calibrate_kwargs["feedback_mode"] = True
+        if feedback_weight is not None:
+            calibrate_kwargs["feedback_weight"] = feedback_weight
+        calibrate_kwargs["propagation_factor"] = (
+            propagation_factor if propagation_factor is not None else config.trust_propagation_factor
         )
+        calibrate_kwargs["dissent_weight"] = (
+            dissent_weight if dissent_weight is not None else config.dissent_weight
+        )
+
+    try:
+        report = store.calibrate(**calibrate_kwargs)
     except (NCPStoreUnavailableError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
 
     table = Table(title="Calibration Report", box=box.SIMPLE)
     table.add_column("Metric", style="cyan")
     table.add_column("Value", style="green")
-    table.add_row("Mode", "dry-run" if report.dry_run else "live")
+    table.add_row("Mode", "feedback" if feedback else "manual" if chunk_id else "decay")
+    table.add_row("Run", "dry-run" if report.dry_run else "live")
     table.add_row("Pipeline", report.pipeline_id or "all")
     table.add_row("Adjusted", str(report.adjusted))
+    if feedback:
+        table.add_row("Feedback adjusted", str(report.feedback_adjusted))
     table.add_row("Protected (user_verified)", str(report.protected))
     table.add_row("Skipped", str(report.skipped))
     table.add_row("Duration", f"{report.duration_seconds:.3f}s")
     console.print(table)
 
-    if report.dry_run and report.adjusted > 0:
-        console.print(f"[yellow]Dry run: {report.adjusted} chunk(s) would be adjusted.[/yellow]")
-    elif report.adjusted == 0:
+    total_changed = report.adjusted + report.feedback_adjusted
+    if report.dry_run and total_changed > 0:
+        console.print(f"[yellow]Dry run: {total_changed} chunk(s) would be adjusted.[/yellow]")
+    elif total_changed == 0:
         console.print("[dim]Nothing to calibrate.[/dim]")
     else:
-        console.print(f"[green]Calibrated {report.adjusted} chunk(s).[/green]")
+        console.print(f"[green]Calibrated {total_changed} chunk(s).[/green]")
 
 
 @main.command("batch")

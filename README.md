@@ -236,10 +236,15 @@ ncp cost        # token and USD rollups
 ncp explain     # human-readable runtime summary
 ncp viz         # pipeline visualization
 ncp consolidate # merge and compact memory
-ncp calibrate   # recalibrate trust and retrieval weights
+ncp calibrate   # recalibrate trust (add --feedback for the self-improvement pass)
 ncp handoff     # cross-agent handoff coordination
 ncp batch       # process a JSONL file of NCP operations
 ```
+
+`ncp calibrate --feedback` runs the self-improvement pass: it boosts chunks that
+keep getting retrieved, penalizes chunks that drew dissent, and propagates the
+net trust change one hop along `caused_by` edges so a cause is credited or
+debited for what it produced. Add `--dry-run` to preview.
 
 -----
 
