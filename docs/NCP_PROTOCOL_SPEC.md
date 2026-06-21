@@ -149,12 +149,18 @@ Store metadata:
   scope           str   = "pipeline"   pipeline|global
   zone            str   = "working"    working|proven|global
   schema_version  int   = 1
-  supersedes      str?  = None
+  supersedes      str?  = None     chunk_id (or JSON list) this chunk replaces
   source_refs     list[str] = []   for synthesis chunks
+  raw_ref         str?  = None     chunk_id of the unfiltered original (reversible compression)
 
 Runtime (set at retrieval):
   relevance       float = 0.0
   age_seconds     float = 0.0
+
+Feedback counters (drive calibration and trust-drift observability):
+  retrieval_count int = 0    incremented on each retrieval (positive signal)
+  dissent_count   int = 0    incremented by record_dissent / dissent whispers (negative signal)
+  Queried by `trust_drift_data()` to surface rising/falling chunks.
 
 Derived property:
   effective_score = relevance × exp(-0.693 × age_seconds / 14400)
@@ -454,6 +460,11 @@ Step 3: Hybrid subconscious retrieval
   apply scope, layer, expiry filters
   apply diversity cap (max 2 per written_by)
   select top 4 by effective_score
+
+Step 3b: 1-hop edge expansion (optional, retrieval.edge_expansion, default on)
+  pull caused_by neighbors of retrieved chunks (decayed inherited relevance)
+  suppress chunks whose superseding chunk is already present
+  neighbors compete inside the same chunk_cap — never widens the budget
 
 Step 4: Peek whisper queue
   filter: not expired, confidence >= 0.60 (except alert + world_check)

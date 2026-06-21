@@ -71,6 +71,8 @@ class Assembler:
         self._whisper_cap_default = config.whisper_cap_default if config else 3
         self._whisper_cap_high = config.whisper_cap_high if config else 2
         self._whisper_cap_critical = config.whisper_cap_critical if config else 1
+        self._edge_expansion = config.edge_expansion_enabled if config else True
+        self._edge_expansion_decay = config.edge_expansion_decay if config else 0.7
 
     # ------------------------------------------------------------------
     # Step 0-5: assemble
@@ -109,6 +111,10 @@ class Assembler:
             diversity_limit=diversity_limit,
         )
         subconscious = self._cold_start_bootstrap(hydrated, subconscious)
+        if self._edge_expansion:
+            expanded = self._expand_edges([*recent_chunks, *subconscious], limit=chunk_cap)
+            subconscious = [*subconscious, *expanded]
+            recent_chunks, subconscious = self._suppress_superseded(recent_chunks, subconscious)
         deduped_chunks = self._dedupe_chunks([*recent_chunks, *subconscious])
         combined_chunks = self._split_recent_and_retrieved_chunks(
             recent_chunks=recent_chunks,
@@ -455,6 +461,83 @@ class Assembler:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # 1-hop edge expansion + supersession suppression
+    # ------------------------------------------------------------------
+
+    def _expand_edges(
+        self,
+        chunks: list[SubconsciousChunk],
+        *,
+        limit: int,
+    ) -> list[SubconsciousChunk]:
+        """Pull in 1-hop ``caused_by`` neighbors of the retrieved set.
+
+        The cause of a relevant chunk is often more useful than the next
+        marginal lexical hit, and fetching it here saves the model an
+        ``ncp_fetch`` round trip. Neighbors inherit a decayed relevance from
+        the chunk that referenced them so they stay subordinate to primary
+        results, and they still compete inside the existing ``chunk_cap`` —
+        expansion never widens the bounded budget.
+        """
+        present_ids = {chunk.chunk_id for chunk in chunks}
+        # Map neighbor id -> best (decayed) relevance inherited from a referrer.
+        wanted: dict[str, float] = {}
+        for chunk in chunks:
+            cause = chunk.caused_by
+            if not cause or cause in present_ids:
+                continue
+            inherited = float(chunk.relevance) * self._edge_expansion_decay
+            if inherited > wanted.get(cause, -1.0):
+                wanted[cause] = inherited
+        if not wanted:
+            return []
+        # Bound the fetch so a fan-out of edges can't blow up the query.
+        neighbor_ids = sorted(wanted, key=lambda cid: -wanted[cid])[: max(1, limit)]
+        fetched = self.store.get_chunks_by_ids(neighbor_ids)
+        expanded: list[SubconsciousChunk] = []
+        for neighbor in fetched:
+            if neighbor.chunk_id in present_ids:
+                continue
+            expanded.append(neighbor.model_copy(update={"relevance": wanted.get(neighbor.chunk_id, 0.0)}))
+        return expanded
+
+    @staticmethod
+    def _superseded_ids(chunks: list[SubconsciousChunk]) -> set[str]:
+        """Collect chunk ids that any present chunk declares it supersedes.
+
+        ``supersedes`` is a single id on manual writes and a JSON list of ids
+        after consolidation; both shapes are handled.
+        """
+        superseded: set[str] = set()
+        for chunk in chunks:
+            raw = chunk.supersedes
+            if not raw:
+                continue
+            try:
+                parsed = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                superseded.add(str(raw))
+                continue
+            if isinstance(parsed, list):
+                superseded.update(str(item) for item in parsed)
+            else:
+                superseded.add(str(parsed))
+        return superseded
+
+    def _suppress_superseded(
+        self,
+        recent_chunks: list[SubconsciousChunk],
+        retrieved_chunks: list[SubconsciousChunk],
+    ) -> tuple[list[SubconsciousChunk], list[SubconsciousChunk]]:
+        """Drop candidates whose successor is already present in the set."""
+        superseded = self._superseded_ids([*recent_chunks, *retrieved_chunks])
+        if not superseded:
+            return recent_chunks, retrieved_chunks
+        recent = [chunk for chunk in recent_chunks if chunk.chunk_id not in superseded]
+        retrieved = [chunk for chunk in retrieved_chunks if chunk.chunk_id not in superseded]
+        return recent, retrieved
 
     def _dedupe_chunks(self, chunks: list[SubconsciousChunk]) -> list[SubconsciousChunk]:
         seen: set[str] = set()

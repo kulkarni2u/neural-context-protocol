@@ -1310,6 +1310,10 @@ def consolidate_command(
 @click.option("--chunk-id", default=None, help="Pinpoint chunk to override (manual mode).")
 @click.option("--trust", default=None, type=float, help="Explicit trust value for manual override (required with --chunk-id).")
 @click.option("--decay-factor", default=0.85, show_default=True, type=float, help="Multiplicative decay applied in batch mode.")
+@click.option("--feedback", is_flag=True, default=False, help="Run the self-improvement pass: boost retrieved chunks, penalize disputed ones, and propagate net trust along caused_by edges.")
+@click.option("--feedback-weight", default=None, type=float, help="Max retrieval boost (default from config, 0.15).")
+@click.option("--propagation-factor", default=None, type=float, help="Fraction of a chunk's net delta propagated to its caused_by parent (default from config, 0.5).")
+@click.option("--dissent-weight", default=None, type=float, help="Max dissent penalty (default from config, 0.2).")
 @click.option("--dry-run", is_flag=True, default=False, help="Preview changes without writing.")
 def calibrate_command(
     cwd: Path | None,
@@ -1317,6 +1321,10 @@ def calibrate_command(
     chunk_id: str | None,
     trust: float | None,
     decay_factor: float,
+    feedback: bool,
+    feedback_weight: float | None,
+    propagation_factor: float | None,
+    dissent_weight: float | None,
     dry_run: bool,
 ) -> None:
     """Re-score base_trust on existing chunks without touching the database manually."""
@@ -1324,6 +1332,8 @@ def calibrate_command(
 
     if chunk_id is not None and trust is None:
         raise click.UsageError("--trust is required when --chunk-id is provided.")
+    if feedback and chunk_id is not None:
+        raise click.UsageError("--feedback cannot be combined with --chunk-id (manual override).")
 
     config = load_config(cwd=cwd or Path.cwd())
 
@@ -1332,34 +1342,232 @@ def calibrate_command(
     except NCPStoreUnavailableError as exc:
         raise click.ClickException(str(exc)) from exc
 
-    try:
-        report = store.calibrate(
-            pipeline_id=pipeline_id,
-            chunk_id=chunk_id,
-            trust=trust,
-            dry_run=dry_run,
-            decay_factor=decay_factor,
+    calibrate_kwargs: dict = {
+        "pipeline_id": pipeline_id,
+        "chunk_id": chunk_id,
+        "trust": trust,
+        "dry_run": dry_run,
+        "decay_factor": decay_factor,
+    }
+    if feedback:
+        calibrate_kwargs["feedback_mode"] = True
+        if feedback_weight is not None:
+            calibrate_kwargs["feedback_weight"] = feedback_weight
+        calibrate_kwargs["propagation_factor"] = (
+            propagation_factor if propagation_factor is not None else config.trust_propagation_factor
         )
+        calibrate_kwargs["dissent_weight"] = (
+            dissent_weight if dissent_weight is not None else config.dissent_weight
+        )
+
+    try:
+        report = store.calibrate(**calibrate_kwargs)
     except (NCPStoreUnavailableError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
 
     table = Table(title="Calibration Report", box=box.SIMPLE)
     table.add_column("Metric", style="cyan")
     table.add_column("Value", style="green")
-    table.add_row("Mode", "dry-run" if report.dry_run else "live")
+    table.add_row("Mode", "feedback" if feedback else "manual" if chunk_id else "decay")
+    table.add_row("Run", "dry-run" if report.dry_run else "live")
     table.add_row("Pipeline", report.pipeline_id or "all")
     table.add_row("Adjusted", str(report.adjusted))
+    if feedback:
+        table.add_row("Feedback adjusted", str(report.feedback_adjusted))
     table.add_row("Protected (user_verified)", str(report.protected))
     table.add_row("Skipped", str(report.skipped))
     table.add_row("Duration", f"{report.duration_seconds:.3f}s")
     console.print(table)
 
-    if report.dry_run and report.adjusted > 0:
-        console.print(f"[yellow]Dry run: {report.adjusted} chunk(s) would be adjusted.[/yellow]")
-    elif report.adjusted == 0:
+    total_changed = report.adjusted + report.feedback_adjusted
+    if report.dry_run and total_changed > 0:
+        console.print(f"[yellow]Dry run: {total_changed} chunk(s) would be adjusted.[/yellow]")
+    elif total_changed == 0:
         console.print("[dim]Nothing to calibrate.[/dim]")
     else:
-        console.print(f"[green]Calibrated {report.adjusted} chunk(s).[/green]")
+        console.print(f"[green]Calibrated {total_changed} chunk(s).[/green]")
+
+
+@main.command("precedents")
+@click.argument("query")
+@click.option("--cwd", type=click.Path(path_type=Path), default=Path.cwd)
+@click.option("--pipeline-id", default=None, help="Optional pipeline scope filter.")
+@click.option("--k", default=5, show_default=True, type=click.IntRange(1, 20), help="Number of precedents to return.")
+@click.option("--tag", "tags", multiple=True, help="Filter by tag (may be repeated).")
+@click.option("--outcome", default=None, type=click.Choice(["pending", "succeeded", "failed", "superseded"]), help="Filter by outcome.")
+@click.option("--json-output", is_flag=True, help="Emit machine-readable JSON instead of tables.")
+def precedents_command(
+    query: str,
+    cwd: Path,
+    pipeline_id: str | None,
+    k: int,
+    tags: tuple[str, ...],
+    outcome: str | None,
+    json_output: bool,
+) -> None:
+    """Query past decisions: 'show me decisions like this one and how they turned out.'"""
+
+    try:
+        config = ncp.configure(cwd=cwd)
+        store = _resolve_reporting_store(config, "precedents", "query_precedents")
+        results = store.query_precedents(
+            query,
+            pipeline_id=pipeline_id,
+            k=k,
+            tags=list(tags) if tags else None,
+            outcome=outcome,
+        )
+    except NCPStoreUnavailableError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    if json_output:
+        console.print_json(data={
+            "query": query,
+            "pipeline_id": pipeline_id,
+            "count": len(results),
+            "precedents": results,
+        })
+        return
+
+    console.print(f"[bold]NCP Precedents[/bold]  query=\"{query}\""
+                  + (f"  pipeline={pipeline_id}" if pipeline_id else ""))
+
+    if not results:
+        console.print("[dim]No matching decision traces found.[/dim]")
+        return
+
+    for i, row in enumerate(results, 1):
+        prec_table = Table(title=f"Precedent {i}", box=box.MINIMAL_DOUBLE_HEAD)
+        prec_table.add_column("Field")
+        prec_table.add_column("Value")
+        prec_table.add_row("Chunk ID", str(row["chunk_id"])[:16])
+        prec_table.add_row("Decision", str(row["decision"]))
+        prec_table.add_row("Rationale", str(row["rationale"]))
+        alts = row.get("alternatives", [])
+        if alts:
+            prec_table.add_row("Alternatives", " | ".join(str(a) for a in alts))
+        prec_table.add_row("Outcome", str(row["outcome"]))
+        prec_table.add_row("Trust", f"{float(row['base_trust']):.3f}")
+        prec_table.add_row("Relevance", f"{float(row['relevance']):.3f}")
+        tags_val = row.get("tags", [])
+        if tags_val:
+            prec_table.add_row("Tags", " ".join(str(t) for t in tags_val))
+        evidence = row.get("evidence_refs", [])
+        if evidence:
+            prec_table.add_row("Evidence", " ".join(str(e) for e in evidence))
+        if row.get("caused_by"):
+            prec_table.add_row("Caused by", str(row["caused_by"]))
+        prec_table.add_row("Retrievals", str(row["retrieval_count"]))
+        prec_table.add_row("Dissents", str(row["dissent_count"]))
+        console.print(prec_table)
+
+
+@main.command("trust-drift")
+@click.option("--cwd", type=click.Path(path_type=Path), default=Path.cwd)
+@click.option("--pipeline-id", default=None, help="Optional pipeline scope filter.")
+@click.option("--top-k", default=10, show_default=True, type=click.IntRange(1, 50), help="Number of top rising/falling chunks to show.")
+@click.option("--json-output", is_flag=True, help="Emit machine-readable JSON instead of tables.")
+def trust_drift_command(cwd: Path, pipeline_id: str | None, top_k: int, json_output: bool) -> None:
+    """Show trust-drift observability: which chunks are gaining or losing trust."""
+
+    from rich.panel import Panel
+
+    try:
+        config = ncp.configure(cwd=cwd)
+        store = _resolve_reporting_store(config, "trust-drift", "trust_drift_data")
+        data = store.trust_drift_data(pipeline_id=pipeline_id, top_k=top_k)
+    except NCPStoreUnavailableError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    if json_output:
+        console.print_json(data={
+            "store_path": _store_display(config),
+            "pipeline_id": pipeline_id,
+            **data,
+        })
+        return
+
+    console.print(f"[bold]NCP Trust Drift[/bold]  store={_store_display(config)}"
+                  + (f"  pipeline={pipeline_id}" if pipeline_id else ""))
+
+    # Feedback summary panel
+    fs = data["feedback_summary"]
+    summary_lines = [
+        f"Total chunks: {fs['total_chunks']}",
+        f"With retrievals: {fs['with_retrievals']}  |  With dissents: {fs['with_dissents']}",
+        f"Net positive: {fs['net_positive']}  |  Net negative: {fs['net_negative']}  |  Untouched: {fs['untouched']}",
+    ]
+    console.print(Panel("\n".join(summary_lines), title="Feedback Summary", expand=False))
+
+    # Trust distribution
+    dist_table = Table(title="Trust Distribution", box=box.SIMPLE_HEAVY)
+    dist_table.add_column("Band")
+    dist_table.add_column("Count", justify="right")
+    dist_table.add_column("Avg Trust", justify="right")
+    for row in data["trust_distribution"]:
+        dist_table.add_row(str(row["band"]), str(row["count"]), f"{float(row['avg_trust']):.4f}")
+    if not data["trust_distribution"]:
+        dist_table.add_row("[dim]-[/dim]", "[dim]0[/dim]", "[dim]-[/dim]")
+    console.print(dist_table)
+
+    # Rising chunks
+    rising_table = Table(title="Rising (most retrieved)", box=box.MINIMAL_DOUBLE_HEAD)
+    rising_table.add_column("ID (16)")
+    rising_table.add_column("Layer")
+    rising_table.add_column("Trust", justify="right")
+    rising_table.add_column("Retrievals", justify="right")
+    rising_table.add_column("Dissents", justify="right")
+    rising_table.add_column("Age (s)", justify="right")
+    for row in data["rising"]:
+        rising_table.add_row(
+            str(row["chunk_id"]),
+            str(row["layer"]),
+            f"{float(row['base_trust']):.3f}",
+            str(row["retrieval_count"]),
+            str(row["dissent_count"]),
+            str(row["age_seconds"]),
+        )
+    if not data["rising"]:
+        rising_table.add_row("[dim]-[/dim]", "[dim]-[/dim]", "[dim]-[/dim]", "[dim]0[/dim]", "[dim]0[/dim]", "[dim]-[/dim]")
+    console.print(rising_table)
+
+    # Falling chunks
+    falling_table = Table(title="Falling (most dissented)", box=box.MINIMAL_DOUBLE_HEAD)
+    falling_table.add_column("ID (16)")
+    falling_table.add_column("Layer")
+    falling_table.add_column("Trust", justify="right")
+    falling_table.add_column("Retrievals", justify="right")
+    falling_table.add_column("Dissents", justify="right")
+    falling_table.add_column("Age (s)", justify="right")
+    for row in data["falling"]:
+        falling_table.add_row(
+            str(row["chunk_id"]),
+            str(row["layer"]),
+            f"{float(row['base_trust']):.3f}",
+            str(row["retrieval_count"]),
+            str(row["dissent_count"]),
+            str(row["age_seconds"]),
+        )
+    if not data["falling"]:
+        falling_table.add_row("[dim]-[/dim]", "[dim]-[/dim]", "[dim]-[/dim]", "[dim]0[/dim]", "[dim]0[/dim]", "[dim]-[/dim]")
+    console.print(falling_table)
+
+    # Drift timeline (if present)
+    drift_timeline = data["drift_timeline"]
+    if drift_timeline:
+        drift_table = Table(title="Recent Drift Readings", box=box.MINIMAL_DOUBLE_HEAD)
+        drift_table.add_column("Session")
+        drift_table.add_column("Turn", justify="right")
+        drift_table.add_column("Drift Score", justify="right")
+        drift_table.add_column("Timestamp")
+        for row in drift_timeline[:10]:
+            drift_table.add_row(
+                str(row["session_id"])[:16],
+                str(row["turn"]),
+                f"{float(row['drift_score']):.4f}",
+                _format_ts(float(row["ts"])),
+            )
+        console.print(drift_table)
 
 
 @main.command("batch")

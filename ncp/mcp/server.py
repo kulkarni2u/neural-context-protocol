@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import BinaryIO
 
 from ncp.assembler import Assembler
+from ncp.chunker import filter_content
 from ncp.config import NCPConfig, load_config
 from ncp.stores.base import BaseStore
 from ncp.stores.factory import create_store
@@ -77,7 +78,13 @@ MCP_TOOLS: list[dict[str, object]] = [
     },
     {
         "name": "ncp_write_memory",
-        "description": "Write a durable subconscious chunk to the store. Use at the end of each turn to persist results.",
+        "description": (
+            "Write a durable subconscious chunk to the store. Content is automatically "
+            "filtered at ingestion (ANSI codes, duplicate lines, boilerplate stripped). "
+            "If filtering reduced the content, the response includes filtered=true, "
+            "reduction_ratio, and a raw_ref chunk ID you can retrieve via ncp_fetch "
+            "to recover the original."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -113,6 +120,14 @@ MCP_TOOLS: list[dict[str, object]] = [
                 "confidence": {"type": "number", "description": "Confidence 0.0-1.0"},
                 "pipeline_id": {"type": "string"},
                 "ttl_seconds": {"type": "integer", "description": "Seconds before expiry. Default 1800."},
+                "ref": {
+                    "type": "string",
+                    "description": (
+                        "Optional chunk_id this whisper refers to. For a dissent whisper, set this "
+                        "to the disputed chunk_id: it debits that chunk's trust and propagates the "
+                        "penalty along its caused_by edge during feedback calibration."
+                    ),
+                },
             },
             "required": ["from", "target", "type", "payload", "confidence"],
         },
@@ -160,13 +175,56 @@ MCP_TOOLS: list[dict[str, object]] = [
             "required": ["query"],
         },
     },
+    {
+        "name": "ncp_record_decision",
+        "description": (
+            "Record a structured decision trace: what was decided, what alternatives "
+            "were considered, and what evidence supported it. Stored as a reasoning_trace "
+            "chunk with caused_by edges for graph traversal and precedent queries."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "decision": {"type": "string", "description": "What was decided (concise statement)"},
+                "alternatives": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Other options that were considered",
+                },
+                "rationale": {"type": "string", "description": "Why this alternative was chosen over others"},
+                "evidence_refs": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Chunk IDs or turn refs that informed this decision",
+                },
+                "outcome": {
+                    "type": "string",
+                    "enum": ["pending", "succeeded", "failed", "superseded"],
+                    "description": "Current outcome status. Default 'pending'.",
+                },
+                "confidence": {"type": "number", "description": "Decision confidence 0.0-1.0"},
+                "agent_id": {"type": "string", "description": "Agent making this decision"},
+                "pipeline_id": {"type": "string", "description": "Pipeline scope"},
+                "caused_by": {"type": "string", "description": "Chunk ID that prompted this decision (causal parent)"},
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Searchable tags for precedent queries (e.g. 'architecture', 'null-guard', 'retry-logic')",
+                },
+            },
+            "required": ["decision", "rationale", "agent_id"],
+        },
+    },
 ]
 
 
 def _encode_fetch_results(chunks: list[SubconsciousChunk]) -> str:
     lines = [f"ncp_fetch:results k:{len(chunks)}"]
     for chunk in chunks:
-        lines.append(f"chunk:{chunk.chunk_id} layer:{chunk.layer} score:{chunk.relevance:.2f}")
+        header = f"chunk:{chunk.chunk_id} layer:{chunk.layer} score:{chunk.relevance:.2f}"
+        if chunk.raw_ref:
+            header += f" raw_ref:{chunk.raw_ref}"
+        lines.append(header)
         lines.append(f"  {chunk.content}")
     return "\n".join(lines)
 
@@ -304,8 +362,12 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             pipeline_id=None if pipeline_id is None else str(pipeline_id),
             agent_id=written_by,
         )
+        raw_content = str(args["content"])
+        fr = filter_content(raw_content)
+        content = fr.filtered
+
         kwargs: dict = {
-            "content": str(args["content"]),
+            "content": content,
             "layer": str(args["layer"]),
             "src": str(args["src"]),
             "written_by": written_by,
@@ -315,9 +377,32 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         }
         if (chunk_id := args.get("chunk_id")):
             kwargs["chunk_id"] = str(chunk_id)
+
+        raw_ref: str | None = None
+        if fr.was_filtered and len(raw_content) <= 2000:
+            raw_chunk = SubconsciousChunk(
+                chunk_id=f"raw_{kwargs.get('chunk_id', '')}_{int(time.time() * 1000)}",
+                layer=str(args["layer"]),
+                content=raw_content,
+                src="tool_result",
+                written_by=written_by,
+                pipeline_id=pipeline_id,
+                base_trust=0.1,
+                zone="working",
+            )
+            store.write(raw_chunk)
+            raw_ref = raw_chunk.chunk_id
+            kwargs["raw_ref"] = raw_ref
+
         chunk = SubconsciousChunk(**kwargs)
         ok = store.write(chunk)
-        return {"written": ok, "chunk_id": chunk.chunk_id}
+        result: dict[str, object] = {"written": ok, "chunk_id": chunk.chunk_id}
+        if fr.was_filtered:
+            result["filtered"] = True
+            result["reduction_ratio"] = round(fr.reduction_ratio, 3)
+            if raw_ref is not None:
+                result["raw_ref"] = raw_ref
+        return result
 
     def _handle_emit_whisper(args: dict[str, object]) -> object:
         whisper_type = str(args["type"])
@@ -326,6 +411,7 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             ttl_seconds = max(1, int(args.get("ttl_seconds", default_whisper_ttl)))
         except (TypeError, ValueError):
             ttl_seconds = default_whisper_ttl
+        ref = args.get("ref")
         whisper = Whisper(
             from_agent=str(args["from"]),
             target=str(args["target"]),
@@ -334,9 +420,13 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             confidence=float(args["confidence"]),
             pipeline_id=args.get("pipeline_id"),
             ttl_seconds=ttl_seconds,
+            ref=None if ref is None else str(ref),
         )
         store.emit_whisper(whisper)
-        return {"emitted": True}
+        result: dict[str, object] = {"emitted": True}
+        if whisper_type == "dissent" and ref:
+            result["dissent_recorded"] = store.record_dissent(str(ref))
+        return result
 
     def _handle_post_turn(args: dict[str, object]) -> object:
         conscious = _build_conscious_from_args(store, args)
@@ -403,12 +493,65 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             return {"result": "ncp_fetch:no_results query_too_specific_or_layer_empty"}
         return {"result": _encode_fetch_results(chunks)}
 
+    def _handle_record_decision(args: dict[str, object]) -> object:
+        decision = str(args["decision"])
+        rationale = str(args["rationale"])
+        agent_id = str(args["agent_id"])
+        alternatives = [str(a) for a in (args.get("alternatives") or [])]
+        evidence_refs = [str(r) for r in (args.get("evidence_refs") or [])]
+        outcome = str(args.get("outcome", "pending"))
+        confidence = float(args.get("confidence", 0.8) or 0.8)
+        pipeline_id = args.get("pipeline_id")
+        caused_by = args.get("caused_by")
+        tags = [str(t) for t in (args.get("tags") or [])]
+
+        alt_section = ""
+        if alternatives:
+            alt_section = "\nalternatives: " + " | ".join(alternatives)
+        evidence_section = ""
+        if evidence_refs:
+            evidence_section = "\nevidence: " + " ".join(evidence_refs)
+        tag_section = ""
+        if tags:
+            tag_section = "\ntags: " + " ".join(tags)
+
+        content = (
+            f"decision: {decision}\n"
+            f"rationale: {rationale}"
+            f"{alt_section}"
+            f"\noutcome: {outcome}"
+            f"{evidence_section}"
+            f"{tag_section}"
+        )
+        if len(content) > 2000:
+            content = content[:1997] + "..."
+
+        chunk = SubconsciousChunk(
+            layer="reasoning_trace",
+            content=content,
+            src="agent_inferred",
+            written_by=agent_id,
+            pipeline_id=pipeline_id,
+            caused_by=None if caused_by is None else str(caused_by),
+            base_trust=min(1.0, max(0.0, confidence)),
+            source_refs=evidence_refs,
+        )
+        ok = store.write(chunk)
+        return {
+            "recorded": ok,
+            "chunk_id": chunk.chunk_id,
+            "outcome": outcome,
+            "tag_count": len(tags),
+            "evidence_count": len(evidence_refs),
+        }
+
     return {
         "ncp_get_context": _handle_get_context,
         "ncp_write_memory": _handle_write_memory,
         "ncp_emit_whisper": _handle_emit_whisper,
         "ncp_post_turn": _handle_post_turn,
         "ncp_fetch": _handle_fetch,
+        "ncp_record_decision": _handle_record_decision,
     }
 
 

@@ -49,9 +49,9 @@ curl -s $BASE/mcp -H "$AUTH" -H 'Content-Type: application/json' -d '{
 }'
 ```
 
-Returns the five tools: `ncp_get_context`, `ncp_write_memory`,
-`ncp_emit_whisper`, `ncp_post_turn`, `ncp_fetch`, each with a JSON Schema
-under `inputSchema`.
+Returns the six tools: `ncp_get_context`, `ncp_write_memory`,
+`ncp_emit_whisper`, `ncp_post_turn`, `ncp_fetch`, `ncp_record_decision`, each
+with a JSON Schema under `inputSchema`.
 
 ## Tool calls
 
@@ -105,8 +105,8 @@ curl -s $BASE/mcp -H "$AUTH" -H 'Content-Type: application/json' -d '{
   }}}'
 ```
 
-Returns `{"posted": true, "turn_id": "..."}`. This is what makes recent-ref
-continuity, `ncp cost`, and `ncp status` work.
+Returns `{"posted": true, "turn_id": "...", "acknowledged_whisper_ids": [...]}`.
+This is what makes recent-ref continuity, `ncp cost`, and `ncp status` work.
 
 ### ncp_write_memory — persist a durable chunk
 
@@ -121,7 +121,29 @@ curl -s $BASE/mcp -H "$AUTH" -H 'Content-Type: application/json' -d '{
 ```
 
 `base_trust` defaults by `src` (`user_verified` 0.95, `tool_result` 0.80,
-`synthesis` 0.70, `agent_inferred` 0.60) and may be set explicitly.
+`synthesis` 0.70, `agent_inferred` 0.60, `subcon_retrieved` 0.55) and may be
+set explicitly.
+
+Content is filtered at ingestion (ANSI codes, duplicate lines, and boilerplate
+are stripped). A clean write returns:
+
+```json
+{"written": true, "chunk_id": "..."}
+```
+
+When filtering reduced the content, the response additionally carries
+`filtered`, `reduction_ratio`, and — for originals under 2000 chars — a
+`raw_ref` chunk id pointing at the stored unfiltered copy (retrievable via
+`ncp_fetch`):
+
+```json
+{"written": true, "chunk_id": "...", "filtered": true,
+ "reduction_ratio": 0.42, "raw_ref": "raw_..._1718900000000"}
+```
+
+`reduction_ratio` is the fraction of content removed (rounded to 3 decimals).
+The `raw_ref` chunk is written with low trust (0.1) so the filtered chunk wins
+ranking while the original remains recoverable.
 
 ### ncp_emit_whisper — signal another agent
 
@@ -151,6 +173,40 @@ curl -s $BASE/mcp -H "$AUTH" -H 'Content-Type: application/json' -d '{
 ```
 
 Limited to 3 calls per `ncp_get_context` session.
+
+### ncp_record_decision — capture a structured decision trace
+
+```bash
+curl -s $BASE/mcp -H "$AUTH" -H 'Content-Type: application/json' -d '{
+  "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+  "params": {"name": "ncp_record_decision", "arguments": {
+    "decision": "guard retryCount before dereference",
+    "rationale": "retryCount is null for ACH trial customers; NPE in prod logs",
+    "alternatives": ["default retryCount to 0", "reject ACH trials upstream"],
+    "evidence_refs": ["chunk_abc", "turn_142"],
+    "outcome": "succeeded", "confidence": 0.9,
+    "agent_id": "executor", "pipeline_id": "pipe_demo",
+    "caused_by": "chunk_abc", "tags": ["null-guard", "retry-logic"]
+  }}}'
+```
+
+Records the decision as a `reasoning_trace` chunk (src `agent_inferred`) with a
+`caused_by` edge to its causal parent, so later precedent queries can traverse
+why a choice was made. `confidence` (default 0.8) becomes the chunk's
+`base_trust`; `evidence_refs` are stored as the chunk's source refs.
+
+Only `decision`, `rationale`, and `agent_id` are required. `alternatives`,
+`evidence_refs`, and `tags` are optional arrays; `outcome` is one of `pending`
+(default), `succeeded`, `failed`, or `superseded`. The decision, rationale,
+alternatives, outcome, evidence, and tags are composed into a single chunk body
+(truncated to 2000 chars).
+
+The decoded result is:
+
+```json
+{"recorded": true, "chunk_id": "...", "outcome": "succeeded",
+ "tag_count": 2, "evidence_count": 2}
+```
 
 ## Streaming
 

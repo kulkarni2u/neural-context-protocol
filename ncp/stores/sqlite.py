@@ -12,6 +12,7 @@ import time
 
 from ncp.config import NCPConfig
 from ncp.stores.base import BaseStore, NCPStoreUnavailableError
+from ncp.stores.calibration import FeedbackRow, compute_feedback_updates
 from ncp.stores.consolidation import cluster_by_tags, find_merge_candidates
 from ncp.stores.retrieval import (
     DEFAULT_RETRIEVAL_POLICY,
@@ -55,7 +56,8 @@ CREATE TABLE IF NOT EXISTS chunks (
     meta TEXT DEFAULT '{}',
     retrieval_count INTEGER DEFAULT 0,
     last_retrieved_at REAL,
-    written_at_drift REAL DEFAULT 0.0
+    written_at_drift REAL DEFAULT 0.0,
+    dissent_count INTEGER DEFAULT 0
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
@@ -236,6 +238,7 @@ class SQLiteStore(BaseStore):
                 "ALTER TABLE chunks ADD COLUMN retrieval_count INTEGER DEFAULT 0",
                 "ALTER TABLE chunks ADD COLUMN last_retrieved_at REAL",
                 "ALTER TABLE chunks ADD COLUMN written_at_drift REAL DEFAULT 0.0",
+                "ALTER TABLE chunks ADD COLUMN dissent_count INTEGER DEFAULT 0",
                 "CREATE TABLE IF NOT EXISTS drift_history (session_id TEXT NOT NULL, turn INTEGER NOT NULL, drift_score REAL NOT NULL, ts REAL NOT NULL)",
                 "CREATE INDEX IF NOT EXISTS idx_drift_session ON drift_history(session_id, turn)",
                 "INSERT INTO chunks_fts(chunks_fts) VALUES ('rebuild')",
@@ -288,7 +291,7 @@ class SQLiteStore(BaseStore):
                     chunk.valid_while,
                     chunk.expiry,
                     chunk.owner,
-                    json.dumps({}),
+                    json.dumps({"raw_ref": chunk.raw_ref} if chunk.raw_ref else {}),
                     chunk.written_at_drift,
                 ),
             )
@@ -475,6 +478,28 @@ class SQLiteStore(BaseStore):
                 scope=None,
                 zone="working",
             )
+        return [self._row_to_chunk(row) for row in rows]
+
+    def record_dissent(self, chunk_id: str) -> bool:
+        normalized = chunk_id.removeprefix("ctx://sub/")
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE chunks SET dissent_count = dissent_count + 1 WHERE chunk_id = ?",
+                (normalized,),
+            )
+            return cursor.rowcount > 0
+
+    def get_chunks_by_ids(self, ids: Sequence[str]) -> list[SubconsciousChunk]:
+        unique_ids = [cid for cid in dict.fromkeys(ids) if cid]
+        if not unique_ids:
+            return []
+        placeholders = ",".join("?" * len(unique_ids))
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM chunks WHERE chunk_id IN ({placeholders})"
+                " AND chunk_id NOT IN (SELECT chunk_id FROM tombstones)",
+                unique_ids,
+            ).fetchall()
         return [self._row_to_chunk(row) for row in rows]
 
     def emit_whisper(self, whisper: Whisper) -> None:
@@ -815,11 +840,16 @@ class SQLiteStore(BaseStore):
         recency_half_life_seconds: float = 14400,
         feedback_mode: bool = False,
         feedback_weight: float = 0.15,
+        propagation_factor: float = 0.5,
+        dissent_weight: float = 0.2,
     ) -> CalibrationReport:
         """Re-score base_trust on live chunks.
 
         Manual mode: chunk_id + trust sets a specific chunk's base_trust directly.
         Batch mode: pipeline_id applies decay to eligible chunks.
+        Feedback mode: applies a net trust delta per chunk (retrieval boost minus
+        dissent penalty) and propagates a fraction (``propagation_factor``) of it
+        one hop along ``caused_by`` edges.
         """
         started = time.monotonic()
         report = CalibrationReport(dry_run=dry_run, pipeline_id=pipeline_id)
@@ -860,7 +890,7 @@ class SQLiteStore(BaseStore):
 
             query = (
                 "SELECT chunk_id, base_trust, src, generation, created_at,"
-                " retrieval_count FROM chunks"
+                " retrieval_count, caused_by, dissent_count FROM chunks"
                 " WHERE chunk_id NOT IN (SELECT chunk_id FROM tombstones)"
             )
             params: list = []
@@ -876,6 +906,7 @@ class SQLiteStore(BaseStore):
                     connection.execute("BEGIN IMMEDIATE")
                 rows = connection.execute(query, params).fetchall()
                 updates: list[tuple[float, str]] = []
+                feedback_rows: list[FeedbackRow] = []
                 for row in rows:
                     cid = str(row["chunk_id"])
                     src = str(row["src"])
@@ -900,18 +931,27 @@ class SQLiteStore(BaseStore):
                         else:
                             report.skipped += 1
                     else:
-                        if rc > 0:
-                            boost = feedback_weight * min(1.0, rc / 10)
-                            new_trust = min(1.0, base_trust + boost)
-                            report.change_log.append({
-                                "chunk_id": cid, "old_trust": base_trust,
-                                "new_trust": new_trust, "reason": "retrieval_feedback",
-                                "retrieval_count": rc,
-                            })
-                            updates.append((new_trust, cid))
-                            report.feedback_adjusted += 1
-                        else:
-                            report.skipped += 1
+                        feedback_rows.append(
+                            FeedbackRow(
+                                chunk_id=cid,
+                                base_trust=base_trust,
+                                retrieval_count=rc,
+                                caused_by=row["caused_by"],
+                                dissent_count=int(row["dissent_count"]) if row["dissent_count"] is not None else 0,
+                            )
+                        )
+
+                if feedback_mode and feedback_rows:
+                    fb = compute_feedback_updates(
+                        feedback_rows,
+                        feedback_weight=feedback_weight,
+                        propagation_factor=propagation_factor,
+                        dissent_weight=dissent_weight,
+                    )
+                    updates.extend(fb.updates)
+                    report.change_log.extend(fb.change_log)
+                    report.feedback_adjusted += fb.adjusted
+                    report.skipped += fb.skipped
 
                 if not dry_run and updates:
                     for new_trust, cid in updates:
@@ -1242,6 +1282,203 @@ class SQLiteStore(BaseStore):
             ],
         }
 
+    def query_precedents(
+        self,
+        query: str,
+        *,
+        pipeline_id: str | None = None,
+        k: int = 5,
+        tags: list[str] | None = None,
+        outcome: str | None = None,
+    ) -> list[dict[str, object]]:
+        chunks = self.query(
+            text=query,
+            k=k * 3,
+            min_score=0.0,
+            layer="reasoning_trace",
+            pipeline_id=pipeline_id,
+            fallback_to_trust_recency=True,
+        )
+        results: list[dict[str, object]] = []
+        for chunk in chunks:
+            content = chunk.content
+            parsed = self._parse_decision_content(content)
+            if outcome is not None and parsed.get("outcome") != outcome:
+                continue
+            if tags:
+                chunk_tags = parsed.get("tags", [])
+                if not any(t in chunk_tags for t in tags):
+                    continue
+            results.append({
+                "chunk_id": chunk.chunk_id,
+                "decision": parsed.get("decision", ""),
+                "rationale": parsed.get("rationale", ""),
+                "alternatives": parsed.get("alternatives", []),
+                "outcome": parsed.get("outcome", "unknown"),
+                "evidence_refs": chunk.source_refs,
+                "tags": parsed.get("tags", []),
+                "base_trust": chunk.base_trust,
+                "relevance": chunk.relevance,
+                "created_at": chunk.age_seconds,
+                "caused_by": chunk.caused_by,
+                "retrieval_count": chunk.retrieval_count,
+                "dissent_count": chunk.dissent_count,
+            })
+            if len(results) >= k:
+                break
+        return results
+
+    @staticmethod
+    def _parse_decision_content(content: str) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for line in content.split("\n"):
+            line = line.strip()
+            if line.startswith("decision: "):
+                result["decision"] = line[len("decision: "):]
+            elif line.startswith("rationale: "):
+                result["rationale"] = line[len("rationale: "):]
+            elif line.startswith("alternatives: "):
+                result["alternatives"] = [a.strip() for a in line[len("alternatives: "):].split("|")]
+            elif line.startswith("outcome: "):
+                result["outcome"] = line[len("outcome: "):]
+            elif line.startswith("evidence: "):
+                result["evidence_refs"] = line[len("evidence: "):].split()
+            elif line.startswith("tags: "):
+                result["tags"] = line[len("tags: "):].split()
+        return result
+
+    def trust_drift_data(
+        self,
+        *,
+        pipeline_id: str | None = None,
+        top_k: int = 10,
+    ) -> dict[str, object]:
+        now = time.time()
+        live_clause = "chunk_id NOT IN (SELECT chunk_id FROM tombstones)"
+        pipe_filter = " AND pipeline_id = ?" if pipeline_id is not None else ""
+        params: list[object] = [pipeline_id] if pipeline_id is not None else []
+
+        with self._connect() as connection:
+            band_rows = connection.execute(
+                f"""
+                SELECT
+                    CASE
+                        WHEN base_trust < 0.3 THEN 'low (0-0.3)'
+                        WHEN base_trust < 0.6 THEN 'mid (0.3-0.6)'
+                        WHEN base_trust < 0.8 THEN 'good (0.6-0.8)'
+                        ELSE 'high (0.8-1.0)'
+                    END AS band,
+                    COUNT(*) AS count,
+                    AVG(base_trust) AS avg_trust
+                FROM chunks
+                WHERE {live_clause}{pipe_filter}
+                GROUP BY band
+                ORDER BY band
+                """,
+                params,
+            ).fetchall()
+            trust_distribution = [
+                {
+                    "band": str(r["band"]),
+                    "count": int(r["count"]),
+                    "avg_trust": round(float(r["avg_trust"]), 4),
+                }
+                for r in band_rows
+            ]
+
+            rising_rows = connection.execute(
+                f"""
+                SELECT chunk_id, layer, pipeline_id, base_trust, retrieval_count,
+                       dissent_count, created_at
+                FROM chunks
+                WHERE {live_clause}{pipe_filter} AND retrieval_count > 0
+                ORDER BY retrieval_count DESC, base_trust DESC
+                LIMIT ?
+                """,
+                [*params, top_k],
+            ).fetchall()
+            rising = [
+                {
+                    "chunk_id": str(r["chunk_id"])[:16],
+                    "layer": str(r["layer"]),
+                    "pipeline_id": r["pipeline_id"],
+                    "base_trust": float(r["base_trust"]),
+                    "retrieval_count": int(r["retrieval_count"]),
+                    "dissent_count": int(r["dissent_count"]) if r["dissent_count"] else 0,
+                    "age_seconds": round(now - float(r["created_at"]), 1),
+                }
+                for r in rising_rows
+            ]
+
+            falling_rows = connection.execute(
+                f"""
+                SELECT chunk_id, layer, pipeline_id, base_trust, retrieval_count,
+                       dissent_count, created_at
+                FROM chunks
+                WHERE {live_clause}{pipe_filter} AND dissent_count > 0
+                ORDER BY dissent_count DESC, base_trust ASC
+                LIMIT ?
+                """,
+                [*params, top_k],
+            ).fetchall()
+            falling = [
+                {
+                    "chunk_id": str(r["chunk_id"])[:16],
+                    "layer": str(r["layer"]),
+                    "pipeline_id": r["pipeline_id"],
+                    "base_trust": float(r["base_trust"]),
+                    "retrieval_count": int(r["retrieval_count"]) if r["retrieval_count"] else 0,
+                    "dissent_count": int(r["dissent_count"]),
+                    "age_seconds": round(now - float(r["created_at"]), 1),
+                }
+                for r in falling_rows
+            ]
+
+            summary_row = connection.execute(
+                f"""
+                SELECT
+                    COUNT(*) AS total_chunks,
+                    SUM(CASE WHEN retrieval_count > 0 THEN 1 ELSE 0 END) AS with_retrievals,
+                    SUM(CASE WHEN dissent_count > 0 THEN 1 ELSE 0 END) AS with_dissents,
+                    SUM(CASE WHEN retrieval_count > dissent_count AND retrieval_count > 0 THEN 1 ELSE 0 END) AS net_positive,
+                    SUM(CASE WHEN dissent_count > retrieval_count AND dissent_count > 0 THEN 1 ELSE 0 END) AS net_negative,
+                    SUM(CASE WHEN retrieval_count = 0 AND dissent_count = 0 THEN 1 ELSE 0 END) AS untouched
+                FROM chunks
+                WHERE {live_clause}{pipe_filter}
+                """,
+                params,
+            ).fetchone()
+            feedback_summary = {
+                "total_chunks": int(summary_row["total_chunks"] or 0),
+                "with_retrievals": int(summary_row["with_retrievals"] or 0),
+                "with_dissents": int(summary_row["with_dissents"] or 0),
+                "net_positive": int(summary_row["net_positive"] or 0),
+                "net_negative": int(summary_row["net_negative"] or 0),
+                "untouched": int(summary_row["untouched"] or 0),
+            }
+
+            drift_rows = connection.execute(
+                "SELECT session_id, turn, drift_score, ts FROM drift_history"
+                " ORDER BY ts DESC LIMIT 20"
+            ).fetchall()
+            drift_timeline = [
+                {
+                    "session_id": str(r["session_id"]),
+                    "turn": int(r["turn"]),
+                    "drift_score": float(r["drift_score"]),
+                    "ts": float(r["ts"]),
+                }
+                for r in drift_rows
+            ]
+
+        return {
+            "trust_distribution": trust_distribution,
+            "rising": rising,
+            "falling": falling,
+            "feedback_summary": feedback_summary,
+            "drift_timeline": drift_timeline,
+        }
+
     def viz_data(self, *, pipeline_id: str | None = None) -> dict[str, object]:
         """Return structured data for the operator viz view."""
         now = time.time()
@@ -1519,6 +1756,7 @@ class SQLiteStore(BaseStore):
 
     def _row_to_chunk(self, row: sqlite3.Row) -> SubconsciousChunk:
         created_at = float(row["created_at"])
+        meta = json.loads(row["meta"]) if row["meta"] else {}
         chunk = SubconsciousChunk(
             chunk_id=str(row["chunk_id"]),
             layer=str(row["layer"]),
@@ -1544,9 +1782,11 @@ class SQLiteStore(BaseStore):
             schema_version=int(row["schema_version"]),
             supersedes=row["supersedes"],
             source_refs=json.loads(row["source_refs"]),
+            raw_ref=meta.get("raw_ref"),
             age_seconds=max(0.0, time.time() - created_at),
             retrieval_count=int(row["retrieval_count"]) if row["retrieval_count"] is not None else 0,
             last_retrieved_at=float(row["last_retrieved_at"]) if row["last_retrieved_at"] is not None else None,
+            dissent_count=int(row["dissent_count"]) if row["dissent_count"] is not None else 0,
         )
         return chunk
 

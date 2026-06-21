@@ -191,7 +191,7 @@ class TestToolsList:
         resp = _handle_request(_req("tools/list"), {})
         result = _result(resp)
         names = [t["name"] for t in result["tools"]]
-        assert names == ["ncp_get_context", "ncp_write_memory", "ncp_emit_whisper", "ncp_post_turn", "ncp_fetch"]
+        assert names == ["ncp_get_context", "ncp_write_memory", "ncp_emit_whisper", "ncp_post_turn", "ncp_fetch", "ncp_record_decision"]
 
     def test_tool_names_match_constants(self) -> None:
         resp = _handle_request(_req("tools/list"), {})
@@ -498,6 +498,84 @@ class TestWriteMemory:
         error = _error(resp)
         assert error["code"] == -32603
         assert store.status()["chunk_count"] == 0
+
+    def test_write_memory_filters_noisy_content(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "test.db")
+        handlers = make_handlers(store)
+        noisy = "\x1b[32mPASSED\x1b[0m\nPASSED\nPASSED\nPASSED\nresult: ok"
+
+        result = _content(_handle_request(
+            _call("ncp_write_memory", {
+                "content": noisy,
+                "layer": "episodic",
+                "src": "tool_result",
+            }),
+            handlers,
+        ))
+
+        assert result["written"] is True
+        assert result["filtered"] is True
+        assert result["reduction_ratio"] > 0.0
+        assert "raw_ref" in result
+        chunks = store.get_working_zone(pipeline_id=None)
+        filtered_chunk = next(c for c in chunks if c.chunk_id == result["chunk_id"])
+        assert "\x1b[" not in filtered_chunk.content
+        assert "(×4)" in filtered_chunk.content
+
+    def test_write_memory_stores_raw_ref_chunk(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "test.db")
+        handlers = make_handlers(store)
+        noisy = "unique_marker line\nunique_marker line\nunique_marker line\nresult"
+
+        result = _content(_handle_request(
+            _call("ncp_write_memory", {
+                "content": noisy,
+                "layer": "episodic",
+                "src": "tool_result",
+            }),
+            handlers,
+        ))
+
+        raw_ref = result["raw_ref"]
+        # Reset fetch session
+        _handle_request(
+            _call("ncp_get_context", {
+                "agent_id": "tester",
+                "role": "test",
+                "owns": [],
+                "must_not": [],
+                "task": "test",
+                "slot": "test",
+                "intent": "test",
+            }),
+            handlers,
+        )
+        # Fetch the raw chunk by searching for its content
+        fetch_resp = _content(_handle_request(
+            _call("ncp_fetch", {"query": "unique_marker", "k": 4}),
+            handlers,
+        ))
+        # The raw chunk should be retrievable and contain unfiltered content
+        assert raw_ref in fetch_resp["result"]
+        assert "unique_marker line" in fetch_resp["result"]
+
+    def test_write_memory_clean_content_not_filtered(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "test.db")
+        handlers = make_handlers(store)
+        clean = "NPE at PaymentProcessor.java:142."
+
+        result = _content(_handle_request(
+            _call("ncp_write_memory", {
+                "content": clean,
+                "layer": "semantic",
+                "src": "agent_inferred",
+            }),
+            handlers,
+        ))
+
+        assert result["written"] is True
+        assert "filtered" not in result
+        assert "raw_ref" not in result
 
 
 class TestEmitWhisper:

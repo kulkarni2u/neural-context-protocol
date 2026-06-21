@@ -36,6 +36,7 @@ from ncp.stores.retrieval import (
     score_trust_recency_candidate,
     score_vector_distance,
 )
+from ncp.stores.calibration import FeedbackRow, compute_feedback_updates
 from ncp.stores.consolidation import cluster_by_tags, find_merge_candidates
 from ncp.types import (
     CalibrationReport,
@@ -972,6 +973,20 @@ class AsyncPgvectorStore(BaseStore):
             )
         await self._acoordination.emit_whisper(whisper)
 
+    async def async_record_dissent(self, chunk_id: str) -> bool:
+        """Increment a chunk's dissent counter via native async DB I/O."""
+        normalized = chunk_id.removeprefix("ctx://sub/")
+        async with self._aconnect() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    self._sql(
+                        "UPDATE {schema}.{prefix}chunks"
+                        " SET dissent_count = dissent_count + 1 WHERE chunk_id = %s"
+                    ),
+                    (normalized,),
+                )
+                return cur.rowcount > 0
+
     async def async_drain_whispers(
         self,
         *,
@@ -1047,6 +1062,7 @@ class AsyncPgvectorStore(BaseStore):
             supersedes=row.get("supersedes"),
             source_refs=[],
             age_seconds=max(0.0, time.time() - created_at),
+            dissent_count=int(row.get("dissent_count") or 0),
         )
 
     def _decode_embedding(self, value: Any) -> list[float] | None:
@@ -1556,6 +1572,8 @@ class AsyncPgvectorStore(BaseStore):
         recency_half_life_seconds: float = 14400,
         feedback_mode: bool = False,
         feedback_weight: float = 0.15,
+        propagation_factor: float = 0.5,
+        dissent_weight: float = 0.2,
     ) -> CalibrationReport:
         """Re-score base_trust on live chunks using async DB I/O. Full parity with calibrate()."""
         started = time.monotonic()
@@ -1613,7 +1631,7 @@ class AsyncPgvectorStore(BaseStore):
                     await cur.execute(
                         self._sql(
                             "SELECT chunk_id, base_trust, src, generation, created_at,"
-                            " retrieval_count FROM {schema}.{prefix}chunks"
+                            " retrieval_count, caused_by, dissent_count FROM {schema}.{prefix}chunks"
                             " WHERE chunk_id NOT IN"
                             " (SELECT chunk_id FROM {schema}.{prefix}tombstones)"
                             " AND pipeline_id = %s"
@@ -1624,7 +1642,7 @@ class AsyncPgvectorStore(BaseStore):
                     await cur.execute(
                         self._sql(
                             "SELECT chunk_id, base_trust, src, generation, created_at,"
-                            " retrieval_count FROM {schema}.{prefix}chunks"
+                            " retrieval_count, caused_by, dissent_count FROM {schema}.{prefix}chunks"
                             " WHERE chunk_id NOT IN"
                             " (SELECT chunk_id FROM {schema}.{prefix}tombstones)"
                         )
@@ -1633,6 +1651,7 @@ class AsyncPgvectorStore(BaseStore):
                 desc = cur.description
 
         updates: list[tuple[float, str]] = []
+        feedback_rows: list[FeedbackRow] = []
         now = time.time()
         for row in rows:
             r = self._normalize_row(row, desc)
@@ -1662,20 +1681,27 @@ class AsyncPgvectorStore(BaseStore):
                 else:
                     report.skipped += 1
             else:
-                if rc > 0:
-                    boost = feedback_weight * min(1.0, rc / 10)
-                    new_trust = min(1.0, bt + boost)
-                    report.change_log.append({
-                        "chunk_id": cid,
-                        "old_trust": bt,
-                        "new_trust": new_trust,
-                        "reason": "retrieval_feedback",
-                        "retrieval_count": rc,
-                    })
-                    updates.append((new_trust, cid))
-                    report.feedback_adjusted += 1
-                else:
-                    report.skipped += 1
+                feedback_rows.append(
+                    FeedbackRow(
+                        chunk_id=cid,
+                        base_trust=bt,
+                        retrieval_count=rc,
+                        caused_by=r.get("caused_by"),
+                        dissent_count=int(r.get("dissent_count") or 0),
+                    )
+                )
+
+        if feedback_mode and feedback_rows:
+            fb = compute_feedback_updates(
+                feedback_rows,
+                feedback_weight=feedback_weight,
+                propagation_factor=propagation_factor,
+                dissent_weight=dissent_weight,
+            )
+            updates.extend(fb.updates)
+            report.change_log.extend(fb.change_log)
+            report.feedback_adjusted += fb.adjusted
+            report.skipped += fb.skipped
 
         if not dry_run and updates:
             async with self._aconnect() as conn:

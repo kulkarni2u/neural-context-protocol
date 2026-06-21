@@ -73,6 +73,24 @@ class BaseStore(ABC):
     ) -> Sequence[SubconsciousChunk]:
         """Return working-zone chunks, optionally filtered."""
 
+    def get_chunks_by_ids(self, ids: Sequence[str]) -> list[SubconsciousChunk]:
+        """Fetch live (non-tombstoned) chunks by exact ids, any order.
+
+        Used for 1-hop edge expansion over chunk relationships
+        (``caused_by``, etc.). Backends that do not implement this return
+        an empty list, which disables edge expansion gracefully.
+        """
+        return []
+
+    def record_dissent(self, chunk_id: str) -> bool:
+        """Record that ``chunk_id`` was disputed (e.g. by a dissent whisper).
+
+        Increments the chunk's dissent counter so feedback calibration can apply
+        a trust penalty and propagate it along ``caused_by`` edges. Best-effort:
+        backends that do not implement this return False.
+        """
+        return False
+
     # ------------------------------------------------------------------
     # Whisper queue
 
@@ -183,15 +201,55 @@ class BaseStore(ABC):
         recency_half_life_seconds: float = 14400,
         feedback_mode: bool = False,
         feedback_weight: float = 0.15,
+        propagation_factor: float = 0.5,
+        dissent_weight: float = 0.2,
     ) -> CalibrationReport:
         """Re-score base_trust on existing chunks.
 
-        Two modes:
+        Modes:
         - Manual override: provide chunk_id + trust to set a specific chunk's base_trust.
         - Batch decay: provide pipeline_id to apply decay to eligible chunks (age >
           recency_half_life_seconds, base_trust > 0.5, generation == 0). Chunks with
           src == "user_verified" are always protected.
+        - Feedback: apply a net trust delta per chunk (retrieval boost minus dissent
+          penalty) and propagate a fraction (``propagation_factor``) of it one hop
+          along ``caused_by`` edges.
         """
+
+    def query_precedents(
+        self,
+        query: str,
+        *,
+        pipeline_id: str | None = None,
+        k: int = 5,
+        tags: list[str] | None = None,
+        outcome: str | None = None,
+    ) -> list[dict[str, object]]:
+        """Query past decision traces by relevance, optionally filtered by tags and outcome.
+
+        Returns a list of dicts with: chunk_id, decision, rationale, alternatives,
+        outcome, evidence_refs, tags, base_trust, created_at, caused_by,
+        retrieval_count, dissent_count.
+        """
+        raise NotImplementedError("query_precedents not implemented for this backend")
+
+    def trust_drift_data(
+        self,
+        *,
+        pipeline_id: str | None = None,
+        top_k: int = 10,
+    ) -> dict[str, object]:
+        """Return structured trust-drift observability data.
+
+        Returns a dict with:
+        - trust_distribution: list of {band, count, avg_trust}
+        - rising: top_k chunks ordered by retrieval_count DESC
+        - falling: top_k chunks ordered by dissent_count DESC
+        - feedback_summary: {total_chunks, with_retrievals, with_dissents,
+          net_positive, net_negative, untouched}
+        - drift_timeline: recent drift_history readings (if available)
+        """
+        raise NotImplementedError("trust_drift_data not implemented for this backend")
 
     @abstractmethod
     def viz_data(self, *, pipeline_id: str | None = None) -> dict[str, object]:
@@ -243,6 +301,10 @@ class BaseStore(ABC):
     async def async_emit_whisper(self, whisper: Whisper) -> None:
         """Asynchronously persist a whisper using thread pool."""
         await anyio.to_thread.run_sync(self.emit_whisper, whisper)
+
+    async def async_record_dissent(self, chunk_id: str) -> bool:
+        """Asynchronously record a dissent against a chunk using thread pool."""
+        return await anyio.to_thread.run_sync(self.record_dissent, chunk_id)
 
     async def async_drain_whispers(
         self,
@@ -299,6 +361,36 @@ class BaseStore(ABC):
         """Asynchronously persist cost telemetry using thread pool."""
         fn = partial(self.log_cost, agent_id=agent_id, response=response)
         await anyio.to_thread.run_sync(fn)
+
+    async def async_query_precedents(
+        self,
+        query: str,
+        *,
+        pipeline_id: str | None = None,
+        k: int = 5,
+        tags: list[str] | None = None,
+        outcome: str | None = None,
+    ) -> list[dict[str, object]]:
+        """Asynchronously query precedents using thread pool."""
+        fn = partial(
+            self.query_precedents,
+            query,
+            pipeline_id=pipeline_id,
+            k=k,
+            tags=tags,
+            outcome=outcome,
+        )
+        return await anyio.to_thread.run_sync(fn)
+
+    async def async_trust_drift_data(
+        self,
+        *,
+        pipeline_id: str | None = None,
+        top_k: int = 10,
+    ) -> dict[str, object]:
+        """Asynchronously build trust-drift data using thread pool."""
+        fn = partial(self.trust_drift_data, pipeline_id=pipeline_id, top_k=top_k)
+        return await anyio.to_thread.run_sync(fn)
 
     async def async_viz_data(self, *, pipeline_id: str | None = None) -> dict[str, object]:
         """Asynchronously build operator viz data using thread pool."""
