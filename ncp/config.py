@@ -67,6 +67,7 @@ DEFAULT_CONFIG = {
         "generation_penalty_base": 0.9,
         "edge_expansion": True,
         "edge_expansion_decay": 0.7,
+        "trust_propagation_factor": 0.5,
     },
     "embedding": {
         "enabled": False,
@@ -185,6 +186,10 @@ class NCPConfig:
     @property
     def edge_expansion_decay(self) -> float:
         return float(self.values.get("retrieval", {}).get("edge_expansion_decay", 0.7))
+
+    @property
+    def trust_propagation_factor(self) -> float:
+        return float(self.values.get("retrieval", {}).get("trust_propagation_factor", 0.5))
 
     @property
     def context_token_budget(self) -> int:
@@ -323,6 +328,8 @@ def _apply_env_overrides(values: dict[str, Any], env: dict[str, str]) -> None:
     if "NCP_EDGE_EXPANSION" in env:
         val = env["NCP_EDGE_EXPANSION"].lower()
         values["retrieval"]["edge_expansion"] = val in {"true", "1", "yes"}
+    if "NCP_TRUST_PROPAGATION_FACTOR" in env:
+        values["retrieval"]["trust_propagation_factor"] = float(env["NCP_TRUST_PROPAGATION_FACTOR"])
     if "NCP_AUTH_TOKEN" in env:
         values["server"]["auth_token"] = env["NCP_AUTH_TOKEN"]
 

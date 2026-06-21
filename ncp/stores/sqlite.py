@@ -12,6 +12,7 @@ import time
 
 from ncp.config import NCPConfig
 from ncp.stores.base import BaseStore, NCPStoreUnavailableError
+from ncp.stores.calibration import FeedbackRow, compute_feedback_updates
 from ncp.stores.consolidation import cluster_by_tags, find_merge_candidates
 from ncp.stores.retrieval import (
     DEFAULT_RETRIEVAL_POLICY,
@@ -828,11 +829,14 @@ class SQLiteStore(BaseStore):
         recency_half_life_seconds: float = 14400,
         feedback_mode: bool = False,
         feedback_weight: float = 0.15,
+        propagation_factor: float = 0.5,
     ) -> CalibrationReport:
         """Re-score base_trust on live chunks.
 
         Manual mode: chunk_id + trust sets a specific chunk's base_trust directly.
         Batch mode: pipeline_id applies decay to eligible chunks.
+        Feedback mode: boosts retrieved chunks and propagates a fraction of that
+        boost (``propagation_factor``) one hop along ``caused_by`` edges.
         """
         started = time.monotonic()
         report = CalibrationReport(dry_run=dry_run, pipeline_id=pipeline_id)
@@ -873,7 +877,7 @@ class SQLiteStore(BaseStore):
 
             query = (
                 "SELECT chunk_id, base_trust, src, generation, created_at,"
-                " retrieval_count FROM chunks"
+                " retrieval_count, caused_by FROM chunks"
                 " WHERE chunk_id NOT IN (SELECT chunk_id FROM tombstones)"
             )
             params: list = []
@@ -889,6 +893,7 @@ class SQLiteStore(BaseStore):
                     connection.execute("BEGIN IMMEDIATE")
                 rows = connection.execute(query, params).fetchall()
                 updates: list[tuple[float, str]] = []
+                feedback_rows: list[FeedbackRow] = []
                 for row in rows:
                     cid = str(row["chunk_id"])
                     src = str(row["src"])
@@ -913,18 +918,25 @@ class SQLiteStore(BaseStore):
                         else:
                             report.skipped += 1
                     else:
-                        if rc > 0:
-                            boost = feedback_weight * min(1.0, rc / 10)
-                            new_trust = min(1.0, base_trust + boost)
-                            report.change_log.append({
-                                "chunk_id": cid, "old_trust": base_trust,
-                                "new_trust": new_trust, "reason": "retrieval_feedback",
-                                "retrieval_count": rc,
-                            })
-                            updates.append((new_trust, cid))
-                            report.feedback_adjusted += 1
-                        else:
-                            report.skipped += 1
+                        feedback_rows.append(
+                            FeedbackRow(
+                                chunk_id=cid,
+                                base_trust=base_trust,
+                                retrieval_count=rc,
+                                caused_by=row["caused_by"],
+                            )
+                        )
+
+                if feedback_mode and feedback_rows:
+                    fb = compute_feedback_updates(
+                        feedback_rows,
+                        feedback_weight=feedback_weight,
+                        propagation_factor=propagation_factor,
+                    )
+                    updates.extend(fb.updates)
+                    report.change_log.extend(fb.change_log)
+                    report.feedback_adjusted += fb.adjusted
+                    report.skipped += fb.skipped
 
                 if not dry_run and updates:
                     for new_trust, cid in updates:

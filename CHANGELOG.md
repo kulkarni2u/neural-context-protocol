@@ -8,6 +8,10 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 - `POST /mcp` now content-negotiates responses via the `Accept` header: clients requesting `text/event-stream` get the JSON-RPC result as an SSE `message` event (with `ncp_chunk` events when `stream: true`), making `/mcp` a spec-compliant stateless Streamable HTTP MCP endpoint. JSON responses remain the default.
 - Add n8n integration example (`examples/08_n8n/`) with an HTTP Request node turn-lifecycle workflow and MCP Client Tool node setup over the Streamable HTTP transport.
+- **Ingestion-time content filtering** (`ncp/chunker.py`): `ncp_write_memory` now runs deterministic noise reduction (ANSI strip, consecutive-line dedup with counts, progress-bar/timing boilerplate removal, JSON null/empty pruning) before chunking, so stored chunks carry signal not framing. The response reports `filtered`, `reduction_ratio`, and a `raw_ref`.
+- **Reversible compression via `raw_ref`** (`ncp/types.py`): when filtering reduces content, the unfiltered original is stored as a low-trust chunk and linked from the filtered chunk's new `raw_ref` field, retrievable on demand via `ncp_fetch`. Surfaced in the pidgin wire format and fetch results.
+- **1-hop edge-expansion retrieval** (`ncp/assembler.py`, `retrieval.edge_expansion`, default on): after top-k retrieval, the assembler pulls in `caused_by` causal parents (decayed inherited relevance) and suppresses chunks whose superseding chunk is already present. Neighbors compete inside the existing `chunk_cap`/token budget — expansion never widens the assembled context. Adds `BaseStore.get_chunks_by_ids` (graceful empty-list default).
+- **Trust propagation along `caused_by` edges** (`ncp/stores/calibration.py`): `calibrate(feedback_mode=True)` now propagates a fraction (`retrieval.trust_propagation_factor`, default 0.5) of a chunk's retrieval-feedback boost one hop to its causal parent, crediting a cause for effects that proved useful. Shared, backend-agnostic helper used by the SQLite, pgvector, and async pgvector stores; `user_verified` parents stay protected.
 
 ## [1.1.0] - 2026-06-11
 

@@ -192,14 +192,17 @@ class BaseStore(ABC):
         recency_half_life_seconds: float = 14400,
         feedback_mode: bool = False,
         feedback_weight: float = 0.15,
+        propagation_factor: float = 0.5,
     ) -> CalibrationReport:
         """Re-score base_trust on existing chunks.
 
-        Two modes:
+        Modes:
         - Manual override: provide chunk_id + trust to set a specific chunk's base_trust.
         - Batch decay: provide pipeline_id to apply decay to eligible chunks (age >
           recency_half_life_seconds, base_trust > 0.5, generation == 0). Chunks with
           src == "user_verified" are always protected.
+        - Feedback: boost retrieved chunks and propagate a fraction
+          (``propagation_factor``) of that boost one hop along ``caused_by`` edges.
         """
 
     @abstractmethod

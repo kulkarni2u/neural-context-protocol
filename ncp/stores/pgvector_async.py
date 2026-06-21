@@ -36,6 +36,7 @@ from ncp.stores.retrieval import (
     score_trust_recency_candidate,
     score_vector_distance,
 )
+from ncp.stores.calibration import FeedbackRow, compute_feedback_updates
 from ncp.stores.consolidation import cluster_by_tags, find_merge_candidates
 from ncp.types import (
     CalibrationReport,
@@ -1556,6 +1557,7 @@ class AsyncPgvectorStore(BaseStore):
         recency_half_life_seconds: float = 14400,
         feedback_mode: bool = False,
         feedback_weight: float = 0.15,
+        propagation_factor: float = 0.5,
     ) -> CalibrationReport:
         """Re-score base_trust on live chunks using async DB I/O. Full parity with calibrate()."""
         started = time.monotonic()
@@ -1613,7 +1615,7 @@ class AsyncPgvectorStore(BaseStore):
                     await cur.execute(
                         self._sql(
                             "SELECT chunk_id, base_trust, src, generation, created_at,"
-                            " retrieval_count FROM {schema}.{prefix}chunks"
+                            " retrieval_count, caused_by FROM {schema}.{prefix}chunks"
                             " WHERE chunk_id NOT IN"
                             " (SELECT chunk_id FROM {schema}.{prefix}tombstones)"
                             " AND pipeline_id = %s"
@@ -1624,7 +1626,7 @@ class AsyncPgvectorStore(BaseStore):
                     await cur.execute(
                         self._sql(
                             "SELECT chunk_id, base_trust, src, generation, created_at,"
-                            " retrieval_count FROM {schema}.{prefix}chunks"
+                            " retrieval_count, caused_by FROM {schema}.{prefix}chunks"
                             " WHERE chunk_id NOT IN"
                             " (SELECT chunk_id FROM {schema}.{prefix}tombstones)"
                         )
@@ -1633,6 +1635,7 @@ class AsyncPgvectorStore(BaseStore):
                 desc = cur.description
 
         updates: list[tuple[float, str]] = []
+        feedback_rows: list[FeedbackRow] = []
         now = time.time()
         for row in rows:
             r = self._normalize_row(row, desc)
@@ -1662,20 +1665,25 @@ class AsyncPgvectorStore(BaseStore):
                 else:
                     report.skipped += 1
             else:
-                if rc > 0:
-                    boost = feedback_weight * min(1.0, rc / 10)
-                    new_trust = min(1.0, bt + boost)
-                    report.change_log.append({
-                        "chunk_id": cid,
-                        "old_trust": bt,
-                        "new_trust": new_trust,
-                        "reason": "retrieval_feedback",
-                        "retrieval_count": rc,
-                    })
-                    updates.append((new_trust, cid))
-                    report.feedback_adjusted += 1
-                else:
-                    report.skipped += 1
+                feedback_rows.append(
+                    FeedbackRow(
+                        chunk_id=cid,
+                        base_trust=bt,
+                        retrieval_count=rc,
+                        caused_by=r.get("caused_by"),
+                    )
+                )
+
+        if feedback_mode and feedback_rows:
+            fb = compute_feedback_updates(
+                feedback_rows,
+                feedback_weight=feedback_weight,
+                propagation_factor=propagation_factor,
+            )
+            updates.extend(fb.updates)
+            report.change_log.extend(fb.change_log)
+            report.feedback_adjusted += fb.adjusted
+            report.skipped += fb.skipped
 
         if not dry_run and updates:
             async with self._aconnect() as conn:
