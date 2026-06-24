@@ -36,7 +36,12 @@ from ncp.stores.retrieval import (
     score_trust_recency_candidate,
     score_vector_distance,
 )
-from ncp.stores.calibration import FeedbackRow, compute_feedback_updates
+from ncp.stores.calibration import (
+    FeedbackRow,
+    ReputationUpdate,
+    compute_feedback_updates,
+    rollup_reputation,
+)
 from ncp.stores.consolidation import cluster_by_tags, find_merge_candidates
 from ncp.types import (
     CalibrationReport,
@@ -82,6 +87,9 @@ class AsyncPgvectorStore(BaseStore):
         self.gc_threshold = gc_threshold
         self.max_working_chunks_per_pipeline = max_working_chunks_per_pipeline
         self.retention_evictions = 0
+        self.reputation_gain = 4.0
+        self.reputation_forget = 0.99
+        self.reputation_confidence_k = 20
         self._embedding_adapter: object | None = embedding_adapter
         self._ivfflat_probes = ivfflat_probes
         self._apool: Any = None
@@ -168,6 +176,64 @@ class AsyncPgvectorStore(BaseStore):
 
     def _table_name(self, logical_name: str) -> str:
         return f"{self.schema}.{self.table_prefix}{logical_name}"
+
+    async def _aload_reputation(
+        self,
+        connection: Any,
+        identity_ids: set[str],
+    ) -> dict[str, tuple[float, float]]:
+        if not identity_ids:
+            return {}
+        placeholders = ", ".join(["%s"] * len(identity_ids))
+        async with connection.cursor() as cursor:
+            await cursor.execute(
+                self._sql(
+                    f"""
+                    SELECT identity_id, alpha, beta
+                    FROM {{schema}}.{{prefix}}reputation
+                    WHERE identity_id IN ({placeholders})
+                    """
+                ),
+                tuple(sorted(identity_ids)),
+            )
+            rows = await self._afetchall(cursor)
+        return {
+            str(row["identity_id"]): (float(row["alpha"]), float(row["beta"]))
+            for row in rows
+        }
+
+    async def _aupsert_reputation_updates(
+        self,
+        connection: Any,
+        updates: tuple[ReputationUpdate, ...],
+        *,
+        now: float,
+    ) -> None:
+        async with connection.cursor() as cursor:
+            for update in updates:
+                await cursor.execute(
+                    self._sql(
+                        """
+                        INSERT INTO {schema}.{prefix}reputation AS rep
+                            (identity_id, alpha, beta, obs_count, last_updated)
+                        VALUES (%s, %s, %s, %s, %s)
+                        ON CONFLICT(identity_id) DO UPDATE SET
+                            alpha = 1.0 + (rep.alpha - 1.0) * %s + (EXCLUDED.alpha - 1.0),
+                            beta = 1.0 + (rep.beta - 1.0) * %s + (EXCLUDED.beta - 1.0),
+                            obs_count = rep.obs_count + EXCLUDED.obs_count,
+                            last_updated = EXCLUDED.last_updated
+                        """
+                    ),
+                    (
+                        update.identity_id,
+                        1.0 + update.positive_evidence,
+                        1.0 + update.negative_evidence,
+                        update.obs_delta,
+                        now,
+                        self.reputation_forget,
+                        self.reputation_forget,
+                    ),
+                )
 
     def _normalize_row(self, row: Any, description: Any) -> dict[str, Any]:
         if isinstance(row, dict):
@@ -1630,7 +1696,7 @@ class AsyncPgvectorStore(BaseStore):
                 if pipeline_id is not None:
                     await cur.execute(
                         self._sql(
-                            "SELECT chunk_id, base_trust, src, generation, created_at,"
+                            "SELECT chunk_id, base_trust, src, written_by, generation, created_at,"
                             " retrieval_count, caused_by, dissent_count FROM {schema}.{prefix}chunks"
                             " WHERE chunk_id NOT IN"
                             " (SELECT chunk_id FROM {schema}.{prefix}tombstones)"
@@ -1641,7 +1707,7 @@ class AsyncPgvectorStore(BaseStore):
                 else:
                     await cur.execute(
                         self._sql(
-                            "SELECT chunk_id, base_trust, src, generation, created_at,"
+                            "SELECT chunk_id, base_trust, src, written_by, generation, created_at,"
                             " retrieval_count, caused_by, dissent_count FROM {schema}.{prefix}chunks"
                             " WHERE chunk_id NOT IN"
                             " (SELECT chunk_id FROM {schema}.{prefix}tombstones)"
@@ -1652,6 +1718,7 @@ class AsyncPgvectorStore(BaseStore):
 
         updates: list[tuple[float, str]] = []
         feedback_rows: list[FeedbackRow] = []
+        chunk_author: dict[str, str] = {}
         now = time.time()
         for row in rows:
             r = self._normalize_row(row, desc)
@@ -1681,6 +1748,8 @@ class AsyncPgvectorStore(BaseStore):
                 else:
                     report.skipped += 1
             else:
+                written_by = str(r.get("written_by") or "system")
+                chunk_author[cid] = self.resolve_identity(written_by, pipeline_id=pipeline_id)
                 feedback_rows.append(
                     FeedbackRow(
                         chunk_id=cid,
@@ -1702,21 +1771,53 @@ class AsyncPgvectorStore(BaseStore):
             report.change_log.extend(fb.change_log)
             report.feedback_adjusted += fb.adjusted
             report.skipped += fb.skipped
-
-        if not dry_run and updates:
             async with self._aconnect() as conn:
-                async with conn.cursor() as cur:
-                    for new_trust, cid in updates:
-                        await cur.execute(
-                            self._sql(
-                                "UPDATE {schema}.{prefix}chunks"
-                                " SET base_trust = %s WHERE chunk_id = %s"
-                            ),
-                            (new_trust, cid),
-                        )
+                prior = await self._aload_reputation(
+                    conn,
+                    {chunk_author[cid] for cid in chunk_author},
+                )
+            rep_updates = rollup_reputation(
+                fb.change_log,
+                chunk_author,
+                prior,
+                gain=self.reputation_gain,
+                forget=self.reputation_forget,
+                K_CONF=self.reputation_confidence_k,
+            )
+            report.change_log.extend(
+                {
+                    "identity_id": update.identity_id,
+                    "reason": "reputation_rollup",
+                    "alpha": update.new_alpha,
+                    "beta": update.new_beta,
+                    "obs_delta": update.obs_delta,
+                }
+                for update in rep_updates
+            )
+        else:
+            rep_updates = ()
+
+        if not dry_run and (updates or (feedback_mode and rep_updates)):
+            async with self._aconnect() as conn:
+                if updates:
+                    async with conn.cursor() as cur:
+                        for new_trust, cid in updates:
+                            await cur.execute(
+                                self._sql(
+                                    "UPDATE {schema}.{prefix}chunks"
+                                    " SET base_trust = %s WHERE chunk_id = %s"
+                                ),
+                                (new_trust, cid),
+                            )
+                if feedback_mode:
+                    await self._aupsert_reputation_updates(conn, rep_updates, now=now)
 
         report.duration_seconds = time.monotonic() - started
         return report
+
+    def resolve_identity(self, agent_id: str, *, pipeline_id: str | None = None) -> str:
+        del pipeline_id
+        return agent_id
 
     # ------------------------------------------------------------------
     # Sync abstract methods — not supported on async-native store

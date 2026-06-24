@@ -14,7 +14,12 @@ import time
 
 from ncp.config import NCPConfig
 from ncp.stores.base import BaseStore, NCPStoreUnavailableError
-from ncp.stores.calibration import FeedbackRow, compute_feedback_updates
+from ncp.stores.calibration import (
+    FeedbackRow,
+    ReputationUpdate,
+    compute_feedback_updates,
+    rollup_reputation,
+)
 from ncp.stores.consolidation import cluster_by_tags, find_merge_candidates
 from ncp.stores.redis_coordination import RedisCoordination
 from ncp.stores.retrieval import (
@@ -63,7 +68,8 @@ CREATE TABLE IF NOT EXISTS {schema}.{prefix}chunks (
     embedding vector(1536),
     retrieval_count INTEGER DEFAULT 0,
     last_retrieved_at DOUBLE PRECISION,
-    written_at_drift DOUBLE PRECISION DEFAULT 0.0
+    written_at_drift DOUBLE PRECISION DEFAULT 0.0,
+    dissent_count INTEGER DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS {schema}.{prefix}tombstones (
@@ -150,6 +156,26 @@ CREATE TABLE IF NOT EXISTS {schema}.{prefix}drift_history (
 
 CREATE INDEX IF NOT EXISTS {prefix}idx_drift_session
     ON {schema}.{prefix}drift_history(session_id, turn);
+
+CREATE TABLE IF NOT EXISTS {schema}.{prefix}identities (
+    identity_id TEXT PRIMARY KEY,
+    public_key TEXT NOT NULL,
+    alg TEXT NOT NULL DEFAULT 'ed25519',
+    label TEXT,
+    created_at DOUBLE PRECISION NOT NULL,
+    revoked_at DOUBLE PRECISION
+);
+
+CREATE TABLE IF NOT EXISTS {schema}.{prefix}reputation (
+    identity_id TEXT PRIMARY KEY,
+    alpha DOUBLE PRECISION NOT NULL DEFAULT 1.0,
+    beta DOUBLE PRECISION NOT NULL DEFAULT 1.0,
+    obs_count INTEGER NOT NULL DEFAULT 0,
+    last_updated DOUBLE PRECISION NOT NULL DEFAULT 0.0
+);
+
+CREATE INDEX IF NOT EXISTS {prefix}idx_reputation_updated
+    ON {schema}.{prefix}reputation(last_updated);
 """
 
 
@@ -233,8 +259,14 @@ class PgvectorStore(BaseStore):
             self.retrieval_policy = retrieval_policy or RetrievalPolicy(
                 generation_penalty_base=cfg.retrieval_generation_penalty_base
             )
+            self.reputation_gain = cfg.reputation_gain
+            self.reputation_forget = cfg.reputation_forget
+            self.reputation_confidence_k = cfg.reputation_confidence_k
         except Exception:
             self.retrieval_policy = retrieval_policy or DEFAULT_RETRIEVAL_POLICY
+            self.reputation_gain = 4.0
+            self.reputation_forget = 0.99
+            self.reputation_confidence_k = 20
 
             class DummyConfig:
                 rerank_enabled = False
@@ -869,6 +901,112 @@ class PgvectorStore(BaseStore):
             finally:
                 self._close_cursor(cursor)
 
+    def resolve_identity(self, agent_id: str, *, pipeline_id: str | None = None) -> str:
+        del pipeline_id
+        return agent_id
+
+    def register_identity(
+        self,
+        *,
+        identity_id: str,
+        public_key: str,
+        label: str | None,
+        alg: str = "ed25519",
+    ) -> None:
+        with self._connect() as connection:
+            cursor = connection.cursor()
+            try:
+                cursor.execute(
+                    self._sql(
+                        """
+                        INSERT INTO {schema}.{prefix}identities
+                            (identity_id, public_key, alg, label, created_at, revoked_at)
+                        VALUES (%s, %s, %s, %s, %s, NULL)
+                        ON CONFLICT(identity_id) DO UPDATE SET
+                            public_key = EXCLUDED.public_key,
+                            alg = EXCLUDED.alg,
+                            label = EXCLUDED.label
+                        """
+                    ),
+                    (identity_id, public_key, alg, label, time.time()),
+                )
+            finally:
+                self._close_cursor(cursor)
+
+    def list_identities(self) -> list[dict[str, object]]:
+        with self._connect() as connection:
+            cursor = connection.cursor()
+            try:
+                cursor.execute(
+                    self._sql(
+                        """
+                        SELECT identity_id, public_key, alg, label, created_at, revoked_at
+                        FROM {schema}.{prefix}identities
+                        ORDER BY created_at DESC
+                        """
+                    )
+                )
+                return self._fetchall(cursor)
+            finally:
+                self._close_cursor(cursor)
+
+    def revoke_identity(self, identity_id: str) -> bool:
+        with self._connect() as connection:
+            cursor = connection.cursor()
+            try:
+                cursor.execute(
+                    self._sql(
+                        """
+                        UPDATE {schema}.{prefix}identities
+                        SET revoked_at = %s
+                        WHERE identity_id = %s AND revoked_at IS NULL
+                        """
+                    ),
+                    (time.time(), identity_id),
+                )
+                return int(getattr(cursor, "rowcount", 0)) > 0
+            finally:
+                self._close_cursor(cursor)
+
+    def list_reputation(self, *, top: int = 20) -> list[dict[str, object]]:
+        with self._connect() as connection:
+            cursor = connection.cursor()
+            try:
+                cursor.execute(
+                    self._sql(
+                        """
+                        SELECT r.identity_id, i.label, r.alpha, r.beta, r.obs_count, r.last_updated
+                        FROM {schema}.{prefix}reputation r
+                        LEFT JOIN {schema}.{prefix}identities i ON i.identity_id = r.identity_id
+                        ORDER BY (r.alpha / (r.alpha + r.beta)) DESC, r.obs_count DESC
+                        LIMIT %s
+                        """
+                    ),
+                    (top,),
+                )
+                rows = self._fetchall(cursor)
+            finally:
+                self._close_cursor(cursor)
+
+        result: list[dict[str, object]] = []
+        for row in rows:
+            alpha = float(row["alpha"])
+            beta = float(row["beta"])
+            obs_count = int(row["obs_count"])
+            result.append(
+                {
+                    "identity_id": str(row["identity_id"]),
+                    "label": row["label"],
+                    "alpha": alpha,
+                    "beta": beta,
+                    "score": alpha / (alpha + beta),
+                    "confidence": obs_count / (obs_count + self.reputation_confidence_k),
+                    "obs_count": obs_count,
+                    "last_updated": float(row["last_updated"]),
+                }
+            )
+        return result
+
     def log_conscious(self, conscious: ConsciousBlock, *, snapshot_hash: str) -> None:
         with self._connect() as connection:
             cursor = connection.cursor()
@@ -1153,7 +1291,7 @@ class PgvectorStore(BaseStore):
                     if pipeline_id is not None:
                         cursor.execute(
                             self._sql(
-                                "SELECT chunk_id, base_trust, src, generation, created_at,"
+                                "SELECT chunk_id, base_trust, src, written_by, generation, created_at,"
                                 " retrieval_count, caused_by, dissent_count FROM {schema}.{prefix}chunks"
                                 " WHERE chunk_id NOT IN (SELECT chunk_id FROM {schema}.{prefix}tombstones)"
                                 " AND pipeline_id = %s"
@@ -1163,7 +1301,7 @@ class PgvectorStore(BaseStore):
                     else:
                         cursor.execute(
                             self._sql(
-                                "SELECT chunk_id, base_trust, src, generation, created_at,"
+                                "SELECT chunk_id, base_trust, src, written_by, generation, created_at,"
                                 " retrieval_count, caused_by, dissent_count FROM {schema}.{prefix}chunks"
                                 " WHERE chunk_id NOT IN (SELECT chunk_id FROM {schema}.{prefix}tombstones)"
                             )
@@ -1174,6 +1312,7 @@ class PgvectorStore(BaseStore):
 
                 updates: list[tuple[float, str]] = []
                 feedback_rows: list[FeedbackRow] = []
+                chunk_author: dict[str, str] = {}
                 for row in rows:
                     cid = str(row["chunk_id"])
                     src = str(row["src"])
@@ -1198,6 +1337,8 @@ class PgvectorStore(BaseStore):
                         else:
                             report.skipped += 1
                     else:
+                        written_by = str(row["written_by"])
+                        chunk_author[cid] = self.resolve_identity(written_by, pipeline_id=pipeline_id)
                         feedback_rows.append(
                             FeedbackRow(
                                 chunk_id=cid,
@@ -1220,6 +1361,31 @@ class PgvectorStore(BaseStore):
                     report.feedback_adjusted += fb.adjusted
                     report.skipped += fb.skipped
 
+                    prior = self._load_reputation(
+                        connection,
+                        {chunk_author[cid] for cid in chunk_author},
+                    )
+                    rep_updates = rollup_reputation(
+                        fb.change_log,
+                        chunk_author,
+                        prior,
+                        gain=self.reputation_gain,
+                        forget=self.reputation_forget,
+                        K_CONF=self.reputation_confidence_k,
+                    )
+                    report.change_log.extend(
+                        {
+                            "identity_id": update.identity_id,
+                            "reason": "reputation_rollup",
+                            "alpha": update.new_alpha,
+                            "beta": update.new_beta,
+                            "obs_delta": update.obs_delta,
+                        }
+                        for update in rep_updates
+                    )
+                else:
+                    rep_updates = ()
+
                 if not dry_run and updates:
                     update_cursor = connection.cursor()
                     try:
@@ -1230,9 +1396,10 @@ class PgvectorStore(BaseStore):
                                 ),
                                 (new_trust, cid),
                             )
-                        connection.commit()
                     finally:
                         self._close_cursor(update_cursor)
+                if feedback_mode and not dry_run:
+                    self._upsert_reputation_updates(connection, rep_updates, now=now)
 
         report.duration_seconds = time.monotonic() - started
         return report
@@ -1497,6 +1664,70 @@ class PgvectorStore(BaseStore):
 
     def _table_name(self, logical_name: str) -> str:
         return f"{self.schema}.{self.table_prefix}{logical_name}"
+
+    def _load_reputation(
+        self,
+        connection: Any,
+        identity_ids: set[str],
+    ) -> dict[str, tuple[float, float]]:
+        if not identity_ids:
+            return {}
+        placeholders = ", ".join(["%s"] * len(identity_ids))
+        cursor = connection.cursor()
+        try:
+            cursor.execute(
+                self._sql(
+                    f"""
+                    SELECT identity_id, alpha, beta
+                    FROM {{schema}}.{{prefix}}reputation
+                    WHERE identity_id IN ({placeholders})
+                    """
+                ),
+                tuple(sorted(identity_ids)),
+            )
+            rows = self._fetchall(cursor)
+        finally:
+            self._close_cursor(cursor)
+        return {
+            str(row["identity_id"]): (float(row["alpha"]), float(row["beta"]))
+            for row in rows
+        }
+
+    def _upsert_reputation_updates(
+        self,
+        connection: Any,
+        updates: tuple[ReputationUpdate, ...],
+        *,
+        now: float,
+    ) -> None:
+        cursor = connection.cursor()
+        try:
+            for update in updates:
+                cursor.execute(
+                    self._sql(
+                        """
+                        INSERT INTO {schema}.{prefix}reputation AS rep
+                            (identity_id, alpha, beta, obs_count, last_updated)
+                        VALUES (%s, %s, %s, %s, %s)
+                        ON CONFLICT(identity_id) DO UPDATE SET
+                            alpha = 1.0 + (rep.alpha - 1.0) * %s + (EXCLUDED.alpha - 1.0),
+                            beta = 1.0 + (rep.beta - 1.0) * %s + (EXCLUDED.beta - 1.0),
+                            obs_count = rep.obs_count + EXCLUDED.obs_count,
+                            last_updated = EXCLUDED.last_updated
+                        """
+                    ),
+                    (
+                        update.identity_id,
+                        1.0 + update.positive_evidence,
+                        1.0 + update.negative_evidence,
+                        update.obs_delta,
+                        now,
+                        self.reputation_forget,
+                        self.reputation_forget,
+                    ),
+                )
+        finally:
+            self._close_cursor(cursor)
 
     def _fetchall(self, cursor: Any) -> list[dict[str, Any]]:
         rows = cursor.fetchall()

@@ -38,6 +38,11 @@ log_level = "info"
 log_format = "pretty"
 cost_tracking = true
 
+[reputation]
+gain = 4.0
+forget = 0.99
+confidence_k = 20
+
 # [retention]
 # Cap on `working`-zone chunks retained per pipeline. When exceeded, the
 # lowest trust/recency-scored chunks are evicted on write. 0 disables

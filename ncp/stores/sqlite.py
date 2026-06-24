@@ -12,7 +12,12 @@ import time
 
 from ncp.config import NCPConfig
 from ncp.stores.base import BaseStore, NCPStoreUnavailableError
-from ncp.stores.calibration import FeedbackRow, compute_feedback_updates
+from ncp.stores.calibration import (
+    FeedbackRow,
+    ReputationUpdate,
+    compute_feedback_updates,
+    rollup_reputation,
+)
 from ncp.stores.consolidation import cluster_by_tags, find_merge_candidates
 from ncp.stores.retrieval import (
     DEFAULT_RETRIEVAL_POLICY,
@@ -160,6 +165,25 @@ CREATE TABLE IF NOT EXISTS drift_history (
 );
 
 CREATE INDEX IF NOT EXISTS idx_drift_session ON drift_history(session_id, turn);
+
+CREATE TABLE IF NOT EXISTS identities (
+    identity_id TEXT PRIMARY KEY,
+    public_key TEXT NOT NULL,
+    alg TEXT NOT NULL DEFAULT 'ed25519',
+    label TEXT,
+    created_at REAL NOT NULL,
+    revoked_at REAL
+);
+
+CREATE TABLE IF NOT EXISTS reputation (
+    identity_id TEXT PRIMARY KEY,
+    alpha REAL NOT NULL DEFAULT 1.0,
+    beta REAL NOT NULL DEFAULT 1.0,
+    obs_count INTEGER NOT NULL DEFAULT 0,
+    last_updated REAL NOT NULL DEFAULT 0.0
+);
+
+CREATE INDEX IF NOT EXISTS idx_reputation_updated ON reputation(last_updated);
 """
 
 
@@ -191,8 +215,14 @@ class SQLiteStore(BaseStore):
             self.retrieval_policy = retrieval_policy or RetrievalPolicy(
                 generation_penalty_base=cfg.retrieval_generation_penalty_base
             )
+            self.reputation_gain = cfg.reputation_gain
+            self.reputation_forget = cfg.reputation_forget
+            self.reputation_confidence_k = cfg.reputation_confidence_k
         except Exception:
             self.retrieval_policy = retrieval_policy or DEFAULT_RETRIEVAL_POLICY
+            self.reputation_gain = 4.0
+            self.reputation_forget = 0.99
+            self.reputation_confidence_k = 20
 
             class DummyConfig:
                 rerank_enabled = False
@@ -241,6 +271,9 @@ class SQLiteStore(BaseStore):
                 "ALTER TABLE chunks ADD COLUMN dissent_count INTEGER DEFAULT 0",
                 "CREATE TABLE IF NOT EXISTS drift_history (session_id TEXT NOT NULL, turn INTEGER NOT NULL, drift_score REAL NOT NULL, ts REAL NOT NULL)",
                 "CREATE INDEX IF NOT EXISTS idx_drift_session ON drift_history(session_id, turn)",
+                "CREATE TABLE IF NOT EXISTS identities (identity_id TEXT PRIMARY KEY, public_key TEXT NOT NULL, alg TEXT NOT NULL DEFAULT 'ed25519', label TEXT, created_at REAL NOT NULL, revoked_at REAL)",
+                "CREATE TABLE IF NOT EXISTS reputation (identity_id TEXT PRIMARY KEY, alpha REAL NOT NULL DEFAULT 1.0, beta REAL NOT NULL DEFAULT 1.0, obs_count INTEGER NOT NULL DEFAULT 0, last_updated REAL NOT NULL DEFAULT 0.0)",
+                "CREATE INDEX IF NOT EXISTS idx_reputation_updated ON reputation(last_updated)",
                 "INSERT INTO chunks_fts(chunks_fts) VALUES ('rebuild')",
             ):
                 try:
@@ -889,7 +922,7 @@ class SQLiteStore(BaseStore):
             cutoff_age = recency_half_life_seconds
 
             query = (
-                "SELECT chunk_id, base_trust, src, generation, created_at,"
+                "SELECT chunk_id, base_trust, src, written_by, generation, created_at,"
                 " retrieval_count, caused_by, dissent_count FROM chunks"
                 " WHERE chunk_id NOT IN (SELECT chunk_id FROM tombstones)"
             )
@@ -907,6 +940,7 @@ class SQLiteStore(BaseStore):
                 rows = connection.execute(query, params).fetchall()
                 updates: list[tuple[float, str]] = []
                 feedback_rows: list[FeedbackRow] = []
+                chunk_author: dict[str, str] = {}
                 for row in rows:
                     cid = str(row["chunk_id"])
                     src = str(row["src"])
@@ -931,6 +965,8 @@ class SQLiteStore(BaseStore):
                         else:
                             report.skipped += 1
                     else:
+                        written_by = str(row["written_by"])
+                        chunk_author[cid] = self.resolve_identity(written_by, pipeline_id=pipeline_id)
                         feedback_rows.append(
                             FeedbackRow(
                                 chunk_id=cid,
@@ -953,12 +989,39 @@ class SQLiteStore(BaseStore):
                     report.feedback_adjusted += fb.adjusted
                     report.skipped += fb.skipped
 
+                    prior = self._load_reputation(
+                        connection,
+                        {chunk_author[cid] for cid in chunk_author},
+                    )
+                    rep_updates = rollup_reputation(
+                        fb.change_log,
+                        chunk_author,
+                        prior,
+                        gain=self.reputation_gain,
+                        forget=self.reputation_forget,
+                        K_CONF=self.reputation_confidence_k,
+                    )
+                    report.change_log.extend(
+                        {
+                            "identity_id": update.identity_id,
+                            "reason": "reputation_rollup",
+                            "alpha": update.new_alpha,
+                            "beta": update.new_beta,
+                            "obs_delta": update.obs_delta,
+                        }
+                        for update in rep_updates
+                    )
+                else:
+                    rep_updates = ()
+
                 if not dry_run and updates:
                     for new_trust, cid in updates:
                         connection.execute(
                             "UPDATE chunks SET base_trust = ? WHERE chunk_id = ?",
                             (new_trust, cid),
                         )
+                if feedback_mode and not dry_run:
+                    self._upsert_reputation_updates(connection, rep_updates, now=now)
 
         report.duration_seconds = time.monotonic() - started
         return report
@@ -983,6 +1046,126 @@ class SQLiteStore(BaseStore):
             connection.execute(
                 "INSERT INTO drift_history (session_id, turn, drift_score, ts) VALUES (?, ?, ?, ?)",
                 (session_id, turn, drift_score, time.time()),
+            )
+
+    def resolve_identity(self, agent_id: str, *, pipeline_id: str | None = None) -> str:
+        del pipeline_id
+        return agent_id
+
+    def register_identity(
+        self,
+        *,
+        identity_id: str,
+        public_key: str,
+        label: str | None,
+        alg: str = "ed25519",
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO identities (identity_id, public_key, alg, label, created_at, revoked_at)
+                VALUES (?, ?, ?, ?, ?, NULL)
+                ON CONFLICT(identity_id) DO UPDATE SET
+                    public_key = excluded.public_key,
+                    alg = excluded.alg,
+                    label = excluded.label
+                """,
+                (identity_id, public_key, alg, label, time.time()),
+            )
+
+    def list_identities(self) -> list[dict[str, object]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT identity_id, public_key, alg, label, created_at, revoked_at
+                FROM identities
+                ORDER BY created_at DESC
+                """
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def revoke_identity(self, identity_id: str) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE identities SET revoked_at = ? WHERE identity_id = ? AND revoked_at IS NULL",
+                (time.time(), identity_id),
+            )
+            return cursor.rowcount > 0
+
+    def list_reputation(self, *, top: int = 20) -> list[dict[str, object]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT r.identity_id, i.label, r.alpha, r.beta, r.obs_count, r.last_updated
+                FROM reputation r
+                LEFT JOIN identities i ON i.identity_id = r.identity_id
+                ORDER BY (r.alpha / (r.alpha + r.beta)) DESC, r.obs_count DESC
+                LIMIT ?
+                """,
+                (top,),
+            ).fetchall()
+
+        result: list[dict[str, object]] = []
+        for row in rows:
+            alpha = float(row["alpha"])
+            beta = float(row["beta"])
+            obs_count = int(row["obs_count"])
+            result.append(
+                {
+                    "identity_id": str(row["identity_id"]),
+                    "label": row["label"],
+                    "alpha": alpha,
+                    "beta": beta,
+                    "score": alpha / (alpha + beta),
+                    "confidence": obs_count / (obs_count + self.reputation_confidence_k),
+                    "obs_count": obs_count,
+                    "last_updated": float(row["last_updated"]),
+                }
+            )
+        return result
+
+    def _load_reputation(
+        self,
+        connection: sqlite3.Connection,
+        identity_ids: set[str],
+    ) -> dict[str, tuple[float, float]]:
+        if not identity_ids:
+            return {}
+        placeholders = ",".join("?" for _ in identity_ids)
+        rows = connection.execute(
+            f"SELECT identity_id, alpha, beta FROM reputation WHERE identity_id IN ({placeholders})",
+            tuple(sorted(identity_ids)),
+        ).fetchall()
+        return {
+            str(row["identity_id"]): (float(row["alpha"]), float(row["beta"]))
+            for row in rows
+        }
+
+    def _upsert_reputation_updates(
+        self,
+        connection: sqlite3.Connection,
+        updates: tuple[ReputationUpdate, ...],
+        *,
+        now: float,
+    ) -> None:
+        for update in updates:
+            connection.execute(
+                """
+                INSERT INTO reputation(identity_id, alpha, beta, obs_count, last_updated)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(identity_id) DO UPDATE SET
+                    alpha = excluded.alpha,
+                    beta = excluded.beta,
+                    obs_count = reputation.obs_count + excluded.obs_count,
+                    last_updated = excluded.last_updated
+                """,
+                (
+                    update.identity_id,
+                    update.new_alpha,
+                    update.new_beta,
+                    update.obs_delta,
+                    now,
+                ),
             )
 
     def status(self) -> dict[str, int | float]:

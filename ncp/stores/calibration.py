@@ -32,6 +32,18 @@ class FeedbackResult:
     skipped: int = 0
 
 
+@dataclass(frozen=True)
+class ReputationUpdate:
+    """New Beta posterior values for one identity."""
+
+    identity_id: str
+    new_alpha: float
+    new_beta: float
+    obs_delta: int
+    positive_evidence: float = 0.0
+    negative_evidence: float = 0.0
+
+
 _DISSENT_SATURATION = 3  # dissents needed for full penalty (vs 10 retrievals for full boost)
 
 
@@ -116,3 +128,59 @@ def compute_feedback_updates(
     result.adjusted = len(adjusted_ids)
     result.skipped = len(rows) - len(adjusted_ids)
     return result
+
+
+def rollup_reputation(
+    change_log: list[dict],
+    chunk_author: dict[str, str],
+    prior: dict[str, tuple[float, float]],
+    *,
+    gain: float,
+    forget: float,
+    K_CONF: int = 20,
+) -> tuple[ReputationUpdate, ...]:
+    """Roll chunk trust deltas up to per-identity Beta posterior updates."""
+
+    del K_CONF  # Readers derive confidence from obs_count; keep the spec-level API.
+
+    pos: dict[str, float] = {}
+    neg: dict[str, float] = {}
+    obs: dict[str, int] = {}
+
+    for entry in change_log:
+        chunk_id = entry.get("chunk_id")
+        if not isinstance(chunk_id, str):
+            continue
+        identity_id = chunk_author.get(chunk_id)
+        if identity_id is None:
+            continue
+
+        old_trust = float(entry.get("old_trust", 0.0))
+        new_trust = float(entry.get("new_trust", old_trust))
+        delta = new_trust - old_trust
+        if delta > 0:
+            pos[identity_id] = pos.get(identity_id, 0.0) + delta
+        elif delta < 0:
+            neg[identity_id] = neg.get(identity_id, 0.0) + (-delta)
+        else:
+            continue
+        obs[identity_id] = obs.get(identity_id, 0) + 1
+
+    updates: list[ReputationUpdate] = []
+    for identity_id in sorted(obs):
+        alpha, beta = prior.get(identity_id, (1.0, 1.0))
+        decayed_alpha = 1.0 + max(0.0, alpha - 1.0) * forget
+        decayed_beta = 1.0 + max(0.0, beta - 1.0) * forget
+        positive_evidence = pos.get(identity_id, 0.0) * gain
+        negative_evidence = neg.get(identity_id, 0.0) * gain
+        updates.append(
+            ReputationUpdate(
+                identity_id=identity_id,
+                new_alpha=max(1.0, decayed_alpha + positive_evidence),
+                new_beta=max(1.0, decayed_beta + negative_evidence),
+                obs_delta=obs[identity_id],
+                positive_evidence=positive_evidence,
+                negative_evidence=negative_evidence,
+            )
+        )
+    return tuple(updates)
