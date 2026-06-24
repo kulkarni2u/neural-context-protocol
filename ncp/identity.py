@@ -13,7 +13,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 def identity_id_for_public_key(public_key: bytes) -> str:
     digest = hashlib.sha256(public_key).digest()
-    return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")[:16]
+    return base64.b32encode(digest).decode("ascii").rstrip("=").lower()[:16]
 
 
 def generate_ed25519_identity() -> tuple[str, str, bytes]:
