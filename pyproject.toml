@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "neural-context-protocol"
-version = "1.1.0"
-description = "Neural Context Protocol (NCP): bounded, persistent context for multi-agent pipelines."
+version = "1.2.0"
+description = "Neural Context Protocol (NCP): context engineering protocol and memory bus for multi-agent systems."
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [{ name = "kulkarni2u" }]

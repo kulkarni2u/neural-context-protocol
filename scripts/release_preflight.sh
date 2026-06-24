@@ -31,7 +31,7 @@ mkdir -p "$SMOKE_DIR"
 
 echo "==> Smoke testing wheel install"
 python -m pip install "$DIST_DIR"/neural_context_protocol-*.whl >/dev/null
-ncp init --cwd "$SMOKE_DIR" >/dev/null
+ncp init --store sqlite --cwd "$SMOKE_DIR" >/dev/null
 ncp status --cwd "$SMOKE_DIR" >/dev/null
 python -m pip uninstall -y neural-context-protocol >/dev/null
 rm -rf "$SMOKE_DIR"
@@ -39,7 +39,7 @@ mkdir -p "$SMOKE_DIR"
 
 echo "==> Smoke testing sdist install"
 python -m pip install "$DIST_DIR"/neural_context_protocol-*.tar.gz >/dev/null
-ncp init --cwd "$SMOKE_DIR" >/dev/null
+ncp init --store sqlite --cwd "$SMOKE_DIR" >/dev/null
 ncp status --cwd "$SMOKE_DIR" >/dev/null
 
 echo "Release preflight passed."
