@@ -198,7 +198,7 @@ async def test_async_calibrate_batch_decay_eligible_chunk() -> None:
         src="agent_inferred",
     )
     store = _make_store()
-    store._test_cursor.fetchall = AsyncMock(return_value=[row])
+    store._test_cursor.fetchall = AsyncMock(side_effect=[[row], []])
 
     report = await store.async_calibrate(decay_factor=0.85)
 
@@ -225,7 +225,7 @@ async def test_async_calibrate_batch_decay_young_chunk_skipped() -> None:
         created_at=recent_created_at,
     )
     store = _make_store()
-    store._test_cursor.fetchall = AsyncMock(return_value=[row])
+    store._test_cursor.fetchall = AsyncMock(side_effect=[[row], []])
 
     report = await store.async_calibrate()  # default recency_half_life_seconds=14400
 
@@ -246,18 +246,37 @@ async def test_async_calibrate_feedback_mode_boosts_trust() -> None:
         retrieval_count=5,
     )
     store = _make_store()
-    store._test_cursor.fetchall = AsyncMock(return_value=[row])
+    store._test_cursor.fetchall = AsyncMock(side_effect=[[row], []])
 
     report = await store.async_calibrate(feedback_mode=True, feedback_weight=0.15)
 
     assert report.feedback_adjusted == 1, f"Expected feedback_adjusted=1, got {report.feedback_adjusted}"
-    assert len(report.change_log) == 1
-    entry = report.change_log[0]
+    entry = next(e for e in report.change_log if e["reason"] == "retrieval_feedback")
     expected_boost = 0.15 * min(1.0, 5 / 10)
     expected_new_trust = min(1.0, 0.6 + expected_boost)
     assert entry["new_trust"] == pytest.approx(expected_new_trust, rel=1e-4)
     assert entry["reason"] == "retrieval_feedback"
     assert entry["retrieval_count"] == 5
+
+
+@pytest.mark.anyio
+async def test_async_calibrate_feedback_mode_rolls_up_reputation() -> None:
+    """feedback_mode=True must roll up chunk deltas to the author's reputation."""
+    row = _make_chunk_row(
+        chunk_id="retrieved",
+        base_trust=0.6,
+        retrieval_count=5,
+        written_by="agent_async",
+    )
+    store = _make_store()
+    store._test_cursor.fetchall = AsyncMock(side_effect=[[row], []])
+
+    report = await store.async_calibrate(feedback_mode=True, feedback_weight=0.15)
+
+    assert report.feedback_adjusted == 1
+    assert any(entry.get("reason") == "reputation_rollup" for entry in report.change_log)
+    execute_calls = [str(c) for c in store._test_cursor.execute.call_args_list]
+    assert any("INSERT INTO ncp.ncp_reputation" in call for call in execute_calls)
 
 
 # ---------------------------------------------------------------------------

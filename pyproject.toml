@@ -29,6 +29,7 @@ dependencies = [
   "anyio>=4.3",
   "orjson>=3.10",
   "structlog>=24.0",
+  "cryptography>=42.0",
 ]
 
 [project.urls]

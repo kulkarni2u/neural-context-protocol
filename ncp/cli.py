@@ -1374,6 +1374,12 @@ def calibrate_command(
     table.add_row("Adjusted", str(report.adjusted))
     if feedback:
         table.add_row("Feedback adjusted", str(report.feedback_adjusted))
+        identities_updated = sum(
+            1 for entry in report.change_log if entry.get("reason") == "reputation_rollup"
+        )
+        table.add_row("Identities updated", str(identities_updated))
+    else:
+        identities_updated = 0
     table.add_row("Protected (user_verified)", str(report.protected))
     table.add_row("Skipped", str(report.skipped))
     table.add_row("Duration", f"{report.duration_seconds:.3f}s")
@@ -1385,7 +1391,121 @@ def calibrate_command(
     elif total_changed == 0:
         console.print("[dim]Nothing to calibrate.[/dim]")
     else:
-        console.print(f"[green]Calibrated {total_changed} chunk(s).[/green]")
+        suffix = f"; {identities_updated} identities updated" if feedback else ""
+        console.print(f"[green]Calibrated {total_changed} chunk(s){suffix}.[/green]")
+
+
+@main.group("identity")
+def identity_group() -> None:
+    """Manage local agent identities."""
+
+
+@identity_group.command("create")
+@click.option("--cwd", default=None, type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("--label", default=None, help="Human-facing identity label.")
+def identity_create_command(cwd: Path | None, label: str | None) -> None:
+    """Create a local Ed25519 identity and store its public key."""
+    from ncp.config import load_config
+    from ncp.identity import generate_ed25519_identity, resolve_keystore_dir, store_secret_key
+
+    config = load_config(cwd=cwd or Path.cwd())
+    store = _resolve_runtime_store(config)
+    if not callable(getattr(store, "register_identity", None)):
+        raise click.ClickException("Configured store does not support identities.")
+
+    identity_id, public_key, private_key = generate_ed25519_identity()
+    keystore_dir = resolve_keystore_dir(config.project_root)
+    key_path = store_secret_key(identity_id, private_key, keystore_dir=keystore_dir)
+    try:
+        store.register_identity(identity_id=identity_id, public_key=public_key, label=label)
+    except Exception as exc:
+        try:
+            key_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise click.ClickException(str(exc)) from exc
+    console.print(identity_id)
+
+
+@identity_group.command("list")
+@click.option("--cwd", default=None, type=click.Path(exists=True, file_okay=False, path_type=Path))
+def identity_list_command(cwd: Path | None) -> None:
+    """List local identities."""
+    from ncp.config import load_config
+
+    config = load_config(cwd=cwd or Path.cwd())
+    store = _resolve_runtime_store(config)
+    if not callable(getattr(store, "list_identities", None)):
+        raise click.ClickException("Configured store does not support identities.")
+    rows = store.list_identities()
+
+    table = Table(title="Identities", box=box.SIMPLE)
+    table.add_column("Identity", style="cyan")
+    table.add_column("Label")
+    table.add_column("Alg")
+    table.add_column("Created")
+    table.add_column("Revoked")
+    for row in rows:
+        table.add_row(
+            str(row["identity_id"]),
+            str(row.get("label") or "-"),
+            str(row.get("alg") or "-"),
+            _format_ts(float(row["created_at"])) if row.get("created_at") is not None else "-",
+            _format_ts(float(row["revoked_at"])) if row.get("revoked_at") is not None else "-",
+        )
+    console.print(table)
+
+
+@identity_group.command("revoke")
+@click.argument("identity_id")
+@click.option("--cwd", default=None, type=click.Path(exists=True, file_okay=False, path_type=Path))
+def identity_revoke_command(identity_id: str, cwd: Path | None) -> None:
+    """Revoke a local identity public key."""
+    from ncp.config import load_config
+
+    config = load_config(cwd=cwd or Path.cwd())
+    store = _resolve_runtime_store(config)
+    if not callable(getattr(store, "revoke_identity", None)):
+        raise click.ClickException("Configured store does not support identities.")
+    if not store.revoke_identity(identity_id):
+        raise click.ClickException(f"Identity not found or already revoked: {identity_id}")
+    console.print(f"Revoked {identity_id}")
+
+
+@main.command("reputation")
+@click.option("--cwd", default=None, type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("--top", default=20, show_default=True, type=int, help="Maximum rows to show.")
+@click.option("--json-output", is_flag=True, help="Emit machine-readable JSON instead of a table.")
+def reputation_command(cwd: Path | None, top: int, json_output: bool) -> None:
+    """Show local reputation scores."""
+    from ncp.config import load_config
+
+    config = load_config(cwd=cwd or Path.cwd())
+    store = _resolve_runtime_store(config)
+    if not callable(getattr(store, "list_reputation", None)):
+        raise click.ClickException("Configured store does not support reputation.")
+    rows = store.list_reputation(top=top)
+    if json_output:
+        click.echo(json.dumps(rows))
+        return
+
+    table = Table(title="Reputation", box=box.SIMPLE)
+    table.add_column("Identity", style="cyan")
+    table.add_column("Label")
+    table.add_column("Score", justify="right")
+    table.add_column("Confidence", justify="right")
+    table.add_column("Obs", justify="right")
+    table.add_column("Updated")
+    for row in rows:
+        table.add_row(
+            str(row["identity_id"]),
+            str(row.get("label") or "-"),
+            f"{float(row['score']):.3f}",
+            f"{float(row['confidence']):.3f}",
+            str(row["obs_count"]),
+            _format_ts(float(row["last_updated"])) if row.get("last_updated") else "-",
+        )
+    console.print(table)
 
 
 @main.command("precedents")
