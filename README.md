@@ -23,6 +23,16 @@ The table above is an illustration of the bounded-context shape. The reproducibl
 
 -----
 
+## Why This Matters: Token Capital Efficiency
+
+Token capital efficiency is the business value captured per dollar spent on model reasoning, task execution, and learning. Most agent stacks still treat token spend as disposable: every run re-reads context, re-discovers prior decisions, and leaves little reusable signal behind.
+
+NCP helps convert that spend into reusable organizational memory. It wraps probabilistic model calls in deterministic infrastructure: bounded context assembly, durable memory, trust scoring, retention, calibration, cost telemetry, and identity/reputation signals.
+
+That does not make NCP a model router or eval platform by itself. It is the substrate those loops need: define the task boundary, preserve the useful state, measure cost and outcomes, and make prior work available to cheaper or smaller models without replaying the whole history.
+
+-----
+
 ## Quickstart
 
 ```bash
