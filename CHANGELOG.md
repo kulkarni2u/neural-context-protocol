@@ -19,6 +19,10 @@ All notable changes to Neural Context Protocol will be documented in this file.
 - **`ncp_record_decision` MCP tool** (`ncp/mcp/server.py`): structured decision trace capture. Records what was decided, alternatives considered, rationale, evidence refs, outcome status, and searchable tags as `reasoning_trace` chunks with `caused_by` edges for graph traversal. Foundation for queryable precedents.
 - **`ncp precedents` CLI command** (`ncp/cli.py`, `ncp/stores/sqlite.py`): query past decisions by relevance with `--tag` and `--outcome` filters. Answers "show me past decisions like this one and how they turned out." Backed by `query_precedents()` store method (with async counterpart).
 
+### Changed
+
+- **README positioning** (`README.md`): refocus the public story on NCP as a Context Engineering Protocol, memory bus, and multi-agent context protocol for durable context, trust, learning, and token capital efficiency instead of leading with compression or token savings.
+
 ## [1.1.0] - 2026-06-11
 
 Correctness, MCP-parity, and credibility overhaul from the protocol review
