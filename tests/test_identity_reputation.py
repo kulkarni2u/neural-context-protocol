@@ -11,7 +11,7 @@ import pytest
 from click.testing import CliRunner
 
 from ncp.cli import main
-from ncp.identity import store_secret_key
+from ncp.identity import identity_id_for_public_key, store_secret_key
 from ncp.stores.calibration import ReputationUpdate
 from ncp.stores.calibration import FeedbackRow, rollup_reputation
 from ncp.stores.pgvector import PgvectorStore
@@ -48,6 +48,14 @@ def _fetch_reputation(db_path: Path, identity_id: str) -> sqlite3.Row | None:
         ).fetchone()
     finally:
         connection.close()
+
+
+def test_identity_id_for_public_key_is_cli_safe() -> None:
+    identity_id = identity_id_for_public_key(b"\xfb" * 32)
+
+    assert len(identity_id) == 16
+    assert identity_id[0].isalnum()
+    assert all(ch.isalnum() for ch in identity_id)
 
 
 def test_rollup_reputation_positive_chunk_raises_alpha() -> None:
