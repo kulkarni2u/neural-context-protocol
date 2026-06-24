@@ -1,8 +1,9 @@
 # NCP End-to-End Handoff Packet
 
-This document is the current restart packet for the NCP project. Use it as the
-primary context for Claude, OpenCode, or another bounded coding agent instead
-of replaying long chat history.
+> Archived restart packet. This captured the original V1/post-1.0 handoff line
+> and is retained for historical context. For current implementation work, use
+> `README.md`, `CHANGELOG.md`, `docs/NCP_PROTOCOL_SPEC.md`, and
+> `docs/NCP_SETUP.md` first.
 
 ## Current State
 

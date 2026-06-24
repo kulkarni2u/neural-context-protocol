@@ -7,19 +7,24 @@
 
 -----
 
-## Your pipeline grows. Your context shouldn't.
+## Context Engineering Protocol for Agent Systems
 
-Multi-agent pipelines compound. Every turn, the model re-reads growing history it mostly doesn't need. In long-running pipelines, that history can grow by orders of magnitude while the useful working set stays small.
+Agents do not fail only because models are weak. They fail because context is unmanaged.
 
-NCP fixes this by replacing full-history replay with a bounded, trust-weighted working memory that stays flat as your pipeline deepens.
+Long-running pipelines lose important decisions, replay stale transcripts, mix trusted facts with guesses, and force every model call to rediscover what the system already learned.
 
-```
-Turn 10:  raw replay → 12,000 tok    NCP → ~840 tok
-Turn 30:  raw replay → 45,000 tok    NCP → ~840 tok
-Turn 50:  raw replay → 80,000 tok    NCP → ~840 tok  ← bounded
-```
+NCP gives agent systems a shared context layer: durable memory, bounded retrieval, trust scoring, cross-agent whispers, turn records, cost telemetry, and feedback calibration. Agents can learn from prior work and share what matters while solving complex business tasks.
 
-The table above is an illustration of the bounded-context shape. The reproducible deterministic coding benchmark below currently shows **13.13x fewer final-turn tokens vs raw replay** with a `chars_div4` token unit and an explicit 340-token benchmark context budget.
+The result is engineered context: relevant, trusted, reusable state that can move across agents, tools, models, and hosts.
+
+| Problem | What NCP provides |
+|---------|-------------------|
+| Agents replay growing transcripts | Bounded context assembly |
+| Useful work disappears after a turn | Durable memory and turn records |
+| All context looks equally credible | Trust scores, drift markers, dissent, and calibration |
+| Multi-agent handoff is brittle | Whispers and shared pipeline memory |
+| Token spend does not compound | Reusable memory, cost telemetry, and reputation signals |
+| Teams want to use smaller models safely | Better engineered context for cheaper model calls |
 
 -----
 
@@ -27,9 +32,9 @@ The table above is an illustration of the bounded-context shape. The reproducibl
 
 Token capital efficiency is the business value captured per dollar spent on model reasoning, task execution, and learning. Most agent stacks still treat token spend as disposable: every run re-reads context, re-discovers prior decisions, and leaves little reusable signal behind.
 
-NCP helps convert that spend into reusable organizational memory. It wraps probabilistic model calls in deterministic infrastructure: bounded context assembly, durable memory, trust scoring, retention, calibration, cost telemetry, and identity/reputation signals.
+NCP helps convert that spend into reusable organizational memory. Each run can leave behind decisions, evidence, outcomes, trust signals, cost records, and reputation updates that future agents can use.
 
-That does not make NCP a model router or eval platform by itself. It is the substrate those loops need: define the task boundary, preserve the useful state, measure cost and outcomes, and make prior work available to cheaper or smaller models without replaying the whole history.
+That does not make NCP a model router or eval platform by itself. It is the context substrate those loops need: define the task boundary, preserve useful state, measure cost and outcomes, and make prior work available to cheaper or smaller models without replaying the whole history.
 
 -----
 
@@ -61,14 +66,12 @@ For n8n, NCP's MCP server must be reachable from your n8n instance with an auth 
 
 ## How It Works
 
-Instead of replaying a growing transcript, NCP assembles a bounded context from three blocks every turn:
+Instead of treating every model call as an isolated chat, NCP assembles a shared working context from three blocks every turn:
 
 ```
-[NCP:CONSCIOUS]     ~120 tok  — what this agent knows right now
-[NCP:SUBCONSCIOUS]  ~480 tok  — relevant past, retrieved not replayed
-[NCP:WHISPERS]      ~240 tok  — bounded signals from other agents
-─────────────────────────────────────────────────────────────────
-Total:              ~840 tok  — stays bounded as the pipeline deepens
+[NCP:CONSCIOUS]     what this agent knows right now
+[NCP:SUBCONSCIOUS]  relevant past, retrieved not replayed
+[NCP:WHISPERS]      bounded signals from other agents
 ```
 
 Memory survives restarts. The same runtime serves multiple hosts against the same store. Agents coordinate through bounded whispers without stuffing prompts.
@@ -97,7 +100,7 @@ PaymentProcessorTest.testAchTrialRetry passes.
 
 `reviewer` assembles its own bounded context, sees the fix outcome, and receives a bounded whisper with the changed file list. If the fix is wrong, it can emit a `dissent` whisper back to `fixer` with the specific issue instead of forcing the whole pipeline to replay session history.
 
-By turn 20, a raw-replay workflow is dragging old stack traces, earlier tool output, and prior reasoning through every turn. The NCP workflow is still assembling a compact working set and fetching only what matters for the current task.
+By turn 20, a raw-replay workflow is dragging old stack traces, earlier tool output, and prior reasoning through every turn. The NCP workflow is working from durable shared memory, current task context, and trust-weighted evidence.
 
 ### Turn Flow
 
@@ -152,13 +155,15 @@ The effect: the model receives context ranked by how much it should believe it, 
 
 -----
 
-## Ingestion-Time Compression
+## Signal Filtering at Write Time
 
-Bounded-context assembly keeps the *retrieved* working set small. Ingestion-time compression is the complementary axis: it keeps the *stored* content lean. The idea is simple — stored chunks should contain signal, not framing.
+NCP is not a compression tool. It is a memory bus, and a memory bus should store useful signal instead of tool-output boilerplate.
 
-When you call `ncp_write_memory`, NCP runs deterministic noise reduction before storing: it strips ANSI codes, collapses blank-line runs, dedups consecutive duplicate lines, removes tool-output boilerplate (progress bars, timing lines), and prunes null/empty JSON fields. This is reversible — the unfiltered original is preserved as a low-trust `raw_ref` chunk and retrievable on demand via `ncp_fetch`, so compression is lossless-in-intent.
+When you call `ncp_write_memory`, NCP runs deterministic noise reduction before storing: it strips ANSI codes, collapses blank-line runs, dedups consecutive duplicate lines, removes tool-output boilerplate (progress bars, timing lines), and prunes null/empty JSON fields. The goal is context quality: stored chunks should be easier for future agents to retrieve, trust, and use.
 
-The filter is conservative, so savings are large where there is structural redundancy and modest where content is already dense. On a fixed corpus of representative noisy agent payloads (`chars_div4` token unit), aggregate token reduction is **33%** (537 → 360 tokens), with per-category results:
+This is reversible. The unfiltered original is preserved as a low-trust `raw_ref` chunk and retrievable on demand via `ncp_fetch`, so filtering does not destroy auditability.
+
+The filter is conservative. It removes obvious noise where there is structural redundancy and leaves already-dense content mostly alone. On a fixed corpus of representative noisy agent payloads (`chars_div4` token unit), aggregate reduction is **33%** (537 -> 360 tokens), with per-category results:
 
 | Payload category                          | Token reduction |
 |-------------------------------------------|----------------:|
@@ -167,15 +172,15 @@ The filter is conservative, so savings are large where there is structural redun
 | CLI output (ANSI + progress + timing)     | **5%**          |
 | Stack-trace-style blobs                   | **2%**          |
 
-This is deterministic noise reduction, not a model-quality change. See [the compression benchmark doc](./docs/NCP_BENCHMARK_COMPRESSION.md).
+This is deterministic signal filtering, not a model-quality change. See [the compression benchmark doc](./docs/NCP_BENCHMARK_COMPRESSION.md).
 
 -----
 
 ## What NCP Is (and Isn't)
 
-**NCP is the memory bus, not the orchestrator.**
+**NCP is the memory bus and context protocol, not the orchestrator.**
 
-It sits underneath your existing agent framework — LangGraph ([runnable example](./examples/03_langgraph/)), CrewAI, AutoGen, or a custom orchestrator — and gives every connected host the same bounded, trust-weighted working memory. Bring your own orchestrator. Bring your own agents.
+It sits underneath your existing agent framework — LangGraph ([runnable example](./examples/03_langgraph/)), CrewAI, AutoGen, or a custom orchestrator — and gives every connected host the same bounded, trust-weighted working memory. Agents can learn, share, dissent, hand off, and build on prior work without making the orchestrator own all context.
 
 It is not a vector database. Not a model training framework. Not an orchestrator. Not the right default for simple single-agent or very short-lived tasks.
 
