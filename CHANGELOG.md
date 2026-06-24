@@ -22,6 +22,7 @@ All notable changes to Neural Context Protocol will be documented in this file.
 ### Changed
 
 - **README positioning** (`README.md`): refocus the public story on NCP as a Context Engineering Protocol, memory bus, and multi-agent context protocol for durable context, trust, learning, and token capital efficiency instead of leading with compression or token savings.
+- **Documentation alignment** (`docs/NCP_SETUP.md`, `docs/NCP_PROTOCOL_SPEC.md`, `docs/NCP_ACTIVE_HANDOFF_PACKET.md`): prefer installed `ncp infra up/down` setup commands, describe turn records as bounded summaries instead of compressed summaries, and mark the old V1 handoff packet as archival.
 
 ## [1.1.0] - 2026-06-11
 

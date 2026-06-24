@@ -151,7 +151,7 @@ Store metadata:
   schema_version  int   = 1
   supersedes      str?  = None     chunk_id (or JSON list) this chunk replaces
   source_refs     list[str] = []   for synthesis chunks
-  raw_ref         str?  = None     chunk_id of the unfiltered original (reversible compression)
+  raw_ref         str?  = None     chunk_id of the unfiltered original when filtering is applied
 
 Runtime (set at retrieval):
   relevance       float = 0.0
@@ -208,7 +208,7 @@ Routing rules:
   pipeline_id     str?
   task            str
   slot            str
-  result          str         compressed summary — what gets injected via recent ref
+  result          str         bounded summary — what gets injected via recent ref
   result_full     str         full output — stored, fetchable via ncp_fetch
   created_at      float
   expires_at      float       created_at + ttl_seconds (default 86400)
@@ -452,7 +452,7 @@ Step 1: Hydrate conscious block
 Step 2: Resolve recent refs
   for each ref in conscious.recent:
     look up TurnRecord by turn_id
-    extract TurnRecord.result (compressed summary)
+    extract TurnRecord.result (bounded summary)
     inject as resolved content
 
 Step 3: Hybrid subconscious retrieval
@@ -483,7 +483,7 @@ Step 6: Call adapter
   adapter.call(ncp_context, user_turn) or adapter.stream(...)
 
 Step 7: Post-turn async writes (non-blocking, anyio task group)
-  write TurnRecord (compressed result + full output)
+  write TurnRecord (bounded result + full output)
   update recent refs on ConsciousBlock
   write any memory chunks from agent's post-turn hooks
   log to conscious_log

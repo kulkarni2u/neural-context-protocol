@@ -77,11 +77,11 @@ ncp init --store pgvector
 
 ### 2. Bring up local infra
 
-Use the repo’s compose-backed helpers:
+Use the installed compose-backed helper:
 
 ```bash
 podman machine start podman-machine-default || true
-NCP_CONTAINER_ENGINE=podman ./scripts/infra_up.sh
+NCP_CONTAINER_ENGINE=podman ncp infra up
 ```
 
 This starts:
@@ -92,8 +92,7 @@ This starts:
 Equivalent local compose stack:
 
 - [compose.yaml](../compose.yaml)
-- [scripts/infra_up.sh](../scripts/infra_up.sh)
-- [scripts/infra_down.sh](../scripts/infra_down.sh)
+- [scripts/infra_up.sh](../scripts/infra_up.sh) and [scripts/infra_down.sh](../scripts/infra_down.sh), the lower-level repo scripts used by `ncp infra up/down`
 
 ### 3. Apply pgvector schema migrations
 
