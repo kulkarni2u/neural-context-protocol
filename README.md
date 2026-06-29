@@ -63,9 +63,25 @@ For Codex CLI, copy [`examples/07_codex_cli/mcp_servers.json`](./examples/07_cod
 
 See [`examples/07_codex_cli/README.md`](./examples/07_codex_cli/README.md).
 
+For Codex CLI and OpenCode, register the same endpoint and copy the host's `AGENTS.md` turn contract — see [`examples/07_codex_cli/README.md`](./examples/07_codex_cli/README.md) and [`examples/09_opencode/README.md`](./examples/09_opencode/README.md).
+
 For n8n, NCP's MCP server must be reachable from your n8n instance with an auth token configured — see [`examples/08_n8n/README.md`](./examples/08_n8n/README.md).
 
 `ncp init` creates `.ncp/config.toml` and a `CLAUDE.md` turn contract in the project root.
+
+### Zero-touch setup (route all agent comms through NCP)
+
+For Claude Code you can go further than registering the server: a **SessionStart hook** can start the bus automatically and instruct every session — and any subagents it dispatches — to use NCP as the agent-to-agent channel.
+
+```bash
+mkdir -p .claude/hooks .claude/skills/ncp
+cp examples/06_claude_code/settings.json             .claude/settings.json
+cp examples/06_claude_code/hooks/ncp-session-start.sh .claude/hooks/
+cp examples/06_claude_code/skills/ncp/SKILL.md        .claude/skills/ncp/
+chmod +x .claude/hooks/ncp-session-start.sh
+```
+
+The hook health-checks `127.0.0.1:4242/healthz`, starts `ncp serve` if it's down, and injects the protocol instruction (including the mandatory subagent dispatch rule); the `/ncp` skill carries the same guidance for on-demand use. Codex CLI and OpenCode lack a comparable hook, so they get the same instruction through their auto-loaded `AGENTS.md` plus the shared `scripts/ncp_ensure_serve.sh` helper. Hooks and contracts *instruct* hosts to use NCP — they don't *enforce* it; reliable coverage comes from registering the MCP tools, the always-loaded `AGENTS.md` rule, the dispatch template, and the SessionStart nudge together. See [`examples/06_claude_code/README.md`](./examples/06_claude_code/README.md).
 
 -----
 
