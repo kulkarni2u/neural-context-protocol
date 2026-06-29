@@ -1,0 +1,11 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "ncp": {
+      "type": "remote",
+      "url": "http://127.0.0.1:4242/mcp",
+      "enabled": true
+    }
+  },
+  "instructions": ["AGENTS.md"]
+}
