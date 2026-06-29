@@ -147,17 +147,18 @@ Every connected agent is a peer on the bus (`A`); `ncp serve` is the transport; 
 
 ## Memory layers
 
-Memory on the bus is not a flat blob. Every chunk is typed into one of five cognitively-named layers, so retrieval, consolidation, and the `ncp status` / `ncp viz` reports can reason about *what kind* of memory they are handling:
+Memory on the bus is not a flat blob. Every chunk carries a required `layer` tag, drawn from a fixed set of five cognitively-named values, so you can filter retrieval by *what kind* of memory you want (`ncp_fetch` takes a `layer` filter, and `ncp status` / `ncp viz` report the distribution).
 
-| Layer             | Holds                                                            |
+The valid layers are `episodic`, `procedural`, `semantic`, `social`, and `reasoning_trace`. Four of them are a writer-chosen convention — NCP stores and filters by the tag but does not enforce a meaning, so use them consistently with their usual sense:
+
+| Layer             | Conventional use                                                |
 |-------------------|-----------------------------------------------------------------|
 | `episodic`        | What happened — events, observations, tool results from a turn  |
 | `procedural`      | How to do something — repeatable steps and methods              |
 | `semantic`        | Stable facts and definitions that outlive a single run          |
 | `social`          | Agent-to-agent context — who said what, handoffs, dissent        |
-| `reasoning_trace` | Why a decision was made — captured by `ncp_record_decision`      |
 
-The `layer` field is required on `ncp_write_memory` and can be used as a filter on `ncp_fetch`. Typed memory is what lets the bus retrieve "the decision rationale" or "the procedure" rather than just "a recent chunk."
+`reasoning_trace` is the exception: it is set automatically — `ncp_record_decision` writes the decision rationale as a `reasoning_trace` chunk. Tagging memory consistently is what lets the bus retrieve "the decision rationale" or "the procedure" rather than just "a recent chunk."
 
 -----
 
