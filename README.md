@@ -9,11 +9,11 @@
 
 ## A protocol for agent-to-agent communication over MCP
 
-NCP is the **memory bus** for multi-agent systems: a shared context layer that lets agents talk to each other, hand off work, and build on prior results — without replaying transcripts or stuffing prompts.
+NCP is an **agent-to-agent communication protocol** for multi-agent systems — and, underneath it, a **memory bus over MCP**. It lets agents talk to each other, hand off work, and build on prior results without replaying transcripts or stuffing prompts.
 
-MCP standardized how a single agent talks to its tools. NCP standardizes how **agents talk to each other**. It exposes one MCP endpoint that every host — Claude, Codex, OpenCode, n8n, LangGraph, or a custom orchestrator — connects to as a peer on the same bus. Each agent reads bounded, trust-weighted context, writes durable memory, and sends bounded signals (whispers) to other agents, all through the same protocol.
+MCP standardized how a single agent talks to its tools. NCP standardizes how **agents talk to each other**. It exposes one MCP endpoint that every host — Claude, Codex, OpenCode, n8n, LangGraph, or a custom orchestrator — connects to as a peer. Each agent reads bounded, trust-weighted context, writes durable memory, and sends bounded signals (whispers) to other agents, all through the same protocol.
 
-It is a context and memory system first: durable shared state, relevance-bounded retrieval, and trust scoring are the product. Making token spend compound is the payoff that follows.
+The protocol rides on a memory bus: durable shared state, relevance-bounded retrieval, and trust scoring are what make the conversation between agents reliable. Making token spend compound is the payoff that follows.
 
 | Problem | What the bus provides |
 |---------|-------------------|
