@@ -13,7 +13,7 @@ NCP is the **memory bus** for multi-agent systems: a shared context layer that l
 
 MCP standardized how a single agent talks to its tools. NCP standardizes how **agents talk to each other**. It exposes one MCP endpoint that every host — Claude, Codex, OpenCode, n8n, LangGraph, or a custom orchestrator — connects to as a peer on the same bus. Each agent reads bounded, trust-weighted context, writes durable memory, and sends bounded signals (whispers) to other agents, all through the same protocol.
 
-The payoff is **token capital efficiency**: every dollar spent on reasoning leaves behind reusable, trusted state instead of being thrown away at the end of the turn. Cheaper and smaller models can stand on the work prior agents already did.
+It is a context and memory system first: durable shared state, relevance-bounded retrieval, and trust scoring are the product. Making token spend compound is the payoff that follows.
 
 | Problem | What the bus provides |
 |---------|-------------------|
@@ -39,15 +39,7 @@ Three properties make it a bus and not just a store:
 - **Directed signals.** Agents emit whispers to specific peers (handoffs, dissent, drift reports) without broadcasting full state.
 - **Trust-aware transport.** Every message on the bus carries a trust score and drift marker, so a receiving agent knows how much to believe what it reads.
 
------
-
-## Token capital efficiency
-
-Token capital efficiency is the business value captured per dollar spent on model reasoning, task execution, and learning. Most agent stacks treat token spend as disposable: every run re-reads context, re-discovers prior decisions, and leaves little reusable signal behind.
-
-The memory bus converts that spend into reusable organizational memory. Each run leaves behind decisions, evidence, outcomes, trust signals, cost records, and reputation updates that future agents — including cheaper or smaller ones — can use without replaying the whole history.
-
-That does not make NCP a model router or eval platform. It is the context substrate those loops need: define the task boundary, preserve useful state, measure cost and outcomes, and make prior work available across agents over a single protocol.
+The payoff is **token capital efficiency**: because work persists as reusable, trusted state instead of being thrown away at the end of each turn, token spend compounds rather than resets. Future agents — including cheaper or smaller models — stand on prior work without replaying the whole history. That does not make NCP a model router or eval platform; it is the context substrate those loops need. The [Benchmarks](#benchmarks) section quantifies the effect.
 
 -----
 
