@@ -7,34 +7,47 @@
 
 -----
 
-## Context Engineering Protocol for Agent Systems
+## A protocol for agent-to-agent communication over MCP
 
-Agents do not fail only because models are weak. They fail because context is unmanaged.
+NCP is the **memory bus** for multi-agent systems: a shared context layer that lets agents talk to each other, hand off work, and build on prior results — without replaying transcripts or stuffing prompts.
 
-Long-running pipelines lose important decisions, replay stale transcripts, mix trusted facts with guesses, and force every model call to rediscover what the system already learned.
+MCP standardized how a single agent talks to its tools. NCP standardizes how **agents talk to each other**. It exposes one MCP endpoint that every host — Claude, Codex, OpenCode, n8n, LangGraph, or a custom orchestrator — connects to as a peer on the same bus. Each agent reads bounded, trust-weighted context, writes durable memory, and sends bounded signals (whispers) to other agents, all through the same protocol.
 
-NCP gives agent systems a shared context layer: durable memory, bounded retrieval, trust scoring, cross-agent whispers, turn records, cost telemetry, and feedback calibration. Agents can learn from prior work and share what matters while solving complex business tasks.
+The payoff is **token capital efficiency**: every dollar spent on reasoning leaves behind reusable, trusted state instead of being thrown away at the end of the turn. Cheaper and smaller models can stand on the work prior agents already did.
 
-The result is engineered context: relevant, trusted, reusable state that can move across agents, tools, models, and hosts.
-
-| Problem | What NCP provides |
+| Problem | What the bus provides |
 |---------|-------------------|
-| Agents replay growing transcripts | Bounded context assembly |
+| Agents have no shared channel between turns | One MCP memory bus every host connects to |
+| Agents replay growing transcripts | Bounded context assembly per turn |
 | Useful work disappears after a turn | Durable memory and turn records |
-| All context looks equally credible | Trust scores, drift markers, dissent, and calibration |
 | Multi-agent handoff is brittle | Whispers and shared pipeline memory |
-| Token spend does not compound | Reusable memory, cost telemetry, and reputation signals |
+| All context looks equally credible | Trust scores, drift markers, dissent, calibration |
+| Token spend does not compound | Reusable memory, cost telemetry, reputation signals |
 | Teams want to use smaller models safely | Better engineered context for cheaper model calls |
 
 -----
 
-## Why This Matters: Token Capital Efficiency
+## Why a memory bus
 
-Token capital efficiency is the business value captured per dollar spent on model reasoning, task execution, and learning. Most agent stacks still treat token spend as disposable: every run re-reads context, re-discovers prior decisions, and leaves little reusable signal behind.
+In a multi-agent system, the hard problem is not any single model — it is the channel between agents. Without one, every agent is an island: it re-reads context, re-discovers prior decisions, and leaves no reusable signal behind. Handoffs degrade into pasting full transcripts forward.
 
-NCP helps convert that spend into reusable organizational memory. Each run can leave behind decisions, evidence, outcomes, trust signals, cost records, and reputation updates that future agents can use.
+NCP is that channel. It is a bus, not an orchestrator: agents attach to it as peers, publish memory and signals, and subscribe to bounded, relevance-ranked context. The orchestrator still decides *who runs when*; the bus owns *what they know and share*.
 
-That does not make NCP a model router or eval platform by itself. It is the context substrate those loops need: define the task boundary, preserve useful state, measure cost and outcomes, and make prior work available to cheaper or smaller models without replaying the whole history.
+Three properties make it a bus and not just a store:
+
+- **Bounded reads.** Every agent gets a budget-bounded working context, not the whole history — so the channel scales as turns and agents grow.
+- **Directed signals.** Agents emit whispers to specific peers (handoffs, dissent, drift reports) without broadcasting full state.
+- **Trust-aware transport.** Every message on the bus carries a trust score and drift marker, so a receiving agent knows how much to believe what it reads.
+
+-----
+
+## Token capital efficiency
+
+Token capital efficiency is the business value captured per dollar spent on model reasoning, task execution, and learning. Most agent stacks treat token spend as disposable: every run re-reads context, re-discovers prior decisions, and leaves little reusable signal behind.
+
+The memory bus converts that spend into reusable organizational memory. Each run leaves behind decisions, evidence, outcomes, trust signals, cost records, and reputation updates that future agents — including cheaper or smaller ones — can use without replaying the whole history.
+
+That does not make NCP a model router or eval platform. It is the context substrate those loops need: define the task boundary, preserve useful state, measure cost and outcomes, and make prior work available across agents over a single protocol.
 
 -----
 
@@ -64,9 +77,9 @@ For n8n, NCP's MCP server must be reachable from your n8n instance with an auth 
 
 -----
 
-## How It Works
+## How agents talk over the bus
 
-Instead of treating every model call as an isolated chat, NCP assembles a shared working context from three blocks every turn:
+Instead of treating every model call as an isolated chat, NCP assembles a shared working context from three blocks every turn. Each block is a different channel on the bus:
 
 ```
 [NCP:CONSCIOUS]     what this agent knows right now
@@ -76,13 +89,13 @@ Instead of treating every model call as an isolated chat, NCP assembles a shared
 
 Memory survives restarts. The same runtime serves multiple hosts against the same store. Agents coordinate through bounded whispers without stuffing prompts.
 
-### Concrete Example: Java Monorepo Bugfix
+### Concrete example: a 3-agent bugfix on the bus
 
-This is where NCP starts paying for itself.
+This is where the memory bus starts paying for itself.
 
-Say you have a 30-module Java monorepo and a bug in `PaymentProcessor.java`. You run three agents on the same `pipeline_id`: `analyzer`, `fixer`, `reviewer`.
+Say you have a 30-module Java monorepo and a bug in `PaymentProcessor.java`. You run three agents on the same `pipeline_id`: `analyzer`, `fixer`, `reviewer`. They never see each other's transcripts — they communicate only through the bus.
 
-`analyzer` reads the file, runs the affected tests, and writes one distilled chunk instead of pasting a full stack trace into the next prompt:
+`analyzer` reads the file, runs the affected tests, and **publishes** one distilled chunk instead of pasting a full stack trace into the next prompt:
 
 ```text
 NPE at PaymentProcessor.java:142.
@@ -90,7 +103,7 @@ root_cause: retryCount is null when payment_method=ACH and customer.tier=trial.
 Guard missing before .intValue() call.
 ```
 
-`fixer` does not receive the full transcript. It assembles bounded context, retrieves that chunk by relevance, opens `PaymentProcessor.java` fresh with its own tools, applies the null guard, runs the targeted tests, and writes the outcome:
+`fixer` does not receive the full transcript. It **reads** bounded context from the bus, retrieves that chunk by relevance, opens `PaymentProcessor.java` fresh with its own tools, applies the null guard, runs the targeted tests, and publishes the outcome:
 
 ```text
 Null guard applied at PaymentProcessor.java:142.
@@ -98,11 +111,11 @@ if (retryCount == null) retryCount = 0.
 PaymentProcessorTest.testAchTrialRetry passes.
 ```
 
-`reviewer` assembles its own bounded context, sees the fix outcome, and receives a bounded whisper with the changed file list. If the fix is wrong, it can emit a `dissent` whisper back to `fixer` with the specific issue instead of forcing the whole pipeline to replay session history.
+`reviewer` reads its own bounded context, sees the fix outcome, and **receives** a bounded whisper with the changed file list. If the fix is wrong, it emits a `dissent` whisper directed back to `fixer` with the specific issue — a targeted message on the bus, not a full-history replay.
 
-By turn 20, a raw-replay workflow is dragging old stack traces, earlier tool output, and prior reasoning through every turn. The NCP workflow is working from durable shared memory, current task context, and trust-weighted evidence.
+By turn 20, a raw-replay workflow is dragging old stack traces, earlier tool output, and prior reasoning through every turn. The bus workflow is working from durable shared memory, current task context, and trust-weighted evidence.
 
-### Turn Flow
+### Turn flow
 
 ```mermaid
 flowchart TD
@@ -136,13 +149,15 @@ flowchart LR
     C --> F
 ```
 
+Every connected agent is a peer on the bus (`A`); `ncp serve` is the transport; the assembler and stores are the bus internals.
+
 -----
 
-## Context Trust
+## Trust-aware transport
 
-Most frameworks treat stored context as equally credible. NCP doesn't.
+Most frameworks treat stored context as equally credible. The bus doesn't. Trust is part of the protocol, so a receiving agent always knows how much to believe a message.
 
-Every memory chunk carries a `base_trust` score and a `written_at_drift` marker. Retrieval scoring discounts chunks written during high-drift periods. The `CoherenceChecker` monitors per-turn `drift_score` and fires alerts when agents start diverging. Agents emit `world_check` whispers to report detected drift back into the runtime.
+Every memory chunk carries a `base_trust` score and a `written_at_drift` marker. Retrieval scoring discounts chunks written during high-drift periods. The `CoherenceChecker` monitors per-turn `drift_score` and fires alerts when agents start diverging. Agents emit `world_check` whispers to report detected drift back onto the bus.
 
 ```
 ChunkSource:      user_verified | tool_result | agent_inferred | synthesis
@@ -151,13 +166,13 @@ drift_score:      float (0.0–1.0) — pipeline coherence, updated per turn
 written_at_drift: float — drift level when this memory was written
 ```
 
-The effect: the model receives context ranked by how much it should believe it, not just by recency.
+The effect: each agent receives context ranked by how much it should believe it, not just by recency.
 
 -----
 
-## Signal Filtering at Write Time
+## Signal filtering at write time
 
-NCP is not a compression tool. It is a memory bus, and a memory bus should store useful signal instead of tool-output boilerplate.
+The bus is not a compression tool — but a memory bus should carry useful signal, not tool-output boilerplate.
 
 When you call `ncp_write_memory`, NCP runs deterministic noise reduction before storing: it strips ANSI codes, collapses blank-line runs, dedups consecutive duplicate lines, removes tool-output boilerplate (progress bars, timing lines), and prunes null/empty JSON fields. The goal is context quality: stored chunks should be easier for future agents to retrieve, trust, and use.
 
@@ -176,9 +191,9 @@ This is deterministic signal filtering, not a model-quality change. See [the com
 
 -----
 
-## What NCP Is (and Isn't)
+## What NCP is (and isn't)
 
-**NCP is the memory bus and context protocol, not the orchestrator.**
+**NCP is the agent-to-agent memory bus and context protocol, not the orchestrator.**
 
 It sits underneath your existing agent framework — LangGraph ([runnable example](./examples/03_langgraph/)), CrewAI, AutoGen, or a custom orchestrator — and gives every connected host the same bounded, trust-weighted working memory. Agents can learn, share, dissent, hand off, and build on prior work without making the orchestrator own all context.
 
@@ -219,24 +234,26 @@ python3 benchmarks/compression/run.py             # ingestion-time compression
 
 -----
 
-## Core Tool Surface
+## The protocol surface
 
-NCP exposes one MCP endpoint: `http://127.0.0.1:4242/mcp`
+NCP exposes one MCP endpoint that every agent connects to: `http://127.0.0.1:4242/mcp`
 
 ```
-ncp_get_context      — assemble bounded context for this turn
-ncp_write_memory     — persist durable memory; filters ingestion noise and keeps a reversible raw_ref
-ncp_emit_whisper     — send a bounded signal to another agent
+ncp_get_context      — read bounded context for this turn (subscribe)
+ncp_write_memory     — publish durable memory; filters ingestion noise and keeps a reversible raw_ref
+ncp_emit_whisper     — send a bounded, directed signal to another agent
 ncp_post_turn        — persist the turn result and acknowledge consumed whispers
-ncp_fetch            — retrieve additional bounded context mid-turn
+ncp_fetch            — pull additional bounded context mid-turn
 ncp_record_decision  — capture a structured decision trace for precedent queries
 ```
+
+These six calls are the agent-to-agent protocol: read context, publish memory, signal peers, record outcomes.
 
 By default the server requires no token on loopback (`127.0.0.1`/`localhost`/`::1`). Set `[server].auth_token` in `.ncp/config.toml` (generated by `ncp init`), the `NCP_AUTH_TOKEN` env var, or `--auth-token` on `ncp serve` to require an `Authorization: Bearer <token>` header on `/mcp` and `/sse`. Never bind `ncp serve` to a non-loopback host without one of these set.
 
 -----
 
-## Storage Tiers
+## Storage tiers
 
 | Tier           | When to use                                              | Backing             |
 |----------------|----------------------------------------------------------|---------------------|
@@ -266,7 +283,7 @@ ncp serve --host 127.0.0.1 --port 4242 --cwd /path/to/project
 
 -----
 
-## Operator Commands
+## Operator commands
 
 ```bash
 ncp status      # store and activity metrics
@@ -288,7 +305,9 @@ debited for what it produced. Add `--dry-run` to preview.
 
 -----
 
-## Cross-Agent Handoffs
+## Cross-agent handoffs
+
+Handoffs are first-class on the bus: one agent hands its task to another host through the same protocol, carrying bounded context forward instead of a transcript.
 
 ```bash
 ncp handoff claude --cwd /path/to/project --pipeline-id pipe_demo --emit-to opencode
@@ -297,7 +316,7 @@ ncp handoff opencode --cwd /path/to/project --pipeline-id pipe_demo --emit-to cl
 
 -----
 
-## Verify Setup
+## Verify setup
 
 ```bash
 ncp status --cwd /path/to/project
@@ -329,7 +348,7 @@ Tool-specific setup lives in:
 
 -----
 
-## In Our Own Pipelines
+## In our own pipelines
 
 NCP is the memory bus. In our workflows, Sarathi is one orchestrator that runs on top of it. Sarathi is an integration example, not a requirement — NCP works under any MCP-compatible host.
 
