@@ -4,6 +4,26 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-06-30
+
+### Added
+
+- **Provider session-start setup** (`ncp init`, `ncp/templates/provider_hooks/`):
+  interactive setup now detects installed Claude Code, Codex CLI, and OpenCode
+  CLIs and asks whether to install the matching NCP hook/setup files. Claude
+  gets `.claude` hook and skill assets, Codex gets `.codex/hooks.json` plus a
+  session-start hook, and OpenCode gets a project plugin at
+  `.opencode/plugins/ncp.js`. Non-interactive setup remains unchanged.
+- **Codex and OpenCode examples** (`examples/07_codex_cli/`,
+  `examples/09_opencode/`): add runnable session-start hook/plugin examples and
+  tests that verify their setup contracts.
+
+### Changed
+
+- **README positioning** (`README.md`): sharpen the public framing around NCP
+  as an agent-to-agent memory bus over MCP and document the new provider setup
+  flow.
+
 ## [1.2.0] - 2026-06-24
 
 ### Added
