@@ -10,6 +10,9 @@ agent-to-agent channel for every turn and subagent.
 - `AGENTS.md` — the NCP turn contract + subagent rule. OpenCode loads
   `AGENTS.md` (and the files under `instructions`), so this is the "session
   start" for OpenCode.
+- `plugins/ncp.js` — an OpenCode project plugin using
+  `experimental.chat.system.transform` to start/check the NCP bus and inject the
+  NCP turn/subagent contract into the system prompt.
 
 ## Setup
 
@@ -17,14 +20,20 @@ agent-to-agent channel for every turn and subagent.
 ncp init
 cp examples/09_opencode/opencode.json ./opencode.json   # or merge into an existing one
 cp examples/09_opencode/AGENTS.md     ./AGENTS.md        # or merge into an existing one
+mkdir -p .opencode/plugins
+cp examples/09_opencode/plugins/ncp.js .opencode/plugins/
 ncp serve --host 127.0.0.1 --port 4242 --cwd /path/to/your/project
 ```
 
 OpenCode then connects to `http://127.0.0.1:4242/mcp` via the `mcp.ncp` entry.
+The project plugin is loaded from `.opencode/plugins/ncp.js`.
 
-OpenCode has no Claude-style SessionStart hook, so "use NCP for all agent
-communication" is delivered through the auto-loaded `AGENTS.md`. To make bus
-start-up one command, use the shared helper before launching OpenCode:
+OpenCode does not use Claude/Codex `hooks.json`; the equivalent is a project
+plugin. The included plugin runs during system-prompt construction, starts the
+bus if needed, and injects the NCP turn/subagent contract without pinning an
+OpenCode model.
+
+You can also run the shared helper before launching OpenCode:
 
 ```bash
 NCP_CWD=/path/to/your/project bash scripts/ncp_ensure_serve.sh

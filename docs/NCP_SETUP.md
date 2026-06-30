@@ -189,7 +189,8 @@ That is the point of the runtime. Shared working memory stays bounded even when 
 
 ### Claude Code
 
-1. Initialize with `ncp init`
+1. Initialize with `ncp init`. If `claude` is installed and the command is
+   running interactively, setup asks whether to add the Claude NCP hook files.
 2. Copy the example MCP config:
 
 ```bash
@@ -212,7 +213,9 @@ Expected tool surface:
 
 ### Codex CLI
 
-1. Initialize with `ncp init`
+1. Initialize with `ncp init`. If `codex` is installed and the command is
+   running interactively, setup asks whether to add `.codex/hooks.json`,
+   `.codex/hooks/ncp-session-start.sh`, and the `AGENTS.md` turn contract.
 2. Copy the MCP example from `examples/07_codex_cli/`
 3. Start the server:
 
@@ -227,6 +230,20 @@ Recommended loop:
 3. persist durable memory with `ncp_write_memory`
 4. call `ncp_post_turn` with consumed `pending_whisper_ids`
 5. use `ncp_fetch` only for bounded retrieval
+
+### OpenCode
+
+1. Initialize with `ncp init`. If `opencode` is installed and the command is
+   running interactively, setup asks whether to add `opencode.json`,
+   `.opencode/plugins/ncp.js`, and the `AGENTS.md` turn contract.
+2. Start the server:
+
+```bash
+ncp serve --host 127.0.0.1 --port 4242 --cwd /path/to/project
+```
+
+OpenCode loads the project plugin through `opencode.json`; the plugin injects
+the NCP turn/subagent contract via `experimental.chat.system.transform`.
 
 ## Optional Whisper Handoff Loop
 
