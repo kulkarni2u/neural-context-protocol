@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "neural-context-protocol"
-version = "1.2.0"
+version = "1.2.1"
 description = "Neural Context Protocol (NCP): context engineering protocol and memory bus for multi-agent systems."
 readme = "README.md"
 requires-python = ">=3.11"
