@@ -8,22 +8,33 @@ the agent-to-agent channel for every turn and subagent.
 - `mcp_servers.json` — points Codex CLI at the HTTP MCP endpoint.
 - `AGENTS.md` — the NCP turn contract + subagent rule. Codex auto-loads
   `AGENTS.md`, so this is the "session start" for Codex.
+- `hooks.json` — a Codex `SessionStart` hook config (copy to
+  `.codex/hooks.json`).
+- `hooks/ncp-session-start.sh` — the hook: health-checks/starts `ncp serve`
+  and injects the "route all agent comms through NCP" instruction.
 
 ## Setup
 
 ```bash
 ncp init
 cp examples/07_codex_cli/AGENTS.md ./AGENTS.md      # or merge into an existing one
+mkdir -p .codex/hooks
+cp examples/07_codex_cli/hooks.json .codex/hooks.json
+cp examples/07_codex_cli/hooks/ncp-session-start.sh .codex/hooks/
+chmod +x .codex/hooks/ncp-session-start.sh
 # copy mcp_servers.json into your Codex MCP config location
 ncp serve --host 127.0.0.1 --port 4242 --cwd /path/to/your/project
 ```
 
 Codex CLI then connects to `http://127.0.0.1:4242/mcp`.
 
-Codex has no SessionStart-hook mechanism like Claude Code, so "use NCP for all
-agent communication" is delivered through the auto-loaded `AGENTS.md` rather than
-a hook. To make bus start-up one command, use the shared helper before launching
-Codex:
+Codex discovers project hooks from `.codex/hooks.json` once the project config
+layer is trusted. The hook runs on `startup`, `resume`, `clear`, and `compact`;
+it starts the bus if needed and injects the NCP turn/subagent contract as
+additional session context. Codex requires reviewing/trusting non-managed hooks
+before they run; use `/hooks` in the CLI if Codex reports a hook trust warning.
+
+You can also run the shared helper before launching Codex:
 
 ```bash
 NCP_CWD=/path/to/your/project bash scripts/ncp_ensure_serve.sh

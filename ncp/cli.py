@@ -53,6 +53,92 @@ def _load_config_template() -> str:
     return resources.files("ncp").joinpath("templates/config.toml.example").read_text()
 
 
+def _init_is_tty() -> bool:
+    return sys.stdin.isatty()
+
+
+def _load_provider_template(*parts: str) -> str:
+    return (
+        resources.files("ncp")
+        .joinpath("templates", "provider_hooks", *parts)
+        .read_text()
+    )
+
+
+def _write_provider_template(
+    cwd: Path,
+    relative_path: str,
+    template_parts: tuple[str, ...],
+    *,
+    executable: bool = False,
+) -> None:
+    destination = cwd / relative_path
+    if destination.exists():
+        console.print(f"  [dim]Preserved existing {relative_path}[/dim]")
+        return
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(_load_provider_template(*template_parts))
+    if executable:
+        destination.chmod(0o755)
+    console.print(f"  Wrote [bold]{relative_path}[/bold]")
+
+
+def _install_claude_hooks(cwd: Path) -> None:
+    _write_provider_template(cwd, ".mcp.json", ("claude", "mcp_servers.json"))
+    _write_provider_template(cwd, ".claude/settings.json", ("claude", "settings.json"))
+    _write_provider_template(
+        cwd,
+        ".claude/hooks/ncp-session-start.sh",
+        ("claude", "hooks", "ncp-session-start.sh"),
+        executable=True,
+    )
+    _write_provider_template(
+        cwd,
+        ".claude/skills/ncp/SKILL.md",
+        ("claude", "skills", "ncp", "SKILL.md"),
+    )
+
+
+def _install_codex_hooks(cwd: Path) -> None:
+    _write_provider_template(cwd, "AGENTS.md", ("codex", "AGENTS.md"))
+    _write_provider_template(cwd, ".codex/hooks.json", ("codex", "hooks.json"))
+    _write_provider_template(
+        cwd,
+        ".codex/hooks/ncp-session-start.sh",
+        ("codex", "hooks", "ncp-session-start.sh"),
+        executable=True,
+    )
+
+
+def _install_opencode_hooks(cwd: Path) -> None:
+    _write_provider_template(cwd, "AGENTS.md", ("opencode", "AGENTS.md"))
+    _write_provider_template(cwd, "opencode.json", ("opencode", "opencode.json"))
+    _write_provider_template(
+        cwd,
+        ".opencode/plugins/ncp.js",
+        ("opencode", "plugins", "ncp.js"),
+    )
+
+
+def _offer_provider_hook_setup(cwd: Path, *, is_tty: bool) -> None:
+    if not is_tty:
+        return
+
+    providers = [
+        ("Claude Code", "claude", _install_claude_hooks),
+        ("Codex CLI", "codex", _install_codex_hooks),
+        ("OpenCode", "opencode", _install_opencode_hooks),
+    ]
+    for label, command, installer in providers:
+        path = shutil.which(command)
+        if not path:
+            continue
+        console.print(f"{label} detected at [bold]{path}[/bold]")
+        if click.confirm(f"Add NCP hook/setup files for {label}?", default=True):
+            installer(cwd)
+
+
 def _render_config_template(
     *,
     store_type: str,
@@ -434,7 +520,7 @@ def init_command(  # noqa: C901
 ) -> None:
     """Interactive setup wizard: store backend, infra mode, ports, credentials, and migrations."""
 
-    is_tty = sys.stdin.isatty()
+    is_tty = _init_is_tty()
 
     # ── Step 1: store backend ─────────────────────────────────────────────────
     if store_type is None:
@@ -573,6 +659,9 @@ def init_command(  # noqa: C901
     claude_path = cwd / "CLAUDE.md"
     if not claude_path.exists():
         claude_path.write_text(CLAUDE_MD_TEMPLATE)
+
+    # ── Provider hook/setup files ─────────────────────────────────────────────
+    _offer_provider_hook_setup(cwd, is_tty=is_tty)
 
     # ── Start containers + run migrations (managed pgvector) ──────────────────
     if store_type == "pgvector" and resolved_infra_mode == "managed" and start_containers:

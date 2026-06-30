@@ -80,7 +80,17 @@ where = ["."]
 include = ["ncp*"]
 
 [tool.setuptools.package-data]
-ncp = ["templates/*.example", "migrations/*.sql"]
+ncp = [
+  "templates/*.example",
+  "templates/provider_hooks/claude/*",
+  "templates/provider_hooks/claude/hooks/*",
+  "templates/provider_hooks/claude/skills/ncp/*",
+  "templates/provider_hooks/codex/*",
+  "templates/provider_hooks/codex/hooks/*",
+  "templates/provider_hooks/opencode/*",
+  "templates/provider_hooks/opencode/plugins/*",
+  "migrations/*.sql",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

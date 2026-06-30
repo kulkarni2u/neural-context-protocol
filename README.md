@@ -68,10 +68,15 @@ For Codex CLI and OpenCode, register the same endpoint and copy the host's `AGEN
 For n8n, NCP's MCP server must be reachable from your n8n instance with an auth token configured — see [`examples/08_n8n/README.md`](./examples/08_n8n/README.md).
 
 `ncp init` creates `.ncp/config.toml` and a `CLAUDE.md` turn contract in the project root.
+When run interactively, it also detects installed `claude`, `codex`, and
+`opencode` CLIs and asks whether to add the matching NCP hook/setup files.
 
 ### Zero-touch setup (route all agent comms through NCP)
 
-For Claude Code you can go further than registering the server: a **SessionStart hook** can start the bus automatically and instruct every session — and any subagents it dispatches — to use NCP as the agent-to-agent channel.
+For Claude Code, Codex CLI, and OpenCode you can go further than registering
+the server: setup files can start/check the bus automatically and instruct
+every session — and any subagents it dispatches — to use NCP as the
+agent-to-agent channel.
 
 ```bash
 mkdir -p .claude/hooks .claude/skills/ncp
@@ -81,7 +86,16 @@ cp examples/06_claude_code/skills/ncp/SKILL.md        .claude/skills/ncp/
 chmod +x .claude/hooks/ncp-session-start.sh
 ```
 
-The hook health-checks `127.0.0.1:4242/healthz`, starts `ncp serve` if it's down, and injects the protocol instruction (including the mandatory subagent dispatch rule); the `/ncp` skill carries the same guidance for on-demand use. Codex CLI and OpenCode lack a comparable hook, so they get the same instruction through their auto-loaded `AGENTS.md` plus the shared `scripts/ncp_ensure_serve.sh` helper. Hooks and contracts *instruct* hosts to use NCP — they don't *enforce* it; reliable coverage comes from registering the MCP tools, the always-loaded `AGENTS.md` rule, the dispatch template, and the SessionStart nudge together. See [`examples/06_claude_code/README.md`](./examples/06_claude_code/README.md).
+The setup files health-check `127.0.0.1:4242/healthz`, start `ncp serve` if
+it's down, and inject the protocol instruction (including the mandatory
+subagent dispatch rule). Codex uses `.codex/hooks.json`; OpenCode uses a
+project plugin at `.opencode/plugins/ncp.js`. Hooks and contracts *instruct*
+hosts to use NCP — they don't *enforce* it; reliable coverage comes from
+registering the MCP tools, the always-loaded instructions, the dispatch
+template, and the session-start nudge together. See
+[`examples/06_claude_code/README.md`](./examples/06_claude_code/README.md),
+[`examples/07_codex_cli/README.md`](./examples/07_codex_cli/README.md), and
+[`examples/09_opencode/README.md`](./examples/09_opencode/README.md).
 
 -----
 

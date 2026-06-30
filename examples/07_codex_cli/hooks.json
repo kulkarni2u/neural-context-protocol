@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$(git rev-parse --show-toplevel)/.codex/hooks/ncp-session-start.sh\"",
+            "statusMessage": "Connecting NCP memory bus",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
