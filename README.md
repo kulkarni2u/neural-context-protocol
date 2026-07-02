@@ -485,6 +485,8 @@ Tool-specific setup lives in:
 - [`examples/06_claude_code/`](./examples/06_claude_code/)
 - [`examples/07_codex_cli/`](./examples/07_codex_cli/)
 - [`examples/08_n8n/`](./examples/08_n8n/)
+- [`examples/09_opencode/`](./examples/09_opencode/)
+- [`examples/10_omnigent/`](./examples/10_omnigent/) — NCP under Databricks' Omnigent meta-harness
 
 -----
 

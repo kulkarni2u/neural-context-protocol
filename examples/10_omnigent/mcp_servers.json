@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "ncp": {
+      "type": "http",
+      "url": "http://NCP_HOST:4242/mcp",
+      "headers": {
+        "Authorization": "Bearer ${NCP_AUTH_TOKEN}"
+      }
+    }
+  }
+}
