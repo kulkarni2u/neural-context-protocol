@@ -37,7 +37,7 @@ Three properties make it a bus and not just a store:
 
 - **Bounded reads.** Every agent gets a budget-bounded working context, not the whole history — so the channel scales as turns and agents grow.
 - **Directed signals.** Agents emit whispers to specific peers (handoffs, dissent, drift reports) without broadcasting full state.
-- **Trust-aware transport.** Every message on the bus carries a trust score and drift marker, so a receiving agent knows how much to believe what it reads.
+- **Trust-aware transport.** Every message on the bus carries a trust score and drift marker — self-reported, advisory inputs, not runtime-verified truth — so a receiving agent knows how much to believe what it reads.
 
 The payoff compounds at the organization level as **token capital efficiency** — the business value captured per dollar spent on model reasoning. Because work persists as reusable, trusted state instead of being thrown away at the end of each turn, token spend accrues into shared organizational memory rather than resetting: decisions, evidence, outcomes, trust signals, and cost records that future runs, teams, and pipelines draw on. Future agents — including cheaper or smaller models — stand on prior work without replaying the whole history. That does not make NCP a model router or eval platform; it is the context substrate those loops need. The [Benchmarks](#benchmarks) section quantifies the effect.
 
@@ -196,13 +196,13 @@ The valid layers are `episodic`, `procedural`, `semantic`, `social`, and `reason
 
 Most frameworks treat stored context as equally credible. The bus doesn't. Trust is part of the protocol, so a receiving agent always knows how much to believe a message.
 
-Every memory chunk carries a `base_trust` score and a `written_at_drift` marker. Retrieval scoring discounts chunks written during high-drift periods. The `CoherenceChecker` monitors per-turn `drift_score` and fires alerts when agents start diverging. Agents emit `world_check` whispers to report detected drift back onto the bus.
+Every memory chunk carries a `base_trust` score (derived from its `src` at write time) and a `written_at_drift` marker. Both `base_trust` and `drift_score` are **self-reported, client-asserted advisory inputs** — NCP does not yet compute drift itself. Retrieval scoring discounts chunks written during high-drift periods, and the `CoherenceChecker` reads the per-turn `drift_score` agents report and fires alerts when it crosses threshold. Agents emit `world_check` whispers to report drift back onto the bus. A runtime-computed drift signal is future work — see the [north-star roadmap](./docs/NCP_NORTH_STAR_CAPABILITY_ROADMAP.md) (WI-016).
 
 ```
 ChunkSource:      user_verified | tool_result | agent_inferred | synthesis
-base_trust:       float (0.0–1.0) — weight applied at retrieval time
-drift_score:      float (0.0–1.0) — pipeline coherence, updated per turn
-written_at_drift: float — drift level when this memory was written
+base_trust:       float (0.0–1.0) — advisory weight applied at retrieval time
+drift_score:      float (0.0–1.0) — self-reported coherence signal (advisory; not runtime-computed)
+written_at_drift: float — drift level reported when this memory was written
 ```
 
 The effect: each agent receives context ranked by how much it should believe it, not just by recency.
@@ -213,7 +213,7 @@ Per-chunk trust is only half the story. Trust on the bus also attaches to *who w
 
 ## Agent identity and reputation
 
-In a multi-agent system, "how much do I trust this message" depends on *who sent it*. NCP gives agents real, cryptographic identities and tracks a reputation for each one — so the bus can weight memory by its author's track record, not just the chunk's own trust score.
+In a multi-agent system, "how much do I trust this message" depends on *who sent it*. NCP gives agents real, cryptographic identities, lets them optionally sign what they write, and tracks a reputation for each one. Reputation is computed and displayed today; weighting retrieval by an author's track record is the next step on the [roadmap](./docs/NCP_NORTH_STAR_CAPABILITY_ROADMAP.md) (CAP-T4 / WI-015), not yet live.
 
 **Cryptographic identity.** `ncp identity create` generates an [Ed25519](https://ed25519.cr.yp.to/) keypair; the identity ID is derived from the SHA-256 of the public key, and the secret key is written to a `0700` keystore (`~/.ncp/keys`, or `NCP_KEYSTORE_DIR`). Public keys are registered in the store; keys can be listed and revoked.
 
@@ -223,13 +223,15 @@ ncp identity list
 ncp identity revoke <identity_id>
 ```
 
+**Optional authorship signing.** `ncp_write_memory` and `ncp_emit_whisper` accept an optional `signature` over a canonical `written_by | sha256(content) | pipeline_id` payload; NCP verifies it against the author's registered public key, persists the result, and surfaces a `verified` marker in fetch results and the pidgin wire format. This is **opt-in and off by default**: it is gated behind `[identity].require_signatures`, which defaults to `false`, so unsigned writes still work and authorship is *not* authenticated unless an operator turns enforcement on. With `require_signatures = true`, writes that cannot be verified — including those from revoked identities — are rejected.
+
 **Reputation as a Beta posterior.** Each identity carries a Beta distribution `(alpha, beta)` over "produces trustworthy memory." When `ncp calibrate --feedback` runs, the per-chunk trust changes it computes are rolled up to the chunk's author: trust gains become positive evidence, dissent-driven losses become negative evidence. A `forget` factor decays old evidence so reputation tracks recent behavior, and `gain` scales how fast evidence accrues. The reported score is the posterior mean; confidence rises with the number of observations.
 
 ```bash
 ncp reputation             # score, confidence, and observation count per identity
 ```
 
-Tune it under `[reputation]` in `.ncp/config.toml` (`gain`, `forget`, `confidence_k`) or via `NCP_REPUTATION_*`. This is what makes cross-team and cross-org trust credible: an agent that has repeatedly produced disputed memory earns a lower reputation, and the bus can down-weight it accordingly.
+Tune it under `[reputation]` in `.ncp/config.toml` (`gain`, `forget`, `confidence_k`) or via `NCP_REPUTATION_*`. An agent that has repeatedly produced disputed memory earns a lower reputation. Today that score is **computed and displayed but does not yet weight retrieval or gate whispers** — wiring reputation into ranking is the next sprint (CAP-T4 / WI-015 on the [roadmap](./docs/NCP_NORTH_STAR_CAPABILITY_ROADMAP.md)).
 
 -----
 
@@ -441,7 +443,7 @@ ncp explain --cwd /path/to/project
 ```
 
 - `ncp status` shows store and activity metrics.
-- `ncp cost` shows token and USD rollups once turns are logged.
+- `ncp cost` shows token and USD rollups once turns are logged. For provider adapters these are **measured** — actual token usage threaded from the SDK and priced via the `[providers]` table; for the local/mock in-process path they are **estimated** (chars/4) and flagged `cost_source=estimated`.
 - `ncp explain` gives a human-readable runtime summary.
 
 -----

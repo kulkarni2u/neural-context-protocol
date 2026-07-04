@@ -106,6 +106,14 @@ Audit remediation from `docs/NCP_AUDIT_AND_REMEDIATION_PLAN.md`. One work item
   coding-pipeline table with the sliding-window comparison, and annotate each
   benchmark row with a one-line honest caveat instead of deleting it. (WI-001,
   F-A3)
+- **Reconcile trust/identity/drift/cost language with reality** (`README.md`,
+  `docs/NCP_PROTOCOL_SPEC.md`): document opt-in Ed25519 authorship signing
+  (`[identity].require_signatures`, default false) and the `verified` wire marker,
+  mark `base_trust`/`drift_score` as self-reported advisory inputs (computed drift
+  is future work WI-016), state that reputation is computed/displayed but does not
+  yet weight retrieval (CAP-T4/WI-015), and clarify cost telemetry is measured for
+  provider adapters and estimated for local/mock; remaining gaps point at the
+  north-star roadmap. (WI-002)
 
 ### Docs
 

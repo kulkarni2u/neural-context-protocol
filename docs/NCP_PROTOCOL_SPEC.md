@@ -28,7 +28,7 @@ failed:[{x},{x}]               # omitted when empty
 drift_score:{0.0-1.0}          # omitted when 0.0
 
 [NCP:SUBCONSCIOUS]
-chunk:{id} layer:{layer} score:{0.0} src:{src} trust:{0.0}
+chunk:{id} layer:{layer} score:{0.0} src:{src} trust:{0.0} verified:1  # verified:1 present only when a valid authorship signature was recorded
   {content — 2-space indent, max 200 tok}
 chunk:{id} layer:{layer} score:{0.0} src:{src} trust:{0.0}
   {content}
@@ -87,7 +87,9 @@ Tracking fields (defaults shown):
   slot_age        int   = 0       calls since slot last confirmed
   slot_confidence float = 1.0     0-1, decays if unconfirmed
   goal_version    int   = 1       increments on goal change, broadcast on change
-  drift_score     float = 0.0     0-1, measured against intent_anchor each turn
+  drift_score     float = 0.0     0-1, self-reported advisory signal (client-asserted,
+                                  NOT runtime-computed; a computed drift signal is
+                                  future work, WI-016 — see north-star roadmap)
   intent_anchor   str?  = None    sha256 of original intent at turn 0
 
 History:
@@ -222,6 +224,9 @@ Routing rules:
   output_tokens       int
   cache_read_tokens   int = 0
   cost_usd            float
+  cost_source         Literal    "measured" | "estimated"
+                                 measured: real provider token usage priced via
+                                 [providers]; estimated: local/mock chars/4 fallback
   model               str
   pipeline_id         str?
   turn_id             str
@@ -403,6 +408,17 @@ contexts. The protocol defends the *envelope*, not the *content*:
 content, source-tag forgery, unbounded payloads, broadcast dissent, silent
 write failures. Every injected line carries provenance the model can see —
 `from:`/`src:`/`trust:` in the wire format.
+
+**Optional authorship signing (opt-in, off by default).** `ncp_write_memory`
+and `ncp_emit_whisper` accept an optional `signature` over the canonical
+`written_by | sha256(content) | pipeline_id` payload; NCP verifies it against
+the author's registered Ed25519 public key, persists the outcome (`verified`
+column), and surfaces a `verified` marker in fetch results and the pidgin wire
+format. This is gated behind `[identity].require_signatures`, which **defaults
+to `false`** — unsigned writes still work and authorship is *not* authenticated
+unless an operator enables enforcement. With `require_signatures = true`, writes
+that cannot be verified (including from revoked identities) are rejected. Signing
+authenticates *who wrote a chunk*, not whether its content is truthful.
 
 **What NCP does NOT defend against**: a compromised or low-quality agent
 writing persuasive instructions into a whisper payload or a high-relevance
