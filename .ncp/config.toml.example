@@ -27,6 +27,13 @@ log_level = "info"
 log_format = "pretty"
 cost_tracking = true
 
+# [embedding]
+# Opt-in local semantic embeddings for SQLite hybrid/vector retrieval. Install
+# with: pip install 'neural-context-protocol[local-embeddings]'
+# enabled = true
+# provider = "local"
+# model = "BAAI/bge-small-en-v1.5"
+
 # [identity]
 # OPT-IN Ed25519 authorship enforcement (CAP-T1, WI-013). When false (default),
 # unsigned writes/whispers keep working and any supplied signature is verified

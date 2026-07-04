@@ -56,6 +56,139 @@ def test_sqlite_connections_set_busy_timeout(tmp_path: Path) -> None:
     assert timeout_ms >= 5000
 
 
+def test_sqlite_embedding_column_added_via_schema_migration(tmp_path: Path) -> None:
+    store_path = tmp_path / "store.db"
+    SQLiteStore(store_path)
+
+    import sqlite3
+    connection = sqlite3.connect(store_path)
+    cols = {row[1] for row in connection.execute("PRAGMA table_info(chunks)").fetchall()}
+    connection.close()
+
+    assert "embedding" in cols, f"columns: {cols}"
+
+
+def test_sqlite_embedding_defaults_to_none_when_adapter_not_configured(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "store.db")
+    chunk = SubconsciousChunk(
+        chunk_id="sub_emb_none",
+        layer="semantic",
+        content="default embedding test",
+        src="tool_result",
+    )
+    assert store.write(chunk) is True
+
+    import sqlite3
+    connection = sqlite3.connect(store.path)
+    connection.row_factory = sqlite3.Row
+    row = connection.execute(
+        "SELECT embedding FROM chunks WHERE chunk_id = ?", ("sub_emb_none",)
+    ).fetchone()
+    connection.close()
+    assert row["embedding"] is None
+
+
+def test_sqlite_embedding_stores_and_retrieves_blob(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "store.db")
+    vec = [0.1, 0.2, 0.3]
+    chunk = SubconsciousChunk(
+        chunk_id="sub_emb_stored",
+        layer="semantic",
+        content="embedding blob round-trip",
+        src="tool_result",
+        embedding=vec,
+    )
+    assert store.write(chunk) is True
+
+    import sqlite3
+    connection = sqlite3.connect(store.path)
+    connection.row_factory = sqlite3.Row
+    row = connection.execute(
+        "SELECT embedding FROM chunks WHERE chunk_id = ?", ("sub_emb_stored",)
+    ).fetchone()
+    connection.close()
+    import json
+    loaded = json.loads(row["embedding"].decode("utf-8"))
+    assert loaded == vec
+
+
+def test_sqlite_vector_mode_ranks_by_cosine(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "store.db")
+    store.write(SubconsciousChunk(
+        chunk_id="sub_close", layer="semantic",
+        content="close match", src="tool_result",
+        embedding=[0.9, 0.1, 0.0],
+    ))
+    store.write(SubconsciousChunk(
+        chunk_id="sub_far", layer="semantic",
+        content="far match", src="tool_result",
+        embedding=[0.1, 0.9, 0.0],
+    ))
+    results = store.query(
+        "unrelated query text",
+        k=2,
+        min_score=0.0,
+        retrieval_mode="vector",
+        embedding=[0.95, 0.05, 0.0],
+    )
+
+    assert [chunk.chunk_id for chunk in results] == ["sub_close", "sub_far"]
+
+
+class _TinySemanticAdapter:
+    def embed(self, text: str) -> list[float]:
+        lowered = text.lower()
+        if any(term in lowered for term in ("feline", "cat", "sofa", "couch")):
+            return [1.0, 0.0, 0.0]
+        if any(term in lowered for term in ("automobile", "brake", "vehicle")):
+            return [0.0, 1.0, 0.0]
+        return [0.0, 0.0, 1.0]
+
+
+def test_sqlite_local_embeddings_retrieve_zero_lexical_overlap_paraphrase(
+    tmp_path: Path,
+) -> None:
+    disabled = SQLiteStore(tmp_path / "disabled.db")
+    enabled = SQLiteStore(tmp_path / "enabled.db", embedding_adapter=_TinySemanticAdapter())
+    for store in (disabled, enabled):
+        store.write(
+            SubconsciousChunk(
+                chunk_id="sub_animal",
+                layer="semantic",
+                content="feline lounges on sofa",
+                src="tool_result",
+            )
+        )
+        store.write(
+            SubconsciousChunk(
+                chunk_id="sub_vehicle",
+                layer="semantic",
+                content="automobile brake repair",
+                src="tool_result",
+            )
+        )
+
+    assert disabled.query("cat rests couch", k=2, min_score=0.01) == []
+
+    results = enabled.query("cat rests couch", k=2, min_score=0.01)
+    assert results
+    assert results[0].chunk_id == "sub_animal"
+    assert results[0].embedding == [1.0, 0.0, 0.0]
+
+
+def test_sqlite_store_preserves_default_behavior_when_no_embedding(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "store.db")
+    store.write(SubconsciousChunk(
+        chunk_id="sub_default_hybrid", layer="semantic",
+        content="standard retrieval content for testing",
+        src="tool_result",
+    ))
+    results = store.query("standard retrieval", k=4, min_score=0.0)
+    assert len(results) == 1
+    assert results[0].chunk_id == "sub_default_hybrid"
+    assert results[0].relevance > 0.0
+
+
 def test_sqlite_rewrite_preserves_feedback_counters_and_created_at(tmp_path: Path) -> None:
     store = SQLiteStore(tmp_path / "store.db")
     original = SubconsciousChunk(

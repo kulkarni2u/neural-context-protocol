@@ -12,24 +12,33 @@ from ncp.adapters.base import (
 
 
 class BaseEmbeddingAdapter:
-    """Minimal contract for embedding providers. Must return exactly 1536 floats."""
-
-    _REQUIRED_DIMS = 1536
+    """Minimal contract for embedding providers."""
 
     @abstractmethod
     def embed(self, text: str) -> list[float]:
-        """Embed text and return a 1536-dimensional vector."""
+        """Embed text and return a non-empty numeric vector."""
+
+    def _validate_vector(self, vector: list[float]) -> list[float]:
+        if not vector:
+            raise NCPAdapterResponseError("Embedding must be a non-empty vector")
+        try:
+            return [float(value) for value in vector]
+        except (TypeError, ValueError) as exc:
+            raise NCPAdapterResponseError("Embedding must contain only numbers") from exc
+
+
+class OpenAIEmbeddingAdapter(BaseEmbeddingAdapter):
+    """Embedding adapter backed by OpenAI text-embedding-3-small (1536 dims)."""
+
+    _REQUIRED_DIMS = 1536
 
     def _validate_dims(self, vector: list[float]) -> list[float]:
+        vector = self._validate_vector(vector)
         if len(vector) != self._REQUIRED_DIMS:
             raise NCPAdapterResponseError(
                 f"Embedding must have {self._REQUIRED_DIMS} dimensions, got {len(vector)}"
             )
         return vector
-
-
-class OpenAIEmbeddingAdapter(BaseEmbeddingAdapter):
-    """Embedding adapter backed by OpenAI text-embedding-3-small (1536 dims)."""
 
     def __init__(
         self,
@@ -62,21 +71,22 @@ class OpenAIEmbeddingAdapter(BaseEmbeddingAdapter):
 
 
 class LocalEmbeddingAdapter(BaseEmbeddingAdapter):
-    """Embedding adapter backed by sentence-transformers (model must output 1536 dims)."""
+    """Embedding adapter backed by fastembed local models."""
 
-    def __init__(self, model: str = "sentence-transformers/all-MiniLM-L6-v2") -> None:
+    def __init__(self, model: str = "BAAI/bge-small-en-v1.5") -> None:
         try:
-            from sentence_transformers import SentenceTransformer
+            from fastembed import TextEmbedding
         except ImportError as err:
             raise ImportError(
-                "sentence-transformers is required. "
-                "Install it with: pip install sentence-transformers"
+                "fastembed is required for [embedding].provider = 'local'. "
+                "Install it with: pip install 'neural-context-protocol[local-embeddings]'"
             ) from err
-        self._model = SentenceTransformer(model)
+        self._model = TextEmbedding(model_name=model)
 
     def embed(self, text: str) -> list[float]:
         try:
-            vector = self._model.encode(text, convert_to_numpy=True).tolist()
+            first = next(iter(self._model.embed([text])))
+            vector = first.tolist() if hasattr(first, "tolist") else list(first)
         except Exception as exc:
             raise NCPAdapterResponseError(f"Local embedding call failed: {exc}") from exc
-        return self._validate_dims(vector)
+        return self._validate_vector(vector)

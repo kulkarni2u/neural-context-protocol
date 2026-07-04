@@ -354,6 +354,8 @@ class PgvectorStore(BaseStore):
             chunk = chunk.model_copy(
                 update={"embedding": self._embedding_adapter.embed(chunk.content)}
             )
+        if chunk.embedding is not None and len(chunk.embedding) != 1536:
+            raise ValueError(f"embedding must have 1536 dimensions, got {len(chunk.embedding)}")
         with self._connect() as connection:
             self._soft_gc(connection)
             self._assert_src_immutable(connection, chunk)

@@ -56,9 +56,9 @@ class BaseStore(ABC):
         - ``"trust_recency"``: recency + trust only; BM25 and the
           term-overlap filter are skipped.  Use this for non-BM25
           backends that perform their own similarity search.
-        - ``"vector"``: cosine ANN search using stored embeddings.
-          Requires ``embedding`` to be provided.  Only supported on
-          the pgvector backend; raises ``ValueError`` on SQLite.
+        - ``"vector"``: cosine search using stored embeddings.
+          Requires ``embedding`` to be provided or an embedding adapter
+          configured.  Pgvector uses ANN; SQLite uses a brute-force scan.
 
         ``diversity_limit`` caps the number of results per author
         (``written_by``).  Default 2 preserves existing behavior.

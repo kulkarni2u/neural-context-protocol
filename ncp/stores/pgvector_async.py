@@ -274,6 +274,8 @@ class AsyncPgvectorStore(BaseStore):
                 lambda: _adapter.embed(_content)  # type: ignore[union-attr]
             )
             chunk = chunk.model_copy(update={"embedding": embedding_vec})
+        if chunk.embedding is not None and len(chunk.embedding) != 1536:
+            raise ValueError(f"embedding must have 1536 dimensions, got {len(chunk.embedding)}")
         embedding_val = (
             "[" + ",".join(str(f) for f in chunk.embedding) + "]"
             if chunk.embedding is not None

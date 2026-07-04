@@ -63,7 +63,8 @@ CREATE TABLE IF NOT EXISTS chunks (
     last_retrieved_at REAL,
     written_at_drift REAL DEFAULT 0.0,
     dissent_count INTEGER DEFAULT 0,
-    verified INTEGER DEFAULT 0
+    verified INTEGER DEFAULT 0,
+    embedding BLOB
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
@@ -203,6 +204,7 @@ class SQLiteStore(BaseStore):
         max_working_chunks_per_pipeline: int = 0,
         retrieval_policy: RetrievalPolicy | None = None,
         config: NCPConfig | None = None,
+        embedding_adapter: object | None = None,
     ) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -210,6 +212,7 @@ class SQLiteStore(BaseStore):
         self.gc_threshold = gc_threshold
         self.max_working_chunks_per_pipeline = max_working_chunks_per_pipeline
         self.retention_evictions = 0
+        self._embedding_adapter = embedding_adapter
 
         from ncp.stores.rerank import Reranker
         from ncp.config import load_config
@@ -278,6 +281,7 @@ class SQLiteStore(BaseStore):
                 "ALTER TABLE cost_log ADD COLUMN cost_source TEXT NOT NULL DEFAULT 'measured'",  # CAP-E1
                 "ALTER TABLE chunks ADD COLUMN verified INTEGER DEFAULT 0",  # CAP-T1/WI-013
                 "ALTER TABLE whispers ADD COLUMN verified INTEGER DEFAULT 0",  # CAP-T1/WI-013
+                "ALTER TABLE chunks ADD COLUMN embedding BLOB",  # CAP-C4
                 "CREATE TABLE IF NOT EXISTS drift_history (session_id TEXT NOT NULL, turn INTEGER NOT NULL, drift_score REAL NOT NULL, ts REAL NOT NULL)",
                 "CREATE INDEX IF NOT EXISTS idx_drift_session ON drift_history(session_id, turn)",
                 "CREATE TABLE IF NOT EXISTS identities (identity_id TEXT PRIMARY KEY, public_key TEXT NOT NULL, alg TEXT NOT NULL DEFAULT 'ed25519', label TEXT, created_at REAL NOT NULL, revoked_at REAL)",
@@ -292,6 +296,10 @@ class SQLiteStore(BaseStore):
 
     def write(self, chunk: SubconsciousChunk) -> bool:
         chunk = self._validate_chunk_for_write(chunk)
+        if self._embedding_adapter is not None and chunk.embedding is None:
+            chunk = chunk.model_copy(
+                update={"embedding": self._embedding_adapter.embed(chunk.content)}
+            )
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             self._soft_gc(connection)
@@ -305,8 +313,8 @@ class SQLiteStore(BaseStore):
                     written_by, caused_by, conscious_hash, evidence_id, version, supersedes,
                     source_refs, schema_version, created_at, base_trust, generation,
                     result_confidence, result_attempts, conditions, valid_while, expiry, owner, meta,
-                    written_at_drift, verified
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    written_at_drift, verified, embedding
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(chunk_id) DO UPDATE SET
                     pipeline_id = excluded.pipeline_id,
                     scope = excluded.scope,
@@ -333,7 +341,8 @@ class SQLiteStore(BaseStore):
                     owner = excluded.owner,
                     meta = excluded.meta,
                     written_at_drift = excluded.written_at_drift,
-                    verified = excluded.verified
+                    verified = excluded.verified,
+                    embedding = excluded.embedding
                 """,
                 (
                     chunk.chunk_id,
@@ -364,12 +373,32 @@ class SQLiteStore(BaseStore):
                     json.dumps({"raw_ref": chunk.raw_ref} if chunk.raw_ref else {}),
                     chunk.written_at_drift,
                     1 if chunk.verified else 0,
+                    self._encode_embedding(chunk.embedding),
                 ),
             )
             self._hard_gc(connection, pipeline_id=chunk.pipeline_id)
             if self.max_working_chunks_per_pipeline > 0 and chunk.zone == "working":
                 self._enforce_retention(connection, pipeline_id=chunk.pipeline_id)
             return True
+
+    @staticmethod
+    def _cosine_similarity(a: list[float], b: list[float]) -> float:
+        if len(a) != len(b):
+            raise ValueError(
+                f"dimension mismatch: query has {len(a)} dims, stored has {len(b)} dims"
+            )
+        dot = sum(av * bv for av, bv in zip(a, b, strict=True))
+        norm_a = sum(av * av for av in a) ** 0.5
+        norm_b = sum(bv * bv for bv in b) ** 0.5
+        if norm_a == 0.0 or norm_b == 0.0:
+            return 0.0
+        return dot / (norm_a * norm_b)
+
+    @staticmethod
+    def _encode_embedding(value: list[float] | None) -> bytes | None:
+        if value is None:
+            return None
+        return json.dumps([float(item) for item in value]).encode("utf-8")
 
     def query(
         self,
@@ -391,10 +420,14 @@ class SQLiteStore(BaseStore):
             raise ValueError(
                 f"Unknown retrieval_mode {retrieval_mode!r}; expected one of {_VALID_RETRIEVAL_MODES}"
             )
-        if retrieval_mode == "vector":
-            raise ValueError(
-                "retrieval_mode='vector' requires pgvector; SQLite does not support ANN search"
-            )
+        if (
+            embedding is None
+            and self._embedding_adapter is not None
+            and retrieval_mode in {"hybrid", "vector"}
+        ):
+            embedding = self._embedding_adapter.embed(text)
+        if retrieval_mode == "vector" and embedding is None:
+            raise ValueError("retrieval_mode='vector' requires an embedding or embedding adapter")
 
         with self._connect() as connection:
             rows = self._load_query_rows(
@@ -409,6 +442,13 @@ class SQLiteStore(BaseStore):
 
         policy = self.retrieval_policy
         now = time.time()
+
+        if retrieval_mode == "vector":
+            return self._query_vector(
+                rows, embedding=embedding, k=k, min_score=min_score,
+                policy=policy, now=now, diversity_limit=diversity_limit,
+            )
+
         candidates: list[SubconsciousChunk] = []
 
         if retrieval_mode == "trust_recency":
@@ -424,6 +464,35 @@ class SQLiteStore(BaseStore):
                     continue
                 chunk = self._row_to_chunk(row)
                 chunk.relevance = max(0.0, min(1.0, score))
+                candidates.append(chunk)
+        elif embedding is not None:
+            lexical_candidates = build_lexical_candidates(
+                text,
+                [str(row["content"]) for row in rows],
+            )
+            for row, lexical_candidate in zip(rows, lexical_candidates, strict=True):
+                row_embedding = self._decode_embedding(
+                    row["embedding"] if "embedding" in row.keys() else None
+                )
+                vector_normalized: float | None = None
+                if row_embedding is not None:
+                    sim = self._cosine_similarity(embedding, row_embedding)
+                    vector_normalized = max(0.0, min(1.0, sim))
+                if lexical_candidate.lexical_signal is None and vector_normalized is None:
+                    continue
+                age_seconds = max(0.0, now - float(row["created_at"]))
+                hybrid_score = policy.score_with_vector(
+                    bm25_normalized=lexical_candidate.lexical_signal or 0.0,
+                    vector_normalized=vector_normalized,
+                    age_seconds=age_seconds,
+                    base_trust=float(row["base_trust"]),
+                    generation=int(row["generation"]),
+                    written_at_drift=float(row["written_at_drift"]) if row["written_at_drift"] is not None else 0.0,
+                )
+                if hybrid_score < min_score:
+                    continue
+                chunk = self._row_to_chunk(row)
+                chunk.relevance = max(0.0, min(1.0, hybrid_score))
                 candidates.append(chunk)
         else:
             for row, lexical_signal in self._fts_lexical_candidates(
@@ -500,6 +569,84 @@ class SQLiteStore(BaseStore):
                 chunk.retrieval_count += 1
                 chunk.last_retrieved_at = now
 
+        return results
+
+    @staticmethod
+    def _decode_embedding(value: object) -> list[float] | None:
+        if value is None:
+            return None
+        if isinstance(value, list):
+            return value
+        if isinstance(value, memoryview):
+            value = value.tobytes()
+        if isinstance(value, bytes):
+            value = value.decode("utf-8")
+        try:
+            parsed = json.loads(str(value))
+            if isinstance(parsed, list) and all(isinstance(v, (int, float)) for v in parsed):
+                return [float(v) for v in parsed]
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+        return None
+
+    def _query_vector(
+        self,
+        rows: list[sqlite3.Row],
+        *,
+        embedding: list[float] | None,
+        k: int,
+        min_score: float,
+        policy: RetrievalPolicy,
+        now: float,
+        diversity_limit: int,
+    ) -> list[SubconsciousChunk]:
+        if embedding is None:
+            raise ValueError("retrieval_mode='vector' requires an embedding or embedding adapter")
+        candidates: list[SubconsciousChunk] = []
+        for row in rows:
+            row_embedding = self._decode_embedding(
+                row["embedding"] if "embedding" in row.keys() else None
+            )
+            if row_embedding is None:
+                continue
+            sim = self._cosine_similarity(embedding, row_embedding)
+            vector_normalized = max(0.0, min(1.0, sim))
+            age_seconds = max(0.0, now - float(row["created_at"]))
+            score = policy.score_with_vector(
+                bm25_normalized=0.0,
+                vector_normalized=vector_normalized,
+                age_seconds=age_seconds,
+                base_trust=float(row["base_trust"]),
+                generation=int(row["generation"]),
+                vector_mix=1.0,
+                written_at_drift=float(row["written_at_drift"]) if row["written_at_drift"] is not None else 0.0,
+            )
+            if score < min_score:
+                continue
+            chunk = self._row_to_chunk(row)
+            chunk.relevance = max(0.0, min(1.0, score))
+            candidates.append(chunk)
+
+        ranked = sorted(candidates, key=lambda c: c.relevance, reverse=True)
+        result_limit = normalize_result_limit(k)
+        results = apply_diversity_limit(
+            ranked,
+            k=result_limit,
+            diversity_limit=diversity_limit,
+            author_getter=lambda chunk: str(chunk.written_by),
+        )
+        if results:
+            now_val = time.time()
+            placeholders = ",".join("?" * len(results))
+            with self._connect() as connection:
+                connection.execute(
+                    f"UPDATE chunks SET retrieval_count = retrieval_count + 1,"
+                    f" last_retrieved_at = ? WHERE chunk_id IN ({placeholders})",
+                    [now_val] + [c.chunk_id for c in results],
+                )
+            for chunk in results:
+                chunk.retrieval_count += 1
+                chunk.last_retrieved_at = now_val
         return results
 
     def tombstone(self, chunk_id: str, *, forward_ref: str | None = None, ttl_seconds: int = 86400) -> None:
@@ -2041,6 +2188,7 @@ class SQLiteStore(BaseStore):
     def _row_to_chunk(self, row: sqlite3.Row) -> SubconsciousChunk:
         created_at = float(row["created_at"])
         meta = json.loads(row["meta"]) if row["meta"] else {}
+        embedding = self._decode_embedding(row["embedding"] if "embedding" in row.keys() else None)
         chunk = SubconsciousChunk(
             chunk_id=str(row["chunk_id"]),
             layer=str(row["layer"]),
@@ -2072,6 +2220,7 @@ class SQLiteStore(BaseStore):
             last_retrieved_at=float(row["last_retrieved_at"]) if row["last_retrieved_at"] is not None else None,
             dissent_count=int(row["dissent_count"]) if row["dissent_count"] is not None else 0,
             verified=bool(row["verified"]) if "verified" in row.keys() and row["verified"] is not None else False,
+            embedding=embedding,
         )
         return chunk
 

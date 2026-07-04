@@ -78,7 +78,7 @@ DEFAULT_CONFIG = {
     "embedding": {
         "enabled": False,
         "provider": "local",
-        "model": "sentence-transformers/all-MiniLM-L6-v2",
+        "model": "BAAI/bge-small-en-v1.5",
     },
     "consolidation": {
         "enabled": True,
@@ -267,7 +267,7 @@ class NCPConfig:
 
     @property
     def embedding_model(self) -> str:
-        return str(self.values.get("embedding", {}).get("model", "sentence-transformers/all-MiniLM-L6-v2"))
+        return str(self.values.get("embedding", {}).get("model", "BAAI/bge-small-en-v1.5"))
 
     @property
     def server_auth_token(self) -> str | None:

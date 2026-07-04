@@ -99,7 +99,7 @@ def test_embedding_config_defaults(tmp_path) -> None:
     config = load_config(cwd=project)
     assert config.embedding_enabled is False
     assert config.embedding_provider == "local"
-    assert config.embedding_model == "sentence-transformers/all-MiniLM-L6-v2"
+    assert config.embedding_model == "BAAI/bge-small-en-v1.5"
 
 
 def test_embedding_config_toml_override(tmp_path) -> None:

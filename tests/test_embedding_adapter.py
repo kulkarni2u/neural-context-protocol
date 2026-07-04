@@ -18,12 +18,12 @@ _DIM = 1536
 
 class _GoodAdapter(BaseEmbeddingAdapter):
     def embed(self, text: str) -> list[float]:
-        return self._validate_dims([0.1] * _DIM)
+        return self._validate_vector([0.1] * _DIM)
 
 
 class _BadDimAdapter(BaseEmbeddingAdapter):
     def embed(self, text: str) -> list[float]:
-        return self._validate_dims([0.1] * 100)
+        return self._validate_vector([])
 
 
 def test_base_adapter_passes_correct_dims() -> None:
@@ -31,7 +31,7 @@ def test_base_adapter_passes_correct_dims() -> None:
 
 
 def test_base_adapter_rejects_wrong_dims() -> None:
-    with pytest.raises(NCPAdapterResponseError, match="1536"):
+    with pytest.raises(NCPAdapterResponseError, match="non-empty"):
         _BadDimAdapter().embed("hi")
 
 
@@ -65,16 +65,22 @@ def test_openai_adapter_rejects_wrong_dims() -> None:
 def test_local_adapter_embed() -> None:
     adapter = LocalEmbeddingAdapter.__new__(LocalEmbeddingAdapter)
     mock_model = MagicMock()
-    mock_model.encode.return_value = MagicMock(tolist=lambda: [0.2] * _DIM)
+    mock_model.embed.return_value = iter([MagicMock(tolist=lambda: [0.2] * 384)])
     adapter._model = mock_model
     result = adapter.embed("hello world")
-    assert len(result) == _DIM
+    assert len(result) == 384
 
 
-def test_local_adapter_rejects_wrong_dims() -> None:
+def test_local_adapter_rejects_empty_vector() -> None:
     adapter = LocalEmbeddingAdapter.__new__(LocalEmbeddingAdapter)
     mock_model = MagicMock()
-    mock_model.encode.return_value = MagicMock(tolist=lambda: [0.2] * 384)
+    mock_model.embed.return_value = iter([MagicMock(tolist=lambda: [])])
     adapter._model = mock_model
-    with pytest.raises(NCPAdapterResponseError, match="1536"):
+    with pytest.raises(NCPAdapterResponseError, match="non-empty"):
         adapter.embed("hello")
+
+
+def test_local_adapter_missing_extra_error_mentions_install() -> None:
+    with patch.dict("sys.modules", {"fastembed": None}):
+        with pytest.raises(ImportError, match="local-embeddings"):
+            LocalEmbeddingAdapter()

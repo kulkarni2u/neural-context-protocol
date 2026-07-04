@@ -50,12 +50,14 @@ tokens = ["tiktoken>=0.7"]
 http = ["aiohttp"]
 redis = ["redis"]
 pgvector = ["psycopg[binary]", "psycopg-pool", "pgvector"]
+local-embeddings = ["fastembed>=0.4.0"]
 all = [
   "anthropic",
   "openai",
   "google-genai",
   "mistralai",
   "cohere",
+  "fastembed>=0.4.0",
   "tiktoken>=0.7",
 ]
 dev = [

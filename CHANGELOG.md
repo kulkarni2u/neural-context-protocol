@@ -24,6 +24,13 @@ Audit remediation from `docs/NCP_AUDIT_AND_REMEDIATION_PLAN.md`. One work item
 
 ### Added
 
+- **Local semantic embeddings for the SQLite tier** (`ncp/adapters/embedding.py`,
+  `ncp/stores/sqlite.py`, `ncp/stores/factory.py`, `ncp/config.py`): add an
+  opt-in `local-embeddings` extra backed by fastembed, persist SQLite chunk
+  embeddings in an additive BLOB column, and use brute-force cosine fusion for
+  SQLite hybrid/vector retrieval when `[embedding].enabled = true`. Defaults
+  stay off; local embeddings fail fast with an install hint when the optional
+  extra is missing. (CAP-C4)
 - **Real per-provider token and USD cost accounting** (`ncp/api.py`,
   `ncp/adapters/base.py`, `ncp/adapters/*.py`, `ncp/costs.py`, `ncp/types.py`,
   `ncp/stores/sqlite.py`): adapters now capture the provider response's real
