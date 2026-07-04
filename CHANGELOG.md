@@ -4,6 +4,53 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [Unreleased]
 
+Audit remediation from `docs/NCP_AUDIT_AND_REMEDIATION_PLAN.md`. One work item
+(`WI-###`) per commit; each addresses a finding (`F-*`) from the audit.
+
+### Added
+
+- **MIT `LICENSE` file** (`LICENSE`): add the MIT license text with the correct
+  copyright holder to match the badge, `pyproject` `license` metadata, and README
+  footer. (WI-012, F-C5)
+
+### Fixed
+
+- **Idempotent calibration feedback** (`ncp/stores/calibration.py`,
+  `ncp/stores/sqlite.py`, `ncp/stores/pgvector.py`,
+  `ncp/stores/pgvector_async.py`): `ncp calibrate --feedback` now computes trust
+  boosts from the *delta* since the last pass via per-chunk
+  retrieval/dissent watermarks, so re-running it with no new activity no longer
+  walks `base_trust` monotonically toward 1.0/0.0. Reputation rollup consumes the
+  same deltas. (WI-003, F-B1)
+- **MCP path honors the config token budget** (`ncp/mcp/server.py`): both
+  `Assembler` constructions now receive the loaded `config`, so
+  `context_token_budget` applies over `/mcp` even when the client omits
+  `max_tokens`. (WI-004, F-B2)
+- **SQLite write hardening** (`ncp/stores/sqlite.py`): add `PRAGMA busy_timeout`
+  and wrap the check-then-insert `write()` path in `BEGIN IMMEDIATE`; a same-`src`
+  rewrite now preserves `created_at`/`retrieval_count`/`dissent_count` instead of
+  clobbering them, so concurrent writers no longer raise `SQLITE_BUSY` and
+  feedback history survives. (WI-009, F-C1/F-C2)
+- **Unauthenticated loopback quickstart** (`ncp/cli.py`,
+  `ncp/templates/config.toml.example`): `ncp init` no longer auto-mints an
+  `auth_token` for loopback SQLite, so the documented "init → copy config →
+  connect" flow no longer 401s against its own server. (WI-010, F-C3)
+
+### Security
+
+- **Escaped pidgin wire delimiters** (`ncp/encoder.py`): chunk/whisper content is
+  neutralized before assembly so stored text cannot forge `[NCP:...]` section
+  headers or counterfeit `src:`/`trust:`/`from:` provenance in another agent's
+  assembled context. (WI-014, F-S1)
+
+### Changed
+
+- **Honest benchmark claims** (`README.md`, `benchmarks/mace/README.md`): replace
+  the stale headline MACE score with the reproduced composite (0.8915), lead the
+  coding-pipeline table with the sliding-window comparison, and annotate each
+  benchmark row with a one-line honest caveat instead of deleting it. (WI-001,
+  F-A3)
+
 ## [1.2.1] - 2026-06-30
 
 ### Added
