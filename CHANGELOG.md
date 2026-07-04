@@ -366,7 +366,7 @@ MACE benchmark plus async pgvector observability parity. No breaking changes.
 - **Docs**: README benchmark section now points to MACE as the end-to-end
   benchmark entry point.
 - **Canonical benchmark run**: `python benchmarks/mace/run.py --turns 40`
-  currently yields composite `0.9608` with D1 `0.8695`, D2 `1.0000`,
+  currently yields composite `0.8915` with D1 `0.6384`, D2 `1.0000`,
   D3 `1.0000`, D4 `1.0000`.
 - **`AsyncPgvectorStore` observability parity** (`ncp/stores/pgvector_async.py`):
   added native async `async_status_detail()`, `async_cost_summary()`, and

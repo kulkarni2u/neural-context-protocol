@@ -55,7 +55,7 @@ Severity: **P0** = ship-blocking / actively misleading, **P1** = real bug,
 |----|-----------------|---------|---------|
 | F-A1 | "13.13x token reduction" | Unbounded raw-replay strawman ÷ fixed 340-token cap. Ratio scales purely with turn count (~3.4x@10, ~13x@40, ~26x@80). No model called; no quality metric. Their honest baseline (sliding window) is **1.44x**. | Misleading |
 | F-A2 | "Task success +1.00" | Mock provider string-scans context for a planted slug; scorer checks the slug is present — circular. Budget is chosen so the baseline *must* fail; at budget 850 the baseline also scores 1.00. | Misleading |
-| F-A3 | "MACE 0.9608" | Reproduces today at **0.8915** (matches committed `benchmarks/mace/results/ncp.json`). README and `benchmarks/mace/README.md` are stale. D2–D4 are hard-coded string-match stub agents, trivially 1.0. | **False / stale** |
+| F-A3 | Stale headline MACE score | Reproduces today at **0.8915** (matches committed `benchmarks/mace/results/ncp.json`). README and `benchmarks/mace/README.md` were stale. D2-D4 are hard-coded string-match stub agents, trivially 1.0. | **False / stale** |
 | F-A4 | "Cross-host handoff 0.8 success" | One process, no MCP server, shared tempdir SQLite. Control is engineered noise-only so it *cannot* succeed; the 0.2 miss was a CLI timeout, not a memory failure. | Misleading |
 | F-A5 | "Real cryptographic Ed25519 identities" / "trust attaches to who wrote it" | Keys generated and **never read again**. No `sign()`/`verify()` call anywhere in `ncp/`. `written_by`/`from` are unauthenticated caller strings; revocation consulted nowhere. | Decorative |
 | F-A6 | "Trust-aware transport… agent knows how much to believe" | `base_trust` is caller-supplied; any client can claim `src=user_verified` → 0.95 + calibration immunity. | Misleading |
@@ -112,19 +112,19 @@ Ordered by recommended execution. Each WI is independently shippable.
 - **Addresses:** F-A1, F-A2, F-A3, F-A4.
 - **Scope:** `README.md` Benchmarks section; `benchmarks/mace/README.md`.
 - **Approach:**
-  1. Regenerate MACE: `python3 benchmarks/mace/run.py`; replace every `0.9608`
-     with the reproduced composite (currently **0.8915**). Grep to confirm none
-     remain: `grep -rn "0.9608" .`
+  1. Regenerate MACE: `python3 benchmarks/mace/run.py`; replace the stale
+     headline MACE score with the reproduced composite (currently **0.8915**).
+     Grep to confirm no stale literal remains.
   2. Re-order the coding-pipeline table so the **sliding-window** row (1.44x) is
      the lead comparison; explicitly label raw-replay "a floor / worst case,"
      and add a one-line note that the ratio scales with turn count.
   3. For the task-success and cross-host rows, add an inline caveat matching the
      benchmark docs ("context adequacy at a chosen budget, mock provider" /
      "control constructed to be noise-only"). Do not delete the rows — annotate.
-- **Acceptance:** No `0.9608` anywhere in the repo; every README benchmark row
+- **Acceptance:** No stale headline MACE score anywhere in the repo; every README benchmark row
   has a one-line honest caveat; numbers reproduce from a clean `python3
   benchmarks/*/run.py`.
-- **Verify:** `grep -rn "0.9608" . ; python3 benchmarks/mace/run.py | grep -i composite`
+- **Verify:** grep for the stale headline MACE score; `python3 benchmarks/mace/run.py | grep -i composite`
 
 #### WI-002 · Reconcile identity/trust/drift/reputation language with reality — P0
 - **Addresses:** F-A5, F-A6, F-A7, F-A8.
@@ -336,7 +336,7 @@ pip install -e '.[dev,providers]' pytest-asyncio
 pytest -q                 # expect all pass except environment-only skips
 python3 benchmarks/mace/run.py            # composite currently 0.8915
 python3 benchmarks/coding_pipeline/run.py # reproduces the ratios in §1.1
-grep -rn "0.9608" .        # WI-001 target: should become empty
+grep -rn "<stale headline MACE score>" .        # WI-001 target: should become empty
 grep -rn "sign\|verify" ncp/   # WI-013 target: identity keys unused today
 ```
 

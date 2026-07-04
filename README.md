@@ -288,17 +288,17 @@ Use it when you have **3+ agents, 10+ turns, and real shared state to preserve**
 
 ## Benchmarks
 
-| Scenario                               | Baseline       | Baseline tokens | NCP tokens | Reduction  |
-|----------------------------------------|----------------|----------------:|-----------:|-----------:|
-| 4-agent coding pipeline (40 turns)     | raw replay     | 3,426           | 261        | **13.13x** |
-| 4-agent coding pipeline (40 turns)     | sliding window | 377             | 261        | **1.44x**  |
-| 4-agent coding pipeline (40 turns)     | rolling summary| 2,096           | 261        | **8.03x**  |
-| 6-role research pipeline (36 turns)    | raw replay     | 3,277           | 267        | **12.27x** |
-| Cross-host handoff (Claude → OpenCode) | window baseline| 0.0 success     | 0.8 success| **+0.8**   |
-| Needle recall at budget 4              | sliding window | 0.00            | 0.50       | **+0.50**  |
-| Task success at matched budget 400 (12 tasks, mock) | sliding window | 0.00 | 1.00 | **+1.00** |
+| Scenario                               | Baseline       | Baseline tokens | NCP tokens | Result     | Caveat |
+|----------------------------------------|----------------|----------------:|-----------:|-----------:|--------|
+| 4-agent coding pipeline (40 turns)     | sliding window | 377             | 261        | **1.44x**  | Closest accounting comparison for a bounded recent-context baseline. |
+| 4-agent coding pipeline (40 turns)     | raw replay     | 3,426           | 261        | **13.13x** | Worst-case floor; the ratio scales with turn count. |
+| 4-agent coding pipeline (40 turns)     | rolling summary| 2,096           | 261        | **8.03x**  | Token accounting only; does not score summary quality. |
+| 6-role research pipeline (36 turns)    | raw replay     | 3,277           | 267        | **12.27x** | Worst-case floor for a deterministic synthetic research trace. |
+| Cross-host handoff (Claude -> OpenCode)| window baseline| 0.0 success     | 0.8 success| **+0.8**   | Local harness with a noise-only control, not a distributed-host reliability study. |
+| Needle recall at budget 4              | sliding window | 0.00            | 0.50       | **+0.50**  | Synthetic budget-stress recall check. |
+| Task success at matched budget 400 (12 tasks, mock) | sliding window | 0.00 | 1.00 | **+1.00** | Context adequacy with a deterministic mock provider, not live model success. |
 
-MACE multi-agent coordination score (40 turns): **0.9608**
+MACE multi-agent coordination score (40 turns): **0.8915**
 
 Coding benchmark token unit: `chars_div4`; context budget: `340`; pass gate: `true`.
 These are deterministic token-accounting benchmarks. The task-success row measures context adequacy at a matched token budget with a deterministic mock provider — whether the needed fact survives into a budget-bounded context (see [the benchmark doc](./docs/NCP_BENCHMARK_TASK_SUCCESS.md)); run it with a live provider to measure real model task success. Quality-at-matched-budget evaluation also lives in `benchmarks/efficacy/`.

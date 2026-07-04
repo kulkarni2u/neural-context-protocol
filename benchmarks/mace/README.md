@@ -40,18 +40,18 @@ python benchmarks/mace/run.py --turns 40
 
 Observed NCP result on the current codebase:
 
-- Composite MACE score: `0.9608`
-- D1 Token Efficiency: `0.8695`
+- Composite MACE score: `0.8915`
+- D1 Token Efficiency: `0.6384`
 - D2 Handoff Quality: `1.0000`
 - D3 Dead-end Prevention: `1.0000`
 - D4 Goal Coherence: `1.0000`
 
 D1 primary checkpoint at turn 40:
 
-- baseline tokens: `1927`
-- NCP tokens: `110`
-- reduction ratio: `17.52x`
-- reduction percentage: `94.3%`
+- baseline tokens: `3426`
+- NCP tokens: `261`
+- reduction ratio: `13.13x`
+- reduction percentage: `92.4%`
 
 ## Scoring
 
@@ -71,7 +71,8 @@ Weights:
 
 - D1 is wired to the existing `benchmarks/coding_pipeline/` benchmark. No
   duplication.
-- D2–D4 run on the real NCP store and assembler path with deterministic agent
-  outputs so the suite is reproducible without provider credentials.
+- D2-D4 run on the real NCP store and assembler path with deterministic agent
+  outputs so the suite is reproducible without provider credentials. They are
+  coordination checks, not live-provider quality measurements.
 - Community comparison artifacts should follow
   `benchmarks/mace/results/community/TEMPLATE.json`.
