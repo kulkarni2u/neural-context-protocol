@@ -206,6 +206,11 @@ class SubconsciousChunk(NCPModel):
     last_retrieved_at: float | None = None
     dissent_count: int = 0
 
+    # CAP-T1/WI-013: authorship verification status. True only when a valid
+    # Ed25519 signature over the canonical authorship payload was verified at
+    # ingest. Default false keeps existing unsigned rows/tests unaffected.
+    verified: bool = False
+
     embedding: list[float] | None = None
 
     @property
@@ -330,6 +335,8 @@ class Whisper(NCPModel):
     ttl_seconds: int = 1800
     pipeline_id: str | None = None
     dissent_target: str | None = None
+    # CAP-T1/WI-013: authorship verification status (see SubconsciousChunk).
+    verified: bool = False
 
     @field_validator("from_agent", "target", "whisper_id")
     @classmethod

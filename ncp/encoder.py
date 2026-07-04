@@ -137,6 +137,8 @@ class PidginEncoder:
                 f"src:{chunk.src}",
                 f"trust:{_fmt_float(chunk.base_trust)}",
             ]
+            if chunk.verified:
+                parts.append("verified:1")
             if chunk.raw_ref:
                 parts.append(f"raw_ref:{chunk.raw_ref}")
             lines.append(" ".join(parts))

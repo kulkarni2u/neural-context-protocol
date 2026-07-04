@@ -69,7 +69,8 @@ CREATE TABLE IF NOT EXISTS {schema}.{prefix}chunks (
     retrieval_count INTEGER DEFAULT 0,
     last_retrieved_at DOUBLE PRECISION,
     written_at_drift DOUBLE PRECISION DEFAULT 0.0,
-    dissent_count INTEGER DEFAULT 0
+    dissent_count INTEGER DEFAULT 0,
+    verified BOOLEAN DEFAULT FALSE
 );
 
 CREATE TABLE IF NOT EXISTS {schema}.{prefix}tombstones (
@@ -89,6 +90,7 @@ CREATE TABLE IF NOT EXISTS {schema}.{prefix}whispers (
     confidence DOUBLE PRECISION NOT NULL,
     ref TEXT,
     dissent_target TEXT,
+    verified BOOLEAN DEFAULT FALSE,
     created_at DOUBLE PRECISION NOT NULL,
     expires_at DOUBLE PRECISION NOT NULL
 );
@@ -372,10 +374,10 @@ class PgvectorStore(BaseStore):
                             written_by, caused_by, conscious_hash, evidence_id, version, supersedes,
                             source_refs, schema_version, created_at, base_trust, generation,
                             result_confidence, result_attempts, conditions, valid_while, expiry, owner, meta,
-                            embedding, written_at_drift
+                            embedding, written_at_drift, verified
                         ) VALUES (
                             %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                         )
                         ON CONFLICT (chunk_id) DO UPDATE SET
                             pipeline_id = EXCLUDED.pipeline_id,
@@ -404,7 +406,8 @@ class PgvectorStore(BaseStore):
                             owner = EXCLUDED.owner,
                             meta = EXCLUDED.meta,
                             embedding = EXCLUDED.embedding,
-                            written_at_drift = EXCLUDED.written_at_drift
+                            written_at_drift = EXCLUDED.written_at_drift,
+                            verified = EXCLUDED.verified
                         """
                     ),
                     (
@@ -436,6 +439,7 @@ class PgvectorStore(BaseStore):
                         json.dumps({}),
                         embedding_val,
                         chunk.written_at_drift,
+                        bool(chunk.verified),
                     ),
                 )
             finally:
@@ -905,9 +909,48 @@ class PgvectorStore(BaseStore):
             finally:
                 self._close_cursor(cursor)
 
-    def resolve_identity(self, agent_id: str, *, pipeline_id: str | None = None) -> str:
-        del pipeline_id
+    def resolve_identity(
+        self,
+        agent_id: str,
+        *,
+        pipeline_id: str | None = None,
+        signature: str | None = None,
+        content: str | None = None,
+    ) -> str:
+        if signature is not None and content is not None:
+            from ncp.identity import canonical_authorship_payload
+
+            payload = canonical_authorship_payload(agent_id, content, pipeline_id)
+            if self.verify_authorship(agent_id, payload, signature):
+                return agent_id
         return agent_id
+
+    def verify_authorship(
+        self, identity_id: str, payload: bytes | str, signature: str
+    ) -> bool:
+        """Verify a signature for ``identity_id``; False if unknown or revoked."""
+
+        from ncp.identity import verify_signature
+
+        with self._connect() as connection:
+            cursor = connection.cursor()
+            try:
+                cursor.execute(
+                    self._sql(
+                        "SELECT public_key, revoked_at FROM {schema}.{prefix}identities"
+                        " WHERE identity_id = %s"
+                    ),
+                    (identity_id,),
+                )
+                rows = self._fetchall(cursor)
+            finally:
+                self._close_cursor(cursor)
+        if not rows:
+            return False
+        row = rows[0]
+        if row.get("revoked_at") is not None:
+            return False
+        return verify_signature(str(row["public_key"]), payload, signature)
 
     def register_identity(
         self,
@@ -2043,6 +2086,7 @@ class PgvectorStore(BaseStore):
             source_refs=self._decode_json_list(row["source_refs"]),
             age_seconds=max(0.0, time.time() - created_at),
             dissent_count=int(row["dissent_count"]) if row.get("dissent_count") is not None else 0,
+            verified=bool(row.get("verified")) if row.get("verified") is not None else False,
         )
 
     def _decode_json_list(self, value: Any) -> list[str]:

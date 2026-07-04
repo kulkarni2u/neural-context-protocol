@@ -95,6 +95,15 @@ MCP_TOOLS: list[dict[str, object]] = [
                 "chunk_id": {"type": "string", "description": "Optional chunk ID (auto-generated if omitted)"},
                 "pipeline_id": {"type": "string"},
                 "base_trust": {"type": "number", "description": "Optional explicit trust score 0.0-1.0; otherwise derived from src."},
+                "signature": {
+                    "type": "string",
+                    "description": (
+                        "Optional base64 Ed25519 signature over the canonical authorship "
+                        "payload (written_by | sha256(content) | pipeline_id). When present it "
+                        "is verified and recorded. Required only if [identity].require_signatures "
+                        "is enabled, in which case an unverifiable write is rejected."
+                    ),
+                },
             },
             "required": ["content", "layer", "src"],
         },
@@ -126,6 +135,14 @@ MCP_TOOLS: list[dict[str, object]] = [
                         "Optional chunk_id this whisper refers to. For a dissent whisper, set this "
                         "to the disputed chunk_id: it debits that chunk's trust and propagates the "
                         "penalty along its caused_by edge during feedback calibration."
+                    ),
+                },
+                "signature": {
+                    "type": "string",
+                    "description": (
+                        "Optional base64 Ed25519 signature over the canonical authorship payload "
+                        "(from | sha256(payload) | pipeline_id). Verified and recorded when present; "
+                        "required only if [identity].require_signatures is enabled."
                     ),
                 },
             },
@@ -222,11 +239,41 @@ def _encode_fetch_results(chunks: list[SubconsciousChunk]) -> str:
     lines = [f"ncp_fetch:results k:{len(chunks)}"]
     for chunk in chunks:
         header = f"chunk:{chunk.chunk_id} layer:{chunk.layer} score:{chunk.relevance:.2f}"
+        if chunk.verified:
+            header += " verified:1"
         if chunk.raw_ref:
             header += f" raw_ref:{chunk.raw_ref}"
         lines.append(header)
         lines.append(f"  {chunk.content}")
     return "\n".join(lines)
+
+
+def _verify_authorship(
+    store: BaseStore,
+    *,
+    identity_id: str,
+    content: str,
+    pipeline_id: str | None,
+    signature: str | None,
+) -> bool:
+    """Verify an optional authorship signature via the store.
+
+    Returns ``False`` when no signature is supplied, the store cannot verify, or
+    verification fails (unknown/revoked identity or bad signature). Never raises.
+    """
+
+    if signature is None:
+        return False
+    verifier = getattr(store, "verify_authorship", None)
+    if not callable(verifier):
+        return False
+    from ncp.identity import canonical_authorship_payload
+
+    payload = canonical_authorship_payload(identity_id, content, pipeline_id)
+    try:
+        return bool(verifier(identity_id, payload, signature))
+    except Exception:
+        return False
 
 
 @dataclass
@@ -271,6 +318,7 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
     sessions_lock = threading.Lock()
     coordination = getattr(store, "coordination", None)
     default_whisper_ttl = config.whisper_ttl_default if config is not None else 1800
+    require_signatures = config.require_signatures if config is not None else False
 
     def _prune_sessions() -> None:
         # Caller must hold sessions_lock. Drop expired entries, then LRU-evict
@@ -394,6 +442,23 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         fr = filter_content(raw_content)
         content = fr.filtered
 
+        # CAP-T1/WI-013: opt-in authorship verification. The client signs over the
+        # canonical (written_by | sha256(raw_content) | pipeline_id) payload, so we
+        # verify against the raw content it sent (not the post-filter content).
+        signature = args.get("signature")
+        verified = _verify_authorship(
+            store,
+            identity_id=written_by,
+            content=raw_content,
+            pipeline_id=None if pipeline_id is None else str(pipeline_id),
+            signature=None if signature is None else str(signature),
+        )
+        if require_signatures and not verified:
+            raise ValueError(
+                "ncp_write_memory rejected: require_signatures is enabled and authorship "
+                "could not be verified (missing/invalid signature or revoked identity)."
+            )
+
         kwargs: dict = {
             "content": content,
             "layer": str(args["layer"]),
@@ -402,6 +467,7 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             "pipeline_id": pipeline_id,
             "base_trust": _trust_from_args(args),
             "written_at_drift": 0.0 if latest is None else latest.drift_score,
+            "verified": verified,
         }
         if (chunk_id := args.get("chunk_id")):
             kwargs["chunk_id"] = str(chunk_id)
@@ -425,6 +491,8 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         chunk = SubconsciousChunk(**kwargs)
         ok = store.write(chunk)
         result: dict[str, object] = {"written": ok, "chunk_id": chunk.chunk_id}
+        if signature is not None:
+            result["verified"] = verified
         if fr.was_filtered:
             result["filtered"] = True
             result["reduction_ratio"] = round(fr.reduction_ratio, 3)
@@ -440,18 +508,37 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         except (TypeError, ValueError):
             ttl_seconds = default_whisper_ttl
         ref = args.get("ref")
+        from_agent = str(args["from"])
+        pipeline_id = args.get("pipeline_id")
+        # CAP-T1/WI-013: sign whispers over (from | sha256(payload) | pipeline_id).
+        signature = args.get("signature")
+        verified = _verify_authorship(
+            store,
+            identity_id=from_agent,
+            content=payload,
+            pipeline_id=None if pipeline_id is None else str(pipeline_id),
+            signature=None if signature is None else str(signature),
+        )
+        if require_signatures and not verified:
+            raise ValueError(
+                "ncp_emit_whisper rejected: require_signatures is enabled and authorship "
+                "could not be verified (missing/invalid signature or revoked identity)."
+            )
         whisper = Whisper(
-            from_agent=str(args["from"]),
+            from_agent=from_agent,
             target=str(args["target"]),
             whisper_type=whisper_type,
             payload=payload,
             confidence=float(args["confidence"]),
-            pipeline_id=args.get("pipeline_id"),
+            pipeline_id=pipeline_id,
             ttl_seconds=ttl_seconds,
             ref=None if ref is None else str(ref),
+            verified=verified,
         )
         store.emit_whisper(whisper)
         result: dict[str, object] = {"emitted": True}
+        if signature is not None:
+            result["verified"] = verified
         if whisper_type == "dissent" and ref:
             result["dissent_recorded"] = store.record_dissent(str(ref))
         return result

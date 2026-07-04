@@ -7,6 +7,21 @@ All notable changes to Neural Context Protocol will be documented in this file.
 Audit remediation from `docs/NCP_AUDIT_AND_REMEDIATION_PLAN.md`. One work item
 (`WI-###`) per commit; each addresses a finding (`F-*`) from the audit.
 
+### Security
+
+- **Opt-in Ed25519 signing and verification of chunk/whisper authorship**
+  (`ncp/identity.py`, `ncp/config.py`, `ncp/mcp/server.py`, `ncp/types.py`,
+  `ncp/encoder.py`, `ncp/stores/sqlite.py`, `ncp/stores/pgvector.py`,
+  `ncp/migrations/008_add_verification_status.sql`): `sign()`/`verify_signature()`
+  operate over a canonical `written_by | sha256(content) | pipeline_id` payload;
+  `ncp_write_memory` and `ncp_emit_whisper` accept an optional `signature`,
+  verify it on ingest, persist the result to a new additive `verified` column
+  (pgvector migration `008`), honor `revoked_at`, and expose the verified marker
+  in fetch results and the pidgin encoding. Gated behind
+  `[identity].require_signatures` (**default false**) so unsigned writes keep
+  working exactly as before; enforcement only rejects unverifiable writes/emits
+  when the flag is enabled. (CAP-T1, WI-013)
+
 ### Added
 
 - **Real per-provider token and USD cost accounting** (`ncp/api.py`,

@@ -1151,6 +1151,7 @@ class AsyncPgvectorStore(BaseStore):
             source_refs=[],
             age_seconds=max(0.0, time.time() - created_at),
             dissent_count=int(row.get("dissent_count") or 0),
+            verified=bool(row.get("verified")) if row.get("verified") is not None else False,
         )
 
     def _decode_embedding(self, value: Any) -> list[float] | None:
@@ -1852,8 +1853,15 @@ class AsyncPgvectorStore(BaseStore):
         report.duration_seconds = time.monotonic() - started
         return report
 
-    def resolve_identity(self, agent_id: str, *, pipeline_id: str | None = None) -> str:
-        del pipeline_id
+    def resolve_identity(
+        self,
+        agent_id: str,
+        *,
+        pipeline_id: str | None = None,
+        signature: str | None = None,
+        content: str | None = None,
+    ) -> str:
+        del pipeline_id, signature, content
         return agent_id
 
     # ------------------------------------------------------------------

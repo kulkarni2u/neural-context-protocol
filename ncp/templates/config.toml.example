@@ -55,3 +55,10 @@ confidence_k = 20
 # this (or NCP_AUTH_TOKEN, or `ncp serve --auth-token`) before binding to a
 # non-loopback host. `ncp init --store pgvector` generates one automatically.
 # auth_token = ""
+
+# [identity]
+# OPT-IN Ed25519 authorship enforcement (CAP-T1, WI-013). When false (default),
+# unsigned writes/whispers keep working and any supplied signature is verified
+# and recorded but never required. Set to true to REJECT any write/emit whose
+# authorship cannot be verified (missing/bad signature or revoked identity).
+# require_signatures = false

@@ -26,3 +26,10 @@ min_confidence = 0.60
 log_level = "info"
 log_format = "pretty"
 cost_tracking = true
+
+# [identity]
+# OPT-IN Ed25519 authorship enforcement (CAP-T1, WI-013). When false (default),
+# unsigned writes/whispers keep working and any supplied signature is verified
+# and recorded but never required. Set to true to REJECT any write/emit whose
+# authorship cannot be verified (missing/bad signature or revoked identity).
+# require_signatures = false

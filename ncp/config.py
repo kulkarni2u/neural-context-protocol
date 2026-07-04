@@ -93,6 +93,14 @@ DEFAULT_CONFIG = {
     "server": {
         "auth_token": "",
     },
+    "identity": {
+        # OPT-IN authorship enforcement. When false (default) unsigned writes and
+        # whispers keep working exactly as before and any supplied signature is
+        # verified and recorded but never required. When true, a write/emit whose
+        # authorship cannot be verified (missing/bad signature or revoked identity)
+        # is rejected.
+        "require_signatures": False,
+    },
     "providers": {
         "pricing": {
             "claude-sonnet-4-20250514": {"input": 3.00, "output": 15.00, "cache_read": 0.30},
@@ -269,6 +277,10 @@ class NCPConfig:
     @property
     def retention_max_working_chunks_per_pipeline(self) -> int:
         return int(self.values.get("retention", {}).get("max_working_chunks_per_pipeline", 0))
+
+    @property
+    def require_signatures(self) -> bool:
+        return bool(self.values.get("identity", {}).get("require_signatures", False))
 
 def load_config(
     path: str | Path | None = None,

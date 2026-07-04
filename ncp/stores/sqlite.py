@@ -62,7 +62,8 @@ CREATE TABLE IF NOT EXISTS chunks (
     retrieval_count INTEGER DEFAULT 0,
     last_retrieved_at REAL,
     written_at_drift REAL DEFAULT 0.0,
-    dissent_count INTEGER DEFAULT 0
+    dissent_count INTEGER DEFAULT 0,
+    verified INTEGER DEFAULT 0
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
@@ -102,6 +103,7 @@ CREATE TABLE IF NOT EXISTS whispers (
     confidence REAL NOT NULL,
     ref TEXT,
     dissent_target TEXT,
+    verified INTEGER DEFAULT 0,
     created_at REAL NOT NULL,
     expires_at REAL NOT NULL
 );
@@ -274,6 +276,8 @@ class SQLiteStore(BaseStore):
                 "ALTER TABLE chunks ADD COLUMN dissent_count INTEGER DEFAULT 0",
                 "ALTER TABLE whispers ADD COLUMN dissent_target TEXT",  # WI-007(b)
                 "ALTER TABLE cost_log ADD COLUMN cost_source TEXT NOT NULL DEFAULT 'measured'",  # CAP-E1
+                "ALTER TABLE chunks ADD COLUMN verified INTEGER DEFAULT 0",  # CAP-T1/WI-013
+                "ALTER TABLE whispers ADD COLUMN verified INTEGER DEFAULT 0",  # CAP-T1/WI-013
                 "CREATE TABLE IF NOT EXISTS drift_history (session_id TEXT NOT NULL, turn INTEGER NOT NULL, drift_score REAL NOT NULL, ts REAL NOT NULL)",
                 "CREATE INDEX IF NOT EXISTS idx_drift_session ON drift_history(session_id, turn)",
                 "CREATE TABLE IF NOT EXISTS identities (identity_id TEXT PRIMARY KEY, public_key TEXT NOT NULL, alg TEXT NOT NULL DEFAULT 'ed25519', label TEXT, created_at REAL NOT NULL, revoked_at REAL)",
@@ -301,8 +305,8 @@ class SQLiteStore(BaseStore):
                     written_by, caused_by, conscious_hash, evidence_id, version, supersedes,
                     source_refs, schema_version, created_at, base_trust, generation,
                     result_confidence, result_attempts, conditions, valid_while, expiry, owner, meta,
-                    written_at_drift
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    written_at_drift, verified
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(chunk_id) DO UPDATE SET
                     pipeline_id = excluded.pipeline_id,
                     scope = excluded.scope,
@@ -328,7 +332,8 @@ class SQLiteStore(BaseStore):
                     expiry = excluded.expiry,
                     owner = excluded.owner,
                     meta = excluded.meta,
-                    written_at_drift = excluded.written_at_drift
+                    written_at_drift = excluded.written_at_drift,
+                    verified = excluded.verified
                 """,
                 (
                     chunk.chunk_id,
@@ -358,6 +363,7 @@ class SQLiteStore(BaseStore):
                     chunk.owner,
                     json.dumps({"raw_ref": chunk.raw_ref} if chunk.raw_ref else {}),
                     chunk.written_at_drift,
+                    1 if chunk.verified else 0,
                 ),
             )
             self._hard_gc(connection, pipeline_id=chunk.pipeline_id)
@@ -576,8 +582,8 @@ class SQLiteStore(BaseStore):
                 """
                 INSERT OR REPLACE INTO whispers (
                     whisper_id, pipeline_id, from_agent, target, whisper_type,
-                    payload, confidence, ref, dissent_target, created_at, expires_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    payload, confidence, ref, dissent_target, verified, created_at, expires_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     whisper.whisper_id,
@@ -589,6 +595,7 @@ class SQLiteStore(BaseStore):
                     whisper.confidence,
                     whisper.ref,
                     whisper.dissent_target,
+                    1 if whisper.verified else 0,
                     whisper.created_at,
                     whisper.created_at + whisper.ttl_seconds,
                 ),
@@ -1094,9 +1101,51 @@ class SQLiteStore(BaseStore):
                 (session_id, turn, drift_score, time.time()),
             )
 
-    def resolve_identity(self, agent_id: str, *, pipeline_id: str | None = None) -> str:
-        del pipeline_id
+    def resolve_identity(
+        self,
+        agent_id: str,
+        *,
+        pipeline_id: str | None = None,
+        signature: str | None = None,
+        content: str | None = None,
+    ) -> str:
+        """Resolve the authenticated author of a write.
+
+        When a ``signature`` and ``content`` are supplied and the signature
+        verifies against the stored (non-revoked) public key for ``agent_id``,
+        the verified identity is returned. Otherwise the claimed ``agent_id`` is
+        returned unchanged (the unsigned/legacy path), preserving prior behavior.
+        """
+
+        if signature is not None and content is not None:
+            from ncp.identity import canonical_authorship_payload
+
+            payload = canonical_authorship_payload(agent_id, content, pipeline_id)
+            if self.verify_authorship(agent_id, payload, signature):
+                return agent_id
         return agent_id
+
+    def verify_authorship(
+        self, identity_id: str, payload: bytes | str, signature: str
+    ) -> bool:
+        """Verify a signature over ``payload`` for ``identity_id``.
+
+        Returns ``False`` for unknown or revoked identities and for any
+        signature that does not verify against the stored public key.
+        """
+
+        from ncp.identity import verify_signature
+
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT public_key, revoked_at FROM identities WHERE identity_id = ?",
+                (identity_id,),
+            ).fetchone()
+        if row is None:
+            return False
+        if row["revoked_at"] is not None:
+            return False
+        return verify_signature(str(row["public_key"]), payload, signature)
 
     def register_identity(
         self,
@@ -2022,6 +2071,7 @@ class SQLiteStore(BaseStore):
             retrieval_count=int(row["retrieval_count"]) if row["retrieval_count"] is not None else 0,
             last_retrieved_at=float(row["last_retrieved_at"]) if row["last_retrieved_at"] is not None else None,
             dissent_count=int(row["dissent_count"]) if row["dissent_count"] is not None else 0,
+            verified=bool(row["verified"]) if "verified" in row.keys() and row["verified"] is not None else False,
         )
         return chunk
 
@@ -2039,6 +2089,7 @@ class SQLiteStore(BaseStore):
             created_at=float(row["created_at"]),
             ttl_seconds=ttl_seconds,
             pipeline_id=row["pipeline_id"],
+            verified=bool(row["verified"]) if "verified" in row.keys() and row["verified"] is not None else False,
         )
 
     def _select_whispers(
