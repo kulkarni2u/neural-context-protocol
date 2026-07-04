@@ -414,7 +414,10 @@ ncp demo        # run a self-contained demo pipeline
 `ncp calibrate --feedback` runs the self-improvement pass: it boosts chunks that
 keep getting retrieved, penalizes chunks that drew dissent, and propagates the
 net trust change one hop along `caused_by` edges so a cause is credited or
-debited for what it produced. Add `--dry-run` to preview.
+debited for what it produced. Add `--dry-run` to preview. Because this pass
+resets the per-chunk retrieval/dissent counters it consumes, `ncp trust-drift`'s
+"most retrieved" view shows activity since the last calibration, not lifetime
+totals.
 
 -----
 

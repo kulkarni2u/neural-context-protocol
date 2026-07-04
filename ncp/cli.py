@@ -1678,7 +1678,13 @@ def precedents_command(
 @click.option("--top-k", default=10, show_default=True, type=click.IntRange(1, 50), help="Number of top rising/falling chunks to show.")
 @click.option("--json-output", is_flag=True, help="Emit machine-readable JSON instead of tables.")
 def trust_drift_command(cwd: Path, pipeline_id: str | None, top_k: int, json_output: bool) -> None:
-    """Show trust-drift observability: which chunks are gaining or losing trust."""
+    """Show trust-drift observability: which chunks are gaining or losing trust.
+
+    Note: because ``ncp calibrate --feedback`` resets the per-chunk
+    retrieval/dissent watermarks it consumes, the "most retrieved" and "most
+    dissented" views reflect activity SINCE THE LAST CALIBRATION, not lifetime
+    totals.
+    """
 
     from rich.panel import Panel
 

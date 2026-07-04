@@ -51,6 +51,14 @@ Audit remediation from `docs/NCP_AUDIT_AND_REMEDIATION_PLAN.md`. One work item
   benchmark row with a one-line honest caveat instead of deleting it. (WI-001,
   F-A3)
 
+### Docs
+
+- **Document the WI-003 counter-reset side effect** (`ncp/cli.py` `trust-drift`
+  help, `README.md` operator commands): note that because `ncp calibrate
+  --feedback` consumes and resets the per-chunk retrieval/dissent watermarks,
+  `ncp trust-drift`'s "most retrieved" view reflects activity since the last
+  calibration, not lifetime totals. (HK-002)
+
 ## [1.2.1] - 2026-06-30
 
 ### Added
