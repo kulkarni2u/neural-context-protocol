@@ -164,7 +164,7 @@ def _render_config_template(
             '# Bearer token required for HTTP requests when set. The server requires no\n'
             '# token on loopback (127.0.0.1/localhost/::1) by default, but you must set\n'
             '# this (or NCP_AUTH_TOKEN, or `ncp serve --auth-token`) before binding to a\n'
-            '# non-loopback host. `ncp init` generates a random token here automatically.\n'
+            '# non-loopback host. `ncp init --store pgvector` generates one automatically.\n'
             '# auth_token = ""',
             f'[server]\nauth_token = "{auth_token}"',
             1,
@@ -643,12 +643,13 @@ def init_command(  # noqa: C901
 
     # ── Write config.toml ─────────────────────────────────────────────────────
     if not config_path.exists():
+        auth_token = secrets.token_urlsafe(32) if store_type != "sqlite" else None
         config_path.write_text(
             _render_config_template(
                 store_type=store_type,
                 pg_dsn=resolved_pg_dsn,
                 redis_url=resolved_redis_url,
-                auth_token=secrets.token_urlsafe(32),
+                auth_token=auth_token,
             )
         )
         console.print(f"Wrote [bold].ncp/config.toml[/bold] (store: {store_type})")

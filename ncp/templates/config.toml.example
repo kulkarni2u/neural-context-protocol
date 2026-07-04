@@ -53,5 +53,5 @@ confidence_k = 20
 # Bearer token required for HTTP requests when set. The server requires no
 # token on loopback (127.0.0.1/localhost/::1) by default, but you must set
 # this (or NCP_AUTH_TOKEN, or `ncp serve --auth-token`) before binding to a
-# non-loopback host. `ncp init` generates a random token here automatically.
+# non-loopback host. `ncp init --store pgvector` generates one automatically.
 # auth_token = ""

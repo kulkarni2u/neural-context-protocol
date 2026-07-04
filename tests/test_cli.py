@@ -100,13 +100,26 @@ def test_cli_init_preserves_existing_config(tmp_path: Path) -> None:
     assert "Existing config preserved" in second.output
 
 
-def test_cli_init_generates_auth_token(tmp_path: Path) -> None:
+def test_cli_init_skips_auth_token_for_sqlite_loopback_quickstart(tmp_path: Path) -> None:
     runner = CliRunner()
 
     result = runner.invoke(main, ["init", "--cwd", str(tmp_path)])
 
     assert result.exit_code == 0
     config_text = (tmp_path / ".ncp" / "config.toml").read_text()
+    match = re.search(r'^\s*auth_token\s*=\s*"(.+)"', config_text, re.MULTILINE)
+    assert match is None
+    assert '# auth_token = ""' in config_text
+
+
+def test_cli_init_generates_auth_token_for_pgvector(tmp_path: Path) -> None:
+    runner = CliRunner()
+
+    result = runner.invoke(main, ["init", "--cwd", str(tmp_path), "--store", "pgvector"])
+
+    assert result.exit_code == 0
+    config_path = tmp_path / ".ncp" / "config.toml"
+    config_text = config_path.read_text()
     match = re.search(r'^\s*auth_token\s*=\s*"(.+)"', config_text, re.MULTILINE)
     assert match is not None
     assert match.group(1)
@@ -115,14 +128,14 @@ def test_cli_init_generates_auth_token(tmp_path: Path) -> None:
 def test_cli_init_does_not_regenerate_auth_token(tmp_path: Path) -> None:
     runner = CliRunner()
 
-    first = runner.invoke(main, ["init", "--cwd", str(tmp_path)])
+    first = runner.invoke(main, ["init", "--cwd", str(tmp_path), "--store", "pgvector"])
     config_path = tmp_path / ".ncp" / "config.toml"
     first_text = config_path.read_text()
     first_match = re.search(r'^\s*auth_token\s*=\s*"(.+)"', first_text, re.MULTILINE)
     assert first.exit_code == 0
     assert first_match is not None
 
-    second = runner.invoke(main, ["init", "--cwd", str(tmp_path)])
+    second = runner.invoke(main, ["init", "--cwd", str(tmp_path), "--store", "pgvector"])
     second_text = config_path.read_text()
     second_match = re.search(r'^\s*auth_token\s*=\s*"(.+)"', second_text, re.MULTILINE)
 
@@ -456,8 +469,8 @@ def test_cli_serve_auth_token_resolution_order(monkeypatch: object, tmp_path: Pa
 
     config_path = tmp_path / ".ncp" / "config.toml"
     config_text = config_path.read_text()
-    config_text = re.sub(
-        r'auth_token = ".*"', 'auth_token = "config-token"', config_text
+    config_text = config_text.replace(
+        '# auth_token = ""', '[server]\nauth_token = "config-token"'
     )
     config_path.write_text(config_text)
 
