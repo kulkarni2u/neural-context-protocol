@@ -1719,6 +1719,7 @@ class AsyncPgvectorStore(BaseStore):
         updates: list[tuple[float, str]] = []
         feedback_rows: list[FeedbackRow] = []
         chunk_author: dict[str, str] = {}
+        consumed_feedback_ids: list[str] = []
         now = time.time()
         for row in rows:
             r = self._normalize_row(row, desc)
@@ -1771,6 +1772,7 @@ class AsyncPgvectorStore(BaseStore):
             report.change_log.extend(fb.change_log)
             report.feedback_adjusted += fb.adjusted
             report.skipped += fb.skipped
+            consumed_feedback_ids = fb.consumed_chunk_ids
             async with self._aconnect() as conn:
                 prior = await self._aload_reputation(
                     conn,
@@ -1797,7 +1799,9 @@ class AsyncPgvectorStore(BaseStore):
         else:
             rep_updates = ()
 
-        if not dry_run and (updates or (feedback_mode and rep_updates)):
+        if not dry_run and (
+            updates or (feedback_mode and (rep_updates or consumed_feedback_ids))
+        ):
             async with self._aconnect() as conn:
                 if updates:
                     async with conn.cursor() as cur:
@@ -1811,6 +1815,17 @@ class AsyncPgvectorStore(BaseStore):
                             )
                 if feedback_mode:
                     await self._aupsert_reputation_updates(conn, rep_updates, now=now)
+                    if consumed_feedback_ids:
+                        async with conn.cursor() as cur:
+                            placeholders = ",".join(["%s"] * len(consumed_feedback_ids))
+                            await cur.execute(
+                                self._sql(
+                                    "UPDATE {schema}.{prefix}chunks"
+                                    " SET retrieval_count = 0, dissent_count = 0"
+                                    f" WHERE chunk_id IN ({placeholders})"
+                                ),
+                                tuple(consumed_feedback_ids),
+                            )
 
         report.duration_seconds = time.monotonic() - started
         return report

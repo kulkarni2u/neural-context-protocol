@@ -28,6 +28,7 @@ class FeedbackResult:
 
     updates: list[tuple[float, str]] = field(default_factory=list)  # (new_trust, chunk_id)
     change_log: list[dict] = field(default_factory=list)
+    consumed_chunk_ids: list[str] = field(default_factory=list)
     adjusted: int = 0
     skipped: int = 0
 
@@ -95,6 +96,9 @@ def compute_feedback_updates(
                 total[parent] = total.get(parent, 0.0) + delta * propagation_factor
 
     result = FeedbackResult()
+    result.consumed_chunk_ids = [
+        row.chunk_id for row in rows if row.retrieval_count > 0 or row.dissent_count > 0
+    ]
     adjusted_ids: set[str] = set()
     for chunk_id, delta in total.items():
         old_trust = base_trust[chunk_id]

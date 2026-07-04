@@ -1313,6 +1313,7 @@ class PgvectorStore(BaseStore):
                 updates: list[tuple[float, str]] = []
                 feedback_rows: list[FeedbackRow] = []
                 chunk_author: dict[str, str] = {}
+                consumed_feedback_ids: list[str] = []
                 for row in rows:
                     cid = str(row["chunk_id"])
                     src = str(row["src"])
@@ -1360,6 +1361,7 @@ class PgvectorStore(BaseStore):
                     report.change_log.extend(fb.change_log)
                     report.feedback_adjusted += fb.adjusted
                     report.skipped += fb.skipped
+                    consumed_feedback_ids = fb.consumed_chunk_ids
 
                     prior = self._load_reputation(
                         connection,
@@ -1400,6 +1402,20 @@ class PgvectorStore(BaseStore):
                         self._close_cursor(update_cursor)
                 if feedback_mode and not dry_run:
                     self._upsert_reputation_updates(connection, rep_updates, now=now)
+                    if consumed_feedback_ids:
+                        reset_cursor = connection.cursor()
+                        try:
+                            placeholders = ",".join(["%s"] * len(consumed_feedback_ids))
+                            reset_cursor.execute(
+                                self._sql(
+                                    "UPDATE {schema}.{prefix}chunks"
+                                    " SET retrieval_count = 0, dissent_count = 0"
+                                    f" WHERE chunk_id IN ({placeholders})"
+                                ),
+                                tuple(consumed_feedback_ids),
+                            )
+                        finally:
+                            self._close_cursor(reset_cursor)
 
         report.duration_seconds = time.monotonic() - started
         return report

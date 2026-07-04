@@ -941,6 +941,7 @@ class SQLiteStore(BaseStore):
                 updates: list[tuple[float, str]] = []
                 feedback_rows: list[FeedbackRow] = []
                 chunk_author: dict[str, str] = {}
+                consumed_feedback_ids: list[str] = []
                 for row in rows:
                     cid = str(row["chunk_id"])
                     src = str(row["src"])
@@ -988,6 +989,7 @@ class SQLiteStore(BaseStore):
                     report.change_log.extend(fb.change_log)
                     report.feedback_adjusted += fb.adjusted
                     report.skipped += fb.skipped
+                    consumed_feedback_ids = fb.consumed_chunk_ids
 
                     prior = self._load_reputation(
                         connection,
@@ -1022,6 +1024,13 @@ class SQLiteStore(BaseStore):
                         )
                 if feedback_mode and not dry_run:
                     self._upsert_reputation_updates(connection, rep_updates, now=now)
+                    if consumed_feedback_ids:
+                        placeholders = ",".join("?" for _ in consumed_feedback_ids)
+                        connection.execute(
+                            f"UPDATE chunks SET retrieval_count = 0, dissent_count = 0 "
+                            f"WHERE chunk_id IN ({placeholders})",
+                            consumed_feedback_ids,
+                        )
 
         report.duration_seconds = time.monotonic() - started
         return report
