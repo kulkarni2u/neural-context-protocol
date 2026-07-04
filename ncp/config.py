@@ -81,6 +81,10 @@ DEFAULT_CONFIG = {
         "provider": "local",
         "model": "BAAI/bge-small-en-v1.5",
     },
+    "distillation": {
+        "enabled": False,
+        "min_chunk_tokens": 120,
+    },
     "consolidation": {
         "enabled": True,
         "similarity_threshold": 0.65,
@@ -275,6 +279,14 @@ class NCPConfig:
         return str(self.values.get("embedding", {}).get("model", "BAAI/bge-small-en-v1.5"))
 
     @property
+    def distillation_enabled(self) -> bool:
+        return bool(self.values.get("distillation", {}).get("enabled", False))
+
+    @property
+    def distillation_min_chunk_tokens(self) -> int:
+        return int(self.values.get("distillation", {}).get("min_chunk_tokens", 120))
+
+    @property
     def server_auth_token(self) -> str | None:
         val = self.values.get("server", {}).get("auth_token")
         return str(val) if val else None
@@ -362,6 +374,11 @@ def _apply_env_overrides(values: dict[str, Any], env: dict[str, str]) -> None:
         values["embedding"]["provider"] = env["NCP_EMBEDDING_PROVIDER"]
     if "NCP_EMBEDDING_MODEL" in env:
         values["embedding"]["model"] = env["NCP_EMBEDDING_MODEL"]
+    if "NCP_DISTILLATION_ENABLED" in env:
+        val = env["NCP_DISTILLATION_ENABLED"].lower()
+        values["distillation"]["enabled"] = val in {"true", "1", "yes"}
+    if "NCP_DISTILLATION_MIN_CHUNK_TOKENS" in env:
+        values["distillation"]["min_chunk_tokens"] = int(env["NCP_DISTILLATION_MIN_CHUNK_TOKENS"])
     if "NCP_GENERATION_PENALTY_BASE" in env:
         values["retrieval"]["generation_penalty_base"] = float(env["NCP_GENERATION_PENALTY_BASE"])
     if "NCP_EDGE_EXPANSION" in env:

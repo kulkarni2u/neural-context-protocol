@@ -143,3 +143,30 @@ def test_retrieval_diversity_lambda_defaults_and_overrides(tmp_path) -> None:
 
     config = load_config(cwd=project, env={"NCP_DIVERSITY_LAMBDA": "0.8"})
     assert config.diversity_lambda == pytest.approx(0.8)
+
+
+def test_distillation_config_defaults_and_overrides(tmp_path) -> None:
+    project = tmp_path / "repo"
+    (project / ".git").mkdir(parents=True)
+    (project / ".ncp").mkdir()
+
+    config = load_config(cwd=project)
+    assert config.distillation_enabled is False
+    assert config.distillation_min_chunk_tokens == 120
+
+    (project / ".ncp" / "config.toml").write_text(
+        "[distillation]\nenabled = true\nmin_chunk_tokens = 32\n"
+    )
+    config = load_config(cwd=project)
+    assert config.distillation_enabled is True
+    assert config.distillation_min_chunk_tokens == 32
+
+    config = load_config(
+        cwd=project,
+        env={
+            "NCP_DISTILLATION_ENABLED": "false",
+            "NCP_DISTILLATION_MIN_CHUNK_TOKENS": "64",
+        },
+    )
+    assert config.distillation_enabled is False
+    assert config.distillation_min_chunk_tokens == 64

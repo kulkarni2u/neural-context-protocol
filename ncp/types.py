@@ -210,6 +210,7 @@ class SubconsciousChunk(NCPModel):
     # Ed25519 signature over the canonical authorship payload was verified at
     # ingest. Default false keeps existing unsigned rows/tests unaffected.
     verified: bool = False
+    distilled: bool = False
 
     embedding: list[float] | None = None
 

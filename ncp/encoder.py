@@ -139,6 +139,8 @@ class PidginEncoder:
             ]
             if chunk.verified:
                 parts.append("verified:1")
+            if chunk.distilled:
+                parts.append("distilled:1")
             if chunk.raw_ref:
                 parts.append(f"raw_ref:{chunk.raw_ref}")
             lines.append(" ".join(parts))

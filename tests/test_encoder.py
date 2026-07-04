@@ -107,6 +107,35 @@ def test_pidgin_encoder_renders_all_blocks_in_order() -> None:
     )
 
 
+def test_pidgin_encoder_marks_distilled_chunks() -> None:
+    encoder = PidginEncoder()
+    conscious = ConsciousBlock(
+        agent_id="executor",
+        role="build",
+        owns=["implementation"],
+        must_not=[],
+        task="implement_encoder",
+        slot="wire_pidgin_blocks",
+        intent="assemble_context",
+    )
+    chunk = SubconsciousChunk(
+        chunk_id="sub_distilled",
+        layer="semantic",
+        content="answer-bearing extract",
+        src="tool_result",
+        distilled=True,
+    )
+    rendered = encoder.assemble(
+        conscious=conscious,
+        chunks=[chunk],
+        whispers=[],
+        budget=BudgetContext(),
+    )
+
+    assert "chunk:sub_distilled" in rendered
+    assert "distilled:1" in rendered
+
+
 def test_pidgin_encoder_escapes_embedded_wire_format_delimiters() -> None:
     encoder = PidginEncoder()
     conscious = ConsciousBlock(

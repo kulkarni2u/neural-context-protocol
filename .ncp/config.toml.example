@@ -39,6 +39,11 @@ cost_tracking = true
 # provider = "local"
 # model = "BAAI/bge-small-en-v1.5"
 
+# [distillation]
+# Opt-in extractive distillation for oversized chunks during assembly.
+# enabled = false
+# min_chunk_tokens = 120
+
 # [identity]
 # OPT-IN Ed25519 authorship enforcement (CAP-T1, WI-013). When false (default),
 # unsigned writes/whispers keep working and any supplied signature is verified

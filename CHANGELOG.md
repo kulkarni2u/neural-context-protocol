@@ -38,6 +38,12 @@ Audit remediation from `docs/NCP_AUDIT_AND_REMEDIATION_PLAN.md`. One work item
   are present. `[retrieval].diversity_lambda` defaults to `1.0` so existing
   relevance ordering is unchanged; `0.7` is documented as a starting point for
   reducing near-duplicate context. (CAP-C1)
+- **Query-aware extractive distillation** (`ncp/distill.py`, `ncp/assembler.py`,
+  `ncp/encoder.py`, `ncp/config.py`): add opt-in assembly-time distillation for
+  oversized chunks that fail the context budget, selecting query-relevant
+  sentences/lines without mutating stored content. Distilled chunks carry a
+  `distilled:1` pidgin marker, and `[distillation].enabled` defaults to
+  `false` so existing fit/drop behavior is unchanged. (CAP-C2)
 - **Real per-provider token and USD cost accounting** (`ncp/api.py`,
   `ncp/adapters/base.py`, `ncp/adapters/*.py`, `ncp/costs.py`, `ncp/types.py`,
   `ncp/stores/sqlite.py`): adapters now capture the provider response's real

@@ -15,6 +15,7 @@ import anyio
 
 from ncp.coherence import CoherenceChecker
 from ncp.config import NCPConfig
+from ncp.distill import distill_chunk
 from ncp.encoder import PidginEncoder
 from ncp.middleware.base import MiddlewarePipeline
 from ncp.stores.base import BaseStore
@@ -74,6 +75,8 @@ class Assembler:
         self._edge_expansion = config.edge_expansion_enabled if config else True
         self._edge_expansion_decay = config.edge_expansion_decay if config else 0.7
         self._diversity_lambda = config.diversity_lambda if config else 1.0
+        self._distillation_enabled = config.distillation_enabled if config else False
+        self._distillation_min_chunk_tokens = config.distillation_min_chunk_tokens if config else 120
 
     # ------------------------------------------------------------------
     # Step 0-5: assemble
@@ -159,6 +162,7 @@ class Assembler:
                 chunks=combined_chunks,
                 whispers=combined_whispers,
                 max_tokens=max(1, effective_max_tokens),
+                query_text=search_text,
             )
             kept_chunk_ids = {chunk.chunk_id for chunk in combined_chunks}
             evicted_ids = {chunk_id for chunk_id, _ in evicted_high_relevance}
@@ -630,6 +634,7 @@ class Assembler:
         chunks: list[SubconsciousChunk],
         whispers: list[Whisper],
         max_tokens: int,
+        query_text: str,
     ) -> tuple[list[SubconsciousChunk], list[Whisper]]:
         fitted_whispers = self._fit_whispers_to_budget(
             conscious=conscious,
@@ -648,7 +653,61 @@ class Assembler:
             )
             if estimate_tokens(candidate) <= max_tokens:
                 fitted_chunks.append(chunk)
+                continue
+            distilled = self._distill_for_budget(
+                conscious=conscious,
+                budget=budget,
+                fitted_chunks=fitted_chunks,
+                fitted_whispers=fitted_whispers,
+                chunk=chunk,
+                max_tokens=max_tokens,
+                query_text=query_text,
+            )
+            if distilled is not None:
+                fitted_chunks.append(distilled)
         return fitted_chunks, fitted_whispers
+
+    def _distill_for_budget(
+        self,
+        *,
+        conscious: ConsciousBlock,
+        budget: BudgetContext,
+        fitted_chunks: list[SubconsciousChunk],
+        fitted_whispers: list[Whisper],
+        chunk: SubconsciousChunk,
+        max_tokens: int,
+        query_text: str,
+    ) -> SubconsciousChunk | None:
+        if not self._distillation_enabled:
+            return None
+        if estimate_tokens(chunk.content) < self._distillation_min_chunk_tokens:
+            return None
+        base_context = self.encoder.assemble(
+            conscious=conscious,
+            chunks=fitted_chunks,
+            whispers=fitted_whispers,
+            budget=budget,
+        )
+        remaining = max_tokens - estimate_tokens(base_context)
+        if remaining <= 0:
+            return None
+        distilled_content = distill_chunk(
+            chunk.content,
+            query_text,
+            max_tokens=max(1, remaining),
+        )
+        if not distilled_content or distilled_content == chunk.content:
+            return None
+        distilled = chunk.model_copy(update={"content": distilled_content, "distilled": True})
+        candidate = self.encoder.assemble(
+            conscious=conscious,
+            chunks=[*fitted_chunks, distilled],
+            whispers=fitted_whispers,
+            budget=budget,
+        )
+        if estimate_tokens(candidate) <= max_tokens:
+            return distilled
+        return None
 
     def _fit_whispers_to_budget(
         self,
