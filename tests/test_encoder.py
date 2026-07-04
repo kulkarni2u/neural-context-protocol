@@ -97,7 +97,7 @@ def test_pidgin_encoder_renders_all_blocks_in_order() -> None:
         "failed:[inline_payload]\n"
         "drift_score:0.1\n\n"
         "[NCP:SUBCONSCIOUS]\n"
-        "chunk:sub_encoder layer:procedural score:0.7 src:tool_result trust:0.9\n"
+        "chunk:sub_encoder layer:procedural score:0.8 src:tool_result trust:0.9\n"
         "  line_one\n"
         "  line_two\n\n"
         "[NCP:WHISPERS]\n"

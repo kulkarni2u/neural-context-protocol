@@ -156,7 +156,26 @@ def test_subconscious_chunk_defaults_and_effective_score() -> None:
     assert chunk.base_trust == 0.7
     assert chunk.scope == "pipeline"
     assert chunk.zone == "working"
-    assert chunk.effective_score == pytest.approx(0.56)
+    # effective_score is the single-application retrieval relevance (no second
+    # trust/recency/generation multiplication), so it equals relevance directly.
+    assert chunk.effective_score == pytest.approx(0.8)
+
+
+def test_effective_score_equals_relevance_no_double_counting() -> None:
+    # relevance is already a fully fused RetrievalPolicy.score (recency, trust,
+    # and the generation penalty folded in exactly once). effective_score must
+    # NOT re-apply the generation penalty, so it equals relevance -- not
+    # 0.5 * 0.9**3.
+    chunk = SubconsciousChunk(
+        layer="episodic",
+        content="fused_fact",
+        src="tool_result",
+        relevance=0.5,
+        generation=3,
+    )
+
+    assert chunk.effective_score == pytest.approx(0.5)
+    assert chunk.effective_score != pytest.approx(0.5 * 0.9 ** 3)
 
 
 def test_subconscious_chunk_proven_zone_requires_expiry() -> None:

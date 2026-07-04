@@ -15,6 +15,11 @@ Audit remediation from `docs/NCP_AUDIT_AND_REMEDIATION_PLAN.md`. One work item
 
 ### Fixed
 
+- **No score double-counting in `effective_score`** (`ncp/types.py`): the
+  pidgin/display score now equals the single-application retrieval relevance from
+  `RetrievalPolicy.score` instead of re-multiplying recency, trust, and the
+  generation penalty a second time, so the displayed score stays comparable to
+  the ranking score. (WI-008, F-B6)
 - **Idempotent calibration feedback** (`ncp/stores/calibration.py`,
   `ncp/stores/sqlite.py`, `ncp/stores/pgvector.py`,
   `ncp/stores/pgvector_async.py`): `ncp calibrate --feedback` now computes trust

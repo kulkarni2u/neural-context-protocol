@@ -1,5 +1,4 @@
 import json
-import math
 import time
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -213,15 +212,14 @@ class SubconsciousChunk(NCPModel):
     def effective_score(self) -> float:
         """Presentation-layer score written into the pidgin wire format.
 
-        ``relevance`` is already a fused retrieval score from RetrievalPolicy
-        (BM25 + recency + trust). This property applies a second recency decay
-        and trust weight so the encoded score reflects the chunk's freshness and
-        credibility at display time, which may differ from when it was retrieved.
-        Retrieval ranking uses ``relevance``; the pidgin encoder uses this value.
+        ``relevance`` is already a fully fused single-application retrieval
+        score from ``RetrievalPolicy.score`` (BM25 + recency + w_trust*base_trust
+        + generation penalty), applied exactly once. The pidgin/display score IS
+        that retrieval relevance -- there is no second trust/recency/generation
+        multiplication here, so the displayed score stays comparable to the
+        ranking score.
         """
-        decay = math.exp(-0.693 * self.age_seconds / 14400)
-        generation_penalty = 0.9 ** self.generation
-        return self.relevance * decay * self.base_trust * generation_penalty
+        return self.relevance
 
     @field_validator("chunk_id", "written_by")
     @classmethod
