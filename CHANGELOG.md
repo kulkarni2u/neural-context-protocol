@@ -89,6 +89,16 @@ Audit remediation from `docs/NCP_AUDIT_AND_REMEDIATION_PLAN.md`. One work item
   `ncp trust-drift`'s "most retrieved" view reflects activity since the last
   calibration, not lifetime totals. (HK-002)
 
+### CI
+
+- **pgvector + redis integration job** (`.github/workflows/ci.yml`): add a
+  `pgvector-redis` job that runs the durable/coordination tier against
+  `pgvector/pgvector:pg16` and `redis:7-alpine` service containers (image tags
+  matching `compose.yaml`) with `NCP_RUN_PGVECTOR_INTEGRATION=1`, so the
+  previously `importorskip`-ed pgvector store, migration, retrieval-feedback, and
+  async coordination tests execute on every PR instead of silently skipping.
+  (WI-011, F-C4)
+
 ## [1.2.1] - 2026-06-30
 
 ### Added
