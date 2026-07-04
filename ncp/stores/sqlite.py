@@ -101,6 +101,7 @@ CREATE TABLE IF NOT EXISTS whispers (
     payload TEXT NOT NULL,
     confidence REAL NOT NULL,
     ref TEXT,
+    dissent_target TEXT,
     created_at REAL NOT NULL,
     expires_at REAL NOT NULL
 );
@@ -270,6 +271,7 @@ class SQLiteStore(BaseStore):
                 "ALTER TABLE chunks ADD COLUMN last_retrieved_at REAL",
                 "ALTER TABLE chunks ADD COLUMN written_at_drift REAL DEFAULT 0.0",
                 "ALTER TABLE chunks ADD COLUMN dissent_count INTEGER DEFAULT 0",
+                "ALTER TABLE whispers ADD COLUMN dissent_target TEXT",  # WI-007(b)
                 "CREATE TABLE IF NOT EXISTS drift_history (session_id TEXT NOT NULL, turn INTEGER NOT NULL, drift_score REAL NOT NULL, ts REAL NOT NULL)",
                 "CREATE INDEX IF NOT EXISTS idx_drift_session ON drift_history(session_id, turn)",
                 "CREATE TABLE IF NOT EXISTS identities (identity_id TEXT PRIMARY KEY, public_key TEXT NOT NULL, alg TEXT NOT NULL DEFAULT 'ed25519', label TEXT, created_at REAL NOT NULL, revoked_at REAL)",
@@ -572,8 +574,8 @@ class SQLiteStore(BaseStore):
                 """
                 INSERT OR REPLACE INTO whispers (
                     whisper_id, pipeline_id, from_agent, target, whisper_type,
-                    payload, confidence, ref, created_at, expires_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    payload, confidence, ref, dissent_target, created_at, expires_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     whisper.whisper_id,
@@ -584,6 +586,7 @@ class SQLiteStore(BaseStore):
                     whisper.payload,
                     whisper.confidence,
                     whisper.ref,
+                    whisper.dissent_target,
                     whisper.created_at,
                     whisper.created_at + whisper.ttl_seconds,
                 ),
@@ -2027,6 +2030,7 @@ class SQLiteStore(BaseStore):
             confidence=float(row["confidence"]),
             whisper_id=str(row["whisper_id"]),
             ref=row["ref"],
+            dissent_target=row["dissent_target"] if "dissent_target" in row.keys() else None,
             created_at=float(row["created_at"]),
             ttl_seconds=ttl_seconds,
             pipeline_id=row["pipeline_id"],

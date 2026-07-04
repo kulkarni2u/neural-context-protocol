@@ -88,6 +88,7 @@ CREATE TABLE IF NOT EXISTS {schema}.{prefix}whispers (
     payload TEXT NOT NULL,
     confidence DOUBLE PRECISION NOT NULL,
     ref TEXT,
+    dissent_target TEXT,
     created_at DOUBLE PRECISION NOT NULL,
     expires_at DOUBLE PRECISION NOT NULL
 );

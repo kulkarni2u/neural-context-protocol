@@ -653,11 +653,13 @@ class Assembler:
             return 1
         return 2
 
-    def _write_with_retry(self, chunk: SubconsciousChunk, *, retries: int = 2, backoff_ms: int = 50) -> None:
+    def _write_with_retry(self, chunk: SubconsciousChunk, *, retries: int = 2, backoff_ms: int = 50) -> bool:
+        # WI-007(a): return whether the chunk was actually persisted. A
+        # deduplication-suppressed write returns False (deterministic — not
+        # retried) so callers do not treat silent data loss as success.
         for attempt in range(retries + 1):
             try:
-                self.store.write(chunk)
-                return
+                return bool(self.store.write(chunk))
             except Exception:
                 if attempt < retries:
                     time.sleep(backoff_ms / 1000)
@@ -665,6 +667,7 @@ class Assembler:
                 raise RuntimeError(
                     f"Failed to persist chunk after {retries + 1} attempts: {chunk.chunk_id}"
                 ) from None
+        return False
 
     # ------------------------------------------------------------------
     # Async helpers for post_turn_async
@@ -682,11 +685,12 @@ class Assembler:
     async def _aacknowledge_whispers(self, whisper_ids: list[str], agent_id: str) -> None:
         await self.store.async_acknowledge_whispers(whisper_ids, agent_id=agent_id)
 
-    async def _alog_write_with_retry(self, chunk: SubconsciousChunk, *, retries: int = 2, backoff_ms: int = 50) -> None:
+    async def _alog_write_with_retry(self, chunk: SubconsciousChunk, *, retries: int = 2, backoff_ms: int = 50) -> bool:
+        # WI-007(a): mirror the sync path — surface a dedup-suppressed write as
+        # False rather than swallowing it as success.
         for attempt in range(retries + 1):
             try:
-                await self.store.async_write(chunk)
-                return
+                return bool(await self.store.async_write(chunk))
             except Exception:
                 if attempt < retries:
                     await anyio.sleep(backoff_ms / 1000)
@@ -694,6 +698,7 @@ class Assembler:
                 raise RuntimeError(
                     f"Failed to persist chunk after {retries + 1} attempts: {chunk.chunk_id}"
                 ) from None
+        return False
 
     # ------------------------------------------------------------------
     # Drift feedback loop
@@ -715,7 +720,11 @@ class Assembler:
                     data = payload
                 else:
                     continue
-                detected_drift = float(data.get("detected_drift", 0.0))
+                # WI-007(c): a world_check without detected_drift must not zero
+                # the agent's drift — skip it instead of defaulting to 0.0.
+                if "detected_drift" not in data:
+                    continue
+                detected_drift = float(data["detected_drift"])
                 if 0.0 <= detected_drift <= 1.0:
                     conscious = conscious.model_copy(update={"drift_score": detected_drift})
                 break

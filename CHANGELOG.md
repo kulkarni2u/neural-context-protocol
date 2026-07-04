@@ -52,6 +52,15 @@ Audit remediation from `docs/NCP_AUDIT_AND_REMEDIATION_PLAN.md`. One work item
   now`), and soft/hard GC physically reclaim expired chunks — so an expired
   "proven" fact is no longer served forever. (WI-006, F-B4)
 
+- **Stopped silent data loss** (`ncp/assembler.py`, `ncp/stores/sqlite.py`,
+  `ncp/stores/pgvector.py`, `ncp/migrations/007_add_whisper_dissent_target.sql`):
+  (a) `Assembler._write_with_retry` now returns whether the chunk was persisted,
+  so a deduplication-suppressed write is reported instead of treated as success;
+  (b) `dissent_target` is now a real column on the SQLite and pgvector `whispers`
+  schema (new migration `007`) and round-trips through emit/read; (c) a
+  `world_check` whisper missing `detected_drift` is skipped instead of silently
+  zeroing the agent's drift. (WI-007, F-B5)
+
 ### Security
 
 - **Escaped pidgin wire delimiters** (`ncp/encoder.py`): chunk/whisper content is
