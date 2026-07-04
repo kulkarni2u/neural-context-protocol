@@ -307,7 +307,7 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
                     sessions[DEFAULT_FETCH_SESSION_ID] = FetchSession(fetch_count=0, pipeline_id=normalized_pipeline_id)
         conscious = _build_conscious_from_args(store, args)
         budget = _budget_from_args(args, conscious=conscious)
-        assembler = Assembler(store=store)
+        assembler = Assembler(store=store, config=config)
         stream = bool(args.get("stream", False))
         try:
             caller_k: int | None = max(1, int(args["k"])) if "k" in args else None  # type: ignore[arg-type]
@@ -430,7 +430,7 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
 
     def _handle_post_turn(args: dict[str, object]) -> object:
         conscious = _build_conscious_from_args(store, args)
-        assembler = Assembler(store=store)
+        assembler = Assembler(store=store, config=config)
         response = NCPResponse(
             content=str(args["result_full"]),
             turn_id=str(args.get("turn_id") or f"turn_{int(time.time() * 1000)}"),

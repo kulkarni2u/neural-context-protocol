@@ -266,6 +266,39 @@ class TestGetContext:
         assert "[NCP:BUDGET]" in result["context"]
         assert "[NCP:CONSCIOUS]" in result["context"]
 
+    def test_get_context_uses_config_token_budget_when_max_tokens_omitted(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "config_budget.db")
+        for index in range(4):
+            store.write(SubconsciousChunk(
+                chunk_id=f"config_budget_{index}",
+                content=" ".join(["config budget mcp context"] + [f"detail_{index}_{j}" for j in range(120)]),
+                layer="semantic",
+                src="tool_result",
+                pipeline_id="pipe_mcp",
+            ))
+        config = load_config(cwd=tmp_path)
+        config.values["budget"]["context_token_budget"] = 200
+        handlers = make_handlers(store, config=config)
+
+        resp = _handle_request(
+            _call("ncp_get_context", {
+                "agent_id": "builder",
+                "role": "build",
+                "owns": [],
+                "must_not": [],
+                "task": "config_budget",
+                "slot": "context",
+                "intent": "test_config_bound",
+                "pipeline_id": "pipe_mcp",
+            }),
+            handlers,
+        )
+
+        result = _content(resp)
+        assert estimate_tokens(result["context"]) <= 200
+        assert "[NCP:BUDGET]" in result["context"]
+        assert "[NCP:CONSCIOUS]" in result["context"]
+
     def test_get_context_surfaces_eviction_telemetry_and_fetch_hint(self, tmp_path: Path) -> None:
         store = SQLiteStore(tmp_path / "telemetry.db")
         for index in range(2):
