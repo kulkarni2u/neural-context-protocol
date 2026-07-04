@@ -92,6 +92,13 @@ Audit remediation from `docs/NCP_AUDIT_AND_REMEDIATION_PLAN.md`. One work item
   `world_check` whisper missing `detected_drift` is skipped instead of silently
   zeroing the agent's drift. (WI-007, F-B5)
 
+- **Dedup-suppressed writes surfaced end to end from `post_turn`**
+  (`ncp/types.py`, `ncp/assembler.py`, `ncp/mcp/server.py`): `post_turn` and
+  `post_turn_async` now collect the chunk_ids whose memory write returned
+  `False` into a new `TurnRecord.suppressed_chunk_ids` field, `ncp_post_turn`
+  accepts `memory_chunks` and reports `suppressed_chunk_ids` in its response —
+  so a host learns which chunks the store's dedup check dropped. (WI-007a, F-B5)
+
 ### Security
 
 - **Escaped pidgin wire delimiters** (`ncp/encoder.py`): chunk/whisper content is

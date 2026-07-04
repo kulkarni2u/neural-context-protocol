@@ -441,6 +441,9 @@ class TurnRecord(NCPModel):
     result_full: str
     created_at: float = Field(default_factory=time.time)
     expires_at: float | None = None
+    # WI-007(a): chunk_ids whose memory writes were suppressed (e.g. by dedup)
+    # during post_turn. Response-surface metadata, not persisted as a column.
+    suppressed_chunk_ids: list[str] = Field(default_factory=list)
 
     @field_validator("turn_id", "agent_id", "task", "slot")
     @classmethod

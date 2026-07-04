@@ -412,6 +412,54 @@ class TestGetContext:
         ))
         assert "recent:[r:sub/turn_builder]" in second["context"]
 
+    def test_post_turn_reports_dedup_suppressed_memory_chunks(self, tmp_path: Path) -> None:
+        # WI-007(a): a memory chunk suppressed by the store's dedup check is
+        # surfaced in the ncp_post_turn response, not silently dropped.
+        store = SQLiteStore(tmp_path / "test.db")
+        handlers = make_handlers(store)
+        content = "the deployment pipeline validates artifacts before every release"
+        store.write(SubconsciousChunk(
+            chunk_id="sub_seed",
+            layer="semantic",
+            content=content,
+            src="tool_result",
+            pipeline_id="pipe_1",
+        ))
+
+        posted = _content(_handle_request(
+            _call("ncp_post_turn", {
+                "agent_id": "builder",
+                "role": "build",
+                "task": "test",
+                "slot": "test",
+                "intent": "test",
+                "pipeline_id": "pipe_1",
+                "turn_id": "turn_dedup",
+                "result_summary": "summary",
+                "result_full": "full result",
+                "memory_chunks": [
+                    {
+                        "chunk_id": "sub_fresh",
+                        "content": "rollbacks require a signed approval from the release captain",
+                        "layer": "semantic",
+                        "src": "tool_result",
+                    },
+                    {
+                        "chunk_id": "sub_dup",
+                        "content": content,
+                        "layer": "semantic",
+                        "src": "tool_result",
+                    },
+                ],
+            }),
+            handlers,
+        ))
+
+        assert posted["posted"] is True
+        assert posted["suppressed_chunk_ids"] == ["sub_dup"]
+        persisted = store.query("rollbacks signed approval release captain", pipeline_id="pipe_1")
+        assert any(chunk.chunk_id == "sub_fresh" for chunk in persisted)
+
     def test_rejects_newline_in_structural_field(self, tmp_path: Path) -> None:
         store = SQLiteStore(tmp_path / "test.db")
         handlers = make_handlers(store)

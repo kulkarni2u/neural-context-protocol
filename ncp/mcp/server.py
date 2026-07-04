@@ -151,7 +151,11 @@ MCP_TOOLS: list[dict[str, object]] = [
     },
     {
         "name": "ncp_post_turn",
-        "description": "Record the completed turn, update conscious state, log cost, and acknowledge consumed whispers.",
+        "description": (
+            "Record the completed turn, update conscious state, log cost, and acknowledge "
+            "consumed whispers. Optionally persists memory_chunks; any writes suppressed by "
+            "deduplication are reported in the response's suppressed_chunk_ids list."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -171,6 +175,25 @@ MCP_TOOLS: list[dict[str, object]] = [
                 "cost_usd": {"type": "number"},
                 "latency_ms": {"type": "integer"},
                 "ack_whisper_ids": {"type": "array", "items": {"type": "string"}},
+                "memory_chunks": {
+                    "type": "array",
+                    "description": (
+                        "Optional subconscious chunks to persist with this turn. Chunks whose "
+                        "write is suppressed (e.g. near-duplicate content) are listed in the "
+                        "response's suppressed_chunk_ids."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "content": {"type": "string", "description": "Content (max 2000 chars)"},
+                            "layer": {"type": "string", "enum": ["episodic", "procedural", "semantic", "social", "reasoning_trace"]},
+                            "src": {"type": "string", "enum": ["user_verified", "tool_result", "agent_inferred", "synthesis", "subcon_retrieved"]},
+                            "chunk_id": {"type": "string", "description": "Optional chunk ID (auto-generated if omitted)"},
+                            "written_by": {"type": "string", "description": "Agent writing this chunk (defaults to agent_id)"},
+                        },
+                        "required": ["content", "layer", "src"],
+                    },
+                },
             },
             "required": ["agent_id", "role", "task", "slot", "intent", "result_summary", "result_full"],
         },
@@ -558,14 +581,33 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             latency_ms=_int_arg(args, "latency_ms", 0),
         )
         ack_ids = [str(item) for item in list(args.get("ack_whisper_ids", []) or [])]
+        memory_chunks: list[SubconsciousChunk] = []
+        for item in list(args.get("memory_chunks", []) or []):
+            if not isinstance(item, dict):
+                raise ValueError("ncp_post_turn: memory_chunks items must be objects")
+            chunk_kwargs: dict = {
+                "content": str(item["content"]),
+                "layer": str(item["layer"]),
+                "src": str(item["src"]),
+                "written_by": str(item.get("written_by") or conscious.agent_id),
+                "pipeline_id": conscious.pipeline_id,
+            }
+            if (chunk_id := item.get("chunk_id")):
+                chunk_kwargs["chunk_id"] = str(chunk_id)
+            memory_chunks.append(SubconsciousChunk(**chunk_kwargs))
         record = assembler.post_turn(
             conscious=conscious,
             response=response,
             result_summary=str(args["result_summary"]),
             result_full=str(args["result_full"]),
+            memory_chunks=memory_chunks or None,
             ack_whisper_ids=ack_ids,
         )
-        return {"posted": True, "turn_id": record.turn_id, "acknowledged_whisper_ids": ack_ids}
+        result: dict[str, object] = {"posted": True, "turn_id": record.turn_id, "acknowledged_whisper_ids": ack_ids}
+        # WI-007(a): surface dedup-suppressed memory writes to the host.
+        if record.suppressed_chunk_ids:
+            result["suppressed_chunk_ids"] = record.suppressed_chunk_ids
+        return result
 
     def _handle_fetch(args: dict[str, object]) -> object:
         session_id = _session_id_from_args(args)

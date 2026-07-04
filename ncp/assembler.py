@@ -314,9 +314,14 @@ class Assembler:
         if ack_whisper_ids:
             self.store.acknowledge_whispers(ack_whisper_ids, agent_id=conscious.agent_id)
 
+        suppressed_chunk_ids: list[str] = []
         for chunk in memory_chunks or []:
             chunk = self.middleware.pre_write(chunk)
-            self._write_with_retry(chunk)
+            # WI-007(a): surface dedup-suppressed writes to the caller instead
+            # of silently dropping them.
+            if not self._write_with_retry(chunk):
+                suppressed_chunk_ids.append(chunk.chunk_id)
+        record.suppressed_chunk_ids = suppressed_chunk_ids
 
         return record
 
@@ -343,6 +348,14 @@ class Assembler:
         updated_conscious = conscious.model_copy(update={"recent": updated_recent})
         snapshot_hash = sha256(updated_conscious.model_dump_json().encode("utf-8")).hexdigest()
 
+        # WI-007(a): start_soon cannot consume return values, so track
+        # dedup-suppressed writes via a shared list populated by a closure.
+        suppressed_chunk_ids: list[str] = []
+
+        async def _write_and_track(chunk: SubconsciousChunk) -> None:
+            if not await self._alog_write_with_retry(chunk):
+                suppressed_chunk_ids.append(chunk.chunk_id)
+
         async with anyio.create_task_group() as tg:
             tg.start_soon(self._alog_turn_record, record)
             tg.start_soon(self._alog_conscious, updated_conscious, snapshot_hash)
@@ -351,8 +364,9 @@ class Assembler:
                 tg.start_soon(self._aacknowledge_whispers, ack_whisper_ids, conscious.agent_id)
             for chunk in memory_chunks or []:
                 chunk = self.middleware.pre_write(chunk)
-                tg.start_soon(self._alog_write_with_retry, chunk)
+                tg.start_soon(_write_and_track, chunk)
 
+        record.suppressed_chunk_ids = suppressed_chunk_ids
         return record
 
     # ------------------------------------------------------------------
