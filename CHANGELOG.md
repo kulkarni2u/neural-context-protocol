@@ -31,6 +31,13 @@ Audit remediation from `docs/NCP_AUDIT_AND_REMEDIATION_PLAN.md`. One work item
   SQLite hybrid/vector retrieval when `[embedding].enabled = true`. Defaults
   stay off; local embeddings fail fast with an install hint when the optional
   extra is missing. (CAP-C4)
+- **Redundancy-aware MMR context selection** (`ncp/assembler.py`,
+  `ncp/stores/retrieval.py`, `ncp/stores/consolidation.py`, `ncp/config.py`):
+  add opt-in Maximal Marginal Relevance selection before token-budget fitting,
+  using BM25 similarity by default and embedding cosine when chunk embeddings
+  are present. `[retrieval].diversity_lambda` defaults to `1.0` so existing
+  relevance ordering is unchanged; `0.7` is documented as a starting point for
+  reducing near-duplicate context. (CAP-C1)
 - **Real per-provider token and USD cost accounting** (`ncp/api.py`,
   `ncp/adapters/base.py`, `ncp/adapters/*.py`, `ncp/costs.py`, `ncp/types.py`,
   `ncp/stores/sqlite.py`): adapters now capture the provider response's real

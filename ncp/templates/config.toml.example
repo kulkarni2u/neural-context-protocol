@@ -43,6 +43,11 @@ gain = 4.0
 forget = 0.99
 confidence_k = 20
 
+# [retrieval]
+# Redundancy-aware MMR selection before context budget fitting.
+# 1.0 preserves pure relevance ordering; 0.7 is a recommended starting point.
+# diversity_lambda = 1.0
+
 # [embedding]
 # Opt-in local semantic embeddings for SQLite hybrid/vector retrieval. Install
 # with: pip install 'neural-context-protocol[local-embeddings]'

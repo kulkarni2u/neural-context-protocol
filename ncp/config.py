@@ -69,6 +69,7 @@ DEFAULT_CONFIG = {
         "edge_expansion_decay": 0.7,
         "trust_propagation_factor": 0.5,
         "dissent_weight": 0.2,
+        "diversity_lambda": 1.0,
     },
     "reputation": {
         "gain": 4.0,
@@ -208,6 +209,10 @@ class NCPConfig:
     @property
     def dissent_weight(self) -> float:
         return float(self.values.get("retrieval", {}).get("dissent_weight", 0.2))
+
+    @property
+    def diversity_lambda(self) -> float:
+        return float(self.values.get("retrieval", {}).get("diversity_lambda", 1.0))
 
     @property
     def reputation_gain(self) -> float:
@@ -366,6 +371,8 @@ def _apply_env_overrides(values: dict[str, Any], env: dict[str, str]) -> None:
         values["retrieval"]["trust_propagation_factor"] = float(env["NCP_TRUST_PROPAGATION_FACTOR"])
     if "NCP_DISSENT_WEIGHT" in env:
         values["retrieval"]["dissent_weight"] = float(env["NCP_DISSENT_WEIGHT"])
+    if "NCP_DIVERSITY_LAMBDA" in env:
+        values["retrieval"]["diversity_lambda"] = float(env["NCP_DIVERSITY_LAMBDA"])
     if "NCP_REPUTATION_GAIN" in env:
         values["reputation"]["gain"] = float(env["NCP_REPUTATION_GAIN"])
     if "NCP_REPUTATION_FORGET" in env:

@@ -30,11 +30,11 @@ def score_pair(a: SubconsciousChunk, b: SubconsciousChunk, cluster_size: int) ->
     and SequenceMatcher for small ones (BM25 is noisy on tiny corpora).
     """
     if cluster_size >= _BM25_CLUSTER_MIN:
-        return _bm25_similarity(a.content, b.content, cluster_size)
+        return bm25_similarity(a.content, b.content, cluster_size)
     return SequenceMatcher(None, a.content, b.content).ratio()
 
 
-def _bm25_similarity(text_a: str, text_b: str, corpus_size: int) -> float:
+def bm25_similarity(text_a: str, text_b: str, corpus_size: int) -> float:
     """Approximate normalized BM25 similarity between two texts.
 
     Tokenises both texts, builds a tiny 2-doc corpus, scores text_b against
@@ -62,6 +62,9 @@ def _bm25_similarity(text_a: str, text_b: str, corpus_size: int) -> float:
     if self_score <= 0.0:
         return 0.0
     return min(1.0, cross_score / self_score)
+
+
+_bm25_similarity = bm25_similarity
 
 
 def select_authoritative(candidates: list[SubconsciousChunk]) -> SubconsciousChunk:

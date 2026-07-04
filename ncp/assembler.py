@@ -18,7 +18,7 @@ from ncp.config import NCPConfig
 from ncp.encoder import PidginEncoder
 from ncp.middleware.base import MiddlewarePipeline
 from ncp.stores.base import BaseStore
-from ncp.stores.retrieval import DEFAULT_RETRIEVAL_POLICY, build_lexical_candidates, normalize_query_terms
+from ncp.stores.retrieval import DEFAULT_RETRIEVAL_POLICY, apply_mmr_selection, build_lexical_candidates, normalize_query_terms
 from ncp.tokens import estimate_tokens
 from ncp.types import BudgetContext, ConsciousBlock, NCPResponse, SubconsciousChunk, TurnRecord, Whisper
 
@@ -73,6 +73,7 @@ class Assembler:
         self._whisper_cap_critical = config.whisper_cap_critical if config else 1
         self._edge_expansion = config.edge_expansion_enabled if config else True
         self._edge_expansion_decay = config.edge_expansion_decay if config else 0.7
+        self._diversity_lambda = config.diversity_lambda if config else 1.0
 
     # ------------------------------------------------------------------
     # Step 0-5: assemble
@@ -109,6 +110,7 @@ class Assembler:
             budget=budget,
             k=chunk_cap,
             diversity_limit=diversity_limit,
+            diversity_lambda=self._diversity_lambda,
         )
         subconscious = self._cold_start_bootstrap(hydrated, subconscious)
         if self._edge_expansion:
@@ -116,12 +118,20 @@ class Assembler:
             subconscious = [*subconscious, *expanded]
             recent_chunks, subconscious = self._suppress_superseded(recent_chunks, subconscious)
         deduped_chunks = self._dedupe_chunks([*recent_chunks, *subconscious])
-        combined_chunks = self._split_recent_and_retrieved_chunks(
-            recent_chunks=recent_chunks,
-            retrieved_chunks=subconscious,
-            chunk_cap=chunk_cap,
-            budget=budget,
-        )
+        if self._diversity_lambda < 1.0:
+            combined_chunks = self._mmr_select_chunks(
+                deduped_chunks,
+                query_text=search_text,
+                diversity_lambda=self._diversity_lambda,
+                chunk_cap=chunk_cap,
+            )
+        else:
+            combined_chunks = self._split_recent_and_retrieved_chunks(
+                recent_chunks=recent_chunks,
+                retrieved_chunks=subconscious,
+                chunk_cap=chunk_cap,
+                budget=budget,
+            )
         combined_ids = {chunk.chunk_id for chunk in combined_chunks}
         evicted_high_relevance = [
             (chunk.chunk_id, float(chunk.relevance))
@@ -426,16 +436,18 @@ class Assembler:
         budget: BudgetContext | None = None,
         k: int | None = None,
         diversity_limit: int | None = None,
+        diversity_lambda: float | None = None,
     ) -> list[SubconsciousChunk]:
         if k is None:
             k = 2 if (budget is not None and budget.pressure == "critical") else 4
+        store_k = k * 3 if (diversity_lambda is not None and diversity_lambda < 1.0) else k
         search_text = query_text or f"{conscious.task} {conscious.slot}"
         extra: dict = {}
         if diversity_limit is not None:
             extra["diversity_limit"] = diversity_limit
         return self.store.query(
             search_text,
-            k=k,
+            k=store_k,
             pipeline_id=conscious.pipeline_id,
             zone="working",
             fallback_to_trust_recency=True,
@@ -594,6 +606,21 @@ class Assembler:
             if len(selected) >= chunk_cap:
                 break
         return selected
+
+    def _mmr_select_chunks(
+        self,
+        chunks: list[SubconsciousChunk],
+        *,
+        query_text: str,
+        diversity_lambda: float,
+        chunk_cap: int,
+    ) -> list[SubconsciousChunk]:
+        return apply_mmr_selection(
+            chunks,
+            query_text=query_text,
+            diversity_lambda=diversity_lambda,
+            chunk_cap=chunk_cap,
+        )
 
     def _fit_token_budget(
         self,

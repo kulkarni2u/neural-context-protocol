@@ -129,3 +129,17 @@ def test_embedding_config_env_overrides(tmp_path) -> None:
     assert config.embedding_enabled is True
     assert config.embedding_provider == "openai"
     assert config.embedding_model == "text-embedding-3-small"
+
+
+def test_retrieval_diversity_lambda_defaults_and_overrides(tmp_path) -> None:
+    project = tmp_path / "repo"
+    (project / ".git").mkdir(parents=True)
+    (project / ".ncp").mkdir()
+
+    assert load_config(cwd=project).diversity_lambda == 1.0
+
+    (project / ".ncp" / "config.toml").write_text("[retrieval]\ndiversity_lambda = 0.7\n")
+    assert load_config(cwd=project).diversity_lambda == pytest.approx(0.7)
+
+    config = load_config(cwd=project, env={"NCP_DIVERSITY_LAMBDA": "0.8"})
+    assert config.diversity_lambda == pytest.approx(0.8)

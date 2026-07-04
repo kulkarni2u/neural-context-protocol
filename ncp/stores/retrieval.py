@@ -15,9 +15,12 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Callable, TypeVar
+from typing import Callable, TYPE_CHECKING, TypeVar
 
 from rank_bm25 import BM25Okapi
+
+if TYPE_CHECKING:
+    from ncp.types import SubconsciousChunk
 
 
 T = TypeVar("T")
@@ -266,3 +269,85 @@ def apply_diversity_limit(
         if len(results) >= result_cap:
             break
     return results
+
+
+def _stable_corpus_size(pool_size: int) -> int:
+    """Minimum corpus size for stable BM25 IDF.
+
+    ``_bm25_similarity`` from consolidation needs at least 5 documents so
+    that the BM25Okapi IDF floor (epsilon) stays positive.
+    """
+    return max(5, pool_size)
+
+
+def _embedding_similarity(a: SubconsciousChunk, b: SubconsciousChunk) -> float | None:
+    if a.embedding is None or b.embedding is None:
+        return None
+    if len(a.embedding) != len(b.embedding):
+        return None
+    dot = sum(left * right for left, right in zip(a.embedding, b.embedding, strict=True))
+    norm_a = math.sqrt(sum(value * value for value in a.embedding))
+    norm_b = math.sqrt(sum(value * value for value in b.embedding))
+    if norm_a == 0.0 or norm_b == 0.0:
+        return 0.0
+    return max(0.0, min(1.0, dot / (norm_a * norm_b)))
+
+
+def apply_mmr_selection(
+    chunks: list[SubconsciousChunk],
+    *,
+    query_text: str,
+    diversity_lambda: float,
+    chunk_cap: int,
+) -> list[SubconsciousChunk]:
+    """Select a diverse subset via Maximal Marginal Relevance.
+
+    Greedy MMR selection between relevance to *query_text* and redundancy
+    with already-selected chunks.  Similarity is measured via BM25 through
+    the shared helper from ``ncp.stores.consolidation._bm25_similarity``.
+
+    Parameters
+    ----------
+    diversity_lambda : float
+        Trade-off between relevance (1.0) and diversity (0.0).
+        At 1.0 the result is identical to picking top-*k* by relevance.
+        At 0.7 redundant content is penalised.
+    """
+    if chunk_cap <= 0:
+        return []
+    sorted_chunks = sorted(chunks, key=lambda c: -float(c.relevance))
+    if not sorted_chunks or diversity_lambda >= 1.0:
+        return sorted_chunks[:chunk_cap]
+
+    from ncp.stores.consolidation import bm25_similarity
+
+    mix = max(0.0, min(1.0, diversity_lambda))
+    corpus_sz = _stable_corpus_size(len(sorted_chunks))
+
+    if len(sorted_chunks) <= chunk_cap:
+        return sorted_chunks
+
+    selected: list[SubconsciousChunk] = [sorted_chunks[0]]
+    remaining: list[SubconsciousChunk] = sorted_chunks[1:]
+
+    while len(selected) < chunk_cap and remaining:
+        best_idx = 0
+        best_mmr = -1.0
+        for i, candidate in enumerate(remaining):
+            relevance = float(candidate.relevance)
+            similarities = []
+            for selected_chunk in selected:
+                embedding_sim = _embedding_similarity(candidate, selected_chunk)
+                similarities.append(
+                    embedding_sim
+                    if embedding_sim is not None
+                    else bm25_similarity(candidate.content, selected_chunk.content, corpus_sz)
+                )
+            max_sim = max(similarities)
+            mmr = mix * relevance - (1.0 - mix) * max_sim
+            if mmr > best_mmr:
+                best_mmr = mmr
+                best_idx = i
+        selected.append(remaining.pop(best_idx))
+
+    return selected
