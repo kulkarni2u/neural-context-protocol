@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -233,6 +233,14 @@ def _encode_fetch_results(chunks: list[SubconsciousChunk]) -> str:
 class FetchSession:
     fetch_count: int = 0
     pipeline_id: str | None = None
+    last_access: float = field(default_factory=time.monotonic)
+
+
+# Bound the in-memory fetch-session table so a client rotating session_ids
+# cannot grow it without limit. Entries older than the TTL are dropped; if the
+# table still exceeds the cap, the least-recently-accessed entries are evicted.
+_FETCH_SESSION_MAX = 1024
+_FETCH_SESSION_TTL_SECONDS = 3600.0
 
 
 @dataclass
@@ -264,8 +272,27 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
     coordination = getattr(store, "coordination", None)
     default_whisper_ttl = config.whisper_ttl_default if config is not None else 1800
 
+    def _prune_sessions() -> None:
+        # Caller must hold sessions_lock. Drop expired entries, then LRU-evict
+        # down to the cap so rotating session_ids cannot grow the table forever.
+        now = time.monotonic()
+        expired = [
+            sid
+            for sid, sess in sessions.items()
+            if now - sess.last_access > _FETCH_SESSION_TTL_SECONDS
+        ]
+        for sid in expired:
+            del sessions[sid]
+        if len(sessions) > _FETCH_SESSION_MAX:
+            for sid in sorted(sessions, key=lambda s: sessions[s].last_access)[
+                : len(sessions) - _FETCH_SESSION_MAX
+            ]:
+                del sessions[sid]
+
     def _fetch_budget_remaining(session_id: str) -> int:
         if coordination is not None:
+            if hasattr(coordination, "fetch_budget_remaining"):
+                return int(coordination.fetch_budget_remaining(session_id))
             return 3
         with sessions_lock:
             session = sessions.get(session_id, FetchSession())
@@ -305,6 +332,7 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
                 sessions[session_id] = FetchSession(fetch_count=0, pipeline_id=normalized_pipeline_id)
                 if session_id != DEFAULT_FETCH_SESSION_ID:
                     sessions[DEFAULT_FETCH_SESSION_ID] = FetchSession(fetch_count=0, pipeline_id=normalized_pipeline_id)
+                _prune_sessions()
         conscious = _build_conscious_from_args(store, args)
         budget = _budget_from_args(args, conscious=conscious)
         assembler = Assembler(store=store, config=config)
@@ -474,11 +502,14 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
                 if session.fetch_count >= 3:
                     raise ValueError("ncp_fetch limit reached: max 3 per session")
                 session.fetch_count += 1
+                session.last_access = time.monotonic()
                 if pipeline_id is not None:
                     session.pipeline_id = str(pipeline_id)
                 effective_pipeline_id = session.pipeline_id
+                _prune_sessions()
         try:
-            k = max(1, int(args.get("k", 2)))
+            # Clamp to the schema max (4); a client asking for k=500 gets 4.
+            k = min(4, max(1, int(args.get("k", 2))))
         except (ValueError, TypeError):
             k = 2
         try:
@@ -544,6 +575,10 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             "tag_count": len(tags),
             "evidence_count": len(evidence_refs),
         }
+
+    # Expose the in-memory fetch-session table for observability/testing of the
+    # LRU+TTL pruning without widening the returned handler mapping.
+    _handle_get_context.fetch_sessions = sessions  # type: ignore[attr-defined]
 
     return {
         "ncp_get_context": _handle_get_context,

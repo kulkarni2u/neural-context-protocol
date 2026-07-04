@@ -36,6 +36,15 @@ Audit remediation from `docs/NCP_AUDIT_AND_REMEDIATION_PLAN.md`. One work item
   `auth_token` for loopback SQLite, so the documented "init → copy config →
   connect" flow no longer 401s against its own server. (WI-010, F-C3)
 
+- **Bounded `ncp_fetch` reads** (`ncp/mcp/server.py`,
+  `ncp/stores/redis_coordination.py`): clamp the per-fetch `k` to the schema max
+  (4) so a `k=500` request serves at most 4 chunks; report the real Redis-mode
+  `fetch_budget_remaining` instead of a hardcoded 3 (new
+  `RedisCoordination.fetch_budget_remaining`); and bound the in-memory fetch
+  session table with an LRU cap + TTL so rotating `session_id`s can't grow it
+  without limit. The per-session cap redesign is deferred (needs verified
+  identity, CAP-T1). (WI-005, F-B3)
+
 ### Security
 
 - **Escaped pidgin wire delimiters** (`ncp/encoder.py`): chunk/whisper content is

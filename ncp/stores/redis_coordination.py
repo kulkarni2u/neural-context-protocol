@@ -208,6 +208,13 @@ class RedisCoordination:
         client.expire(key, ttl_seconds)
         return updated, resolved_pipeline
 
+    def fetch_budget_remaining(self, session_id: str, *, max_fetches: int = 3) -> int:
+        """Report the real remaining fetch budget without consuming a slot."""
+        client = self._client_or_raise()
+        payload = client.hgetall(self._fetch_key(session_id))
+        current = int(payload.get("fetch_count", "0") or 0)
+        return max(0, max_fetches - current)
+
     def _payload_key(self, whisper_id: str) -> str:
         return f"{self.whisper_payload_prefix}:{whisper_id}"
 

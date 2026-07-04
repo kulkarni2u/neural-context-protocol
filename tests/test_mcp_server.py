@@ -777,6 +777,58 @@ class TestFetch:
         assert "Paris" in result["result"]
         assert result["result"].startswith("ncp_fetch:results")
 
+    def test_fetch_k_clamped_to_schema_max(self, tmp_path: Path) -> None:
+        # WI-005: an over-large k must be clamped to the schema max (4) so a
+        # client asking for k=500 cannot pull an unbounded read.
+        store = SQLiteStore(tmp_path / "test.db")
+        for i in range(8):
+            store.write(SubconsciousChunk(
+                content=f"shared marker chunk number {i}",
+                layer="semantic", src="tool_result", written_by="executor",
+            ))
+        handlers = make_handlers(store)
+        _handle_request(
+            _call("ncp_get_context", {
+                "agent_id": "builder", "role": "build", "owns": [], "must_not": [],
+                "task": "test", "slot": "test", "intent": "test",
+            }),
+            handlers,
+        )
+        captured: dict = {}
+        original_query = store.query
+
+        def spy(*args, **kwargs):
+            captured["k"] = kwargs.get("k")
+            return original_query(*args, **kwargs)
+
+        store.query = spy  # type: ignore[method-assign]
+        resp = _handle_request(
+            _call("ncp_fetch", {"query": "shared marker chunk", "k": 500}),
+            handlers,
+        )
+        result = _content(resp)
+        assert captured["k"] == 4
+        # The store was never asked for more than 4, so at most 4 are served.
+        assert result["result"].startswith("ncp_fetch:results")
+
+    def test_fetch_sessions_dict_is_bounded(self, tmp_path: Path, monkeypatch) -> None:
+        # WI-005: rotating session_ids must not grow the in-memory table forever.
+        from ncp.mcp import server as server_mod
+
+        monkeypatch.setattr(server_mod, "_FETCH_SESSION_MAX", 5)
+        store = SQLiteStore(tmp_path / "test.db")
+        handlers = make_handlers(store)
+        for i in range(50):
+            _handle_request(
+                _call("ncp_get_context", {
+                    "agent_id": f"agent_{i}", "role": "build", "owns": [], "must_not": [],
+                    "task": "t", "slot": "s", "intent": "i",
+                }),
+                handlers,
+            )
+        sessions = handlers["ncp_get_context"].fetch_sessions
+        assert len(sessions) <= 5
+
     def test_no_results(self, tmp_path: Path) -> None:
         store = SQLiteStore(tmp_path / "test.db")
         handlers = make_handlers(store)
