@@ -558,8 +558,9 @@ class SQLiteStore(BaseStore):
         with self._connect() as connection:
             rows = connection.execute(
                 f"SELECT * FROM chunks WHERE chunk_id IN ({placeholders})"
-                " AND chunk_id NOT IN (SELECT chunk_id FROM tombstones)",
-                unique_ids,
+                " AND chunk_id NOT IN (SELECT chunk_id FROM tombstones)"
+                " AND (expiry IS NULL OR expiry > ?)",  # WI-006
+                [*unique_ids, time.time()],
             ).fetchall()
         return [self._row_to_chunk(row) for row in rows]
 
@@ -1903,6 +1904,9 @@ class SQLiteStore(BaseStore):
         if scope is not None:
             clauses.append("scope = ?")
             params.append(scope)
+        # WI-006: never surface chunks whose expiry has passed.
+        clauses.append("(expiry IS NULL OR expiry > ?)")
+        params.append(time.time())
         return connection.execute(
             f"SELECT * FROM chunks WHERE {' AND '.join(clauses)} ORDER BY created_at DESC",
             params,
@@ -1940,6 +1944,9 @@ class SQLiteStore(BaseStore):
         if scope is not None:
             clauses.append("chunks.scope = ?")
             params.append(scope)
+        # WI-006: exclude expired chunks from lexical retrieval.
+        clauses.append("(chunks.expiry IS NULL OR chunks.expiry > ?)")
+        params.append(time.time())
 
         try:
             with self._connect() as connection:
@@ -2132,8 +2139,14 @@ class SQLiteStore(BaseStore):
         connection.execute("DELETE FROM tombstones WHERE expires_at <= ?", (now,))
         connection.execute("DELETE FROM whispers WHERE expires_at <= ?", (now,))
         connection.execute("DELETE FROM turn_records WHERE expires_at <= ?", (now,))
+        # WI-006: reclaim chunks whose expiry has passed.
+        connection.execute("DELETE FROM chunks WHERE expiry IS NOT NULL AND expiry <= ?", (now,))
 
     def _hard_gc(self, connection: sqlite3.Connection, *, pipeline_id: str | None) -> None:
+        # WI-006: drop expired chunks before evaluating overflow capacity.
+        connection.execute(
+            "DELETE FROM chunks WHERE expiry IS NOT NULL AND expiry <= ?", (time.time(),)
+        )
         clauses = ["zone = 'working'"]
         params: list[object] = []
         if pipeline_id is not None:

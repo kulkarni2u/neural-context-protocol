@@ -367,7 +367,7 @@ class AsyncPgvectorStore(BaseStore):
     # ------------------------------------------------------------------
 
     async def _async_soft_gc(self, conn: Any) -> None:
-        """Delete expired tombstones, whispers, and turn_records."""
+        """Delete expired tombstones, whispers, turn_records, and chunks."""
         now = time.time()
         for table in ("tombstones", "whispers", "turn_records"):
             async with conn.cursor() as cur:
@@ -377,6 +377,14 @@ class AsyncPgvectorStore(BaseStore):
                     ),
                     (now,),
                 )
+        # WI-006: reclaim chunks whose expiry has passed.
+        async with conn.cursor() as cur:
+            await cur.execute(
+                self._sql(
+                    "DELETE FROM {schema}.{prefix}chunks WHERE expiry IS NOT NULL AND expiry <= %s"
+                ),
+                (now,),
+            )
 
     async def _async_assert_src_immutable(self, conn: Any, chunk: SubconsciousChunk) -> None:
         """Raise ValueError if src field changes for an existing chunk_id."""
@@ -423,6 +431,14 @@ class AsyncPgvectorStore(BaseStore):
 
     async def _async_hard_gc(self, conn: Any, *, pipeline_id: str | None) -> None:
         """Evict oldest working-zone chunks if count exceeds max_working_chunks."""
+        # WI-006: drop expired chunks before evaluating overflow capacity.
+        async with conn.cursor() as cur:
+            await cur.execute(
+                self._sql(
+                    "DELETE FROM {schema}.{prefix}chunks WHERE expiry IS NOT NULL AND expiry <= %s"
+                ),
+                (time.time(),),
+            )
         clauses = ["zone = 'working'"]
         params: list[object] = []
         if pipeline_id is not None:
@@ -567,6 +583,9 @@ class AsyncPgvectorStore(BaseStore):
         if scope is not None:
             where_clauses.append("scope = %s")
             where_params.append(scope)
+        # WI-006: exclude expired chunks from vector retrieval.
+        where_clauses.append("(expiry IS NULL OR expiry > %s)")
+        where_params.append(time.time())
 
         result_limit = normalize_result_limit(k)
         limit = result_limit * 4
@@ -678,6 +697,9 @@ class AsyncPgvectorStore(BaseStore):
         if scope is not None:
             clauses.append("scope = %s")
             params.append(scope)
+        # WI-006: never surface chunks whose expiry has passed.
+        clauses.append("(expiry IS NULL OR expiry > %s)")
+        params.append(time.time())
 
         async with self._aconnect() as conn:
             async with conn.cursor() as cur:

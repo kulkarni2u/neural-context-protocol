@@ -45,6 +45,13 @@ Audit remediation from `docs/NCP_AUDIT_AND_REMEDIATION_PLAN.md`. One work item
   without limit. The per-session cap redesign is deferred (needs verified
   identity, CAP-T1). (WI-005, F-B3)
 
+- **Enforced chunk expiry at read and GC** (`ncp/stores/sqlite.py`,
+  `ncp/stores/pgvector.py`, `ncp/stores/pgvector_async.py`): all retrieval read
+  paths (`query`, FTS/lexical, vector, `get_chunks_by_ids`, working-zone loads)
+  now exclude chunks whose `expiry` has passed (`expiry IS NULL OR expiry >
+  now`), and soft/hard GC physically reclaim expired chunks — so an expired
+  "proven" fact is no longer served forever. (WI-006, F-B4)
+
 ### Security
 
 - **Escaped pidgin wire delimiters** (`ncp/encoder.py`): chunk/whisper content is

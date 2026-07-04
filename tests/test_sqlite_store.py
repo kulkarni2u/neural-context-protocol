@@ -452,3 +452,58 @@ def test_sqlite_store_status_detail_and_cost_summary(tmp_path: Path) -> None:
     assert costs["by_agent"][0]["agent_id"] == "planner"
     assert costs["by_model"][0]["model"] == "claude_sonnet"
     assert costs["recent_entries"][0]["turn_id"] == "turn_cost_alpha"
+
+
+def test_sqlite_expired_chunk_absent_from_reads_and_gc(tmp_path: Path) -> None:
+    # WI-006: a chunk past its expiry must not be retrieved, fetched by id, or
+    # listed in the working zone, and GC must reclaim it from the table.
+    import sqlite3
+    import time
+
+    store_path = tmp_path / "store.db"
+    store = SQLiteStore(store_path)
+
+    expired = SubconsciousChunk(
+        chunk_id="sub_expired",
+        layer="procedural",
+        content="stale proven fact about bearer token rotation",
+        src="tool_result",
+        pipeline_id="pipe_exp",
+        expiry=time.time() - 3600,
+    )
+    live = SubconsciousChunk(
+        chunk_id="sub_live",
+        layer="procedural",
+        content="current fact about bearer token rotation",
+        src="tool_result",
+        pipeline_id="pipe_exp",
+        expiry=time.time() + 3600,
+    )
+    assert store.write(expired) is True
+    assert store.write(live) is True
+
+    # Not retrievable via query.
+    ids = [c.chunk_id for c in store.query("bearer token rotation", pipeline_id="pipe_exp")]
+    assert "sub_expired" not in ids
+    assert "sub_live" in ids
+
+    # Not fetchable by id.
+    fetched = {c.chunk_id for c in store.get_chunks_by_ids(["sub_expired", "sub_live"])}
+    assert fetched == {"sub_live"}
+
+    # Not present in the working zone.
+    zone_ids = {c.chunk_id for c in store.get_working_zone(pipeline_id="pipe_exp")}
+    assert "sub_expired" not in zone_ids
+
+    # A soft-GC-triggering write physically reclaims the expired row.
+    store.write(SubconsciousChunk(
+        chunk_id="sub_trigger", layer="procedural",
+        content="unrelated trigger chunk", src="tool_result", pipeline_id="pipe_exp",
+    ))
+    connection = sqlite3.connect(store_path)
+    remaining = {
+        row[0]
+        for row in connection.execute("SELECT chunk_id FROM chunks").fetchall()
+    }
+    connection.close()
+    assert "sub_expired" not in remaining

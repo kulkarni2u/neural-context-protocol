@@ -607,6 +607,9 @@ class PgvectorStore(BaseStore):
         if scope is not None:
             where_clauses.append("scope = %s")
             where_params.append(scope)
+        # WI-006: exclude expired chunks from vector retrieval.
+        where_clauses.append("(expiry IS NULL OR expiry > %s)")
+        where_params.append(time.time())
 
         # Always fetch k*4 to give the diversity loop enough candidates.
         result_limit = normalize_result_limit(k)
@@ -1792,6 +1795,9 @@ class PgvectorStore(BaseStore):
         if scope is not None:
             clauses.append("scope = %s")
             params.append(scope)
+        # WI-006: never surface chunks whose expiry has passed.
+        clauses.append("(expiry IS NULL OR expiry > %s)")
+        params.append(time.time())
         cursor = connection.cursor()
         try:
             cursor.execute(
@@ -2143,8 +2149,26 @@ class PgvectorStore(BaseStore):
                 )
             finally:
                 self._close_cursor(cursor)
+        # WI-006: reclaim chunks whose expiry has passed.
+        chunk_cursor = connection.cursor()
+        try:
+            chunk_cursor.execute(
+                self._sql("DELETE FROM {schema}.{prefix}chunks WHERE expiry IS NOT NULL AND expiry <= %s"),
+                (now,),
+            )
+        finally:
+            self._close_cursor(chunk_cursor)
 
     def _hard_gc(self, connection: Any, *, pipeline_id: str | None) -> None:
+        # WI-006: drop expired chunks before evaluating overflow capacity.
+        expiry_cursor = connection.cursor()
+        try:
+            expiry_cursor.execute(
+                self._sql("DELETE FROM {schema}.{prefix}chunks WHERE expiry IS NOT NULL AND expiry <= %s"),
+                (time.time(),),
+            )
+        finally:
+            self._close_cursor(expiry_cursor)
         clauses = ["zone = 'working'"]
         params: list[object] = []
         if pipeline_id is not None:
