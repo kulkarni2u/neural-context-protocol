@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -44,6 +45,83 @@ def test_sqlite_store_write_query_and_restart(tmp_path: Path) -> None:
 
     assert [result.chunk_id for result in results] == ["sub_auth"]
     assert results[0].pipeline_id == "pipe_1"
+
+
+def test_sqlite_connections_set_busy_timeout(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "store.db")
+
+    with store._connect() as connection:
+        timeout_ms = connection.execute("PRAGMA busy_timeout").fetchone()[0]
+
+    assert timeout_ms >= 5000
+
+
+def test_sqlite_rewrite_preserves_feedback_counters_and_created_at(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "store.db")
+    original = SubconsciousChunk(
+        chunk_id="sub_rewrite",
+        layer="semantic",
+        content="first write about retry accounting",
+        src="tool_result",
+        pipeline_id="pipe_1",
+    )
+    replacement = SubconsciousChunk(
+        chunk_id="sub_rewrite",
+        layer="semantic",
+        content="replacement write about billing reconciliation",
+        src="tool_result",
+        pipeline_id="pipe_1",
+        base_trust=0.8,
+    )
+    assert store.write(original) is True
+    with store._connect() as connection:
+        connection.execute(
+            "UPDATE chunks SET created_at = ?, retrieval_count = ?, dissent_count = ? WHERE chunk_id = ?",
+            (123.0, 7, 2, "sub_rewrite"),
+        )
+
+    assert store.write(replacement) is True
+
+    with store._connect() as connection:
+        row = connection.execute(
+            "SELECT content, base_trust, created_at, retrieval_count, dissent_count "
+            "FROM chunks WHERE chunk_id = ?",
+            ("sub_rewrite",),
+        ).fetchone()
+    assert row["content"] == replacement.content
+    assert row["base_trust"] == pytest.approx(0.8)
+    assert row["created_at"] == pytest.approx(123.0)
+    assert row["retrieval_count"] == 7
+    assert row["dissent_count"] == 2
+
+
+def test_sqlite_concurrent_unique_writes_do_not_raise_store_unavailable(tmp_path: Path) -> None:
+    store_path = tmp_path / "store.db"
+    SQLiteStore(store_path)
+
+    def write_one(index: int) -> bool:
+        store = SQLiteStore(store_path)
+        return store.write(
+            SubconsciousChunk(
+                chunk_id=f"sub_concurrent_{index}",
+                layer="semantic",
+                content=" ".join(f"unique_concurrent_{index}_{token}" for token in range(20)),
+                src="tool_result",
+                pipeline_id="pipe_1",
+            )
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(write_one, range(24)))
+
+    assert all(results)
+    restarted = SQLiteStore(store_path)
+    with restarted._connect() as connection:
+        row = connection.execute(
+            "SELECT COUNT(*) AS count FROM chunks WHERE pipeline_id = ?",
+            ("pipe_1",),
+        ).fetchone()
+    assert row["count"] == 24
 
 
 def test_sqlite_store_query_filters_zero_score_noise_and_uses_effective_score(tmp_path: Path) -> None:

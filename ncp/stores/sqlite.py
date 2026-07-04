@@ -236,11 +236,12 @@ class SQLiteStore(BaseStore):
     @contextmanager
     def _connect(self) -> sqlite3.Connection:
         try:
-            connection = sqlite3.connect(self.path)
+            connection = sqlite3.connect(self.path, timeout=5.0)
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA journal_mode=WAL;")
             connection.execute("PRAGMA synchronous=NORMAL;")
             connection.execute("PRAGMA foreign_keys=ON;")
+            connection.execute("PRAGMA busy_timeout=5000;")
             connection.execute("PRAGMA cache_size=-64000;")
         except sqlite3.Error as exc:
             raise NCPStoreUnavailableError(
@@ -284,19 +285,46 @@ class SQLiteStore(BaseStore):
     def write(self, chunk: SubconsciousChunk) -> bool:
         chunk = self._validate_chunk_for_write(chunk)
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             self._soft_gc(connection)
             self._assert_src_immutable(connection, chunk)
             if self._is_duplicate(connection, chunk):
                 return False
             connection.execute(
                 """
-                INSERT OR REPLACE INTO chunks (
+                INSERT INTO chunks (
                     chunk_id, pipeline_id, scope, zone, layer, chunk_type, content, src,
                     written_by, caused_by, conscious_hash, evidence_id, version, supersedes,
                     source_refs, schema_version, created_at, base_trust, generation,
                     result_confidence, result_attempts, conditions, valid_while, expiry, owner, meta,
                     written_at_drift
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(chunk_id) DO UPDATE SET
+                    pipeline_id = excluded.pipeline_id,
+                    scope = excluded.scope,
+                    zone = excluded.zone,
+                    layer = excluded.layer,
+                    chunk_type = excluded.chunk_type,
+                    content = excluded.content,
+                    src = excluded.src,
+                    written_by = excluded.written_by,
+                    caused_by = excluded.caused_by,
+                    conscious_hash = excluded.conscious_hash,
+                    evidence_id = excluded.evidence_id,
+                    version = excluded.version,
+                    supersedes = excluded.supersedes,
+                    source_refs = excluded.source_refs,
+                    schema_version = excluded.schema_version,
+                    base_trust = excluded.base_trust,
+                    generation = excluded.generation,
+                    result_confidence = excluded.result_confidence,
+                    result_attempts = excluded.result_attempts,
+                    conditions = excluded.conditions,
+                    valid_while = excluded.valid_while,
+                    expiry = excluded.expiry,
+                    owner = excluded.owner,
+                    meta = excluded.meta,
+                    written_at_drift = excluded.written_at_drift
                 """,
                 (
                     chunk.chunk_id,
@@ -805,6 +833,8 @@ class SQLiteStore(BaseStore):
         report = ConsolidationReport(dry_run=dry_run, pipeline_id=pipeline_id)
 
         with self._connect() as connection:
+            if not dry_run:
+                connection.execute("BEGIN IMMEDIATE")
             query = "SELECT * FROM chunks WHERE chunk_id NOT IN (SELECT chunk_id FROM tombstones)"
             params: list = []
             if pipeline_id is not None:
@@ -812,28 +842,26 @@ class SQLiteStore(BaseStore):
                 params.append(pipeline_id)
             rows = connection.execute(query, params).fetchall()
 
-        all_chunks = [self._row_to_chunk(row) for row in rows]
-        eligible = [c for c in all_chunks if c.base_trust >= trust_floor]
-        report.skipped += len(all_chunks) - len(eligible)
-        clusters = cluster_by_tags(eligible)
-        report.clusters_scanned = len(clusters)
+            all_chunks = [self._row_to_chunk(row) for row in rows]
+            eligible = [c for c in all_chunks if c.base_trust >= trust_floor]
+            report.skipped += len(all_chunks) - len(eligible)
+            clusters = cluster_by_tags(eligible)
+            report.clusters_scanned = len(clusters)
 
-        for cluster in clusters:
-            candidates = find_merge_candidates(cluster, similarity_threshold=similarity_threshold)
-            for keeper, losers in candidates:
-                loser_ids = [c.chunk_id for c in losers]
-                report.merge_log.append({
-                    "kept": keeper.chunk_id,
-                    "merged": loser_ids,
-                    "layer": keeper.layer,
-                    "zone": keeper.zone,
-                    "pipeline_id": keeper.pipeline_id,
-                })
-                if not dry_run:
-                    supersedes_json = json.dumps(loser_ids)
-                    new_gen = keeper.generation + 1
-                    with self._connect() as connection:
-                        connection.execute("BEGIN IMMEDIATE")
+            for cluster in clusters:
+                candidates = find_merge_candidates(cluster, similarity_threshold=similarity_threshold)
+                for keeper, losers in candidates:
+                    loser_ids = [c.chunk_id for c in losers]
+                    report.merge_log.append({
+                        "kept": keeper.chunk_id,
+                        "merged": loser_ids,
+                        "layer": keeper.layer,
+                        "zone": keeper.zone,
+                        "pipeline_id": keeper.pipeline_id,
+                    })
+                    if not dry_run:
+                        supersedes_json = json.dumps(loser_ids)
+                        new_gen = keeper.generation + 1
                         for loser_id in loser_ids:
                             connection.execute("DELETE FROM chunks WHERE chunk_id = ?", (loser_id,))
                             connection.execute(
@@ -845,16 +873,16 @@ class SQLiteStore(BaseStore):
                             "UPDATE chunks SET generation = ?, supersedes = ? WHERE chunk_id = ?",
                             (new_gen, supersedes_json, keeper.chunk_id),
                         )
-                report.merged += 1
-                report.tombstoned += len(loser_ids)
+                    report.merged += 1
+                    report.tombstoned += len(loser_ids)
 
-            report.skipped += sum(
-                1 for c in cluster
-                if not any(
-                    c.chunk_id == k.chunk_id or c.chunk_id in [m.chunk_id for m in ls]
-                    for k, ls in candidates
+                report.skipped += sum(
+                    1 for c in cluster
+                    if not any(
+                        c.chunk_id == k.chunk_id or c.chunk_id in [m.chunk_id for m in ls]
+                        for k, ls in candidates
+                    )
                 )
-            )
 
         if not dry_run and report.merged > 0:
             self._emit_consolidation_whisper(pipeline_id=pipeline_id)
