@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from os import environ
 
-from ncp.adapters.base import BaseAdapter
+from ncp.adapters.base import BaseAdapter, TokenUsage
 
 
 class AnthropicAdapter(BaseAdapter):
@@ -44,8 +44,20 @@ class AnthropicAdapter(BaseAdapter):
             provider="Anthropic",
             timeout_types=(self._anthropic.APITimeoutError, TimeoutError),
         )
+        self.last_usage = self._usage_from_anthropic(msg)
         texts = [b.text for b in msg.content if b.type == "text"]
         return self._coerce_text("".join(texts), provider="Anthropic")
+
+    @staticmethod
+    def _usage_from_anthropic(msg: object) -> TokenUsage | None:
+        usage = getattr(msg, "usage", None)
+        if usage is None:
+            return None
+        return TokenUsage(
+            input_tokens=int(getattr(usage, "input_tokens", 0) or 0),
+            output_tokens=int(getattr(usage, "output_tokens", 0) or 0),
+            cache_read_tokens=int(getattr(usage, "cache_read_input_tokens", 0) or 0),
+        )
 
     def stream(self, ncp_context: str, user_turn: str) -> Iterator[str]:
         stream_ctx = self._run_provider_call(
@@ -62,3 +74,9 @@ class AnthropicAdapter(BaseAdapter):
             for event in stream:
                 if event.type == "content_block_delta" and event.delta.type == "text_delta":
                     yield event.delta.text
+            final = getattr(stream, "get_final_message", None)
+            if callable(final):
+                try:
+                    self.last_usage = self._usage_from_anthropic(final())
+                except Exception:
+                    self.last_usage = None

@@ -144,7 +144,8 @@ CREATE TABLE IF NOT EXISTS cost_log (
     cache_read_tokens INTEGER DEFAULT 0,
     cost_usd REAL NOT NULL,
     latency_ms INTEGER,
-    logged_at REAL NOT NULL
+    logged_at REAL NOT NULL,
+    cost_source TEXT NOT NULL DEFAULT 'measured'
 );
 
 CREATE INDEX IF NOT EXISTS idx_chunks_pipeline ON chunks(pipeline_id, scope, zone);
@@ -272,6 +273,7 @@ class SQLiteStore(BaseStore):
                 "ALTER TABLE chunks ADD COLUMN written_at_drift REAL DEFAULT 0.0",
                 "ALTER TABLE chunks ADD COLUMN dissent_count INTEGER DEFAULT 0",
                 "ALTER TABLE whispers ADD COLUMN dissent_target TEXT",  # WI-007(b)
+                "ALTER TABLE cost_log ADD COLUMN cost_source TEXT NOT NULL DEFAULT 'measured'",  # CAP-E1
                 "CREATE TABLE IF NOT EXISTS drift_history (session_id TEXT NOT NULL, turn INTEGER NOT NULL, drift_score REAL NOT NULL, ts REAL NOT NULL)",
                 "CREATE INDEX IF NOT EXISTS idx_drift_session ON drift_history(session_id, turn)",
                 "CREATE TABLE IF NOT EXISTS identities (identity_id TEXT PRIMARY KEY, public_key TEXT NOT NULL, alg TEXT NOT NULL DEFAULT 'ed25519', label TEXT, created_at REAL NOT NULL, revoked_at REAL)",
@@ -742,8 +744,8 @@ class SQLiteStore(BaseStore):
                 """
                 INSERT OR REPLACE INTO cost_log (
                     turn_id, pipeline_id, agent_id, model, input_tokens, output_tokens,
-                    cache_read_tokens, cost_usd, latency_ms, logged_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    cache_read_tokens, cost_usd, latency_ms, logged_at, cost_source
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     response.turn_id,
@@ -756,6 +758,7 @@ class SQLiteStore(BaseStore):
                     response.cost_usd,
                     response.latency_ms,
                     time.time(),
+                    getattr(response, "cost_source", "measured"),
                 ),
             )
 
@@ -770,14 +773,15 @@ class SQLiteStore(BaseStore):
         pipeline_id: str | None = None,
         turn_id: str,
         latency_ms: int = 0,
+        cost_source: str = "estimated",
     ) -> None:
         with self._connect() as connection:
             connection.execute(
                 """
                 INSERT OR REPLACE INTO cost_log (
                     turn_id, pipeline_id, agent_id, model, input_tokens, output_tokens,
-                    cache_read_tokens, cost_usd, latency_ms, logged_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    cache_read_tokens, cost_usd, latency_ms, logged_at, cost_source
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     turn_id,
@@ -790,6 +794,7 @@ class SQLiteStore(BaseStore):
                     cost_usd,
                     latency_ms,
                     time.time(),
+                    cost_source,
                 ),
             )
 

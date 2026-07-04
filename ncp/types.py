@@ -483,6 +483,9 @@ class NCPResponse(NCPModel):
     pipeline_id: str | None = None
     turn_id: str
     latency_ms: int
+    # Provenance of the token/cost figures: "measured" when threaded from a real
+    # provider usage object, "estimated" for the local/mock chars-div-4 fallback.
+    cost_source: Literal["measured", "estimated"] = "measured"
 
     @field_validator("model", "turn_id")
     @classmethod

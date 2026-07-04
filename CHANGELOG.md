@@ -9,6 +9,17 @@ Audit remediation from `docs/NCP_AUDIT_AND_REMEDIATION_PLAN.md`. One work item
 
 ### Added
 
+- **Real per-provider token and USD cost accounting** (`ncp/api.py`,
+  `ncp/adapters/base.py`, `ncp/adapters/*.py`, `ncp/costs.py`, `ncp/types.py`,
+  `ncp/stores/sqlite.py`): adapters now capture the provider response's real
+  `input`/`output`/`cache_read` token usage (`BaseAdapter.last_usage`), which
+  `_build_response` prices via the `[providers]` table instead of fabricating
+  telemetry from whitespace word counts and a hardcoded `cost_usd=0.0`. The
+  local/mock path stays a `chars/4` estimate flagged via a new additive
+  `cost_source` field (`"measured"`/`"estimated"`; defaults to `"measured"`,
+  persisted to `cost_log`). Turn ids gain a `uuid4` suffix
+  (`turn_{ms}_{uuid}`) so two rapid turns no longer overwrite each other's
+  `cost_log` row under `INSERT OR REPLACE`. (CAP-E1)
 - **MIT `LICENSE` file** (`LICENSE`): add the MIT license text with the correct
   copyright holder to match the badge, `pyproject` `license` metadata, and README
   footer. (WI-012, F-C5)

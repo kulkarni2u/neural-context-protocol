@@ -2,13 +2,17 @@ from __future__ import annotations
 
 from os import environ
 
-from ncp.adapters.base import BaseAdapter
+from ncp.adapters.base import BaseAdapter, TokenUsage
 
 
 class GeminiAdapter(BaseAdapter):
     @property
     def ctx_window(self) -> int:
         return 1000000
+
+    @property
+    def model_name(self) -> str:
+        return self._model_name
 
     def __init__(
         self,
@@ -36,4 +40,16 @@ class GeminiAdapter(BaseAdapter):
             ),
             provider="Gemini",
         )
+        self.last_usage = self._usage_from_gemini(resp)
         return self._coerce_text(resp.text, provider="Gemini")
+
+    @staticmethod
+    def _usage_from_gemini(resp: object) -> TokenUsage | None:
+        usage = getattr(resp, "usage_metadata", None)
+        if usage is None:
+            return None
+        return TokenUsage(
+            input_tokens=int(getattr(usage, "prompt_token_count", 0) or 0),
+            output_tokens=int(getattr(usage, "candidates_token_count", 0) or 0),
+            cache_read_tokens=int(getattr(usage, "cached_content_token_count", 0) or 0),
+        )

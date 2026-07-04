@@ -4,7 +4,21 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
+from dataclasses import dataclass
 from typing import Callable, TypeVar
+
+
+@dataclass(slots=True)
+class TokenUsage:
+    """Real per-call token usage reported by a provider response.
+
+    Adapters populate ``BaseAdapter.last_usage`` with one of these after a
+    provider call so the runtime can bill actual (not estimated) tokens.
+    """
+
+    input_tokens: int
+    output_tokens: int
+    cache_read_tokens: int = 0
 
 
 class NCPAdapterError(RuntimeError):
@@ -29,9 +43,35 @@ _T = TypeVar("_T")
 class BaseAdapter(ABC):
     """Minimal provider adapter contract for the first NCP API slice."""
 
+    #: Real token usage from the most recent provider call, when the provider
+    #: reports it. ``None`` means the adapter has no authoritative usage (e.g.
+    #: the local/mock path) and the runtime should fall back to an estimate.
+    last_usage: TokenUsage | None = None
+
     @property
     def ctx_window(self) -> int:
         return 200000
+
+    @property
+    def model_name(self) -> str:
+        """Provider model id used for pricing; falls back to the class name."""
+
+        return getattr(self, "_model", None) or type(self).__name__.lower()
+
+    @staticmethod
+    def _usage_from_openai_shape(response: object) -> TokenUsage | None:
+        """Extract usage from an OpenAI-compatible response (OpenAI/Ollama/Mistral)."""
+
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return None
+        details = getattr(usage, "prompt_tokens_details", None)
+        cached = int(getattr(details, "cached_tokens", 0) or 0) if details is not None else 0
+        return TokenUsage(
+            input_tokens=int(getattr(usage, "prompt_tokens", 0) or 0),
+            output_tokens=int(getattr(usage, "completion_tokens", 0) or 0),
+            cache_read_tokens=cached,
+        )
 
     @abstractmethod
     def call(self, ncp_context: str, user_turn: str) -> str:

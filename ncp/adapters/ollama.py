@@ -50,4 +50,5 @@ class OllamaAdapter(BaseAdapter):
             provider="Ollama",
             timeout_types=(self._openai.APITimeoutError, TimeoutError),
         )
+        self.last_usage = self._usage_from_openai_shape(resp)
         return self._coerce_text(resp.choices[0].message.content, provider="Ollama")

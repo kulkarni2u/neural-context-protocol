@@ -63,6 +63,7 @@ class OpenAIAdapter(BaseAdapter):
             provider="OpenAI",
             timeout_types=(self._openai.APITimeoutError, TimeoutError),
         )
+        self.last_usage = self._usage_from_openai_shape(resp)
         return self._coerce_text(resp.choices[0].message.content, provider="OpenAI")
 
     def stream(self, ncp_context: str, user_turn: str) -> Iterator[str]:
