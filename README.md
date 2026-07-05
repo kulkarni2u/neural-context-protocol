@@ -303,7 +303,7 @@ Use it when you have **3+ agents, 10+ turns, and real shared state to preserve**
 MACE multi-agent coordination score (40 turns): **0.8915**
 
 Coding benchmark token unit: `chars_div4`; context budget: `340`; pass gate: `true`.
-These are deterministic token-accounting benchmarks. The task-success row measures context adequacy at a matched token budget with a deterministic mock provider — whether the needed fact survives into a budget-bounded context (see [the benchmark doc](./docs/NCP_BENCHMARK_TASK_SUCCESS.md)); run it with a live provider to measure real model task success. Quality-at-matched-budget evaluation also lives in `benchmarks/efficacy/`.
+These are deterministic token-accounting benchmarks. The task-success row measures context adequacy at a matched token budget with a deterministic mock provider — whether the needed fact survives into a budget-bounded context (see [the benchmark doc](./docs/NCP_BENCHMARK_TASK_SUCCESS.md)); run it with a live provider to measure real model task success. Provider-real quality-at-matched-budget evaluation lives in `benchmarks/efficacy/` and compares NCP with sliding-window and rolling-summary controls (see [the efficacy benchmark doc](./docs/NCP_BENCHMARK_EFFICACY_LIVE.md)).
 
 A separate, complementary compression benchmark measures ingestion-time noise reduction on a fixed noisy-payload corpus: **33% aggregate token reduction** (537 → 360, `chars_div4`, pass gate aggregate >= 0.20), ranging from **68%** on duplicate-heavy logs down to **2%** on already-dense stack traces (see [the compression benchmark doc](./docs/NCP_BENCHMARK_COMPRESSION.md)).
 
@@ -314,6 +314,7 @@ python3 benchmarks/coding_pipeline/run.py
 python3 benchmarks/needle/run.py --turns 24 --needles 6 --budget 4
 python3 benchmarks/task_success/run.py            # mock provider, no keys needed
 python3 benchmarks/task_success/run.py --provider anthropic   # live task success
+python3 benchmarks/efficacy/run.py --provider mock --seeds 2  # context adequacy at matched budget
 python3 benchmarks/compression/run.py             # ingestion-time compression
 ```
 
@@ -507,6 +508,7 @@ NCP is the memory bus. In our workflows, Sarathi is one orchestrator that runs o
 - [Protocol spec](./docs/NCP_PROTOCOL_SPEC.md)
 - [HTTP API contract](./docs/NCP_HTTP_API.md)
 - [Benchmark: task success at matched budget](./docs/NCP_BENCHMARK_TASK_SUCCESS.md)
+- [Benchmark: provider-real efficacy](./docs/NCP_BENCHMARK_EFFICACY_LIVE.md)
 - [Benchmark: coding pipeline](./docs/NCP_BENCHMARK_CODING_PIPELINE.md)
 - [Benchmark: needle recall](./docs/NCP_BENCHMARK_NEEDLE_RECALL.md)
 - [Benchmark: matched-budget efficacy](./docs/NCP_BENCHMARK_MATCHED_BUDGET_EFFICACY.md)

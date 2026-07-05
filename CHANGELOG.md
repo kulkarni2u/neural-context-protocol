@@ -44,6 +44,14 @@ Audit remediation from `docs/NCP_AUDIT_AND_REMEDIATION_PLAN.md`. One work item
   sentences/lines without mutating stored content. Distilled chunks carry a
   `distilled:1` pidgin marker, and `[distillation].enabled` defaults to
   `false` so existing fit/drop behavior is unchanged. (CAP-C2)
+- **Provider-real matched-budget efficacy benchmark** (`benchmarks/efficacy/`,
+  `docs/NCP_BENCHMARK_EFFICACY_LIVE.md`): replace the old single-scenario
+  window-control harness with a task-set benchmark that compares `ncp`,
+  `sliding_window`, and `rolling_summary` at the same requested budget. The
+  default `mock` provider is deterministic and keyless; `anthropic` is live and
+  writes an explicit skip artifact when `ANTHROPIC_API_KEY` is unset. The
+  harness replaces the old `--continuation-adapter`/`--attempts` flags with
+  `--provider`/`--seeds`. (CAP-E4)
 - **Real per-provider token and USD cost accounting** (`ncp/api.py`,
   `ncp/adapters/base.py`, `ncp/adapters/*.py`, `ncp/costs.py`, `ncp/types.py`,
   `ncp/stores/sqlite.py`): adapters now capture the provider response's real
