@@ -767,7 +767,6 @@ class PgvectorStore(BaseStore):
                 self._close_cursor(cursor)
 
     def record_outcome(self, outcome: OutcomeRecord) -> bool:
-        normalized_turn = outcome.turn_id
         chunk_ids = outcome.chunk_ids
         with self._connect() as connection:
             cursor = connection.cursor()

@@ -111,7 +111,8 @@ class TestSqliteWhisperGating:
     def test_gating_disabled_by_default(self):
         from ncp.stores.sqlite import SQLiteStore
         from ncp.config import NCPConfig
-        import tempfile, os
+        import os
+        import tempfile
 
         with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
             db_path = f.name
@@ -130,7 +131,8 @@ class TestSqliteWhisperGating:
     def test_gating_filters_low_reputation(self):
         from ncp.stores.sqlite import SQLiteStore
         from ncp.config import NCPConfig
-        import tempfile, os
+        import os
+        import tempfile
 
         with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
             db_path = f.name
@@ -152,7 +154,8 @@ class TestSqliteWhisperGating:
     def test_gating_passes_high_reputation(self):
         from ncp.stores.sqlite import SQLiteStore
         from ncp.config import NCPConfig
-        import tempfile, os
+        import os
+        import tempfile
 
         with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
             db_path = f.name
@@ -175,7 +178,8 @@ class TestSqliteWhisperGating:
         """Unknown author has uniform prior Beta(1,1)=0.5; passes 0.3 threshold."""
         from ncp.stores.sqlite import SQLiteStore
         from ncp.config import NCPConfig
-        import tempfile, os
+        import os
+        import tempfile
 
         with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
             db_path = f.name
