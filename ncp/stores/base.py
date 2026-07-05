@@ -130,6 +130,13 @@ class BaseStore(ABC):
         ``output_tokens_est`` records how many output tokens a memo hit is
         estimated to save; when None, backends estimate it from the stored
         result via ``ncp.tokens.estimate_tokens``. Returns True on success.
+
+        Re-recording an existing ``signature`` is an upsert of the task/
+        content fields only: ``created_at``, ``hit_count``, ``last_hit_at``,
+        ``outcome``, and ``verified`` are preserved rather than reset, so a
+        memo doesn't lose its accumulated telemetry or review state just
+        because the same work was recorded again.
+
         Backends that do not implement this return False.
         """
         return False
@@ -137,7 +144,40 @@ class BaseStore(ABC):
     def lookup_memo(self, signature: str) -> dict | None:
         """Return a memo entry if found and not stale, or None.
 
+        This unconditionally counts a hit whenever a fresh row is found — it
+        has no notion of any downstream usability gating (e.g. outcome/verified
+        thresholds applied by a caller). Callers that apply further validation
+        before deciding whether a memo is actually *usable* should instead use
+        ``peek_memo`` (no telemetry side effects) followed by an explicit
+        ``record_memo_hit``/``record_memo_miss`` once that decision is made, so
+        hit/miss telemetry only reflects memos actually returned to the caller.
+
         Backends that do not implement this return None.
+        """
+        return None
+
+    def peek_memo(self, signature: str) -> dict | None:
+        """Fetch a memo entry (applying staleness filtering) without touching telemetry.
+
+        Returns None if the signature is unknown or the entry is stale. Does
+        not increment hit_count/last_hit_at nor the miss counter — pair this
+        with ``record_memo_hit``/``record_memo_miss`` so telemetry is only
+        recorded once the caller has decided whether the memo is usable.
+        Backends that do not implement this return None.
+        """
+        return None
+
+    def record_memo_hit(self, signature: str) -> None:
+        """Increment hit_count/last_hit_at for a memo actually returned as usable.
+
+        Backends that do not implement memoization are no-ops.
+        """
+        return None
+
+    def record_memo_miss(self) -> None:
+        """Increment the S4.1 miss counter for a lookup that yielded no usable memo.
+
+        Backends that do not implement memoization are no-ops.
         """
         return None
 
@@ -179,6 +219,18 @@ class BaseStore(ABC):
     async def async_lookup_memo(self, signature: str) -> dict | None:
         """Asynchronously look up a memo by signature."""
         return await anyio.to_thread.run_sync(self.lookup_memo, signature)
+
+    async def async_peek_memo(self, signature: str) -> dict | None:
+        """Asynchronously fetch a memo without touching hit/miss telemetry."""
+        return await anyio.to_thread.run_sync(self.peek_memo, signature)
+
+    async def async_record_memo_hit(self, signature: str) -> None:
+        """Asynchronously mark a memo as a counted hit."""
+        await anyio.to_thread.run_sync(self.record_memo_hit, signature)
+
+    async def async_record_memo_miss(self) -> None:
+        """Asynchronously increment the miss counter."""
+        await anyio.to_thread.run_sync(self.record_memo_miss)
 
     async def async_update_memo_outcome(self, signature: str, outcome: float, verified: bool = False) -> bool:
         """Asynchronously update memo outcome."""

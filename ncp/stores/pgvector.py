@@ -828,7 +828,6 @@ class PgvectorStore(BaseStore):
                             task = EXCLUDED.task,
                             result_summary = EXCLUDED.result_summary,
                             chunk_ids = EXCLUDED.chunk_ids,
-                            created_at = EXCLUDED.created_at,
                             output_tokens_est = EXCLUDED.output_tokens_est
                         """
                     ),
@@ -843,6 +842,20 @@ class PgvectorStore(BaseStore):
                 self._close_cursor(cursor)
 
     def lookup_memo(self, signature: str) -> dict | None:
+        """Look up a memo, unconditionally counting a hit if found and fresh.
+
+        See ``BaseStore.lookup_memo`` for why callers that apply further
+        usability gating should prefer ``peek_memo`` + ``record_memo_hit``/
+        ``record_memo_miss`` instead.
+        """
+        memo = self.peek_memo(signature)
+        if memo is None:
+            self._bump_memo_miss()
+            return None
+        self.record_memo_hit(signature)
+        return memo
+
+    def peek_memo(self, signature: str) -> dict | None:
         with self._connect() as connection:
             cursor = connection.cursor()
             try:
@@ -856,13 +869,14 @@ class PgvectorStore(BaseStore):
             finally:
                 self._close_cursor(cursor)
         if row is None:
-            self._bump_memo_miss()
             return None
         max_age = self.config.memoization_max_age_hours if self.config is not None else 24
         age_seconds = time.time() - float(row["created_at"])
         if age_seconds > max_age * 3600:
-            self._bump_memo_miss()
             return None
+        return dict(row)
+
+    def record_memo_hit(self, signature: str) -> None:
         with self._connect() as connection:
             cursor = connection.cursor()
             try:
@@ -877,7 +891,9 @@ class PgvectorStore(BaseStore):
                 connection.commit()
             finally:
                 self._close_cursor(cursor)
-        return dict(row)
+
+    def record_memo_miss(self) -> None:
+        self._bump_memo_miss()
 
     def update_memo_outcome(self, signature: str, outcome: float, verified: bool = False) -> bool:
         with self._connect() as connection:

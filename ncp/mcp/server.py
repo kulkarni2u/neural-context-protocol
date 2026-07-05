@@ -351,6 +351,17 @@ MCP_TOOLS: list[dict[str, object]] = [
                         "estimated from result_summary when omitted"
                     ),
                 },
+                "kind": {
+                    "type": "string",
+                    "enum": ["function", "class", "module"],
+                    "description": (
+                        "Optional declared shape of result_summary when it holds code. "
+                        "If set, result_summary must parse as Python and (for 'function'/"
+                        "'class') contain a matching top-level def/class, or the memo is "
+                        "rejected. This is a structural presence check only — it does not "
+                        "verify correctness or safety of the code."
+                    ),
+                },
             },
             "required": ["task", "chunk_ids"],
         },
@@ -854,9 +865,16 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             task = str(args.get("task", ""))
             context = str(args.get("context", ""))
             sig = compute_memo_signature(task, context)
-        memo = store.lookup_memo(str(sig))
+        sig = str(sig)
+        # Use the telemetry-neutral peek here, not `store.lookup_memo` — the
+        # latter unconditionally counts a hit as soon as a fresh row exists,
+        # before the outcome/verified gating below runs. We only want to
+        # count a hit once we know the memo will actually be returned as
+        # usable; anything else (not found, stale, or gated) is a miss.
+        memo = store.peek_memo(sig)
         result: dict[str, object] = {"found": False, "memo": None}
         cfg = config
+        usable = False
         if memo is not None and (cfg is None or cfg.memoization_enabled):
             # Apply outcome and verified gating at the handler level
             gated = False
@@ -866,22 +884,39 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
                 elif not cfg.memoization_allow_unverified and not bool(memo.get("verified", 0)):
                     gated = True
             if not gated:
+                usable = True
                 result = {"found": True, "memo": dict(memo)}
+        if usable:
+            store.record_memo_hit(sig)
+        else:
+            store.record_memo_miss()
         counters = _memo_counters()
         if counters is not None:
             result["stats"] = counters
         return result
 
     def _handle_record_memo(args: dict[str, object]) -> object:
-        from ncp.stores.memo import compute_memo_signature
+        from ncp.stores.memo import compute_memo_signature, validate_code_memo_ast
         task = str(args.get("task", ""))
         sig = args.get("signature")
         if sig is None:
             sig = compute_memo_signature(task)
+        sig = str(sig)
         chunk_ids = [str(c) for c in list(args.get("chunk_ids", []) or [])]
         result_summary = args.get("result_summary")
         if result_summary is not None:
             result_summary = str(result_summary)
+        kind = args.get("kind")
+        if kind is not None:
+            kind = str(kind)
+            if not validate_code_memo_ast(result_summary or "", kind):
+                return {
+                    "recorded": False,
+                    "signature": sig,
+                    "error": (
+                        f"result_summary does not parse as Python matching declared kind {kind!r}"
+                    ),
+                }
         output_tokens_est: int | None = None
         raw_tokens = args.get("output_tokens_est")
         if raw_tokens is not None:
@@ -890,9 +925,9 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             except (TypeError, ValueError):
                 output_tokens_est = None
         recorded = store.record_memo(
-            str(sig), task, chunk_ids, result_summary, output_tokens_est
+            sig, task, chunk_ids, result_summary, output_tokens_est
         )
-        return {"recorded": recorded, "signature": str(sig)}
+        return {"recorded": recorded, "signature": sig}
 
     # Expose the in-memory fetch-session table for observability/testing of the
     # LRU+TTL pruning without widening the returned handler mapping.

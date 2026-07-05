@@ -21,6 +21,7 @@ from difflib import SequenceMatcher
 from typing import Any, AsyncIterator
 
 import anyio
+import structlog
 
 from ncp.stores.base import BaseStore, NCPStoreUnavailableError
 from ncp.stores.pgvector import (
@@ -55,6 +56,8 @@ from ncp.types import (
     TurnRecord,
     Whisper,
 )
+
+_logger = structlog.get_logger(__name__)
 
 
 class AsyncPgvectorStore(BaseStore):
@@ -1165,7 +1168,6 @@ class AsyncPgvectorStore(BaseStore):
                             task = EXCLUDED.task,
                             result_summary = EXCLUDED.result_summary,
                             chunk_ids = EXCLUDED.chunk_ids,
-                            created_at = EXCLUDED.created_at,
                             output_tokens_est = EXCLUDED.output_tokens_est
                         """
                     ),
@@ -1188,30 +1190,48 @@ class AsyncPgvectorStore(BaseStore):
                     )
                 )
 
+    async def async_record_memo_miss(self) -> None:
+        """Public entry point for bumping the miss counter (S4.1)."""
+        await self._abump_memo_miss()
+
     async def async_memo_stats(self) -> dict[str, int]:
         """Aggregate memoization telemetry: hits, misses, entries, tokens saved.
 
         ``estimated_tokens_saved`` is an estimate: SUM(hit_count * output_tokens_est).
+
+        If the query fails (e.g. the memo tables are missing because
+        migrations haven't run, or the connection drops), this logs a
+        warning and re-raises rather than masking the failure as an
+        all-zero result — a genuine error must not look identical to "no
+        memo activity yet".
         """
-        async with self._aconnect() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute(
-                    self._sql(
-                        "SELECT COUNT(*) AS entry_count,"
-                        " COALESCE(SUM(hit_count), 0) AS hits,"
-                        " COALESCE(SUM(hit_count * output_tokens_est), 0) AS tokens_saved"
-                        " FROM {schema}.{prefix}memo_entries"
+        try:
+            async with self._aconnect() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        self._sql(
+                            "SELECT COUNT(*) AS entry_count,"
+                            " COALESCE(SUM(hit_count), 0) AS hits,"
+                            " COALESCE(SUM(hit_count * output_tokens_est), 0) AS tokens_saved"
+                            " FROM {schema}.{prefix}memo_entries"
+                        )
                     )
-                )
-                row = await self._afetchone(cur)
-            async with conn.cursor() as cur:
-                await cur.execute(
-                    self._sql(
-                        "SELECT stat_value FROM {schema}.{prefix}memo_stats"
-                        " WHERE stat_key = 'misses'"
+                    row = await self._afetchone(cur)
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        self._sql(
+                            "SELECT stat_value FROM {schema}.{prefix}memo_stats"
+                            " WHERE stat_key = 'misses'"
+                        )
                     )
-                )
-                miss_row = await self._afetchone(cur)
+                    miss_row = await self._afetchone(cur)
+        except Exception:
+            _logger.warning(
+                "ncp.memo_stats.query_failed",
+                exc_info=True,
+                hint="memo_entries/memo_stats tables may be missing or unreachable",
+            )
+            raise
         return {
             "hits": int(row["hits"]) if row is not None else 0,
             "misses": int(miss_row["stat_value"]) if miss_row is not None else 0,
@@ -1220,6 +1240,20 @@ class AsyncPgvectorStore(BaseStore):
         }
 
     async def async_lookup_memo(self, signature: str) -> dict | None:
+        """Look up a memo, unconditionally counting a hit if found and fresh.
+
+        See ``BaseStore.lookup_memo`` for why callers that apply further
+        usability gating should prefer ``async_peek_memo`` + ``async_record_memo_hit``/
+        ``async_record_memo_miss`` instead.
+        """
+        memo = await self.async_peek_memo(signature)
+        if memo is None:
+            await self._abump_memo_miss()
+            return None
+        await self.async_record_memo_hit(signature)
+        return memo
+
+    async def async_peek_memo(self, signature: str) -> dict | None:
         async with self._aconnect() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
@@ -1231,14 +1265,15 @@ class AsyncPgvectorStore(BaseStore):
                 raw = await cur.fetchone()
                 description = cur.description
         if raw is None:
-            await self._abump_memo_miss()
             return None
         row = self._normalize_row(raw, description)
         max_age = self.config.memoization_max_age_hours if self.config is not None else 24
         age_seconds = time.time() - float(row["created_at"])
         if age_seconds > max_age * 3600:
-            await self._abump_memo_miss()
             return None
+        return dict(row)
+
+    async def async_record_memo_hit(self, signature: str) -> None:
         async with self._aconnect() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
@@ -1249,7 +1284,6 @@ class AsyncPgvectorStore(BaseStore):
                     ),
                     (time.time(), signature),
                 )
-        return dict(row)
 
     async def async_update_memo_outcome(self, signature: str, outcome: float, verified: bool = False) -> bool:
         async with self._aconnect() as conn:

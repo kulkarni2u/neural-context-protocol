@@ -818,37 +818,58 @@ class SQLiteStore(BaseStore):
             connection.execute("BEGIN IMMEDIATE")
             connection.execute(
                 """
-                INSERT OR REPLACE INTO memo_entries
+                INSERT INTO memo_entries
                     (signature, task, result_summary, chunk_ids, outcome, verified, created_at,
                      last_hit_at, hit_count, output_tokens_est)
                 VALUES (?, ?, ?, ?, 0.0, 0, ?, 0.0, 0, ?)
+                ON CONFLICT(signature) DO UPDATE SET
+                    task = excluded.task,
+                    result_summary = excluded.result_summary,
+                    chunk_ids = excluded.chunk_ids,
+                    output_tokens_est = excluded.output_tokens_est
                 """,
                 (signature, task, result_summary, json.dumps(chunk_ids), time.time(), max(0, int(output_tokens_est))),
             )
             return True
 
     def lookup_memo(self, signature: str) -> dict | None:
+        """Look up a memo, unconditionally counting a hit if found and fresh.
+
+        See ``BaseStore.lookup_memo`` for why callers that apply further
+        usability gating (e.g. ``ncp_lookup_memo``'s outcome/verified checks)
+        should prefer ``peek_memo`` + ``record_memo_hit``/``record_memo_miss``.
+        """
+        memo = self.peek_memo(signature)
+        if memo is None:
+            self._bump_memo_miss()
+            return None
+        self.record_memo_hit(signature)
+        return memo
+
+    def peek_memo(self, signature: str) -> dict | None:
         with self._connect() as connection:
             row = connection.execute(
                 "SELECT * FROM memo_entries WHERE signature = ?",
                 (signature,),
             ).fetchone()
         if row is None:
-            self._bump_memo_miss()
             return None
         # Check staleness
         max_age = self.config.memoization_max_age_hours if self.config is not None else 24
         age_seconds = time.time() - float(row["created_at"])
         if age_seconds > max_age * 3600:
-            self._bump_memo_miss()
             return None
-        # Update hit tracking
+        return dict(row)
+
+    def record_memo_hit(self, signature: str) -> None:
         with self._connect() as connection:
             connection.execute(
                 "UPDATE memo_entries SET hit_count = hit_count + 1, last_hit_at = ? WHERE signature = ?",
                 (time.time(), signature),
             )
-        return dict(row)
+
+    def record_memo_miss(self) -> None:
+        self._bump_memo_miss()
 
     def _bump_memo_miss(self) -> None:
         """Increment the S4.1 memoization miss counter."""
