@@ -170,3 +170,64 @@ def test_distillation_config_defaults_and_overrides(tmp_path) -> None:
     )
     assert config.distillation_enabled is False
     assert config.distillation_min_chunk_tokens == 64
+
+
+def test_budget_governor_config_defaults(tmp_path: Path) -> None:
+    project = tmp_path / "repo"
+    (project / ".git").mkdir(parents=True)
+
+    config = load_config(cwd=project)
+
+    assert config.pipeline_budget_usd is None
+    assert config.budget_warn_fraction == pytest.approx(0.8)
+    assert config.budget_enforcement == "warn"
+
+
+def test_budget_governor_config_file_and_env_overrides(tmp_path: Path) -> None:
+    project = tmp_path / "repo"
+    (project / ".git").mkdir(parents=True)
+    (project / ".ncp").mkdir()
+    (project / ".ncp" / "config.toml").write_text(
+        "[budget]\npipeline_budget_usd = 5.0\nbudget_warn_fraction = 0.5\n"
+        "budget_enforcement = \"block\"\n"
+    )
+
+    config = load_config(cwd=project)
+    assert config.pipeline_budget_usd == pytest.approx(5.0)
+    assert config.budget_warn_fraction == pytest.approx(0.5)
+    assert config.budget_enforcement == "block"
+
+    config = load_config(
+        cwd=project,
+        env={
+            "NCP_PIPELINE_BUDGET_USD": "12.5",
+            "NCP_BUDGET_WARN_FRACTION": "0.9",
+            "NCP_BUDGET_ENFORCEMENT": "off",
+        },
+    )
+    assert config.pipeline_budget_usd == pytest.approx(12.5)
+    assert config.budget_warn_fraction == pytest.approx(0.9)
+    assert config.budget_enforcement == "off"
+
+
+def test_budget_governor_env_override_can_clear_pipeline_budget(tmp_path: Path) -> None:
+    project = tmp_path / "repo"
+    (project / ".git").mkdir(parents=True)
+    (project / ".ncp").mkdir()
+    (project / ".ncp" / "config.toml").write_text("[budget]\npipeline_budget_usd = 5.0\n")
+
+    config = load_config(cwd=project, env={"NCP_PIPELINE_BUDGET_USD": ""})
+    assert config.pipeline_budget_usd is None
+
+
+def test_budget_enforcement_falls_back_to_warn_for_unknown_value(tmp_path: Path) -> None:
+    project = tmp_path / "repo"
+    (project / ".git").mkdir(parents=True)
+    (project / ".ncp").mkdir()
+    (project / ".ncp" / "config.toml").write_text(
+        "[budget]\nbudget_enforcement = \"nonsense\"\n"
+    )
+
+    config = load_config(cwd=project)
+    assert config.budget_enforcement == "warn"
+

@@ -32,6 +32,17 @@ Audit remediation from `docs/NCP_AUDIT_AND_REMEDIATION_PLAN.md`. One work item
 
 ### Added
 
+- **Per-pipeline cost governor** (`ncp/budget.py`, `ncp/mcp/server.py`,
+  `ncp/config.py`): opt-in `[budget].pipeline_budget_usd` ceiling, classified
+  against cumulative recorded spend from the existing CAP-E1 `cost_log` (never
+  an estimate) via `budget_warn_fraction` (**default `0.8`**) and
+  `budget_enforcement` (**default `"warn"`**: `"off"` | `"warn"` | `"block"`).
+  `ncp_get_context` and `ncp_post_turn` surface a `budget` block
+  (`spent_usd`/`budget_usd`/`fraction_used`/`status`) whenever a budget is
+  configured; in `"block"` mode an already-exceeded pipeline gets a structured
+  `{"budget_exceeded": true, ...}` refusal from `ncp_get_context` instead of an
+  exception, before any assembly work runs. Unset `pipeline_budget_usd`
+  (default) keeps the governor fully off. (CAP-E2)
 - **Outcome-calibrated reputation** (`ncp/types.py`, `ncp/stores/base.py`,
   `ncp/stores/calibration.py`, `ncp/stores/sqlite.py`, `ncp/stores/pgvector.py`,
   `ncp/stores/pgvector_async.py`, `ncp/mcp/server.py`,

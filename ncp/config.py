@@ -45,6 +45,11 @@ DEFAULT_CONFIG = {
         "whisper_cap_default": 3,
         "whisper_cap_high": 2,
         "whisper_cap_critical": 1,
+        # CAP-E2: per-pipeline $ budget governance over real (CAP-E1) cost
+        # accounting. None (default) disables the governor entirely.
+        "pipeline_budget_usd": None,
+        "budget_warn_fraction": 0.8,
+        "budget_enforcement": "warn",
     },
     "chunking": {
         "max_chunk_tokens": 200,
@@ -281,6 +286,22 @@ class NCPConfig:
         return int(self.values.get("budget", {}).get("whisper_cap_critical", 1))
 
     @property
+    def pipeline_budget_usd(self) -> float | None:
+        """CAP-E2: per-pipeline $ spend ceiling. None (default) disables the governor."""
+        val = self.values.get("budget", {}).get("pipeline_budget_usd")
+        return None if val is None else float(val)
+
+    @property
+    def budget_warn_fraction(self) -> float:
+        return float(self.values.get("budget", {}).get("budget_warn_fraction", 0.8))
+
+    @property
+    def budget_enforcement(self) -> str:
+        """CAP-E2 enforcement mode: 'off' | 'warn' | 'block'. Falls back to 'warn' for unknown values."""
+        val = str(self.values.get("budget", {}).get("budget_enforcement", "warn"))
+        return val if val in {"off", "warn", "block"} else "warn"
+
+    @property
     def whisper_ttl_default(self) -> int:
         return int(self.values.get("whispers", {}).get("default_ttl_seconds", 1800))
 
@@ -440,6 +461,13 @@ def _apply_env_overrides(values: dict[str, Any], env: dict[str, str]) -> None:
         values["reputation"]["confidence_k"] = int(env["NCP_REPUTATION_CONFIDENCE_K"])
     if "NCP_AUTH_TOKEN" in env:
         values["server"]["auth_token"] = env["NCP_AUTH_TOKEN"]
+    if "NCP_PIPELINE_BUDGET_USD" in env:
+        raw_budget = env["NCP_PIPELINE_BUDGET_USD"]
+        values["budget"]["pipeline_budget_usd"] = None if raw_budget == "" else float(raw_budget)
+    if "NCP_BUDGET_WARN_FRACTION" in env:
+        values["budget"]["budget_warn_fraction"] = float(env["NCP_BUDGET_WARN_FRACTION"])
+    if "NCP_BUDGET_ENFORCEMENT" in env:
+        values["budget"]["budget_enforcement"] = env["NCP_BUDGET_ENFORCEMENT"]
 
 
 def _deep_merge(target: dict[str, Any], updates: dict[str, Any]) -> None:

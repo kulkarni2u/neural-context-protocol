@@ -8,6 +8,7 @@ import threading
 from pathlib import Path
 
 import httpx
+import pytest
 
 from ncp.version import __version__
 from ncp.config import load_config
@@ -1516,3 +1517,137 @@ class TestStreamingGetContext:
         )
         assert assembled_from_sections == non_stream_context
         assert stream_result.handler_result["context"] == non_stream_context
+
+
+class TestCostGovernor:
+    """CAP-E2: per-pipeline budget governance."""
+
+    def _post_turn(self, handlers: dict, *, pipeline_id: str, cost_usd: float, turn_id: str) -> object:
+        return _content(_handle_request(
+            _call("ncp_post_turn", {
+                "agent_id": "builder",
+                "role": "build",
+                "task": "test",
+                "slot": "test",
+                "intent": "test",
+                "pipeline_id": pipeline_id,
+                "turn_id": turn_id,
+                "result_summary": "summary",
+                "result_full": "full result",
+                "model": "gpt-4o-mini",
+                "cost_usd": cost_usd,
+            }),
+            handlers,
+        ))
+
+    def _get_context(self, handlers: dict, *, pipeline_id: str) -> object:
+        return _content(_handle_request(
+            _call("ncp_get_context", {
+                "agent_id": "builder",
+                "role": "build",
+                "owns": [],
+                "must_not": [],
+                "task": "test",
+                "slot": "test",
+                "intent": "test",
+                "pipeline_id": pipeline_id,
+            }),
+            handlers,
+        ))
+
+    def test_no_budget_configured_is_a_no_op(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "gov.db")
+        handlers = make_handlers(store, config=load_config(cwd=tmp_path))
+
+        posted = self._post_turn(handlers, pipeline_id="pipe_gov", cost_usd=100.0, turn_id="t1")
+        context = self._get_context(handlers, pipeline_id="pipe_gov")
+
+        assert "budget" not in posted
+        assert "budget" not in context
+
+    def test_off_enforcement_is_a_no_op_even_with_budget_set(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "gov_off.db")
+        config = load_config(cwd=tmp_path)
+        config.values["budget"]["pipeline_budget_usd"] = 1.0
+        config.values["budget"]["budget_enforcement"] = "off"
+        handlers = make_handlers(store, config=config)
+
+        posted = self._post_turn(handlers, pipeline_id="pipe_gov", cost_usd=100.0, turn_id="t1")
+        context = self._get_context(handlers, pipeline_id="pipe_gov")
+
+        assert "budget" not in posted
+        assert "budget" not in context
+
+    def test_spend_accumulates_across_turns(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "gov_accum.db")
+        config = load_config(cwd=tmp_path)
+        config.values["budget"]["pipeline_budget_usd"] = 10.0
+        config.values["budget"]["budget_warn_fraction"] = 0.8
+        handlers = make_handlers(store, config=config)
+
+        first = self._post_turn(handlers, pipeline_id="pipe_accum", cost_usd=3.0, turn_id="t1")
+        assert first["budget"] == {
+            "spent_usd": 3.0,
+            "budget_usd": 10.0,
+            "fraction_used": 0.3,
+            "status": "ok",
+        }
+
+        second = self._post_turn(handlers, pipeline_id="pipe_accum", cost_usd=3.0, turn_id="t2")
+        assert second["budget"]["spent_usd"] == pytest.approx(6.0)
+        assert second["budget"]["fraction_used"] == pytest.approx(0.6)
+        assert second["budget"]["status"] == "ok"
+
+        context = self._get_context(handlers, pipeline_id="pipe_accum")
+        assert context["budget"]["spent_usd"] == pytest.approx(6.0)
+
+        # A separate pipeline's spend must not bleed into this one's total.
+        self._post_turn(handlers, pipeline_id="pipe_other", cost_usd=50.0, turn_id="other1")
+        unaffected = self._get_context(handlers, pipeline_id="pipe_accum")
+        assert unaffected["budget"]["spent_usd"] == pytest.approx(6.0)
+
+    def test_warn_threshold_crossing(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "gov_warn.db")
+        config = load_config(cwd=tmp_path)
+        config.values["budget"]["pipeline_budget_usd"] = 10.0
+        config.values["budget"]["budget_warn_fraction"] = 0.5
+        handlers = make_handlers(store, config=config)
+
+        below = self._post_turn(handlers, pipeline_id="pipe_warn", cost_usd=4.0, turn_id="t1")
+        assert below["budget"]["status"] == "ok"
+
+        crossing = self._post_turn(handlers, pipeline_id="pipe_warn", cost_usd=2.0, turn_id="t2")
+        assert crossing["budget"]["fraction_used"] == pytest.approx(0.6)
+        assert crossing["budget"]["status"] == "warning"
+
+    def test_block_mode_refuses_get_context_once_exceeded(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "gov_block.db")
+        config = load_config(cwd=tmp_path)
+        config.values["budget"]["pipeline_budget_usd"] = 1.0
+        config.values["budget"]["budget_enforcement"] = "block"
+        handlers = make_handlers(store, config=config)
+
+        posted = self._post_turn(handlers, pipeline_id="pipe_block", cost_usd=1.5, turn_id="t1")
+        assert posted["budget"]["status"] == "exceeded"
+
+        refusal = self._get_context(handlers, pipeline_id="pipe_block")
+
+        assert refusal["budget_exceeded"] is True
+        assert refusal["context"] == ""
+        assert refusal["budget"]["status"] == "exceeded"
+        assert refusal["session_id"] == "pipe_block:builder"
+        assert "telemetry" not in refusal
+
+    def test_warn_mode_never_blocks_get_context(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "gov_warn_noblock.db")
+        config = load_config(cwd=tmp_path)
+        config.values["budget"]["pipeline_budget_usd"] = 1.0
+        config.values["budget"]["budget_enforcement"] = "warn"
+        handlers = make_handlers(store, config=config)
+
+        self._post_turn(handlers, pipeline_id="pipe_wnb", cost_usd=5.0, turn_id="t1")
+        context = self._get_context(handlers, pipeline_id="pipe_wnb")
+
+        assert "budget_exceeded" not in context
+        assert context["budget"]["status"] == "exceeded"
+        assert "context" in context and isinstance(context["context"], str) and context["context"] != ""

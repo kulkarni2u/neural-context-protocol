@@ -23,6 +23,16 @@ context_token_budget = 840
 warn_at_ratio = 0.70
 critical_at_ratio = 0.85
 recent_slot_budget = 2
+# CAP-E2: per-pipeline $ spend ceiling over real (CAP-E1) recorded cost. None
+# (default) disables the governor entirely -- ncp_get_context/ncp_post_turn
+# never surface a "budget" block when this is unset.
+# pipeline_budget_usd = 5.00
+# Fraction of pipeline_budget_usd at which status flips from "ok" to
+# "warning" (default 0.8).
+# budget_warn_fraction = 0.8
+# "off" (no governance), "warn" (surface status, never refuse), or "block"
+# (ncp_get_context returns {"budget_exceeded": true, ...} once exceeded).
+# budget_enforcement = "warn"
 
 [chunking]
 max_chunk_tokens = 200

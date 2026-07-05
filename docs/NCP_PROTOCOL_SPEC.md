@@ -424,6 +424,54 @@ Semantics:
 
 ---
 
+## 4c. Cost Governance (CAP-E2, normative)
+
+```
+Config gate ([budget] table):
+  pipeline_budget_usd:   float?  — $ ceiling per pipeline_id. None (default)
+                                   disables the governor: no "budget" field
+                                   is ever present in responses.
+  budget_warn_fraction:  float   — fraction of the ceiling at which status
+                                   flips from "ok" to "warning" (default 0.8).
+  budget_enforcement:    str     — "off" | "warn" (default) | "block".
+                                   "off" fully disables the governor even if
+                                   pipeline_budget_usd is set.
+
+Spend source (honesty constraint):
+  spent_usd is read back from store.cost_summary(pipeline_id=...) --
+  the same cost_log rows CAP-E1 populates from real provider usage
+  (cost_source == "measured") or the unpriced (0.0) local/mock estimate
+  path (cost_source == "estimated"). The governor never presents an
+  estimated figure as billed spend.
+
+"budget" block shape (present on ncp_get_context and ncp_post_turn only
+when pipeline_budget_usd is configured and budget_enforcement != "off"):
+  {
+    "spent_usd":      float,  # cumulative recorded cost_usd for this pipeline_id
+    "budget_usd":     float,  # the configured ceiling
+    "fraction_used":  float,  # spent_usd / budget_usd
+    "status":         "ok" | "warning" | "exceeded"
+  }
+  status = "exceeded" once spent_usd >= budget_usd; "warning" once
+  fraction_used >= budget_warn_fraction; "ok" otherwise.
+
+Block-mode refusal (ncp_get_context only):
+  When budget_enforcement == "block" and status == "exceeded", assembly is
+  skipped entirely and ncp_get_context returns a structured refusal instead
+  of an exception:
+    {
+      "budget_exceeded": true,
+      "context": "",
+      "session_id": str,
+      "budget": { ...budget block above, status == "exceeded"... }
+    }
+  ncp_post_turn never blocks (the turn's cost is already spent by the time
+  post_turn runs); it only surfaces the post-turn "budget" block, including
+  when status is "exceeded", so a warn/off-mode host can react on its own.
+```
+
+---
+
 ## 5. Trust Boundaries (normative, first-class)
 
 These rules are enforced by the assembler and store. Not optional.
@@ -770,6 +818,9 @@ cold_start_retry = 2
 max_tokens_per_call = 4000
 warn_at_ratio = 0.70
 critical_at_ratio = 0.85
+# pipeline_budget_usd = 5.00   # CAP-E2; unset (default) disables the governor
+budget_warn_fraction = 0.8     # CAP-E2
+budget_enforcement = "warn"    # CAP-E2: off | warn | block
 
 [chunking]
 max_chunk_tokens = 200

@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import BinaryIO
 
 from ncp.assembler import Assembler
+from ncp.budget import BudgetSnapshot, evaluate_budget
 from ncp.chunker import filter_content
 from ncp.config import NCPConfig, load_config
 from ncp.stores.base import BaseStore
@@ -453,6 +454,32 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
     coordination = getattr(store, "coordination", None)
     default_whisper_ttl = config.whisper_ttl_default if config is not None else 1800
     require_signatures = config.require_signatures if config is not None else False
+    # CAP-E2: per-pipeline budget governance settings.
+    pipeline_budget_usd = config.pipeline_budget_usd if config is not None else None
+    budget_warn_fraction = config.budget_warn_fraction if config is not None else 0.8
+    budget_enforcement = config.budget_enforcement if config is not None else "warn"
+
+    def _budget_snapshot(*, pipeline_id: str | None) -> BudgetSnapshot | None:
+        """CAP-E2: read real recorded spend and classify it against the ceiling.
+
+        Returns ``None`` when no budget is configured, the governor is off,
+        or the store cannot report cost (never fabricates a number).
+        """
+        if pipeline_budget_usd is None or budget_enforcement == "off":
+            return None
+        cost_summary_fn = getattr(store, "cost_summary", None)
+        if not callable(cost_summary_fn):
+            return None
+        try:
+            summary = cost_summary_fn(pipeline_id=pipeline_id, limit=1)
+            spent_usd = float(summary.get("summary", {}).get("cost_usd_total", 0.0))
+        except Exception:
+            return None
+        return evaluate_budget(
+            spent_usd=spent_usd,
+            budget_usd=pipeline_budget_usd,
+            warn_fraction=budget_warn_fraction,
+        )
 
     def _prune_sessions() -> None:
         # Caller must hold sessions_lock. Drop expired entries, then LRU-evict
@@ -517,8 +544,21 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
                 _prune_sessions()
         conscious = _build_conscious_from_args(store, args)
         budget = _budget_from_args(args, conscious=conscious)
+
+        # CAP-E2: pre-flight budget check. In "block" mode an already-exceeded
+        # pipeline gets a structured refusal instead of paying for assembly.
+        budget_snapshot = _budget_snapshot(pipeline_id=normalized_pipeline_id)
+        if budget_snapshot is not None and budget_enforcement == "block" and budget_snapshot.status == "exceeded":
+            return {
+                "budget_exceeded": True,
+                "context": "",
+                "session_id": session_id,
+                "budget": budget_snapshot.to_dict(),
+            }
+
         assembler = Assembler(store=store, config=config)
         stream = bool(args.get("stream", False))
+        search_text = conscious.task + " " + conscious.slot
         try:
             caller_k: int | None = max(1, int(args["k"])) if "k" in args else None  # type: ignore[arg-type]
         except (ValueError, TypeError):
@@ -535,35 +575,41 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             stream_result = assembler.assemble(
                 conscious=conscious,
                 budget=budget,
-                query_text=conscious.task + " " + conscious.slot,
+                query_text=search_text,
                 k=caller_k,
                 diversity_limit=caller_diversity_limit,
                 max_tokens=caller_max_tokens,
             )
             sections = assembler.sections_from_result(result=stream_result, budget=budget)
+            handler_result: dict[str, object] = {
+                "context": stream_result.context,
+                "session_id": session_id,
+                "pending_whisper_ids": stream_result.pending_whisper_ids,
+                "telemetry": _context_telemetry(stream_result, session_id=session_id),
+            }
+            if budget_snapshot is not None:
+                handler_result["budget"] = budget_snapshot.to_dict()
             return StreamResponse(
                 sections=sections,
-                handler_result={
-                    "context": stream_result.context,
-                    "session_id": session_id,
-                    "pending_whisper_ids": stream_result.pending_whisper_ids,
-                    "telemetry": _context_telemetry(stream_result, session_id=session_id),
-                },
+                handler_result=handler_result,
             )
         result = assembler.assemble(
             conscious=conscious,
             budget=budget,
-            query_text=conscious.task + " " + conscious.slot,
+            query_text=search_text,
             k=caller_k,
             diversity_limit=caller_diversity_limit,
             max_tokens=caller_max_tokens,
         )
-        return {
+        response: dict[str, object] = {
             "context": result.context,
             "session_id": session_id,
             "pending_whisper_ids": result.pending_whisper_ids,
             "telemetry": _context_telemetry(result, session_id=session_id),
         }
+        if budget_snapshot is not None:
+            response["budget"] = budget_snapshot.to_dict()
+        return response
 
     def _handle_write_memory(args: dict[str, object]) -> object:
         written_by = str(args.get("written_by", "agent"))
@@ -718,6 +764,10 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         # WI-007(a): surface dedup-suppressed memory writes to the host.
         if record.suppressed_chunk_ids:
             result["suppressed_chunk_ids"] = record.suppressed_chunk_ids
+        # CAP-E2: reflect spend *after* this turn's cost was just logged above.
+        budget_snapshot = _budget_snapshot(pipeline_id=conscious.pipeline_id)
+        if budget_snapshot is not None:
+            result["budget"] = budget_snapshot.to_dict()
         return result
 
     def _handle_fetch(args: dict[str, object]) -> object:
