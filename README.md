@@ -213,7 +213,7 @@ Per-chunk trust is only half the story. Trust on the bus also attaches to *who w
 
 ## Agent identity and reputation
 
-In a multi-agent system, "how much do I trust this message" depends on *who sent it*. NCP gives agents real, cryptographic identities, lets them optionally sign what they write, and tracks a reputation for each one. Reputation is computed and displayed today; weighting retrieval by an author's track record is the next step on the [roadmap](./docs/NCP_NORTH_STAR_CAPABILITY_ROADMAP.md) (CAP-T4 / WI-015), not yet live.
+In a multi-agent system, "how much do I trust this message" depends on *who sent it*. NCP gives agents real, cryptographic identities, lets them optionally sign what they write, and tracks a reputation for each one. Reputation is computed and displayed by default; it can also weight retrieval and gate whispers, but only when an operator opts in (CAP-T4 — see below).
 
 **Cryptographic identity.** `ncp identity create` generates an [Ed25519](https://ed25519.cr.yp.to/) keypair; the identity ID is derived from the SHA-256 of the public key, and the secret key is written to a `0700` keystore (`~/.ncp/keys`, or `NCP_KEYSTORE_DIR`). Public keys are registered in the store; keys can be listed and revoked.
 
@@ -231,7 +231,12 @@ ncp identity revoke <identity_id>
 ncp reputation             # score, confidence, and observation count per identity
 ```
 
-Tune it under `[reputation]` in `.ncp/config.toml` (`gain`, `forget`, `confidence_k`) or via `NCP_REPUTATION_*`. An agent that has repeatedly produced disputed memory earns a lower reputation. Today that score is **computed and displayed but does not yet weight retrieval or gate whispers** — wiring reputation into ranking is the next sprint (CAP-T4 / WI-015 on the [roadmap](./docs/NCP_NORTH_STAR_CAPABILITY_ROADMAP.md)).
+Tune it under `[reputation]` in `.ncp/config.toml` (`gain`, `forget`, `confidence_k`) or via `NCP_REPUTATION_*`. An agent that has repeatedly produced disputed memory earns a lower reputation. Since Sprint 4 that score can also act on the bus — each piece is **opt-in and off by default**:
+
+- **Outcomes as evidence** (CAP-T3) — `ncp_record_outcome` records task success/failure against the chunks (or turn) that informed it; `ncp calibrate --feedback` consumes each outcome exactly once as the primary trust/reputation signal, ahead of the retrieval-count prior (`[retrieval].usage_prior_weight`).
+- **Reputation-weighted retrieval** (CAP-T4) — `[retrieval].reputation_weight` (default `0.0`) blends the author's reputation confidence into chunk trust at ranking time, identically across the SQLite, pgvector, and async pgvector backends.
+- **Whisper gating** (CAP-T4) — `[whispers].min_author_reputation` (default `0.0`) drops whispers from low-reputation authors at drain time. It gates on the *claimed* sender: sender identity is only as strong as `[identity].require_signatures` enforcement, which also stays off by default.
+- **Work memoization** (CAP-C3) — `[memoization].enabled` (default `false`) turns on `ncp_lookup_memo`/`ncp_record_memo`, a signature-keyed memo of completed work. It is lookup-only: NCP surfaces memo hits, misses, and an *estimated* tokens-saved figure in `ncp status`, and the host decides whether a memo lets it skip its own model call.
 
 -----
 

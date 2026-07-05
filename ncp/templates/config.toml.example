@@ -32,6 +32,12 @@ default_type = "auto"
 default_ttl_seconds = 1800
 max_per_drain = 3
 min_confidence = 0.60
+# Drop whispers whose author's Beta-reputation confidence is below this
+# threshold (CAP-T4). 0.0 (default) disables gating. NOTE: this gates on the
+# whisper's claimed sender — sender identity is only as strong as
+# [identity].require_signatures enforcement, so enable that too if authorship
+# matters.
+# min_author_reputation = 0.0
 
 [observability]
 log_level = "info"
@@ -47,6 +53,28 @@ confidence_k = 20
 # Redundancy-aware MMR selection before context budget fitting.
 # 1.0 preserves pure relevance ordering; 0.7 is a recommended starting point.
 # diversity_lambda = 1.0
+# Blend each author's reputation confidence into chunk trust at query time
+# (CAP-T4): blended = (1-w)*base_trust + w*confidence. 0.0 (default) disables.
+# reputation_weight = 0.0
+# Scale of the retrieval-count prior during `ncp calibrate --feedback` once
+# outcome evidence (CAP-T3) exists; 1.0 (default) keeps the historical prior,
+# 0.0 makes recorded outcomes the only trust signal.
+# usage_prior_weight = 1.0
+
+# [memoization]
+# Opt-in semantic work memoization (CAP-C3). Lookup-only: the host decides
+# whether a returned memo lets it skip its model call.
+# Master switch; ncp_lookup_memo returns nothing while false (default).
+# enabled = false
+# Memos older than this many hours are treated as stale misses (default 24).
+# max_age_hours = 24
+# Minimum recorded outcome score a memo needs to be returned (default 0.0).
+# min_outcome = 0.0
+# Return memos that were never verified via update_memo_outcome (default false).
+# allow_unverified = false
+# Reserved for similarity-based signature matching (default 0.95; exact
+# signature match is what ships today).
+# similarity_threshold = 0.95
 
 # [embedding]
 # Opt-in local semantic embeddings for SQLite hybrid/vector retrieval. Install

@@ -32,6 +32,44 @@ Audit remediation from `docs/NCP_AUDIT_AND_REMEDIATION_PLAN.md`. One work item
 
 ### Added
 
+- **Outcome-calibrated reputation** (`ncp/types.py`, `ncp/stores/base.py`,
+  `ncp/stores/calibration.py`, `ncp/stores/sqlite.py`, `ncp/stores/pgvector.py`,
+  `ncp/stores/pgvector_async.py`, `ncp/mcp/server.py`,
+  `ncp/migrations/009_add_outcomes_table.sql`): new `ncp_record_outcome` MCP
+  tool persists task success/failure evidence (`OutcomeRecord`, additive
+  `outcomes` table, pgvector migration `009`) keyed by `turn_id` or explicit
+  `chunk_ids`. `ncp calibrate --feedback` consumes unconsumed outcomes as the
+  primary trust signal (with `[retrieval].usage_prior_weight` scaling the old
+  retrieval-count prior) and marks them consumed, so re-running with no new
+  outcomes is idempotent. Implemented across all three store backends. (CAP-T3)
+- **Reputation-weighted retrieval and whisper gating** (`ncp/stores/retrieval.py`,
+  `ncp/stores/sqlite.py`, `ncp/stores/pgvector.py`, `ncp/stores/pgvector_async.py`,
+  `ncp/config.py`): `[retrieval].reputation_weight` (**default `0.0`**, off)
+  blends each author's Beta-reputation confidence into chunk `base_trust` at
+  query time — `(1-w)·base_trust + w·(alpha/(alpha+beta))`, unknown authors
+  unchanged — and `[whispers].min_author_reputation` (**default `0.0`**, off)
+  makes `drain_whispers` drop whispers whose author's reputation confidence is
+  below the threshold. Defaults preserve exact prior behavior. (CAP-T4)
+- **Semantic work memoization** (`ncp/stores/memo.py`, `ncp/stores/base.py`,
+  `ncp/stores/sqlite.py`, `ncp/stores/pgvector.py`, `ncp/stores/pgvector_async.py`,
+  `ncp/mcp/server.py`, `ncp/config.py`): opt-in `ncp_lookup_memo` /
+  `ncp_record_memo` MCP tools keyed by a normalized task+context SHA-256
+  signature (additive `memo_entries` table). Lookups are gated by
+  `[memoization]` config (`enabled` **default `false`**, staleness
+  `max_age_hours`, `min_outcome` floor, `allow_unverified`) and are
+  advisory-only: the host decides whether a returned memo lets it skip its
+  model call. (CAP-C3)
+- **Sprint 4.1 cleanup** (`ncp/stores/pgvector_async.py`,
+  `ncp/stores/retrieval.py`, `ncp/stores/sqlite.py`, `ncp/stores/pgvector.py`,
+  `ncp/cli.py`, `ncp/mcp/server.py`, `ncp/migrations/010_add_memo_telemetry.sql`):
+  port CAP-T4 reputation-weighted retrieval to `AsyncPgvectorStore.async_query`
+  for sync/async ranking parity; consolidate the blending formula into a single
+  shared `blend_trust` helper used by every backend; and surface memoization
+  telemetry — memo hits, misses, and estimated tokens saved
+  (`SUM(hit_count · output_tokens_est)`, an estimate) — in `ncp status` and
+  `ncp_lookup_memo` responses via an additive `output_tokens_est` column and
+  `memo_stats` counter table (pgvector migration `010`). Status output is
+  unchanged unless memoization is enabled or has data. (S4.1)
 - **Local semantic embeddings for the SQLite tier** (`ncp/adapters/embedding.py`,
   `ncp/stores/sqlite.py`, `ncp/stores/factory.py`, `ncp/config.py`): add an
   opt-in `local-embeddings` extra backed by fastembed, persist SQLite chunk
