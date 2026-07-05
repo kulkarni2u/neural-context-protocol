@@ -7,6 +7,14 @@ All notable changes to Neural Context Protocol will be documented in this file.
 Audit remediation from `docs/NCP_AUDIT_AND_REMEDIATION_PLAN.md`. One work item
 (`WI-###`) per commit; each addresses a finding (`F-*`) from the audit.
 
+### Chore
+
+- **Stop committing the efficacy benchmark artifact**
+  (`benchmarks/efficacy/efficacy_results.json`, `.gitignore`): remove the
+  generated artifact from version control so the git tree stays clean after
+  every `run.py` invocation. The smoke test now asserts the artifact is
+  *written* rather than matching a committed file. (HK-003)
+
 ### Security
 
 - **Opt-in Ed25519 signing and verification of chunk/whisper authorship**

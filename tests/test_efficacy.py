@@ -55,6 +55,7 @@ def test_efficacy_mock_artifact_uses_provider_real_contract(tmp_path):
         assert summary["mean_cost_usd_per_task"] == 0.0
         assert summary["n"] == 2
 
+    assert artifact_path.exists(), "artifact must be written to disk"
     saved = json.loads(artifact_path.read_text())
     assert saved["benchmark"] == artifact["benchmark"]
     assert saved["summary"] == artifact["summary"]
