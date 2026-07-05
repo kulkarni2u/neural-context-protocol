@@ -3,89 +3,79 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Callable
 import json
 import time
 
 import pytest
 
-from ncp.stores.retrieval import apply_reputation_weight
-from ncp.types import SubconsciousChunk, Whisper
+from ncp.stores.retrieval import blend_trust
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# blend_trust — the single shared CAP-T4 blending formula used by
+# SQLiteStore, PgvectorStore, and AsyncPgvectorStore at query time.
 # ---------------------------------------------------------------------------
 
-def _make_chunk(*, written_by: str = "alice", base_trust: float = 0.7) -> SubconsciousChunk:
-    return SubconsciousChunk(
-        layer="semantic",
-        content="test content",
-        src="tool_result",
-        written_by=written_by,
-        base_trust=base_trust,
-    )
-
-
-# ---------------------------------------------------------------------------
-# apply_reputation_weight
-# ---------------------------------------------------------------------------
-
-class TestApplyReputationWeight:
+class TestBlendTrust:
 
     def test_weight_zero_is_pass_through(self):
-        chunks = [_make_chunk(written_by="alice", base_trust=0.7)]
-        lookup: Callable[[str], float | None] = lambda _: 0.9
-        result = apply_reputation_weight(chunks, lookup, reputation_weight=0.0)
-        assert result[0].base_trust == 0.7
+        # (alpha, beta) = (9, 1) -> confidence 0.9, ignored at weight 0.
+        assert blend_trust(0.7, (9.0, 1.0), 0.0) == 0.7
 
     def test_weight_one_overrides_fully(self):
-        chunks = [_make_chunk(written_by="alice", base_trust=0.2)]
-        lookup: Callable[[str], float | None] = lambda _: 0.95
-        result = apply_reputation_weight(chunks, lookup, reputation_weight=1.0)
-        assert result[0].base_trust == pytest.approx(0.95)
+        # confidence = 95 / (95 + 5) = 0.95
+        assert blend_trust(0.2, (95.0, 5.0), 1.0) == pytest.approx(0.95)
 
     def test_blend_half(self):
-        chunks = [_make_chunk(written_by="alice", base_trust=0.6)]
-        lookup: Callable[[str], float | None] = lambda _: 0.8
-        result = apply_reputation_weight(chunks, lookup, reputation_weight=0.5)
-        assert result[0].base_trust == pytest.approx(0.7)
+        # confidence = 8 / (8 + 2) = 0.8 -> (1-0.5)*0.6 + 0.5*0.8 = 0.7
+        assert blend_trust(0.6, (8.0, 2.0), 0.5) == pytest.approx(0.7)
 
     def test_unknown_author_preserves_base_trust(self):
-        chunks = [_make_chunk(written_by="unknown", base_trust=0.5)]
-        lookup: Callable[[str], float | None] = lambda _: None
-        result = apply_reputation_weight(chunks, lookup, reputation_weight=0.8)
-        assert result[0].base_trust == 0.5
+        assert blend_trust(0.5, None, 0.8) == 0.5
 
     def test_mixed_known_and_unknown_authors(self):
-        chunks = [
-            _make_chunk(written_by="alice", base_trust=0.3),
-            _make_chunk(written_by="bob", base_trust=0.7),
-            _make_chunk(written_by="unknown", base_trust=0.9),
-        ]
-        rep: dict[str, float] = {"alice": 0.9, "bob": 0.2}
-        def lookup(author: str) -> float | None:
-            return rep.get(author)
-
-        result = apply_reputation_weight(chunks, lookup, reputation_weight=0.5)
+        rep: dict[str, tuple[float, float]] = {
+            "alice": (9.0, 1.0),  # confidence 0.9
+            "bob": (2.0, 8.0),    # confidence 0.2
+        }
         # alice: (1-0.5)*0.3 + 0.5*0.9 = 0.15 + 0.45 = 0.6
-        assert result[0].base_trust == pytest.approx(0.6)
+        assert blend_trust(0.3, rep.get("alice"), 0.5) == pytest.approx(0.6)
         # bob: (1-0.5)*0.7 + 0.5*0.2 = 0.35 + 0.1 = 0.45
-        assert result[1].base_trust == pytest.approx(0.45)
+        assert blend_trust(0.7, rep.get("bob"), 0.5) == pytest.approx(0.45)
         # unknown: unchanged
-        assert result[2].base_trust == 0.9
+        assert blend_trust(0.9, rep.get("unknown"), 0.5) == 0.9
 
     def test_negative_weight_treated_as_zero(self):
-        chunks = [_make_chunk(written_by="alice", base_trust=0.7)]
-        lookup: Callable[[str], float | None] = lambda _: 0.3
-        result = apply_reputation_weight(chunks, lookup, reputation_weight=-0.1)
-        assert result[0].base_trust == 0.7
+        assert blend_trust(0.7, (3.0, 7.0), -0.1) == 0.7
 
     def test_clamps_to_unit_interval(self):
-        chunks = [_make_chunk(written_by="alice", base_trust=0.1)]
-        lookup: Callable[[str], float | None] = lambda _: 1.2
-        result = apply_reputation_weight(chunks, lookup, reputation_weight=1.0)
-        assert result[0].base_trust == pytest.approx(1.0)
+        # An out-of-range base_trust cannot push the blend above 1.0.
+        assert blend_trust(1.5, (9.0, 1.0), 0.5) == pytest.approx(1.0)
+
+    def test_degenerate_reputation_evidence_is_ignored(self):
+        # alpha + beta <= 0 would divide by zero; base_trust passes through.
+        assert blend_trust(0.4, (0.0, 0.0), 0.5) == 0.4
+
+    def test_stores_share_the_helper(self):
+        """The formula must live in exactly one place: every store backend's
+        query path calls ncp.stores.retrieval.blend_trust."""
+        import ast
+        import inspect
+
+        from ncp.stores import pgvector, pgvector_async, sqlite as sqlite_store
+
+        for module in (sqlite_store, pgvector, pgvector_async):
+            source = inspect.getsource(module)
+            tree = ast.parse(source)
+            calls = [
+                node for node in ast.walk(tree)
+                if isinstance(node, ast.Call)
+                and (
+                    (isinstance(node.func, ast.Name) and node.func.id == "blend_trust")
+                    or (isinstance(node.func, ast.Attribute) and node.func.attr == "blend_trust")
+                )
+            ]
+            assert calls, f"{module.__name__} must call the shared blend_trust helper"
 
 
 # ---------------------------------------------------------------------------

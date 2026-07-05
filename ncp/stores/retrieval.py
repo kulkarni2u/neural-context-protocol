@@ -26,35 +26,31 @@ if TYPE_CHECKING:
 T = TypeVar("T")
 
 
-def apply_reputation_weight(
-    chunks: list[SubconsciousChunk],
-    reputation_lookup: Callable[[str], float | None],
-    *,
-    reputation_weight: float = 0.0,
-) -> list[SubconsciousChunk]:
-    """Blend each chunk's ``base_trust`` with its author's reputation confidence.
+def blend_trust(
+    base_trust: float,
+    reputation: tuple[float, float] | None,
+    weight: float,
+) -> float:
+    """Blend a chunk's ``base_trust`` with its author's reputation confidence.
 
-    When ``reputation_weight`` is 0.0 (default) every chunk passes through
-    unchanged.  The formula is::
+    Shared CAP-T4 formula used by every store backend at query time.
+    ``reputation`` is the author's Beta evidence ``(alpha, beta)`` as loaded
+    from the reputation table; confidence is ``alpha / (alpha + beta)``::
 
-        blended_trust = (1 - reputation_weight) * base_trust
-                        + reputation_weight * reputation_confidence
+        blended_trust = (1 - weight) * base_trust + weight * confidence
 
-    If ``reputation_lookup`` returns ``None`` for an author the chunk's
-    ``base_trust`` is kept as-is (no blending for unknown authors).
+    When ``weight`` is <= 0.0 (default config) or the author is unknown
+    (``reputation`` is ``None``) the raw ``base_trust`` passes through
+    unchanged. Blended results are clamped to [0.0, 1.0].
     """
-    if reputation_weight <= 0.0:
-        return chunks
-    for chunk in chunks:
-        rep_conf = reputation_lookup(chunk.written_by)
-        if rep_conf is None:
-            continue
-        bt = chunk.base_trust
-        chunk.base_trust = max(
-            0.0,
-            min(1.0, (1.0 - reputation_weight) * bt + reputation_weight * rep_conf),
-        )
-    return chunks
+    if weight <= 0.0 or reputation is None:
+        return base_trust
+    alpha, beta = reputation
+    total = alpha + beta
+    if total <= 0.0:
+        return base_trust
+    confidence = alpha / total
+    return max(0.0, min(1.0, (1.0 - weight) * base_trust + weight * confidence))
 
 
 @dataclass

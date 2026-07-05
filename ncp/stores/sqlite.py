@@ -23,6 +23,7 @@ from ncp.stores.retrieval import (
     DEFAULT_RETRIEVAL_POLICY,
     RetrievalPolicy,
     apply_diversity_limit,
+    blend_trust,
     build_lexical_candidates,
     normalize_query_terms,
     normalize_result_limit,
@@ -484,16 +485,14 @@ class SQLiteStore(BaseStore):
             with self._connect() as connection:
                 rep_data = self._load_reputation(connection, authors)
             rw = self.config.reputation_weight
-            blended_trust = {}
-            for row in rows:
-                cid = str(row["chunk_id"])
-                bt = float(row["base_trust"])
-                written_by = str(row["written_by"])
-                result = rep_data.get(written_by)
-                if result is not None:
-                    rep_conf = result[0] / (result[0] + result[1])
-                    bt = (1.0 - rw) * bt + rw * rep_conf
-                blended_trust[cid] = bt
+            blended_trust = {
+                str(row["chunk_id"]): blend_trust(
+                    float(row["base_trust"]),
+                    rep_data.get(str(row["written_by"])),
+                    rw,
+                )
+                for row in rows
+            }
 
         def _bt(row: object) -> float:
             if blended_trust is not None:

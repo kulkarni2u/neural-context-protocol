@@ -31,6 +31,7 @@ from ncp.stores.pgvector import (
 from ncp.stores.redis_coordination import AsyncRedisCoordination
 from ncp.stores.retrieval import (
     apply_diversity_limit,
+    blend_trust,
     build_lexical_candidates,
     normalize_result_limit,
     score_trust_recency_candidate,
@@ -739,16 +740,14 @@ class AsyncPgvectorStore(BaseStore):
             async with self._aconnect() as conn:
                 rep_data = await self._aload_reputation(conn, authors)
             rw = self.config.reputation_weight
-            blended_trust = {}
-            for row in rows:
-                cid = str(row["chunk_id"])
-                bt = float(row["base_trust"])
-                written_by = str(row["written_by"])
-                result = rep_data.get(written_by)
-                if result is not None:
-                    rep_conf = result[0] / (result[0] + result[1])
-                    bt = (1.0 - rw) * bt + rw * rep_conf
-                blended_trust[cid] = bt
+            blended_trust = {
+                str(row["chunk_id"]): blend_trust(
+                    float(row["base_trust"]),
+                    rep_data.get(str(row["written_by"])),
+                    rw,
+                )
+                for row in rows
+            }
 
         def _bt(row: dict) -> float:
             if blended_trust is not None:
