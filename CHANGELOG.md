@@ -32,6 +32,16 @@ Audit remediation from `docs/NCP_AUDIT_AND_REMEDIATION_PLAN.md`. One work item
 
 ### Added
 
+- **Model-tiering advisory signal** (`ncp/tiering.py`, `ncp/mcp/server.py`,
+  `ncp/config.py`): `ncp_get_context` responses gain a top-level `tier_hint`
+  (`"light"`/`"standard"`/`"deep"`), `complexity_signal` (0.0-1.0), and a
+  `factors` block exposing every raw input (query length, retrieved chunk
+  count/author diversity, drift score, budget pressure, cold-start flag) that
+  fed the deterministic formula documented in `ncp/tiering.py` and
+  `docs/NCP_PROTOCOL_SPEC.md` §4c. NCP does not route models itself — this
+  only hands an orchestrator a defensible, auditable signal for downshifting
+  cheap turns to a smaller model. Gated by `[tiering].tier_hints_enabled`
+  (**default `true`**). (CAP-E3)
 - **Per-pipeline cost governor** (`ncp/budget.py`, `ncp/mcp/server.py`,
   `ncp/config.py`): opt-in `[budget].pipeline_budget_usd` ceiling, classified
   against cumulative recorded spend from the existing CAP-E1 `cost_log` (never

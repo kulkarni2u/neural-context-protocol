@@ -424,7 +424,9 @@ Semantics:
 
 ---
 
-## 4c. Cost Governance (CAP-E2, normative)
+## 4c. Cost Governance and Model-Tiering Signals (CAP-E2, CAP-E3, normative)
+
+### CAP-E2 — budget block on ncp_get_context / ncp_post_turn
 
 ```
 Config gate ([budget] table):
@@ -468,6 +470,48 @@ Block-mode refusal (ncp_get_context only):
   ncp_post_turn never blocks (the turn's cost is already spent by the time
   post_turn runs); it only surfaces the post-turn "budget" block, including
   when status is "exceeded", so a warn/off-mode host can react on its own.
+```
+
+### CAP-E3 — tier_hint / complexity_signal on ncp_get_context
+
+```
+Config gate ([tiering] table):
+  tier_hints_enabled: bool (default true) -- set false to omit these fields.
+
+NCP does not route models. This signal only tells an external orchestrator
+whether a turn looks safe to downshift to a cheaper model; NCP makes no
+routing decision itself.
+
+Response fields (top-level, alongside "context"/"telemetry"):
+  "tier_hint":         "light" | "standard" | "deep"
+  "complexity_signal": float in [0.0, 1.0]
+  "factors": {
+    "query_length_chars": int,
+    "query_length_norm":  float,  # min(1.0, query_length_chars / 240)
+    "chunk_count":        int,    # chunks in the assembled context
+    "distinct_authors":   int,    # distinct written_by among those chunks
+    "diversity_ratio":    float,  # distinct_authors / chunk_count (0.0 if empty)
+    "drift_score":        float,  # ConsciousBlock.drift_score, already 0-1
+    "pressure":           "low" | "medium" | "high" | "critical",
+    "pressure_norm":      float,  # {low:0.0, medium:0.33, high:0.66, critical:1.0}
+    "cold_start":         bool    # true iff retrieval was empty and the
+                                  # assembler substituted its synthetic
+                                  # cold_* pipeline_summary chunk
+  }
+
+Formula (deterministic; see ncp/tiering.py for the reference implementation):
+  complexity_signal = 0.25 * query_length_norm
+                     + 0.25 * drift_score
+                     + 0.25 * pressure_norm
+                     + 0.15 * diversity_ratio
+                     + 0.10 * (1.0 if cold_start else 0.0)
+
+  tier_hint = "light"    if complexity_signal <  0.35
+            = "deep"     if complexity_signal >= 0.65
+            = "standard" otherwise
+
+Every factor above is one of the raw inputs to the formula -- the signal is
+fully reconstructable from the "factors" block, not a black box.
 ```
 
 ---
@@ -821,6 +865,9 @@ critical_at_ratio = 0.85
 # pipeline_budget_usd = 5.00   # CAP-E2; unset (default) disables the governor
 budget_warn_fraction = 0.8     # CAP-E2
 budget_enforcement = "warn"    # CAP-E2: off | warn | block
+
+[tiering]
+tier_hints_enabled = true      # CAP-E3
 
 [chunking]
 max_chunk_tokens = 200

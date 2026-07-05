@@ -1637,6 +1637,7 @@ class TestCostGovernor:
         assert refusal["budget"]["status"] == "exceeded"
         assert refusal["session_id"] == "pipe_block:builder"
         assert "telemetry" not in refusal
+        assert "tier_hint" not in refusal
 
     def test_warn_mode_never_blocks_get_context(self, tmp_path: Path) -> None:
         store = SQLiteStore(tmp_path / "gov_warn_noblock.db")
@@ -1651,3 +1652,103 @@ class TestCostGovernor:
         assert "budget_exceeded" not in context
         assert context["budget"]["status"] == "exceeded"
         assert "context" in context and isinstance(context["context"], str) and context["context"] != ""
+
+
+class TestTierHintSignal:
+    """CAP-E3: advisory model-tiering signal on ncp_get_context."""
+
+    def test_tier_hint_present_by_default_with_factors(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "tier.db")
+        handlers = make_handlers(store)
+
+        result = _content(_handle_request(
+            _call("ncp_get_context", {
+                "agent_id": "builder",
+                "role": "build",
+                "owns": [],
+                "must_not": [],
+                "task": "test",
+                "slot": "test",
+                "intent": "test",
+                "pipeline_id": "pipe_tier",
+            }),
+            handlers,
+        ))
+
+        assert result["tier_hint"] in {"light", "standard", "deep"}
+        assert 0.0 <= result["complexity_signal"] <= 1.0
+        factors = result["factors"]
+        for key in (
+            "query_length_chars", "query_length_norm", "chunk_count",
+            "distinct_authors", "diversity_ratio", "drift_score",
+            "pressure", "pressure_norm", "cold_start",
+        ):
+            assert key in factors
+
+    def test_tier_hints_disabled_omits_fields(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "tier_off.db")
+        config = load_config(cwd=tmp_path)
+        config.values["tiering"]["tier_hints_enabled"] = False
+        handlers = make_handlers(store, config=config)
+
+        result = _content(_handle_request(
+            _call("ncp_get_context", {
+                "agent_id": "builder",
+                "role": "build",
+                "owns": [],
+                "must_not": [],
+                "task": "test",
+                "slot": "test",
+                "intent": "test",
+                "pipeline_id": "pipe_tier_off",
+            }),
+            handlers,
+        ))
+
+        assert "tier_hint" not in result
+        assert "complexity_signal" not in result
+        assert "factors" not in result
+
+    def test_tier_hint_is_deterministic_for_identical_state(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "tier_det.db")
+        handlers = make_handlers(store)
+        args = {
+            "agent_id": "builder",
+            "role": "build",
+            "owns": [],
+            "must_not": [],
+            "task": "test",
+            "slot": "test",
+            "intent": "test",
+            "pipeline_id": "pipe_tier_det",
+        }
+
+        first = _content(_handle_request(_call("ncp_get_context", args), handlers))
+        second = _content(_handle_request(_call("ncp_get_context", args), handlers))
+
+        assert first["tier_hint"] == second["tier_hint"]
+        assert first["complexity_signal"] == pytest.approx(second["complexity_signal"])
+        assert first["factors"] == second["factors"]
+
+    def test_cold_start_turn_raises_complexity_signal(self, tmp_path: Path) -> None:
+        # Empty store -> the assembler's cold-start bootstrap fires, which
+        # the tier signal should surface via factors["cold_start"].
+        store = SQLiteStore(tmp_path / "tier_cold.db")
+        handlers = make_handlers(store)
+
+        result = _content(_handle_request(
+            _call("ncp_get_context", {
+                "agent_id": "builder",
+                "role": "build",
+                "owns": [],
+                "must_not": [],
+                "task": "test",
+                "slot": "test",
+                "intent": "test",
+                "pipeline_id": "pipe_tier_cold",
+            }),
+            handlers,
+        ))
+
+        assert result["factors"]["cold_start"] is True
+        assert result["factors"]["chunk_count"] == 1

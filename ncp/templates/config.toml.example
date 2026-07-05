@@ -117,3 +117,9 @@ confidence_k = 20
 # and recorded but never required. Set to true to REJECT any write/emit whose
 # authorship cannot be verified (missing/bad signature or revoked identity).
 # require_signatures = false
+
+# [tiering]
+# CAP-E3: advisory model-tiering signal (tier_hint/complexity_signal/factors)
+# on ncp_get_context responses. NCP never routes models itself. Default true;
+# set false to omit the fields entirely.
+# tier_hints_enabled = true

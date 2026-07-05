@@ -121,6 +121,12 @@ DEFAULT_CONFIG = {
         # is rejected.
         "require_signatures": False,
     },
+    "tiering": {
+        # CAP-E3: advisory model-tiering signal on ncp_get_context responses.
+        # NCP never routes models itself; this only emits a signal an
+        # orchestrator can use. Default true; set false to omit the fields.
+        "tier_hints_enabled": True,
+    },
     "providers": {
         "pricing": {
             "claude-sonnet-4-20250514": {"input": 3.00, "output": 15.00, "cache_read": 0.30},
@@ -302,6 +308,11 @@ class NCPConfig:
         return val if val in {"off", "warn", "block"} else "warn"
 
     @property
+    def tier_hints_enabled(self) -> bool:
+        """CAP-E3: whether ncp_get_context emits the advisory tier_hint/complexity_signal fields."""
+        return bool(self.values.get("tiering", {}).get("tier_hints_enabled", True))
+
+    @property
     def whisper_ttl_default(self) -> int:
         return int(self.values.get("whispers", {}).get("default_ttl_seconds", 1800))
 
@@ -468,6 +479,9 @@ def _apply_env_overrides(values: dict[str, Any], env: dict[str, str]) -> None:
         values["budget"]["budget_warn_fraction"] = float(env["NCP_BUDGET_WARN_FRACTION"])
     if "NCP_BUDGET_ENFORCEMENT" in env:
         values["budget"]["budget_enforcement"] = env["NCP_BUDGET_ENFORCEMENT"]
+    if "NCP_TIER_HINTS_ENABLED" in env:
+        val = env["NCP_TIER_HINTS_ENABLED"].lower()
+        values["tiering"]["tier_hints_enabled"] = val in {"true", "1", "yes"}
 
 
 def _deep_merge(target: dict[str, Any], updates: dict[str, Any]) -> None:

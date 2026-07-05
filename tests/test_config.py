@@ -231,3 +231,17 @@ def test_budget_enforcement_falls_back_to_warn_for_unknown_value(tmp_path: Path)
     config = load_config(cwd=project)
     assert config.budget_enforcement == "warn"
 
+
+def test_tier_hints_enabled_config_default_and_overrides(tmp_path: Path) -> None:
+    project = tmp_path / "repo"
+    (project / ".git").mkdir(parents=True)
+
+    assert load_config(cwd=project).tier_hints_enabled is True
+
+    (project / ".ncp").mkdir()
+    (project / ".ncp" / "config.toml").write_text("[tiering]\ntier_hints_enabled = false\n")
+    config = load_config(cwd=project)
+    assert config.tier_hints_enabled is False
+
+    config = load_config(cwd=project, env={"NCP_TIER_HINTS_ENABLED": "true"})
+    assert config.tier_hints_enabled is True

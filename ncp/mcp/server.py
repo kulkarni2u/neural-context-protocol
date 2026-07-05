@@ -20,6 +20,7 @@ from ncp.chunker import filter_content
 from ncp.config import NCPConfig, load_config
 from ncp.stores.base import BaseStore
 from ncp.stores.factory import create_store
+from ncp.tiering import compute_tier_signal
 from ncp.types import BudgetContext, ConsciousBlock, NCPResponse, OutcomeRecord, SubconsciousChunk, Whisper
 from ncp.version import __version__
 
@@ -458,6 +459,8 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
     pipeline_budget_usd = config.pipeline_budget_usd if config is not None else None
     budget_warn_fraction = config.budget_warn_fraction if config is not None else 0.8
     budget_enforcement = config.budget_enforcement if config is not None else "warn"
+    # CAP-E3: model-tiering advisory signal, on by default.
+    tier_hints_enabled = config.tier_hints_enabled if config is not None else True
 
     def _budget_snapshot(*, pipeline_id: str | None) -> BudgetSnapshot | None:
         """CAP-E2: read real recorded spend and classify it against the ceiling.
@@ -528,6 +531,28 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             "fetch_hint": "ncp_fetch" if evicted_high_relevance and fetch_budget_remaining > 0 else None,
         }
 
+    def _tier_signal(result: object, *, budget: BudgetContext, search_text: str):
+        """CAP-E3: derive the tier-hint signal from one assembly result.
+
+        ``cold_start`` mirrors ``Assembler._cold_start_bootstrap``: it fires
+        when retrieval came back empty and the assembler substituted its
+        single synthetic ``cold_*`` pipeline_summary chunk.
+        """
+        chunks = list(getattr(result, "chunks", []))
+        chunk_count = len(chunks)
+        distinct_authors = len({chunk.written_by for chunk in chunks})
+        cold_start = chunk_count == 1 and chunks[0].chunk_id.startswith("cold_")
+        conscious = getattr(result, "conscious", None)
+        drift_score = float(getattr(conscious, "drift_score", 0.0))
+        return compute_tier_signal(
+            query_text=search_text,
+            chunk_count=chunk_count,
+            distinct_authors=distinct_authors,
+            drift_score=drift_score,
+            pressure=budget.pressure,
+            cold_start=cold_start,
+        )
+
     def _handle_get_context(args: dict[str, object]) -> object:
         session_id = _session_id_from_args(args)
         pipeline_id = args.get("pipeline_id")
@@ -589,6 +614,8 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             }
             if budget_snapshot is not None:
                 handler_result["budget"] = budget_snapshot.to_dict()
+            if tier_hints_enabled:
+                handler_result.update(_tier_signal(stream_result, budget=budget, search_text=search_text).to_dict())
             return StreamResponse(
                 sections=sections,
                 handler_result=handler_result,
@@ -609,6 +636,8 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         }
         if budget_snapshot is not None:
             response["budget"] = budget_snapshot.to_dict()
+        if tier_hints_enabled:
+            response.update(_tier_signal(result, budget=budget, search_text=search_text).to_dict())
         return response
 
     def _handle_write_memory(args: dict[str, object]) -> object:
