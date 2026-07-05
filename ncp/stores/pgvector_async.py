@@ -732,13 +732,36 @@ class AsyncPgvectorStore(BaseStore):
         candidates: list[SubconsciousChunk] = []
         result_limit = normalize_result_limit(k)
 
+        # CAP-T4: reputation-weighted retrieval blending (parity with sync stores)
+        blended_trust: dict[str, float] | None = None
+        if self.config is not None and self.config.reputation_weight > 0.0:
+            authors = {str(r["written_by"]) for r in rows}
+            async with self._aconnect() as conn:
+                rep_data = await self._aload_reputation(conn, authors)
+            rw = self.config.reputation_weight
+            blended_trust = {}
+            for row in rows:
+                cid = str(row["chunk_id"])
+                bt = float(row["base_trust"])
+                written_by = str(row["written_by"])
+                result = rep_data.get(written_by)
+                if result is not None:
+                    rep_conf = result[0] / (result[0] + result[1])
+                    bt = (1.0 - rw) * bt + rw * rep_conf
+                blended_trust[cid] = bt
+
+        def _bt(row: dict) -> float:
+            if blended_trust is not None:
+                return blended_trust.get(str(row["chunk_id"]), float(row["base_trust"]))
+            return float(row["base_trust"])
+
         if retrieval_mode == "trust_recency":
             for row in rows:
                 score = score_trust_recency_candidate(
                     policy,
                     created_at=float(row["created_at"]),
                     now=now,
-                    base_trust=float(row["base_trust"]),
+                    base_trust=_bt(row),
                     generation=int(row["generation"]),
                     written_at_drift=float(row["written_at_drift"]) if row.get("written_at_drift") is not None else 0.0,
                 )
@@ -765,7 +788,7 @@ class AsyncPgvectorStore(BaseStore):
                     bm25_normalized=lexical_candidate.lexical_signal,
                     vector_normalized=vector_score,
                     age_seconds=age_s,
-                    base_trust=float(row["base_trust"]),
+                    base_trust=_bt(row),
                     generation=int(row["generation"]),
                     written_at_drift=float(row["written_at_drift"]) if row.get("written_at_drift") is not None else 0.0,
                 )
