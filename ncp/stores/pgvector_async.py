@@ -24,6 +24,7 @@ import anyio
 import structlog
 
 from ncp.stores.base import BaseStore, NCPStoreUnavailableError
+from ncp.stores.bitemporal import collect_successor_ids, filter_bitemporal
 from ncp.stores.pgvector import (
     DEFAULT_RETRIEVAL_POLICY,
     PGVECTOR_SCHEMA_TEMPLATE,
@@ -307,10 +308,10 @@ class AsyncPgvectorStore(BaseStore):
                             written_by, caused_by, conscious_hash, evidence_id, version, supersedes,
                             source_refs, schema_version, created_at, base_trust, generation,
                             result_confidence, result_attempts, conditions, valid_while, expiry,
-                            owner, meta, embedding
+                            owner, meta, embedding, valid_from, valid_to, superseded_by
                         ) VALUES (
                             %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                         )
                         ON CONFLICT (chunk_id) DO UPDATE SET
                             pipeline_id = EXCLUDED.pipeline_id,
@@ -338,7 +339,8 @@ class AsyncPgvectorStore(BaseStore):
                             expiry = EXCLUDED.expiry,
                             owner = EXCLUDED.owner,
                             meta = EXCLUDED.meta,
-                            embedding = EXCLUDED.embedding
+                            embedding = EXCLUDED.embedding,
+                            valid_from = EXCLUDED.valid_from
                         """
                     ),
                     (
@@ -369,6 +371,9 @@ class AsyncPgvectorStore(BaseStore):
                         chunk.owner,
                         json.dumps({}),
                         embedding_val,
+                        chunk.valid_from,
+                        chunk.valid_to,
+                        chunk.superseded_by,
                     ),
                 )
             await self._async_hard_gc(conn, pipeline_id=chunk.pipeline_id)
@@ -558,6 +563,36 @@ class AsyncPgvectorStore(BaseStore):
             )
         self.retention_evictions += len(evict_ids)
 
+    async def _async_apply_bitemporal_filter(
+        self,
+        conn: Any,
+        rows: list[dict[str, Any]],
+        *,
+        as_of: float | None,
+    ) -> list[dict[str, Any]]:
+        """CAP-C5: apply bi-temporal visibility as a Python post-filter.
+
+        See ``PgvectorStore._apply_bitemporal_filter`` for why this stays out
+        of the SQL WHERE clause. Native async I/O for the one follow-up
+        successor-timestamp lookup, reusing the caller's open connection.
+        """
+        now = time.time()
+        if as_of is None:
+            return filter_bitemporal(rows, as_of=None, now=now)
+        successor_ids = collect_successor_ids(rows)
+        successor_created_at: dict[str, float] = {}
+        if successor_ids:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    self._sql(
+                        "SELECT chunk_id, created_at FROM {schema}.{prefix}chunks WHERE chunk_id = ANY(%s)"
+                    ),
+                    (list(successor_ids),),
+                )
+                succ_rows = await self._afetchall(cur)
+            successor_created_at = {str(r["chunk_id"]): float(r["created_at"]) for r in succ_rows}
+        return filter_bitemporal(rows, as_of=as_of, now=now, successor_created_at=successor_created_at)
+
     async def _async_query_vector(
         self,
         *,
@@ -570,6 +605,7 @@ class AsyncPgvectorStore(BaseStore):
         scope: str | None,
         zone: str,
         diversity_limit: int = 2,
+        as_of: float | None = None,
     ) -> list[SubconsciousChunk]:
         if embedding is None:
             if self._embedding_adapter is not None:
@@ -620,7 +656,8 @@ class AsyncPgvectorStore(BaseStore):
                 raw_rows = await cur.fetchall()
                 description = cur.description
 
-        rows = [self._normalize_row(r, description) for r in raw_rows]
+            rows = [self._normalize_row(r, description) for r in raw_rows]
+            rows = await self._async_apply_bitemporal_filter(conn, rows, as_of=as_of)
         results: list[SubconsciousChunk] = []
         for row in rows:
             score = score_vector_distance(
@@ -671,6 +708,7 @@ class AsyncPgvectorStore(BaseStore):
         retrieval_mode: str = "hybrid",
         embedding: list[float] | None = None,
         diversity_limit: int = 2,
+        as_of: float | None = None,
     ) -> list[SubconsciousChunk]:
         """Query chunks using native async DB I/O; score computation stays synchronous."""
         _VALID_RETRIEVAL_MODES = ("hybrid", "trust_recency", "vector")
@@ -689,6 +727,7 @@ class AsyncPgvectorStore(BaseStore):
                 scope=scope,
                 zone=zone,
                 diversity_limit=diversity_limit,
+                as_of=as_of,
             )
         if embedding is None and self._embedding_adapter is not None:
             _adapter = self._embedding_adapter
@@ -728,7 +767,8 @@ class AsyncPgvectorStore(BaseStore):
                 raw_rows = await cur.fetchall()
                 description = cur.description
 
-        rows = [self._normalize_row(r, description) for r in raw_rows]
+            rows = [self._normalize_row(r, description) for r in raw_rows]
+            rows = await self._async_apply_bitemporal_filter(conn, rows, as_of=as_of)
         if not rows:
             return []
 
@@ -1129,6 +1169,31 @@ class AsyncPgvectorStore(BaseStore):
             )
         await self._acoordination.emit_whisper(whisper)
 
+    async def async_supersede(
+        self,
+        old_chunk_id: str,
+        new_chunk_id: str,
+        *,
+        valid_to: float | None = None,
+    ) -> bool:
+        """CAP-C5: mark ``old_chunk_id`` as honestly replaced, via native async I/O.
+
+        The old row is never deleted -- only ``superseded_by`` and
+        ``valid_to`` are updated in place, so a later ``as_of`` query can
+        still recover it.
+        """
+        resolved_valid_to = time.time() if valid_to is None else valid_to
+        async with self._aconnect() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    self._sql(
+                        "UPDATE {schema}.{prefix}chunks"
+                        " SET superseded_by = %s, valid_to = %s WHERE chunk_id = %s"
+                    ),
+                    (new_chunk_id, resolved_valid_to, old_chunk_id),
+                )
+                return cur.rowcount > 0
+
     async def async_record_dissent(self, chunk_id: str) -> bool:
         """Increment a chunk's dissent counter via native async DB I/O."""
         normalized = chunk_id.removeprefix("ctx://sub/")
@@ -1462,6 +1527,9 @@ class AsyncPgvectorStore(BaseStore):
             age_seconds=max(0.0, time.time() - created_at),
             dissent_count=int(row.get("dissent_count") or 0),
             verified=bool(row.get("verified")) if row.get("verified") is not None else False,
+            valid_from=float(row["valid_from"]) if row.get("valid_from") is not None else None,
+            valid_to=float(row["valid_to"]) if row.get("valid_to") is not None else None,
+            superseded_by=row.get("superseded_by"),
         )
 
     def _decode_embedding(self, value: Any) -> list[float] | None:

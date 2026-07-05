@@ -200,6 +200,17 @@ class SubconsciousChunk(NCPModel):
     source_refs: list[str] = Field(default_factory=list)
     raw_ref: str | None = None
 
+    # CAP-C5: bi-temporal memory. valid_from/valid_to bound when a fact was
+    # true in the *world* (valid time); both are epoch seconds, nullable, and
+    # independent of created_at (transaction time -- when NCP recorded it).
+    # superseded_by holds the chunk_id of whatever honestly replaced this one;
+    # the superseded chunk is never deleted, only marked. All three are None
+    # by default so old data and writes without bi-temporal params are
+    # unaffected.
+    valid_from: float | None = None
+    valid_to: float | None = None
+    superseded_by: str | None = None
+
     relevance: float = 0.0
     age_seconds: float = 0.0
     retrieval_count: int = 0

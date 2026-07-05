@@ -146,6 +146,15 @@ Validity:
   expiry          datetime? = None  required for proven/global zones
   owner           str?      = None  team or agent identifier
 
+Bi-temporal fields (CAP-C5 -- see §4f):
+  valid_from      float?    = None  epoch seconds; when this fact became
+                                    true in the world (valid time)
+  valid_to        float?    = None  epoch seconds; when this fact stopped
+                                    being true in the world
+  superseded_by   str?      = None  chunk_id of the chunk that honestly
+                                    replaced this one; set by supersede(),
+                                    never by a plain write
+
 Chunk type (for chunker dispatch):
   chunk_type      str = "prose"    prose|json|code|table|auto
 
@@ -678,6 +687,66 @@ non-streaming, only when drift_computed_enabled is true):
 
 ---
 
+## 4f. Bi-temporal Memory (CAP-C5, normative)
+
+```
+Why: facts go stale, and destructive overwrite discards history. Best-in-
+class memory carries two independent time dimensions per chunk:
+  - transaction time (created_at): when NCP recorded the row. Fixed at
+    first write, never rewritten by later upserts of the same chunk_id.
+  - valid time (valid_from / valid_to): when the fact was/is true in the
+    world. Both nullable; unset means "no bound in that direction."
+Supersession (superseded_by) records that a newer chunk honestly replaced
+this one. The old chunk is NEVER deleted -- only marked -- so "what did we
+believe as of turn N" stays answerable via as_of.
+
+ncp_write_memory — new optional params:
+  valid_from   str?  ISO-8601 timestamp or epoch seconds. When this chunk's
+                     fact became true in the world.
+  valid_to     str?  ISO-8601 timestamp or epoch seconds. When this chunk's
+                     own fact stops being true in the world. Independent of
+                     supersedes (which sets the PREVIOUS chunk's valid_to).
+  supersedes   str?  chunk_id of an existing chunk this write honestly
+                     replaces. After the new chunk is written:
+                       old.superseded_by = new.chunk_id
+                       old.valid_to      = new.valid_from  (or "now" if
+                                           valid_from was omitted)
+                     The old chunk is not deleted. Response includes
+                     "superseded": bool (whether the old chunk_id was found
+                     and updated).
+
+ncp_get_context — new optional param:
+  as_of        str?  ISO-8601 timestamp or epoch seconds. See view semantics
+                     below. Echoed back in the response as "as_of" (epoch
+                     seconds) when given.
+
+View semantics (query(), get_working_zone(), get_chunks_by_ids() on every
+backend — SQLiteStore, PgvectorStore, AsyncPgvectorStore):
+  as_of omitted (default, currently-valid view):
+    EXCLUDE a chunk if superseded_by is set (regardless of when), OR if
+    valid_to is set and has already passed "now".
+  as_of given (point-in-time view):
+    INCLUDE a chunk only if:
+      1. created_at <= as_of                      (recorded by then)
+      2. not superseded by a chunk itself recorded by as_of -- the
+         transaction time a supersession took effect is the superseding
+         chunk's own created_at, since supersede() always runs
+         transactionally alongside that chunk's write
+      3. valid_from is unset or <= as_of, AND valid_to is unset or > as_of
+         (valid at that instant)
+    A chunk whose successor cannot be resolved (should not normally happen)
+    is treated as not-yet-confirmed-superseded and stays visible --
+    correctness over aggressiveness.
+
+Backward compatibility: rows written before this feature (or by writers
+that never pass the new params) have valid_from/valid_to/superseded_by all
+NULL, which is a no-op under both views above -- default reads are
+unaffected except that they now correctly exclude chunks that literally
+cannot exist in pre-CAP-C5 data (nothing to filter).
+```
+
+---
+
 ## 5. Trust Boundaries (normative, first-class)
 
 These rules are enforced by the assembler and store. Not optional.
@@ -869,7 +938,10 @@ CREATE TABLE chunks (
     valid_while     TEXT,
     expiry          REAL,
     owner           TEXT,
-    meta            TEXT DEFAULT '{}'
+    meta            TEXT DEFAULT '{}',
+    valid_from      REAL,             -- CAP-C5: bi-temporal valid-time lower bound
+    valid_to        REAL,             -- CAP-C5: bi-temporal valid-time upper bound
+    superseded_by   TEXT              -- CAP-C5: chunk_id of the honest replacement
 );
 
 -- Reference integrity

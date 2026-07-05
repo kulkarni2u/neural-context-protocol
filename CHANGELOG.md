@@ -32,6 +32,25 @@ Audit remediation from `docs/NCP_AUDIT_AND_REMEDIATION_PLAN.md`. One work item
 
 ### Added
 
+- **Bi-temporal memory** (`ncp/types.py`, `ncp/stores/base.py`,
+  `ncp/stores/bitemporal.py`, `ncp/stores/sqlite.py`, `ncp/stores/pgvector.py`,
+  `ncp/stores/pgvector_async.py`, `ncp/assembler.py`, `ncp/mcp/server.py`,
+  `ncp/migrations/011_add_bitemporal_columns.sql`): chunks gain nullable
+  `valid_from`/`valid_to` (valid time -- when a fact was/is true in the
+  world, independent of `created_at`'s transaction time) and `superseded_by`
+  (honest supersedence: the replaced chunk is never deleted, only marked).
+  `ncp_write_memory` accepts optional `valid_from`/`valid_to` (ISO-8601 or
+  epoch seconds) and `supersedes` (an existing `chunk_id`); superseding sets
+  `old.superseded_by = new.chunk_id` and `old.valid_to = new.valid_from`
+  (or "now"). `ncp_get_context` gains an optional `as_of` param: omitted, it
+  returns the currently-valid view (excludes superseded chunks and chunks
+  whose `valid_to` has passed); given, it returns the point-in-time view as
+  of that transaction time (recorded by then, not superseded by a chunk
+  itself recorded by then, valid at that instant) -- "what did we believe as
+  of turn N." Implemented identically across `SQLiteStore`, `PgvectorStore`,
+  and `AsyncPgvectorStore`. Backward compatible: writes without the new
+  params, and all pre-existing rows (`NULL` in the new columns), behave
+  exactly as before. See `docs/NCP_PROTOCOL_SPEC.md` §4f. (CAP-C5)
 - **`recent_turns` parity for pgvector** (`ncp/stores/pgvector.py`,
   `ncp/stores/pgvector_async.py`): `PgvectorStore.recent_turns` and
   `AsyncPgvectorStore.async_recent_turns` (native async, no thread-pool

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -76,6 +77,16 @@ MCP_TOOLS: list[dict[str, object]] = [
                 "ctx_used": {"type": "number", "description": "Context window usage ratio 0.0-1.0."},
                 "steps_completed": {"type": "integer", "description": "Completed plan steps for budget pressure."},
                 "steps_total": {"type": "integer", "description": "Total plan steps for budget pressure."},
+                "as_of": {
+                    "type": "string",
+                    "description": (
+                        "CAP-C5: optional ISO-8601 timestamp (or epoch seconds). When given, "
+                        "assembles the bi-temporal view as of that transaction time -- only "
+                        "chunks recorded by then, not superseded by a chunk recorded by then, "
+                        "and valid (valid_from/valid_to) at that instant. Omit for the default "
+                        "currently-valid view."
+                    ),
+                },
             },
             "required": ["agent_id", "role", "task", "slot", "intent"],
         },
@@ -106,6 +117,33 @@ MCP_TOOLS: list[dict[str, object]] = [
                         "payload (written_by | sha256(content) | pipeline_id). When present it "
                         "is verified and recorded. Required only if [identity].require_signatures "
                         "is enabled, in which case an unverifiable write is rejected."
+                    ),
+                },
+                "valid_from": {
+                    "type": "string",
+                    "description": (
+                        "CAP-C5: optional ISO-8601 timestamp (or epoch seconds) for when this "
+                        "fact became true in the world (valid time). Defaults to unset (no bound)."
+                    ),
+                },
+                "valid_to": {
+                    "type": "string",
+                    "description": (
+                        "CAP-C5: optional ISO-8601 timestamp (or epoch seconds) for when this "
+                        "chunk's own fact stops being true in the world. Defaults to unset (no "
+                        "bound). Independent of 'supersedes', which sets the *previous* chunk's "
+                        "valid_to, not this one's."
+                    ),
+                },
+                "supersedes": {
+                    "type": "string",
+                    "description": (
+                        "CAP-C5: chunk_id of an existing chunk this write honestly replaces. "
+                        "The old chunk is NOT deleted: its superseded_by is set to this new "
+                        "chunk's id and its own valid_to is set to this chunk's valid_from (or "
+                        "now if valid_from is omitted). Default (non-as_of) reads then return "
+                        "only this new chunk; an as_of query before the supersession still "
+                        "returns the old one."
                     ),
                 },
             },
@@ -718,6 +756,9 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             caller_max_tokens: int | None = max(1, int(args["max_tokens"])) if "max_tokens" in args else None  # type: ignore[arg-type]
         except (ValueError, TypeError):
             caller_max_tokens = None
+        # CAP-C5: optional bi-temporal point-in-time view.
+        as_of_raw = args.get("as_of")
+        as_of: float | None = None if as_of_raw is None else _parse_iso_timestamp(as_of_raw, field="as_of")
         # CAP-C6: adaptive budget only ever substitutes for an *omitted*
         # max_tokens; an explicit caller value is never overridden.
         effective_max_tokens, budget_tokens_block = _adaptive_budget_tokens(
@@ -735,6 +776,7 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
                 k=caller_k,
                 diversity_limit=caller_diversity_limit,
                 max_tokens=effective_max_tokens,
+                as_of=as_of,
             )
             sections = assembler.sections_from_result(result=stream_result, budget=budget)
             handler_result: dict[str, object] = {
@@ -751,6 +793,8 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
                 handler_result["budget_tokens"] = budget_tokens_block
             if drift_block is not None:
                 handler_result["drift"] = drift_block
+            if as_of is not None:
+                handler_result["as_of"] = as_of
             return StreamResponse(
                 sections=sections,
                 handler_result=handler_result,
@@ -762,6 +806,7 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             k=caller_k,
             diversity_limit=caller_diversity_limit,
             max_tokens=effective_max_tokens,
+            as_of=as_of,
         )
         response: dict[str, object] = {
             "context": result.context,
@@ -777,6 +822,8 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             response["budget_tokens"] = budget_tokens_block
         if drift_block is not None:
             response["drift"] = drift_block
+        if as_of is not None:
+            response["as_of"] = as_of
         return response
 
     def _handle_write_memory(args: dict[str, object]) -> object:
@@ -807,6 +854,15 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
                 "could not be verified (missing/invalid signature or revoked identity)."
             )
 
+        # CAP-C5: optional bi-temporal validity window and honest supersedence.
+        valid_from_raw = args.get("valid_from")
+        valid_from = (
+            None if valid_from_raw is None else _parse_iso_timestamp(valid_from_raw, field="valid_from")
+        )
+        valid_to_raw = args.get("valid_to")
+        valid_to = None if valid_to_raw is None else _parse_iso_timestamp(valid_to_raw, field="valid_to")
+        supersedes = args.get("supersedes")
+
         kwargs: dict = {
             "content": content,
             "layer": str(args["layer"]),
@@ -816,6 +872,8 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             "base_trust": _trust_from_args(args),
             "written_at_drift": 0.0 if latest is None else latest.drift_score,
             "verified": verified,
+            "valid_from": valid_from,
+            "valid_to": valid_to,
         }
         if (chunk_id := args.get("chunk_id")):
             kwargs["chunk_id"] = str(chunk_id)
@@ -846,6 +904,13 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             result["reduction_ratio"] = round(fr.reduction_ratio, 3)
             if raw_ref is not None:
                 result["raw_ref"] = raw_ref
+        if supersedes is not None:
+            # Honest supersedence: the old chunk is never deleted, only marked.
+            # Its valid_to becomes this chunk's valid_from (or "now" if unset).
+            resolved_old_valid_to = time.time() if valid_from is None else valid_from
+            result["superseded"] = store.supersede(
+                str(supersedes), chunk.chunk_id, valid_to=resolved_old_valid_to
+            )
         return result
 
     def _handle_emit_whisper(args: dict[str, object]) -> object:
@@ -1238,6 +1303,25 @@ def _build_conscious_from_args(store: BaseStore, args: dict[str, object]) -> Con
         steps_completed=_int_arg(args, "steps_completed", 0 if latest is None else latest.steps_completed),
         steps_total=(None if latest is None else latest.steps_total),
     )
+
+
+def _parse_iso_timestamp(value: object, *, field: str) -> float:
+    """CAP-C5: parse an ISO-8601 timestamp arg into epoch seconds.
+
+    Accepts a bare epoch number too (int/float or numeric string) so callers
+    that already track epoch time don't need to round-trip through ISO.
+    """
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except ValueError as exc:
+        raise ValueError(f"{field} must be an ISO-8601 timestamp or epoch seconds: {value!r}") from exc
 
 
 def _trust_from_args(args: dict[str, object]) -> float:

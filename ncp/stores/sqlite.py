@@ -75,7 +75,10 @@ CREATE TABLE IF NOT EXISTS chunks (
     written_at_drift REAL DEFAULT 0.0,
     dissent_count INTEGER DEFAULT 0,
     verified INTEGER DEFAULT 0,
-    embedding BLOB
+    embedding BLOB,
+    valid_from REAL,
+    valid_to REAL,
+    superseded_by TEXT
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
@@ -325,6 +328,9 @@ class SQLiteStore(BaseStore):
                 "ALTER TABLE whispers ADD COLUMN verified INTEGER DEFAULT 0",  # CAP-T1/WI-013
                 "ALTER TABLE chunks ADD COLUMN embedding BLOB",  # CAP-C4
                 "ALTER TABLE memo_entries ADD COLUMN output_tokens_est INTEGER NOT NULL DEFAULT 0",  # S4.1 memo telemetry
+                "ALTER TABLE chunks ADD COLUMN valid_from REAL",  # CAP-C5
+                "ALTER TABLE chunks ADD COLUMN valid_to REAL",  # CAP-C5
+                "ALTER TABLE chunks ADD COLUMN superseded_by TEXT",  # CAP-C5
                 "CREATE TABLE IF NOT EXISTS drift_history (session_id TEXT NOT NULL, turn INTEGER NOT NULL, drift_score REAL NOT NULL, ts REAL NOT NULL)",
                 "CREATE INDEX IF NOT EXISTS idx_drift_session ON drift_history(session_id, turn)",
                 "CREATE TABLE IF NOT EXISTS identities (identity_id TEXT PRIMARY KEY, public_key TEXT NOT NULL, alg TEXT NOT NULL DEFAULT 'ed25519', label TEXT, created_at REAL NOT NULL, revoked_at REAL)",
@@ -356,8 +362,8 @@ class SQLiteStore(BaseStore):
                     written_by, caused_by, conscious_hash, evidence_id, version, supersedes,
                     source_refs, schema_version, created_at, base_trust, generation,
                     result_confidence, result_attempts, conditions, valid_while, expiry, owner, meta,
-                    written_at_drift, verified, embedding
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    written_at_drift, verified, embedding, valid_from, valid_to, superseded_by
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(chunk_id) DO UPDATE SET
                     pipeline_id = excluded.pipeline_id,
                     scope = excluded.scope,
@@ -385,7 +391,8 @@ class SQLiteStore(BaseStore):
                     meta = excluded.meta,
                     written_at_drift = excluded.written_at_drift,
                     verified = excluded.verified,
-                    embedding = excluded.embedding
+                    embedding = excluded.embedding,
+                    valid_from = excluded.valid_from
                 """,
                 (
                     chunk.chunk_id,
@@ -417,6 +424,9 @@ class SQLiteStore(BaseStore):
                     chunk.written_at_drift,
                     1 if chunk.verified else 0,
                     self._encode_embedding(chunk.embedding),
+                    chunk.valid_from,
+                    chunk.valid_to,
+                    chunk.superseded_by,
                 ),
             )
             self._hard_gc(connection, pipeline_id=chunk.pipeline_id)
@@ -457,6 +467,7 @@ class SQLiteStore(BaseStore):
         embedding: list[float] | None = None,
         diversity_limit: int = 2,
         fallback_to_trust_recency: bool = False,
+        as_of: float | None = None,
     ) -> list[SubconsciousChunk]:
         _VALID_RETRIEVAL_MODES = ("hybrid", "trust_recency", "vector")
         if retrieval_mode not in _VALID_RETRIEVAL_MODES:
@@ -479,6 +490,7 @@ class SQLiteStore(BaseStore):
                 pipeline_id=pipeline_id,
                 scope=scope,
                 zone=zone,
+                as_of=as_of,
             )
         if not rows:
             return []
@@ -567,6 +579,7 @@ class SQLiteStore(BaseStore):
                 pipeline_id=pipeline_id,
                 scope=scope,
                 zone=zone,
+                as_of=as_of,
             ):
                 age_seconds = max(0.0, now - float(row["created_at"]))
                 hybrid_score = policy.score(
@@ -755,6 +768,7 @@ class SQLiteStore(BaseStore):
         *,
         pipeline_id: str | None = None,
         layer: str | None = None,
+        as_of: float | None = None,
     ) -> Sequence[SubconsciousChunk]:
         with self._connect() as connection:
             rows = self._load_query_rows(
@@ -763,8 +777,30 @@ class SQLiteStore(BaseStore):
                 pipeline_id=pipeline_id,
                 scope=None,
                 zone="working",
+                as_of=as_of,
             )
         return [self._row_to_chunk(row) for row in rows]
+
+    def supersede(
+        self,
+        old_chunk_id: str,
+        new_chunk_id: str,
+        *,
+        valid_to: float | None = None,
+    ) -> bool:
+        """CAP-C5: mark ``old_chunk_id`` as honestly replaced by ``new_chunk_id``.
+
+        The old row is never deleted -- only ``superseded_by`` and
+        ``valid_to`` are updated in place, so a later ``as_of`` query can
+        still recover it.
+        """
+        resolved_valid_to = time.time() if valid_to is None else valid_to
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE chunks SET superseded_by = ?, valid_to = ? WHERE chunk_id = ?",
+                (new_chunk_id, resolved_valid_to, old_chunk_id),
+            )
+            return cursor.rowcount > 0
 
     def record_dissent(self, chunk_id: str) -> bool:
         normalized = chunk_id.removeprefix("ctx://sub/")
@@ -938,17 +974,21 @@ class SQLiteStore(BaseStore):
             outcome_ids,
         )
 
-    def get_chunks_by_ids(self, ids: Sequence[str]) -> list[SubconsciousChunk]:
+    def get_chunks_by_ids(
+        self, ids: Sequence[str], *, as_of: float | None = None
+    ) -> list[SubconsciousChunk]:
         unique_ids = [cid for cid in dict.fromkeys(ids) if cid]
         if not unique_ids:
             return []
         placeholders = ",".join("?" * len(unique_ids))
+        bitemporal_sql, bitemporal_params = self._bitemporal_clause(as_of)
         with self._connect() as connection:
             rows = connection.execute(
                 f"SELECT * FROM chunks WHERE chunk_id IN ({placeholders})"
                 " AND chunk_id NOT IN (SELECT chunk_id FROM tombstones)"
-                " AND (expiry IS NULL OR expiry > ?)",  # WI-006
-                [*unique_ids, time.time()],
+                " AND (expiry IS NULL OR expiry > ?)"  # WI-006
+                f" AND ({bitemporal_sql})",
+                [*unique_ids, time.time(), *bitemporal_params],
             ).fetchall()
         return [self._row_to_chunk(row) for row in rows]
 
@@ -2369,6 +2409,37 @@ class SQLiteStore(BaseStore):
             "whisper_queue": whisper_queue,
         }
 
+    @staticmethod
+    def _bitemporal_clause(as_of: float | None) -> tuple[str, list[object]]:
+        """CAP-C5: build a SQL fragment + params enforcing bi-temporal visibility.
+
+        Default view (``as_of=None``): the currently-valid view -- excludes
+        chunks that are superseded (period) or whose ``valid_to`` has
+        already passed "now".
+
+        ``as_of`` view (epoch seconds): chunks recorded (``created_at``) by
+        that transaction time, not superseded by a chunk itself recorded by
+        that time, and valid (``valid_from``/``valid_to``) at that instant.
+        Supersession always happens transactionally together with the
+        superseding chunk's write, so the superseding chunk's own
+        ``created_at`` is the transaction time the supersession took effect.
+        """
+        if as_of is None:
+            return (
+                "chunks.superseded_by IS NULL AND (chunks.valid_to IS NULL OR chunks.valid_to > ?)",
+                [time.time()],
+            )
+        return (
+            "chunks.created_at <= ?"
+            " AND (chunks.superseded_by IS NULL OR NOT EXISTS ("
+            "     SELECT 1 FROM chunks AS s"
+            "     WHERE s.chunk_id = chunks.superseded_by AND s.created_at <= ?"
+            " ))"
+            " AND (chunks.valid_from IS NULL OR chunks.valid_from <= ?)"
+            " AND (chunks.valid_to IS NULL OR chunks.valid_to > ?)",
+            [as_of, as_of, as_of, as_of],
+        )
+
     def _load_query_rows(
         self,
         connection: sqlite3.Connection,
@@ -2377,6 +2448,7 @@ class SQLiteStore(BaseStore):
         pipeline_id: str | None,
         scope: str | None,
         zone: str,
+        as_of: float | None = None,
     ) -> list[sqlite3.Row]:
         clauses = ["zone = ?"]
         params: list[object] = [zone]
@@ -2394,6 +2466,9 @@ class SQLiteStore(BaseStore):
         # WI-006: never surface chunks whose expiry has passed.
         clauses.append("(expiry IS NULL OR expiry > ?)")
         params.append(time.time())
+        bitemporal_sql, bitemporal_params = self._bitemporal_clause(as_of)
+        clauses.append(f"({bitemporal_sql})")
+        params.extend(bitemporal_params)
         return connection.execute(
             f"SELECT * FROM chunks WHERE {' AND '.join(clauses)} ORDER BY created_at DESC",
             params,
@@ -2408,6 +2483,7 @@ class SQLiteStore(BaseStore):
         pipeline_id: str | None,
         scope: str | None,
         zone: str,
+        as_of: float | None = None,
     ) -> list[tuple[sqlite3.Row, float]]:
         terms = sorted(normalize_query_terms(text))
         if not terms:
@@ -2434,6 +2510,10 @@ class SQLiteStore(BaseStore):
         # WI-006: exclude expired chunks from lexical retrieval.
         clauses.append("(chunks.expiry IS NULL OR chunks.expiry > ?)")
         params.append(time.time())
+        # CAP-C5: bi-temporal visibility (see _bitemporal_clause).
+        bitemporal_sql, bitemporal_params = self._bitemporal_clause(as_of)
+        clauses.append(f"({bitemporal_sql})")
+        params.extend(bitemporal_params)
 
         try:
             with self._connect() as connection:
@@ -2504,6 +2584,9 @@ class SQLiteStore(BaseStore):
             dissent_count=int(row["dissent_count"]) if row["dissent_count"] is not None else 0,
             verified=bool(row["verified"]) if "verified" in row.keys() and row["verified"] is not None else False,
             embedding=embedding,
+            valid_from=float(row["valid_from"]) if "valid_from" in row.keys() and row["valid_from"] is not None else None,
+            valid_to=float(row["valid_to"]) if "valid_to" in row.keys() and row["valid_to"] is not None else None,
+            superseded_by=row["superseded_by"] if "superseded_by" in row.keys() else None,
         )
         return chunk
 

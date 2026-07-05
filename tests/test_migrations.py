@@ -342,6 +342,83 @@ def test_bundled_001_substitution_produces_no_placeholders() -> None:
     assert "testschema" in substituted
 
 
+# ── 011_add_bitemporal_columns (CAP-C5) ───────────────────────────────────────
+
+def _migration_011_path() -> Path:
+    from importlib import resources
+    pkg = resources.files("ncp.migrations")
+    matches = [f for f in pkg.iterdir() if str(f).endswith("011_add_bitemporal_columns.sql")]
+    assert len(matches) == 1, "expected exactly one 011_add_bitemporal_columns.sql"
+    return Path(str(matches[0]))
+
+
+def test_migration_011_is_discovered_at_version_11() -> None:
+    runner = MigrationRunner(MagicMock(), schema="ncp", prefix="ncp_")
+    files = {f.version: f for f in runner._discover()}
+    assert 11 in files
+    assert files[11].name == "011_add_bitemporal_columns"
+
+
+def test_migration_011_up_adds_three_columns() -> None:
+    sql = _migration_011_path().read_text()
+    up, _ = MigrationRunner.parse_sections(sql)
+    assert "ALTER TABLE {schema}.{prefix}chunks ADD COLUMN IF NOT EXISTS valid_from" in up
+    assert "ALTER TABLE {schema}.{prefix}chunks ADD COLUMN IF NOT EXISTS valid_to" in up
+    assert "ALTER TABLE {schema}.{prefix}chunks ADD COLUMN IF NOT EXISTS superseded_by" in up
+    # No CREATE TABLE here -- this migration is additive columns only.
+    assert "CREATE TABLE" not in up
+
+
+def test_migration_011_down_drops_the_same_three_columns() -> None:
+    sql = _migration_011_path().read_text()
+    _, down = MigrationRunner.parse_sections(sql)
+    assert "DROP COLUMN IF EXISTS valid_from" in down
+    assert "DROP COLUMN IF EXISTS valid_to" in down
+    assert "DROP COLUMN IF EXISTS superseded_by" in down
+
+
+def test_migration_011_down_never_touches_schema_versions_table() -> None:
+    """Real migrations must never drop their own schema/version tracking table."""
+    sql = _migration_011_path().read_text()
+    _, down = MigrationRunner.parse_sections(sql)
+    assert "schema_versions" not in down
+    assert "DROP SCHEMA" not in down.upper()
+
+
+def test_migration_011_substitution_produces_no_placeholders() -> None:
+    runner = MigrationRunner(MagicMock(), schema="testschema", prefix="test_")
+    sql = _migration_011_path().read_text()
+    up, down = MigrationRunner.parse_sections(sql)
+    for section in (up, down):
+        substituted = runner._sub(section)
+        assert "{schema}" not in substituted
+        assert "{prefix}" not in substituted
+        assert "testschema.test_chunks" in substituted
+
+
+def test_migration_011_checksum_is_sha256_of_raw_bytes() -> None:
+    path = _migration_011_path()
+    raw = path.read_bytes()
+    expected = hashlib.sha256(raw).hexdigest()
+    runner = MigrationRunner(MagicMock(), schema="ncp", prefix="ncp_")
+    files = {f.version: f for f in runner._discover()}
+    assert files[11].checksum == expected
+
+
+def test_migration_011_apply_all_dry_run_shows_add_column_sql(tmp_path: Path) -> None:
+    """Non-live check that apply_all(dry_run=True) surfaces migration 011's UP SQL
+    verbatim (mirrors how test_apply_all_dry_run_returns_sql_without_executing
+    validates non-live migration behavior for 001)."""
+    sql = _migration_011_path().read_text()
+    _sql_file(tmp_path, "011_add_bitemporal_columns.sql", sql)
+    conn = _mock_conn(fetchall_rows=[])
+    runner = _runner(conn, tmp_path)
+    results = runner.apply_all(dry_run=True)
+    assert len(results) == 1
+    assert results[0]["version"] == 11
+    assert "ADD COLUMN IF NOT EXISTS valid_from" in results[0]["sql"]
+
+
 # ── integration (requires live Postgres) ─────────────────────────────────────
 
 INTEGRATION = pytest.mark.skipif(

@@ -57,6 +57,7 @@ class BaseStore(ABC):
         embedding: list[float] | None = None,
         diversity_limit: int = 2,
         fallback_to_trust_recency: bool = False,
+        as_of: float | None = None,
     ) -> list[SubconsciousChunk]:
         """Query stored chunks by text relevance.
 
@@ -71,6 +72,13 @@ class BaseStore(ABC):
 
         ``diversity_limit`` caps the number of results per author
         (``written_by``).  Default 2 preserves existing behavior.
+
+        ``as_of`` (CAP-C5, epoch seconds): when ``None`` (default), returns
+        the currently-valid view -- excludes chunks that are superseded or
+        whose ``valid_to`` has passed. When given, returns the bi-temporal
+        view as of that transaction time: only chunks recorded (written) by
+        then, not superseded by a chunk recorded by then, and valid
+        (``valid_from``/``valid_to``) at that instant.
         """
 
     @abstractmethod
@@ -79,17 +87,55 @@ class BaseStore(ABC):
         *,
         pipeline_id: str | None = None,
         layer: str | None = None,
+        as_of: float | None = None,
     ) -> Sequence[SubconsciousChunk]:
-        """Return working-zone chunks, optionally filtered."""
+        """Return working-zone chunks, optionally filtered.
 
-    def get_chunks_by_ids(self, ids: Sequence[str]) -> list[SubconsciousChunk]:
+        See ``query`` for ``as_of`` (CAP-C5 bi-temporal view) semantics.
+        """
+
+    def get_chunks_by_ids(
+        self, ids: Sequence[str], *, as_of: float | None = None
+    ) -> list[SubconsciousChunk]:
         """Fetch live (non-tombstoned) chunks by exact ids, any order.
 
         Used for 1-hop edge expansion over chunk relationships
         (``caused_by``, etc.). Backends that do not implement this return
         an empty list, which disables edge expansion gracefully.
+
+        See ``query`` for ``as_of`` (CAP-C5 bi-temporal view) semantics.
         """
         return []
+
+    def supersede(
+        self,
+        old_chunk_id: str,
+        new_chunk_id: str,
+        *,
+        valid_to: float | None = None,
+    ) -> bool:
+        """CAP-C5: mark ``old_chunk_id`` as honestly replaced by ``new_chunk_id``.
+
+        Sets ``old.superseded_by = new_chunk_id`` and ``old.valid_to =
+        valid_to`` (the caller resolves ``valid_to`` to the new chunk's
+        ``valid_from`` or "now"). The old chunk is never deleted -- this is
+        the bi-temporal honesty story: supersession is recorded, not
+        overwritten. Returns True if a row was found and updated. Backends
+        that do not implement this return False.
+        """
+        return False
+
+    async def async_supersede(
+        self,
+        old_chunk_id: str,
+        new_chunk_id: str,
+        *,
+        valid_to: float | None = None,
+    ) -> bool:
+        """Asynchronously mark a chunk as superseded."""
+        return await anyio.to_thread.run_sync(
+            partial(self.supersede, old_chunk_id, new_chunk_id, valid_to=valid_to)
+        )
 
     def record_dissent(self, chunk_id: str) -> bool:
         """Record that ``chunk_id`` was disputed (e.g. by a dissent whisper).
@@ -436,6 +482,7 @@ class BaseStore(ABC):
         zone: str = "working",
         retrieval_mode: str = "hybrid",
         embedding: list[float] | None = None,
+        as_of: float | None = None,
     ) -> list[SubconsciousChunk]:
         """Asynchronously query stored chunks by text relevance using thread pool."""
         fn = partial(
@@ -449,6 +496,7 @@ class BaseStore(ABC):
             zone=zone,
             retrieval_mode=retrieval_mode,
             embedding=embedding,
+            as_of=as_of,
         )
         return await anyio.to_thread.run_sync(fn)
 
