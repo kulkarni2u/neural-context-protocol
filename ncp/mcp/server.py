@@ -14,6 +14,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import BinaryIO
 
+from ncp.adaptive_budget import AdaptiveBudgetResult, compute_adaptive_budget
 from ncp.assembler import Assembler
 from ncp.budget import BudgetSnapshot, evaluate_budget
 from ncp.chunker import filter_content
@@ -63,7 +64,7 @@ MCP_TOOLS: list[dict[str, object]] = [
                 "stream": {"type": "boolean", "description": "If true, returns sections progressively as NDJSON (HTTP) or JSON-RPC notifications (stdio). Default false."},
                 "k": {"type": "integer", "description": "Number of subconscious chunks to retrieve. Overrides the default budget-pressure-based value (2 for critical, 4 otherwise)."},
                 "diversity_limit": {"type": "integer", "description": "Max chunks per author in retrieved results. Default 2. Set higher to allow more results from one author."},
-                "max_tokens": {"type": "integer", "description": "Optional estimated token ceiling for the assembled context block."},
+                "max_tokens": {"type": "integer", "description": "Optional estimated token ceiling for the assembled context block. Always honored as-is; when omitted and [budget].adaptive_budget_enabled is true, the ceiling is instead computed per-turn (see the response's budget_tokens block)."},
                 "recent": {"type": "array", "items": {"type": "string"}, "description": "Optional recent refs overriding hydrated conscious state."},
                 "tried": {"type": "array", "items": {"type": "string"}, "description": "Optional attempted actions overriding hydrated conscious state."},
                 "failed": {"type": "array", "items": {"type": "string"}, "description": "Optional failed actions overriding hydrated conscious state."},
@@ -461,6 +462,11 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
     budget_enforcement = config.budget_enforcement if config is not None else "warn"
     # CAP-E3: model-tiering advisory signal, on by default.
     tier_hints_enabled = config.tier_hints_enabled if config is not None else True
+    # CAP-C6: adaptive per-turn context token budget, opt-in (off by default).
+    adaptive_budget_enabled = config.adaptive_budget_enabled if config is not None else False
+    adaptive_budget_floor_tokens = config.adaptive_budget_floor_tokens if config is not None else 300
+    adaptive_budget_ceiling_tokens = config.adaptive_budget_ceiling_tokens if config is not None else 2000
+    default_context_token_budget = config.context_token_budget if config is not None else 840
 
     def _budget_snapshot(*, pipeline_id: str | None) -> BudgetSnapshot | None:
         """CAP-E2: read real recorded spend and classify it against the ceiling.
@@ -553,6 +559,51 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             cold_start=cold_start,
         )
 
+    def _adaptive_budget_tokens(
+        *,
+        caller_max_tokens: int | None,
+        conscious: ConsciousBlock,
+        budget: BudgetContext,
+        search_text: str,
+        budget_snapshot: BudgetSnapshot | None,
+    ) -> tuple[int | None, dict[str, object] | None]:
+        """CAP-C6: resolve the effective ``max_tokens`` for this call.
+
+        Returns ``(effective_max_tokens, budget_tokens_block)``. The block is
+        ``None`` whenever the feature is disabled; ``effective_max_tokens`` is
+        always exactly ``caller_max_tokens`` (including ``None``, i.e. "let
+        the assembler use its configured default") when disabled, so a
+        disabled flag reproduces legacy behavior byte-for-byte.
+
+        An explicit caller ``max_tokens`` always wins: when present, no
+        adaptive computation runs and the block (when the feature is on)
+        simply echoes it back with ``reason_factors: {"explicit_override": True}``.
+        """
+
+        if not adaptive_budget_enabled:
+            return caller_max_tokens, None
+
+        if caller_max_tokens is not None:
+            return caller_max_tokens, {
+                "requested": caller_max_tokens,
+                "adjusted": caller_max_tokens,
+                "reason_factors": {"explicit_override": True},
+            }
+
+        result: AdaptiveBudgetResult = compute_adaptive_budget(
+            requested_tokens=default_context_token_budget,
+            floor_tokens=adaptive_budget_floor_tokens,
+            ceiling_tokens=adaptive_budget_ceiling_tokens,
+            query_text=search_text,
+            drift_score=conscious.drift_score,
+            pressure=budget.pressure,
+            slot_age=conscious.slot_age,
+            dollar_budget_fraction_used=(
+                None if budget_snapshot is None else budget_snapshot.fraction_used
+            ),
+        )
+        return result.adjusted_tokens, result.to_dict()
+
     def _handle_get_context(args: dict[str, object]) -> object:
         session_id = _session_id_from_args(args)
         pipeline_id = args.get("pipeline_id")
@@ -596,6 +647,15 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             caller_max_tokens: int | None = max(1, int(args["max_tokens"])) if "max_tokens" in args else None  # type: ignore[arg-type]
         except (ValueError, TypeError):
             caller_max_tokens = None
+        # CAP-C6: adaptive budget only ever substitutes for an *omitted*
+        # max_tokens; an explicit caller value is never overridden.
+        effective_max_tokens, budget_tokens_block = _adaptive_budget_tokens(
+            caller_max_tokens=caller_max_tokens,
+            conscious=conscious,
+            budget=budget,
+            search_text=search_text,
+            budget_snapshot=budget_snapshot,
+        )
         if stream:
             stream_result = assembler.assemble(
                 conscious=conscious,
@@ -603,7 +663,7 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
                 query_text=search_text,
                 k=caller_k,
                 diversity_limit=caller_diversity_limit,
-                max_tokens=caller_max_tokens,
+                max_tokens=effective_max_tokens,
             )
             sections = assembler.sections_from_result(result=stream_result, budget=budget)
             handler_result: dict[str, object] = {
@@ -616,6 +676,8 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
                 handler_result["budget"] = budget_snapshot.to_dict()
             if tier_hints_enabled:
                 handler_result.update(_tier_signal(stream_result, budget=budget, search_text=search_text).to_dict())
+            if budget_tokens_block is not None:
+                handler_result["budget_tokens"] = budget_tokens_block
             return StreamResponse(
                 sections=sections,
                 handler_result=handler_result,
@@ -626,7 +688,7 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             query_text=search_text,
             k=caller_k,
             diversity_limit=caller_diversity_limit,
-            max_tokens=caller_max_tokens,
+            max_tokens=effective_max_tokens,
         )
         response: dict[str, object] = {
             "context": result.context,
@@ -638,6 +700,8 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             response["budget"] = budget_snapshot.to_dict()
         if tier_hints_enabled:
             response.update(_tier_signal(result, budget=budget, search_text=search_text).to_dict())
+        if budget_tokens_block is not None:
+            response["budget_tokens"] = budget_tokens_block
         return response
 
     def _handle_write_memory(args: dict[str, object]) -> object:

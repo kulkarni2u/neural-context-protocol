@@ -232,6 +232,45 @@ def test_budget_enforcement_falls_back_to_warn_for_unknown_value(tmp_path: Path)
     assert config.budget_enforcement == "warn"
 
 
+def test_adaptive_budget_config_defaults(tmp_path: Path) -> None:
+    project = tmp_path / "repo"
+    (project / ".git").mkdir(parents=True)
+
+    config = load_config(cwd=project)
+
+    assert config.adaptive_budget_enabled is False
+    assert config.adaptive_budget_floor_tokens == 300
+    assert config.adaptive_budget_ceiling_tokens == 2000
+
+
+def test_adaptive_budget_config_file_and_env_overrides(tmp_path: Path) -> None:
+    project = tmp_path / "repo"
+    (project / ".git").mkdir(parents=True)
+    (project / ".ncp").mkdir()
+    (project / ".ncp" / "config.toml").write_text(
+        "[budget]\nadaptive_budget_enabled = true\n"
+        "adaptive_budget_floor_tokens = 250\n"
+        "adaptive_budget_ceiling_tokens = 1500\n"
+    )
+
+    config = load_config(cwd=project)
+    assert config.adaptive_budget_enabled is True
+    assert config.adaptive_budget_floor_tokens == 250
+    assert config.adaptive_budget_ceiling_tokens == 1500
+
+    config = load_config(
+        cwd=project,
+        env={
+            "NCP_ADAPTIVE_BUDGET_ENABLED": "false",
+            "NCP_ADAPTIVE_BUDGET_FLOOR_TOKENS": "400",
+            "NCP_ADAPTIVE_BUDGET_CEILING_TOKENS": "1800",
+        },
+    )
+    assert config.adaptive_budget_enabled is False
+    assert config.adaptive_budget_floor_tokens == 400
+    assert config.adaptive_budget_ceiling_tokens == 1800
+
+
 def test_tier_hints_enabled_config_default_and_overrides(tmp_path: Path) -> None:
     project = tmp_path / "repo"
     (project / ".git").mkdir(parents=True)

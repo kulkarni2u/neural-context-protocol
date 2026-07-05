@@ -50,6 +50,12 @@ DEFAULT_CONFIG = {
         "pipeline_budget_usd": None,
         "budget_warn_fraction": 0.8,
         "budget_enforcement": "warn",
+        # CAP-C6: adaptive per-turn context token budget. Default false
+        # (opt-in) -- disabled preserves exact legacy behavior. Floor/ceiling
+        # are only consulted when enabled.
+        "adaptive_budget_enabled": False,
+        "adaptive_budget_floor_tokens": 300,
+        "adaptive_budget_ceiling_tokens": 2000,
     },
     "chunking": {
         "max_chunk_tokens": 200,
@@ -308,6 +314,19 @@ class NCPConfig:
         return val if val in {"off", "warn", "block"} else "warn"
 
     @property
+    def adaptive_budget_enabled(self) -> bool:
+        """CAP-C6: whether ncp_get_context adapts the token budget to turn difficulty."""
+        return bool(self.values.get("budget", {}).get("adaptive_budget_enabled", False))
+
+    @property
+    def adaptive_budget_floor_tokens(self) -> int:
+        return int(self.values.get("budget", {}).get("adaptive_budget_floor_tokens", 300))
+
+    @property
+    def adaptive_budget_ceiling_tokens(self) -> int:
+        return int(self.values.get("budget", {}).get("adaptive_budget_ceiling_tokens", 2000))
+
+    @property
     def tier_hints_enabled(self) -> bool:
         """CAP-E3: whether ncp_get_context emits the advisory tier_hint/complexity_signal fields."""
         return bool(self.values.get("tiering", {}).get("tier_hints_enabled", True))
@@ -482,6 +501,13 @@ def _apply_env_overrides(values: dict[str, Any], env: dict[str, str]) -> None:
     if "NCP_TIER_HINTS_ENABLED" in env:
         val = env["NCP_TIER_HINTS_ENABLED"].lower()
         values["tiering"]["tier_hints_enabled"] = val in {"true", "1", "yes"}
+    if "NCP_ADAPTIVE_BUDGET_ENABLED" in env:
+        val = env["NCP_ADAPTIVE_BUDGET_ENABLED"].lower()
+        values["budget"]["adaptive_budget_enabled"] = val in {"true", "1", "yes"}
+    if "NCP_ADAPTIVE_BUDGET_FLOOR_TOKENS" in env:
+        values["budget"]["adaptive_budget_floor_tokens"] = int(env["NCP_ADAPTIVE_BUDGET_FLOOR_TOKENS"])
+    if "NCP_ADAPTIVE_BUDGET_CEILING_TOKENS" in env:
+        values["budget"]["adaptive_budget_ceiling_tokens"] = int(env["NCP_ADAPTIVE_BUDGET_CEILING_TOKENS"])
 
 
 def _deep_merge(target: dict[str, Any], updates: dict[str, Any]) -> None:

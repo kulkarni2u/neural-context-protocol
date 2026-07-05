@@ -32,6 +32,22 @@ Audit remediation from `docs/NCP_AUDIT_AND_REMEDIATION_PLAN.md`. One work item
 
 ### Added
 
+- **Adaptive per-turn context token budget** (`ncp/adaptive_budget.py`,
+  `ncp/mcp/server.py`, `ncp/config.py`): `ncp_get_context` can scale its
+  effective token budget to turn difficulty instead of always spending
+  `[budget].context_token_budget`. When `[budget].adaptive_budget_enabled`
+  is true (**default `false`**) and the caller omits `max_tokens`, the
+  budget is computed from query length, drift score, budget pressure, and
+  slot cadence (all already observable before assembly runs), scaled
+  `0.5x`-`1.5x` of the requested budget, further pulled down under CAP-E2 $
+  budget pressure, and always clamped to
+  `[adaptive_budget_floor_tokens, adaptive_budget_ceiling_tokens]`
+  (**defaults `300`/`2000`**). The response gains a `budget_tokens`
+  (`requested`/`adjusted`/`reason_factors`) block, present only when the
+  feature is enabled. An explicit caller `max_tokens` is always honored
+  as-is regardless of this setting. Disabled (default) reproduces legacy
+  behavior byte-for-byte. See the formula in `ncp/adaptive_budget.py` and
+  `docs/NCP_PROTOCOL_SPEC.md` §4d. (CAP-C6)
 - **Model-tiering advisory signal** (`ncp/tiering.py`, `ncp/mcp/server.py`,
   `ncp/config.py`): `ncp_get_context` responses gain a top-level `tier_hint`
   (`"light"`/`"standard"`/`"deep"`), `complexity_signal` (0.0-1.0), and a

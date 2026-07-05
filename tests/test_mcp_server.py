@@ -1752,3 +1752,133 @@ class TestTierHintSignal:
 
         assert result["factors"]["cold_start"] is True
         assert result["factors"]["chunk_count"] == 1
+
+
+class TestAdaptiveBudget:
+    """CAP-C6: adaptive per-turn context token budget."""
+
+    def _args(self, **overrides: object) -> dict:
+        base = {
+            "agent_id": "builder",
+            "role": "build",
+            "owns": [],
+            "must_not": [],
+            "task": "test",
+            "slot": "test",
+            "intent": "test",
+            "pipeline_id": "pipe_adaptive",
+        }
+        base.update(overrides)
+        return base
+
+    def test_disabled_by_default_omits_budget_tokens_block(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "adaptive_off.db")
+        handlers = make_handlers(store)
+
+        result = _content(_handle_request(_call("ncp_get_context", self._args()), handlers))
+
+        assert "budget_tokens" not in result
+
+    def test_disabled_flag_is_byte_identical_to_no_config(self, tmp_path: Path) -> None:
+        store_a = SQLiteStore(tmp_path / "adaptive_legacy_a.db")
+        store_b = SQLiteStore(tmp_path / "adaptive_legacy_b.db")
+        handlers_no_config = make_handlers(store_a)
+
+        config = load_config(cwd=tmp_path)
+        config.values["budget"]["adaptive_budget_enabled"] = False
+        handlers_explicit_off = make_handlers(store_b, config=config)
+
+        args = self._args(pipeline_id="pipe_legacy")
+        result_no_config = _content(_handle_request(_call("ncp_get_context", args), handlers_no_config))
+        result_explicit_off = _content(_handle_request(_call("ncp_get_context", args), handlers_explicit_off))
+
+        assert result_no_config["context"] == result_explicit_off["context"]
+        assert "budget_tokens" not in result_no_config
+        assert "budget_tokens" not in result_explicit_off
+
+    def test_enabled_without_caller_max_tokens_exposes_budget_tokens_block(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "adaptive_on.db")
+        config = load_config(cwd=tmp_path)
+        config.values["budget"]["adaptive_budget_enabled"] = True
+        handlers = make_handlers(store, config=config)
+
+        result = _content(_handle_request(_call("ncp_get_context", self._args()), handlers))
+
+        assert "budget_tokens" in result
+        block = result["budget_tokens"]
+        assert set(block) == {"requested", "adjusted", "reason_factors"}
+        assert block["requested"] == config.context_token_budget
+        assert config.adaptive_budget_floor_tokens <= block["adjusted"] <= config.adaptive_budget_ceiling_tokens
+        assert estimate_tokens(result["context"]) <= block["adjusted"]
+
+    def test_explicit_caller_max_tokens_is_never_overridden(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "adaptive_explicit.db")
+        for index in range(4):
+            store.write(SubconsciousChunk(
+                chunk_id=f"adaptive_large_{index}",
+                content=" ".join(["adaptive explicit context"] + [f"tokenish_{index}_{j}" for j in range(120)]),
+                layer="semantic",
+                src="tool_result",
+                pipeline_id="pipe_adaptive_explicit",
+            ))
+        config = load_config(cwd=tmp_path)
+        config.values["budget"]["adaptive_budget_enabled"] = True
+        config.values["budget"]["adaptive_budget_floor_tokens"] = 50
+        config.values["budget"]["adaptive_budget_ceiling_tokens"] = 100
+        handlers = make_handlers(store, config=config)
+
+        result = _content(_handle_request(
+            _call("ncp_get_context", self._args(
+                pipeline_id="pipe_adaptive_explicit",
+                max_tokens=200,
+                drift_score=1.0,
+                ctx_used=0.95,
+            )),
+            handlers,
+        ))
+
+        assert result["budget_tokens"] == {
+            "requested": 200,
+            "adjusted": 200,
+            "reason_factors": {"explicit_override": True},
+        }
+        assert estimate_tokens(result["context"]) <= 200
+
+    def test_adjusted_always_within_configured_floor_and_ceiling(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "adaptive_bounds.db")
+        config = load_config(cwd=tmp_path)
+        config.values["budget"]["adaptive_budget_enabled"] = True
+        config.values["budget"]["adaptive_budget_floor_tokens"] = 120
+        config.values["budget"]["adaptive_budget_ceiling_tokens"] = 180
+        handlers = make_handlers(store, config=config)
+
+        easy = _content(_handle_request(
+            _call("ncp_get_context", self._args(pipeline_id="pipe_bounds_easy", task="t", slot="s")),
+            handlers,
+        ))
+        hard = _content(_handle_request(
+            _call("ncp_get_context", self._args(
+                pipeline_id="pipe_bounds_hard",
+                task="x" * 200,
+                slot="y" * 100,
+                drift_score=1.0,
+                ctx_used=0.95,
+            )),
+            handlers,
+        ))
+
+        assert 120 <= easy["budget_tokens"]["adjusted"] <= 180
+        assert 120 <= hard["budget_tokens"]["adjusted"] <= 180
+        assert hard["budget_tokens"]["adjusted"] >= easy["budget_tokens"]["adjusted"]
+
+    def test_budget_tokens_is_deterministic_for_identical_state(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "adaptive_det.db")
+        config = load_config(cwd=tmp_path)
+        config.values["budget"]["adaptive_budget_enabled"] = True
+        handlers = make_handlers(store, config=config)
+        args = self._args(pipeline_id="pipe_adaptive_det", drift_score=0.4, ctx_used=0.6)
+
+        first = _content(_handle_request(_call("ncp_get_context", args), handlers))
+        second = _content(_handle_request(_call("ncp_get_context", args), handlers))
+
+        assert first["budget_tokens"] == second["budget_tokens"]

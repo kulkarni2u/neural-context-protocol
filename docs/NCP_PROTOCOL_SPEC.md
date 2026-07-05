@@ -514,6 +514,88 @@ Every factor above is one of the raw inputs to the formula -- the signal is
 fully reconstructable from the "factors" block, not a black box.
 ```
 
+## 4d. Adaptive Context Token Budget (CAP-C6, normative)
+
+```
+Config gate ([budget] table):
+  adaptive_budget_enabled:        bool (default false, OPT-IN) -- disabled
+                                   reproduces legacy behavior exactly: the
+                                   effective max_tokens is always whatever
+                                   the caller passed (or None, letting the
+                                   assembler fall back to its own configured
+                                   default), and no "budget_tokens" field is
+                                   ever present in the response.
+  adaptive_budget_floor_tokens:    int (default 300)  -- hard lower bound.
+  adaptive_budget_ceiling_tokens:  int (default 2000) -- hard upper bound.
+
+Precedence (never violated): an explicit caller max_tokens argument always
+wins. When present, no adaptive computation is applied to the value actually
+used for assembly -- it is passed through unchanged. This holds whether or
+not adaptive_budget_enabled is true.
+
+"budget_tokens" block shape (present on ncp_get_context, streaming and
+non-streaming, only when adaptive_budget_enabled is true):
+  {
+    "requested": int,   # what would have been used: the caller's explicit
+                         # max_tokens if given, else [budget].context_token_budget
+    "adjusted":  int,    # what was actually passed to assembly.
+                         # == "requested" whenever the caller passed an
+                         # explicit max_tokens (never overridden); otherwise
+                         # the computed value, always in
+                         # [adaptive_budget_floor_tokens, adaptive_budget_ceiling_tokens]
+    "reason_factors": {
+      # when the caller supplied an explicit max_tokens:
+      "explicit_override": true
+      # otherwise, every raw input to the formula below:
+      "query_length_chars": int,
+      "query_length_norm":  float,  # min(1.0, query_length_chars / 240)
+      "drift_score":        float,  # ConsciousBlock.drift_score, already 0-1
+      "pressure":           "low" | "medium" | "high" | "critical",
+      "pressure_norm":      float,  # {low:0.0, medium:0.33, high:0.66, critical:1.0}
+      "slot_age":           int,    # ConsciousBlock.slot_age (turns on this slot)
+      "cadence_norm":       float,  # min(1.0, slot_age / 10)
+      "task_signal":        float,  # weighted blend, in [0.0, 1.0]
+      "scale":               float, # 0.5 + task_signal, in [0.5, 1.5]
+      "dollar_budget_fraction_used": float | null,  # CAP-E2 fraction_used, or
+                                                     # null when the $ governor
+                                                     # is not configured
+      "conserved_scale":    float,  # scale after the $ pressure cut
+      "floor_tokens":       int,
+      "ceiling_tokens":     int,
+    }
+  }
+
+Formula (deterministic; see ncp/adaptive_budget.py for the reference
+implementation). All computed from values already available before
+assembly runs -- no extra retrieval, no ML:
+  query_length_norm = min(1.0, len(query_text) / 240)      # same reference as CAP-E3
+  drift              = clamp(drift_score, 0.0, 1.0)
+  pressure_norm      = {"low":0.0,"medium":0.33,"high":0.66,"critical":1.0}[pressure]
+  cadence_norm       = min(1.0, slot_age / 10)              # 10 turns on one slot == "sustained"
+
+  task_signal = 0.30 * query_length_norm
+              + 0.30 * drift
+              + 0.25 * pressure_norm
+              + 0.15 * cadence_norm
+
+  scale = 0.5 + task_signal                                  # in [0.5, 1.5]
+
+  dollar_pressure  = 0.0 if no CAP-E2 $ ceiling is configured
+                     else clamp(BudgetSnapshot.fraction_used, 0.0, 1.0)
+  conserved_scale  = scale * (1.0 - 0.5 * dollar_pressure)
+
+  adjusted_tokens = round(requested_tokens * conserved_scale)
+  adjusted_tokens = clamp(adjusted_tokens, floor_tokens, ceiling_tokens)
+
+Intent: simple/cheap turns (short query, low drift, low pressure, fresh slot)
+spend fewer tokens; complex/contested turns (long query, high drift, high
+pressure, a long-running slot) are allowed to spend more -- but a pipeline
+that is close to exhausting its CAP-E2 $ ceiling gets pulled back down, and
+the result never leaves [floor_tokens, ceiling_tokens] regardless of inputs.
+NCP never widens the ceiling itself; it only chooses where inside the fixed
+[floor, ceiling] range to spend for this turn.
+```
+
 ---
 
 ## 5. Trust Boundaries (normative, first-class)
@@ -865,6 +947,9 @@ critical_at_ratio = 0.85
 # pipeline_budget_usd = 5.00   # CAP-E2; unset (default) disables the governor
 budget_warn_fraction = 0.8     # CAP-E2
 budget_enforcement = "warn"    # CAP-E2: off | warn | block
+adaptive_budget_enabled = false        # CAP-C6: opt-in
+adaptive_budget_floor_tokens = 300     # CAP-C6
+adaptive_budget_ceiling_tokens = 2000  # CAP-C6
 
 [tiering]
 tier_hints_enabled = true      # CAP-E3
