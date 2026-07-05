@@ -123,11 +123,14 @@ class BaseStore(ABC):
         task: str,
         chunk_ids: list[str],
         result_summary: str | None = None,
+        output_tokens_est: int | None = None,
     ) -> bool:
         """Persist a work memo for CAP-C3 semantic memoization.
 
-        Returns True on success. Backends that do not implement this
-        return False.
+        ``output_tokens_est`` records how many output tokens a memo hit is
+        estimated to save; when None, backends estimate it from the stored
+        result via ``ncp.tokens.estimate_tokens``. Returns True on success.
+        Backends that do not implement this return False.
         """
         return False
 
@@ -146,15 +149,32 @@ class BaseStore(ABC):
         """
         return False
 
+    def memo_stats(self) -> dict[str, int]:
+        """Aggregate memoization telemetry (S4.1).
+
+        Returns ``hits`` (total per-entry hit_count), ``misses`` (lookups
+        that returned None), ``entry_count``, and ``estimated_tokens_saved``
+        — an estimate computed as SUM(hit_count * output_tokens_est).
+        Backends that do not implement memoization return zeros.
+        """
+        return {"hits": 0, "misses": 0, "entry_count": 0, "estimated_tokens_saved": 0}
+
+    async def async_memo_stats(self) -> dict[str, int]:
+        """Asynchronously fetch aggregate memoization telemetry."""
+        return await anyio.to_thread.run_sync(self.memo_stats)
+
     async def async_record_memo(
         self,
         signature: str,
         task: str,
         chunk_ids: list[str],
         result_summary: str | None = None,
+        output_tokens_est: int | None = None,
     ) -> bool:
         """Asynchronously record a work memo."""
-        return await anyio.to_thread.run_sync(self.record_memo, signature, task, chunk_ids, result_summary)
+        return await anyio.to_thread.run_sync(
+            self.record_memo, signature, task, chunk_ids, result_summary, output_tokens_est
+        )
 
     async def async_lookup_memo(self, signature: str) -> dict | None:
         """Asynchronously look up a memo by signature."""

@@ -44,6 +44,7 @@ from ncp.stores.calibration import (
     rollup_reputation,
 )
 from ncp.stores.consolidation import cluster_by_tags, find_merge_candidates
+from ncp.tokens import estimate_tokens
 from ncp.types import (
     CalibrationReport,
     ConsciousBlock,
@@ -1146,7 +1147,11 @@ class AsyncPgvectorStore(BaseStore):
         task: str,
         chunk_ids: list[str],
         result_summary: str | None = None,
+        output_tokens_est: int | None = None,
     ) -> bool:
+        if output_tokens_est is None:
+            # No real token count available: estimate over the stored result.
+            output_tokens_est = estimate_tokens(result_summary) if result_summary else 0
         async with self._aconnect() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
@@ -1154,18 +1159,65 @@ class AsyncPgvectorStore(BaseStore):
                         """
                         INSERT INTO {schema}.{prefix}memo_entries
                             (signature, task, result_summary, chunk_ids, outcome, verified,
-                             created_at, last_hit_at, hit_count)
-                        VALUES (%s, %s, %s, %s, 0.0, 0, %s, 0.0, 0)
+                             created_at, last_hit_at, hit_count, output_tokens_est)
+                        VALUES (%s, %s, %s, %s, 0.0, 0, %s, 0.0, 0, %s)
                         ON CONFLICT (signature) DO UPDATE SET
                             task = EXCLUDED.task,
                             result_summary = EXCLUDED.result_summary,
                             chunk_ids = EXCLUDED.chunk_ids,
-                            created_at = EXCLUDED.created_at
+                            created_at = EXCLUDED.created_at,
+                            output_tokens_est = EXCLUDED.output_tokens_est
                         """
                     ),
-                    (signature, task, result_summary, json.dumps(chunk_ids), time.time()),
+                    (
+                        signature, task, result_summary, json.dumps(chunk_ids),
+                        time.time(), max(0, int(output_tokens_est)),
+                    ),
                 )
                 return cur.rowcount > 0
+
+    async def _abump_memo_miss(self) -> None:
+        """Increment the S4.1 memoization miss counter."""
+        async with self._aconnect() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    self._sql(
+                        "INSERT INTO {schema}.{prefix}memo_stats AS ms (stat_key, stat_value)"
+                        " VALUES ('misses', 1)"
+                        " ON CONFLICT (stat_key) DO UPDATE SET stat_value = ms.stat_value + 1"
+                    )
+                )
+
+    async def async_memo_stats(self) -> dict[str, int]:
+        """Aggregate memoization telemetry: hits, misses, entries, tokens saved.
+
+        ``estimated_tokens_saved`` is an estimate: SUM(hit_count * output_tokens_est).
+        """
+        async with self._aconnect() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    self._sql(
+                        "SELECT COUNT(*) AS entry_count,"
+                        " COALESCE(SUM(hit_count), 0) AS hits,"
+                        " COALESCE(SUM(hit_count * output_tokens_est), 0) AS tokens_saved"
+                        " FROM {schema}.{prefix}memo_entries"
+                    )
+                )
+                row = await self._afetchone(cur)
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    self._sql(
+                        "SELECT stat_value FROM {schema}.{prefix}memo_stats"
+                        " WHERE stat_key = 'misses'"
+                    )
+                )
+                miss_row = await self._afetchone(cur)
+        return {
+            "hits": int(row["hits"]) if row is not None else 0,
+            "misses": int(miss_row["stat_value"]) if miss_row is not None else 0,
+            "entry_count": int(row["entry_count"]) if row is not None else 0,
+            "estimated_tokens_saved": int(row["tokens_saved"]) if row is not None else 0,
+        }
 
     async def async_lookup_memo(self, signature: str) -> dict | None:
         async with self._aconnect() as conn:
@@ -1179,11 +1231,13 @@ class AsyncPgvectorStore(BaseStore):
                 raw = await cur.fetchone()
                 description = cur.description
         if raw is None:
+            await self._abump_memo_miss()
             return None
         row = self._normalize_row(raw, description)
         max_age = self.config.memoization_max_age_hours if self.config is not None else 24
         age_seconds = time.time() - float(row["created_at"])
         if age_seconds > max_age * 3600:
+            await self._abump_memo_miss()
             return None
         async with self._aconnect() as conn:
             async with conn.cursor() as cur:

@@ -29,6 +29,7 @@ from ncp.stores.retrieval import (
     normalize_result_limit,
     score_trust_recency_candidate,
 )
+from ncp.tokens import estimate_tokens
 from ncp.types import (
     CalibrationReport,
     ConsolidationReport,
@@ -220,7 +221,13 @@ CREATE TABLE IF NOT EXISTS memo_entries (
     verified INTEGER DEFAULT 0,
     created_at REAL NOT NULL,
     last_hit_at REAL NOT NULL DEFAULT 0.0,
-    hit_count INTEGER NOT NULL DEFAULT 0
+    hit_count INTEGER NOT NULL DEFAULT 0,
+    output_tokens_est INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS memo_stats (
+    stat_key TEXT PRIMARY KEY,
+    stat_value INTEGER NOT NULL DEFAULT 0
 );
 """
 
@@ -317,6 +324,7 @@ class SQLiteStore(BaseStore):
                 "ALTER TABLE chunks ADD COLUMN verified INTEGER DEFAULT 0",  # CAP-T1/WI-013
                 "ALTER TABLE whispers ADD COLUMN verified INTEGER DEFAULT 0",  # CAP-T1/WI-013
                 "ALTER TABLE chunks ADD COLUMN embedding BLOB",  # CAP-C4
+                "ALTER TABLE memo_entries ADD COLUMN output_tokens_est INTEGER NOT NULL DEFAULT 0",  # S4.1 memo telemetry
                 "CREATE TABLE IF NOT EXISTS drift_history (session_id TEXT NOT NULL, turn INTEGER NOT NULL, drift_score REAL NOT NULL, ts REAL NOT NULL)",
                 "CREATE INDEX IF NOT EXISTS idx_drift_session ON drift_history(session_id, turn)",
                 "CREATE TABLE IF NOT EXISTS identities (identity_id TEXT PRIMARY KEY, public_key TEXT NOT NULL, alg TEXT NOT NULL DEFAULT 'ed25519', label TEXT, created_at REAL NOT NULL, revoked_at REAL)",
@@ -801,17 +809,21 @@ class SQLiteStore(BaseStore):
         task: str,
         chunk_ids: list[str],
         result_summary: str | None = None,
+        output_tokens_est: int | None = None,
     ) -> bool:
+        if output_tokens_est is None:
+            # No real token count available: estimate over the stored result.
+            output_tokens_est = estimate_tokens(result_summary) if result_summary else 0
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             connection.execute(
                 """
                 INSERT OR REPLACE INTO memo_entries
                     (signature, task, result_summary, chunk_ids, outcome, verified, created_at,
-                     last_hit_at, hit_count)
-                VALUES (?, ?, ?, ?, 0.0, 0, ?, 0.0, 0)
+                     last_hit_at, hit_count, output_tokens_est)
+                VALUES (?, ?, ?, ?, 0.0, 0, ?, 0.0, 0, ?)
                 """,
-                (signature, task, result_summary, json.dumps(chunk_ids), time.time()),
+                (signature, task, result_summary, json.dumps(chunk_ids), time.time(), max(0, int(output_tokens_est))),
             )
             return True
 
@@ -822,11 +834,13 @@ class SQLiteStore(BaseStore):
                 (signature,),
             ).fetchone()
         if row is None:
+            self._bump_memo_miss()
             return None
         # Check staleness
         max_age = self.config.memoization_max_age_hours if self.config is not None else 24
         age_seconds = time.time() - float(row["created_at"])
         if age_seconds > max_age * 3600:
+            self._bump_memo_miss()
             return None
         # Update hit tracking
         with self._connect() as connection:
@@ -835,6 +849,36 @@ class SQLiteStore(BaseStore):
                 (time.time(), signature),
             )
         return dict(row)
+
+    def _bump_memo_miss(self) -> None:
+        """Increment the S4.1 memoization miss counter."""
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO memo_stats (stat_key, stat_value) VALUES ('misses', 1)"
+                " ON CONFLICT(stat_key) DO UPDATE SET stat_value = stat_value + 1"
+            )
+
+    def memo_stats(self) -> dict[str, int]:
+        """Aggregate memoization telemetry: hits, misses, entries, tokens saved.
+
+        ``estimated_tokens_saved`` is an estimate: SUM(hit_count * output_tokens_est).
+        """
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) AS entry_count,"
+                " COALESCE(SUM(hit_count), 0) AS hits,"
+                " COALESCE(SUM(hit_count * output_tokens_est), 0) AS tokens_saved"
+                " FROM memo_entries"
+            ).fetchone()
+            miss_row = connection.execute(
+                "SELECT stat_value FROM memo_stats WHERE stat_key = 'misses'"
+            ).fetchone()
+        return {
+            "hits": int(row["hits"]),
+            "misses": int(miss_row["stat_value"]) if miss_row is not None else 0,
+            "entry_count": int(row["entry_count"]),
+            "estimated_tokens_saved": int(row["tokens_saved"]),
+        }
 
     def update_memo_outcome(self, signature: str, outcome: float, verified: bool = False) -> bool:
         with self._connect() as connection:

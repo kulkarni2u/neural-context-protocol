@@ -32,6 +32,7 @@ from ncp.stores.retrieval import (
     score_trust_recency_candidate,
     score_vector_distance,
 )
+from ncp.tokens import estimate_tokens
 from ncp.types import CalibrationReport, ConsolidationReport, ConsciousBlock, NCPResponse, OutcomeRecord, SubconsciousChunk, TurnRecord, Whisper
 
 
@@ -201,7 +202,16 @@ CREATE TABLE IF NOT EXISTS {schema}.{prefix}memo_entries (
     verified INTEGER DEFAULT 0,
     created_at DOUBLE PRECISION NOT NULL,
     last_hit_at DOUBLE PRECISION NOT NULL DEFAULT 0.0,
-    hit_count INTEGER NOT NULL DEFAULT 0
+    hit_count INTEGER NOT NULL DEFAULT 0,
+    output_tokens_est INTEGER NOT NULL DEFAULT 0
+);
+
+ALTER TABLE {schema}.{prefix}memo_entries
+    ADD COLUMN IF NOT EXISTS output_tokens_est INTEGER NOT NULL DEFAULT 0;
+
+CREATE TABLE IF NOT EXISTS {schema}.{prefix}memo_stats (
+    stat_key TEXT PRIMARY KEY,
+    stat_value BIGINT NOT NULL DEFAULT 0
 );
 """
 
@@ -800,7 +810,11 @@ class PgvectorStore(BaseStore):
         task: str,
         chunk_ids: list[str],
         result_summary: str | None = None,
+        output_tokens_est: int | None = None,
     ) -> bool:
+        if output_tokens_est is None:
+            # No real token count available: estimate over the stored result.
+            output_tokens_est = estimate_tokens(result_summary) if result_summary else 0
         with self._connect() as connection:
             cursor = connection.cursor()
             try:
@@ -809,16 +823,20 @@ class PgvectorStore(BaseStore):
                         """
                         INSERT INTO {schema}.{prefix}memo_entries
                             (signature, task, result_summary, chunk_ids, outcome, verified,
-                             created_at, last_hit_at, hit_count)
-                        VALUES (%s, %s, %s, %s, 0.0, 0, %s, 0.0, 0)
+                             created_at, last_hit_at, hit_count, output_tokens_est)
+                        VALUES (%s, %s, %s, %s, 0.0, 0, %s, 0.0, 0, %s)
                         ON CONFLICT (signature) DO UPDATE SET
                             task = EXCLUDED.task,
                             result_summary = EXCLUDED.result_summary,
                             chunk_ids = EXCLUDED.chunk_ids,
-                            created_at = EXCLUDED.created_at
+                            created_at = EXCLUDED.created_at,
+                            output_tokens_est = EXCLUDED.output_tokens_est
                         """
                     ),
-                    (signature, task, result_summary, json.dumps(chunk_ids), time.time()),
+                    (
+                        signature, task, result_summary, json.dumps(chunk_ids),
+                        time.time(), max(0, int(output_tokens_est)),
+                    ),
                 )
                 connection.commit()
                 return cursor.rowcount > 0
@@ -839,10 +857,12 @@ class PgvectorStore(BaseStore):
             finally:
                 self._close_cursor(cursor)
         if row is None:
+            self._bump_memo_miss()
             return None
         max_age = self.config.memoization_max_age_hours if self.config is not None else 24
         age_seconds = time.time() - float(row["created_at"])
         if age_seconds > max_age * 3600:
+            self._bump_memo_miss()
             return None
         with self._connect() as connection:
             cursor = connection.cursor()
@@ -875,6 +895,55 @@ class PgvectorStore(BaseStore):
                 return cursor.rowcount > 0
             finally:
                 self._close_cursor(cursor)
+
+    def _bump_memo_miss(self) -> None:
+        """Increment the S4.1 memoization miss counter."""
+        with self._connect() as connection:
+            cursor = connection.cursor()
+            try:
+                cursor.execute(
+                    self._sql(
+                        "INSERT INTO {schema}.{prefix}memo_stats AS ms (stat_key, stat_value)"
+                        " VALUES ('misses', 1)"
+                        " ON CONFLICT (stat_key) DO UPDATE SET stat_value = ms.stat_value + 1"
+                    )
+                )
+                connection.commit()
+            finally:
+                self._close_cursor(cursor)
+
+    def memo_stats(self) -> dict[str, int]:
+        """Aggregate memoization telemetry: hits, misses, entries, tokens saved.
+
+        ``estimated_tokens_saved`` is an estimate: SUM(hit_count * output_tokens_est).
+        """
+        with self._connect() as connection:
+            cursor = connection.cursor()
+            try:
+                cursor.execute(
+                    self._sql(
+                        "SELECT COUNT(*) AS entry_count,"
+                        " COALESCE(SUM(hit_count), 0) AS hits,"
+                        " COALESCE(SUM(hit_count * output_tokens_est), 0) AS tokens_saved"
+                        " FROM {schema}.{prefix}memo_entries"
+                    )
+                )
+                row = self._fetchone(cursor)
+                cursor.execute(
+                    self._sql(
+                        "SELECT stat_value FROM {schema}.{prefix}memo_stats"
+                        " WHERE stat_key = 'misses'"
+                    )
+                )
+                miss_row = self._fetchone(cursor)
+            finally:
+                self._close_cursor(cursor)
+        return {
+            "hits": int(row["hits"]) if row is not None else 0,
+            "misses": int(miss_row["stat_value"]) if miss_row is not None else 0,
+            "entry_count": int(row["entry_count"]) if row is not None else 0,
+            "estimated_tokens_saved": int(row["tokens_saved"]) if row is not None else 0,
+        }
 
     def drain_whispers(
         self,

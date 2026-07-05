@@ -732,11 +732,27 @@ def status_command(cwd: Path, pipeline_id: str | None, json_output: bool) -> Non
         detail = store.status_detail(pipeline_id=pipeline_id)
     except NCPStoreUnavailableError as exc:
         raise click.ClickException(str(exc)) from exc
+
+    # S4.1: memoization telemetry — shown only when memoization is enabled or
+    # has recorded any data, so default output stays unchanged.
+    memo_stats: dict[str, int] | None = None
+    memo_stats_fn = getattr(store, "memo_stats", None)
+    if callable(memo_stats_fn):
+        try:
+            memo_stats = {str(k): int(v) for k, v in memo_stats_fn().items()}
+        except Exception:
+            memo_stats = None
+    show_memo = memo_stats is not None and (
+        config.memoization_enabled or any(memo_stats.values())
+    )
+
     payload = {
         "store_path": _store_display(config),
         "pipeline_id": pipeline_id,
         **detail,
     }
+    if show_memo:
+        payload["memoization"] = memo_stats
     if json_output:
         console.print_json(data=payload)
         return
@@ -757,6 +773,19 @@ def status_command(cwd: Path, pipeline_id: str | None, json_output: bool) -> Non
     table.add_row("Cost USD", f"{float(overview['cost_usd_total']):.4f}")
     table.add_row("Last activity", _format_ts(overview["last_activity_at"]))  # type: ignore[arg-type]
     console.print(table)
+
+    if show_memo and memo_stats is not None:
+        memo_table = Table(title="Memoization (CAP-C3)", box=box.MINIMAL_DOUBLE_HEAD)
+        memo_table.add_column("Metric")
+        memo_table.add_column("Value", justify="right")
+        memo_table.add_row("Memo hits", str(memo_stats.get("hits", 0)))
+        memo_table.add_row("Memo misses", str(memo_stats.get("misses", 0)))
+        memo_table.add_row("Memo entries", str(memo_stats.get("entry_count", 0)))
+        memo_table.add_row(
+            "Tokens saved (estimate)",
+            str(memo_stats.get("estimated_tokens_saved", 0)),
+        )
+        console.print(memo_table)
 
     layer_counts = detail["layer_counts"]
     if layer_counts:

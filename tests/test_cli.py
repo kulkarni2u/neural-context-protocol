@@ -201,6 +201,49 @@ def test_cli_status_json_and_cost_command(tmp_path: Path) -> None:
     assert cost_payload["recent_entries"][0]["turn_id"] == "turn_cost_cli"
 
 
+def test_cli_status_hides_memoization_by_default(tmp_path: Path) -> None:
+    """Memo telemetry must not change default status output (S4.1)."""
+    runner = CliRunner()
+    runner.invoke(main, ["init", "--cwd", str(tmp_path)])
+
+    result = runner.invoke(main, ["status", "--cwd", str(tmp_path)])
+
+    assert result.exit_code == 0
+    assert "Memoization" not in result.output
+
+    json_result = runner.invoke(main, ["status", "--cwd", str(tmp_path), "--json-output"])
+    assert json_result.exit_code == 0
+    assert "memoization" not in json.loads(json_result.output)
+
+
+def test_cli_status_surfaces_memoization_telemetry(tmp_path: Path) -> None:
+    """`ncp status` shows memo hits/misses/estimated tokens saved (S4.1)."""
+    from ncp.stores.memo import compute_memo_signature
+    from ncp.tokens import estimate_tokens
+
+    runner = CliRunner()
+    runner.invoke(main, ["init", "--cwd", str(tmp_path)])
+    store = SQLiteStore(tmp_path / ".ncp" / "store.db")
+    sig = compute_memo_signature("cli_status_task")
+    result_summary = "cli status memoized result summary"
+    store.record_memo(sig, "cli_status_task", [], result_summary)
+    assert store.lookup_memo(sig) is not None  # hit 1
+    assert store.lookup_memo(sig) is not None  # hit 2
+    assert store.lookup_memo("missing_signature") is None  # miss 1
+
+    json_result = runner.invoke(main, ["status", "--cwd", str(tmp_path), "--json-output"])
+    assert json_result.exit_code == 0
+    memo_payload = json.loads(json_result.output)["memoization"]
+    assert memo_payload["hits"] == 2
+    assert memo_payload["misses"] == 1
+    assert memo_payload["entry_count"] == 1
+    assert memo_payload["estimated_tokens_saved"] == 2 * estimate_tokens(result_summary)
+
+    table_result = runner.invoke(main, ["status", "--cwd", str(tmp_path)])
+    assert table_result.exit_code == 0
+    assert "Memoization" in table_result.output
+
+
 def test_cli_calibrate_feedback_runs_self_improvement_pass(tmp_path: Path) -> None:
     runner = CliRunner()
     runner.invoke(main, ["init", "--cwd", str(tmp_path)])

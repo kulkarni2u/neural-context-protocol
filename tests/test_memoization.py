@@ -10,6 +10,7 @@ from pathlib import Path
 from ncp.mcp.server import make_handlers, _handle_request
 from ncp.stores.memo import compute_memo_signature
 from ncp.stores.sqlite import SQLiteStore
+from ncp.tokens import estimate_tokens
 
 
 def _call(name: str, arguments: dict) -> dict:
@@ -180,6 +181,93 @@ def test_ncp_record_memo_end_to_end(tmp_path: Path) -> None:
     assert memo is not None
     assert memo["task"] == "record_test"
     assert json.loads(memo["chunk_ids"]) == ["c1", "c2"]
+
+
+# ---------------------------------------------------------------------------
+# S4.1: memoization telemetry — hits, misses, estimated tokens saved
+# ---------------------------------------------------------------------------
+
+
+def test_memo_telemetry_hits_misses_tokens_saved(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "store.db")
+    sig = compute_memo_signature("telemetry_task", "ctx")
+    result_summary = "a memoized result summary long enough to have several tokens"
+    store.record_memo(sig, "telemetry_task", ["c1"], result_summary)
+    expected_tokens = estimate_tokens(result_summary)
+
+    first_hit = store.lookup_memo(sig)
+    assert first_hit is not None
+    assert first_hit["output_tokens_est"] == expected_tokens
+    second_hit = store.lookup_memo(sig)
+    assert second_hit is not None
+    assert store.lookup_memo("no_such_signature") is None
+
+    stats = store.memo_stats()
+    assert stats["hits"] == 2
+    assert stats["misses"] == 1
+    assert stats["entry_count"] == 1
+    # Estimated savings: SUM(hit_count * output_tokens_est).
+    assert stats["estimated_tokens_saved"] == 2 * expected_tokens
+
+
+def test_memo_stats_empty_store_is_all_zero(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "store.db")
+    stats = store.memo_stats()
+    assert stats == {
+        "hits": 0,
+        "misses": 0,
+        "entry_count": 0,
+        "estimated_tokens_saved": 0,
+    }
+
+
+def test_stale_memo_lookup_counts_as_miss(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "store.db")
+    sig = compute_memo_signature("stale_telemetry_task")
+    store.record_memo(sig, "stale_telemetry_task", [])
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE memo_entries SET created_at = ? WHERE signature = ?",
+            (time.time() - 25 * 3600, sig),
+        )
+    assert store.lookup_memo(sig) is None
+    stats = store.memo_stats()
+    assert stats["hits"] == 0
+    assert stats["misses"] == 1
+
+
+def test_record_memo_explicit_output_tokens_est(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "store.db")
+    sig = compute_memo_signature("real_count_task")
+    store.record_memo(sig, "real_count_task", [], "summary", output_tokens_est=1234)
+    memo = store.lookup_memo(sig)
+    assert memo is not None
+    assert memo["output_tokens_est"] == 1234
+    stats = store.memo_stats()
+    assert stats["estimated_tokens_saved"] == 1234
+
+
+def test_ncp_lookup_memo_response_includes_counters(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "store.db")
+    sig = compute_memo_signature("stats_task", "stats_ctx")
+    store.record_memo(sig, "stats_task", ["c1"], "stats result")
+    handlers = make_handlers(store)
+
+    hit = _content(_handle_request(
+        _call("ncp_lookup_memo", {"task": "stats_task", "context": "stats_ctx"}),
+        handlers,
+    ))
+    assert hit["found"] is True
+    assert hit["stats"]["hits"] == 1
+    assert hit["stats"]["misses"] == 0
+
+    miss = _content(_handle_request(
+        _call("ncp_lookup_memo", {"task": "unknown_stats_task"}),
+        handlers,
+    ))
+    assert miss["found"] is False
+    assert miss["stats"]["hits"] == 1
+    assert miss["stats"]["misses"] == 1
 
 
 def test_ncp_record_memo_with_explicit_signature(tmp_path: Path) -> None:

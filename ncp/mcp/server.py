@@ -344,6 +344,13 @@ MCP_TOOLS: list[dict[str, object]] = [
                     "type": "string",
                     "description": "Explicit memo signature (overrides task+context hash)",
                 },
+                "output_tokens_est": {
+                    "type": "integer",
+                    "description": (
+                        "Optional real output token count of the memoized work; "
+                        "estimated from result_summary when omitted"
+                    ),
+                },
             },
             "required": ["task", "chunk_ids"],
         },
@@ -829,6 +836,17 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         recorded = store.record_outcome(outcome)
         return {"recorded": recorded, "outcome_id": outcome.outcome_id}
 
+    def _memo_counters() -> dict[str, int] | None:
+        """Cheap hits/misses totals for hosts (S4.1 memoization telemetry)."""
+        stats_fn = getattr(store, "memo_stats", None)
+        if not callable(stats_fn):
+            return None
+        try:
+            stats = stats_fn()
+        except Exception:
+            return None
+        return {"hits": int(stats.get("hits", 0)), "misses": int(stats.get("misses", 0))}
+
     def _handle_lookup_memo(args: dict[str, object]) -> object:
         from ncp.stores.memo import compute_memo_signature
         sig = args.get("signature")
@@ -837,18 +855,22 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             context = str(args.get("context", ""))
             sig = compute_memo_signature(task, context)
         memo = store.lookup_memo(str(sig))
-        if memo is None:
-            return {"found": False, "memo": None}
+        result: dict[str, object] = {"found": False, "memo": None}
         cfg = config
-        if cfg is not None and not cfg.memoization_enabled:
-            return {"found": False, "memo": None}
-        # Apply outcome and verified gating at the handler level
-        if cfg is not None:
-            if float(memo.get("outcome", 0.0)) < cfg.memoization_min_outcome:
-                return {"found": False, "memo": None}
-            if not cfg.memoization_allow_unverified and not bool(memo.get("verified", 0)):
-                return {"found": False, "memo": None}
-        return {"found": True, "memo": dict(memo)}
+        if memo is not None and (cfg is None or cfg.memoization_enabled):
+            # Apply outcome and verified gating at the handler level
+            gated = False
+            if cfg is not None:
+                if float(memo.get("outcome", 0.0)) < cfg.memoization_min_outcome:
+                    gated = True
+                elif not cfg.memoization_allow_unverified and not bool(memo.get("verified", 0)):
+                    gated = True
+            if not gated:
+                result = {"found": True, "memo": dict(memo)}
+        counters = _memo_counters()
+        if counters is not None:
+            result["stats"] = counters
+        return result
 
     def _handle_record_memo(args: dict[str, object]) -> object:
         from ncp.stores.memo import compute_memo_signature
@@ -860,7 +882,16 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         result_summary = args.get("result_summary")
         if result_summary is not None:
             result_summary = str(result_summary)
-        recorded = store.record_memo(str(sig), task, chunk_ids, result_summary)
+        output_tokens_est: int | None = None
+        raw_tokens = args.get("output_tokens_est")
+        if raw_tokens is not None:
+            try:
+                output_tokens_est = max(0, int(raw_tokens))  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                output_tokens_est = None
+        recorded = store.record_memo(
+            str(sig), task, chunk_ids, result_summary, output_tokens_est
+        )
         return {"recorded": recorded, "signature": str(sig)}
 
     # Expose the in-memory fetch-session table for observability/testing of the
