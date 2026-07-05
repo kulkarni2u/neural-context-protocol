@@ -32,6 +32,15 @@ Audit remediation from `docs/NCP_AUDIT_AND_REMEDIATION_PLAN.md`. One work item
 
 ### Added
 
+- **`recent_turns` parity for pgvector** (`ncp/stores/pgvector.py`,
+  `ncp/stores/pgvector_async.py`): `PgvectorStore.recent_turns` and
+  `AsyncPgvectorStore.async_recent_turns` (native async, no thread-pool
+  shim) now query `turn_records` for real, mirroring
+  `SQLiteStore.recent_turns` exactly (most-recent `limit` rows for the
+  pipeline, returned oldest-first). Computed drift (CAP-T5,
+  `ncp/drift.py`) previously silently degraded to `0.0` on pgvector
+  deployments via `BaseStore`'s empty-list default; it now sees real turn
+  history there too.
 - **Computed drift signal** (`ncp/drift.py`, `ncp/mcp/server.py`,
   `ncp/config.py`, `ncp/stores/base.py`, `ncp/stores/sqlite.py`):
   `ConsciousBlock.drift_score` was previously pure honor system — an agent

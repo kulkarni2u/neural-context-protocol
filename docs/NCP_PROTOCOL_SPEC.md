@@ -624,10 +624,12 @@ section replaces that with a value NCP computes from observable turn
 history (ncp/drift.py), while still exposing the self-reported value so the
 two can be compared -- the divergence is the trust signal.
 
-Turn history source: SQLiteStore.recent_turns(pipeline_id, limit) returns up
-to drift_window_turns TurnRecords for the pipeline, oldest-first (backends
-that have not implemented recent_turns default to returning [], which
-degrades to a computed score of 0.0 -- never a crash).
+Turn history source: BaseStore.recent_turns(pipeline_id, limit) returns up to
+drift_window_turns TurnRecords for the pipeline, oldest-first. Implemented
+identically by SQLiteStore, PgvectorStore, and AsyncPgvectorStore (the async
+variant is native async, no thread-pool shim); a backend that has not
+implemented it defaults to returning [], which degrades to a computed score
+of 0.0 -- never a crash.
 
 Formula (deterministic lexical baseline; see ncp/drift.py for the reference
 implementation):

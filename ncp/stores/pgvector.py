@@ -1103,6 +1103,42 @@ class PgvectorStore(BaseStore):
                 self._close_cursor(cursor)
         return None if row is None else TurnRecord(**row)
 
+    def recent_turns(self, *, pipeline_id: str | None, limit: int = 20) -> list[TurnRecord]:
+        """CAP-T5/Sprint 5d parity: most recent turn records, oldest-first.
+
+        Mirrors ``SQLiteStore.recent_turns`` exactly: most-recent ``limit``
+        rows for the pipeline (or pipeline_id IS NULL), returned oldest-first
+        so callers can feed them straight into computed drift.
+        """
+        capped_limit = max(0, int(limit))
+        if capped_limit == 0:
+            return []
+        with self._connect() as connection:
+            cursor = connection.cursor()
+            try:
+                if pipeline_id is None:
+                    cursor.execute(
+                        self._sql(
+                            "SELECT * FROM {schema}.{prefix}turn_records"
+                            " WHERE pipeline_id IS NULL ORDER BY created_at DESC LIMIT %s"
+                        ),
+                        (capped_limit,),
+                    )
+                else:
+                    cursor.execute(
+                        self._sql(
+                            "SELECT * FROM {schema}.{prefix}turn_records"
+                            " WHERE pipeline_id = %s ORDER BY created_at DESC LIMIT %s"
+                        ),
+                        (pipeline_id, capped_limit),
+                    )
+                rows = self._fetchall(cursor)
+            finally:
+                self._close_cursor(cursor)
+        records = [TurnRecord(**row) for row in rows]
+        records.reverse()
+        return records
+
     def log_cost(self, *, agent_id: str, response: NCPResponse) -> None:
         self.log_cost_raw(
             agent_id=agent_id,

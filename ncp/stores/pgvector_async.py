@@ -876,6 +876,39 @@ class AsyncPgvectorStore(BaseStore):
         row = self._normalize_row(raw, description)
         return TurnRecord(**row)
 
+    async def async_recent_turns(self, *, pipeline_id: str | None, limit: int = 20) -> list[TurnRecord]:
+        """CAP-T5/Sprint 5d parity: most recent turn records, oldest-first.
+
+        Native async DB I/O (no thread pool) -- mirrors ``SQLiteStore.recent_turns``
+        and ``PgvectorStore.recent_turns`` exactly so computed drift
+        (``ncp/drift.py``) works identically across all three backends.
+        """
+        capped_limit = max(0, int(limit))
+        if capped_limit == 0:
+            return []
+        async with self._aconnect() as conn:
+            async with conn.cursor() as cur:
+                if pipeline_id is None:
+                    await cur.execute(
+                        self._sql(
+                            "SELECT * FROM {schema}.{prefix}turn_records"
+                            " WHERE pipeline_id IS NULL ORDER BY created_at DESC LIMIT %s"
+                        ),
+                        (capped_limit,),
+                    )
+                else:
+                    await cur.execute(
+                        self._sql(
+                            "SELECT * FROM {schema}.{prefix}turn_records"
+                            " WHERE pipeline_id = %s ORDER BY created_at DESC LIMIT %s"
+                        ),
+                        (pipeline_id, capped_limit),
+                    )
+                rows = await self._afetchall(cur)
+        records = [TurnRecord(**row) for row in rows]
+        records.reverse()
+        return records
+
     async def async_log_conscious(self, conscious: ConsciousBlock, *, snapshot_hash: str) -> None:
         """Persist a conscious-block snapshot using native async DB I/O."""
         async with self._aconnect() as conn:
