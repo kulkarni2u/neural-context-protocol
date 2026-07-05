@@ -19,7 +19,7 @@ from ncp.chunker import filter_content
 from ncp.config import NCPConfig, load_config
 from ncp.stores.base import BaseStore
 from ncp.stores.factory import create_store
-from ncp.types import BudgetContext, ConsciousBlock, NCPResponse, SubconsciousChunk, Whisper
+from ncp.types import BudgetContext, ConsciousBlock, NCPResponse, OutcomeRecord, SubconsciousChunk, Whisper
 from ncp.version import __version__
 
 
@@ -253,6 +253,99 @@ MCP_TOOLS: list[dict[str, object]] = [
                 },
             },
             "required": ["decision", "rationale", "agent_id"],
+        },
+    },
+    {
+        "name": "ncp_record_outcome",
+        "description": (
+            "Record a task outcome for outcome-calibrated reputation (CAP-T3). "
+            "Provide either chunk_ids (explicit) or turn_id (resolved to chunk_ids). "
+            "Success=True increases author reputation; success=False decreases it."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "success": {
+                    "type": "boolean",
+                    "description": "Whether the outcome was successful",
+                },
+                "chunk_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Chunk IDs that contributed to this outcome. Exclusive with turn_id.",
+                },
+                "turn_id": {
+                    "type": "string",
+                    "description": "Turn ID to resolve to chunk_ids. Exclusive with chunk_ids.",
+                },
+                "outcome_id": {
+                    "type": "string",
+                    "description": "Optional custom outcome_id. Auto-generated if omitted.",
+                },
+                "weight": {
+                    "type": "number",
+                    "description": "Evidence weight multiplier (default 1.0). Higher = stronger signal.",
+                },
+                "note": {
+                    "type": "string",
+                    "description": "Optional human-readable note about this outcome.",
+                },
+            },
+        },
+    },
+    {
+        "name": "ncp_lookup_memo",
+        "description": (
+            "Look up a previously recorded work memo by task+context signature (CAP-C3). "
+            "Returns the memo if found, not stale, and meeting minimum outcome/verified criteria. "
+            "Provide either task+context or an explicit signature."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "description": "Task description for signature computation (ignored if signature is provided)",
+                },
+                "context": {
+                    "type": "string",
+                    "description": "Optional context string for signature computation",
+                },
+                "signature": {
+                    "type": "string",
+                    "description": "Explicit memo signature (overrides task+context hash)",
+                },
+            },
+        },
+    },
+    {
+        "name": "ncp_record_memo",
+        "description": (
+            "Record a work memo for CAP-C3 semantic memoization. "
+            "Stores a signature-keyed entry that can be looked up later to skip redundant work."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "description": "Task description for signature computation (ignored if signature is provided)",
+                },
+                "chunk_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Chunk IDs produced by this work",
+                },
+                "result_summary": {
+                    "type": "string",
+                    "description": "Optional summary of the work result",
+                },
+                "signature": {
+                    "type": "string",
+                    "description": "Explicit memo signature (overrides task+context hash)",
+                },
+            },
+            "required": ["task", "chunk_ids"],
         },
     },
 ]
@@ -705,6 +798,71 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             "evidence_count": len(evidence_refs),
         }
 
+    def _handle_record_outcome(args: dict[str, object]) -> object:
+        success_raw = args.get("success")
+        if success_raw is None:
+            raise ValueError("ncp_record_outcome requires 'success' (boolean)")
+        if not isinstance(success_raw, bool):
+            raise ValueError("ncp_record_outcome 'success' must be a boolean")
+        success: bool = success_raw
+
+        chunk_ids: list[str] = [str(c) for c in (args.get("chunk_ids") or [])]
+        turn_id: str | None = args.get("turn_id")
+        if not isinstance(turn_id, str) and turn_id is not None:
+            raise ValueError("ncp_record_outcome 'turn_id' must be a string or null")
+        outcome_id: str | None = args.get("outcome_id")
+        if outcome_id is not None and not isinstance(outcome_id, str):
+            raise ValueError("ncp_record_outcome 'outcome_id' must be a string or null")
+        weight = float(args.get("weight", 1.0) or 1.0)
+        note: str | None = args.get("note")
+        if note is not None and not isinstance(note, str):
+            raise ValueError("ncp_record_outcome 'note' must be a string or null")
+
+        outcome = OutcomeRecord(
+            outcome_id=outcome_id or f"out_{int(time.time() * 1000)}",
+            turn_id=turn_id,
+            chunk_ids=chunk_ids,
+            success=success,
+            weight=weight,
+            note=note,
+        )
+        recorded = store.record_outcome(outcome)
+        return {"recorded": recorded, "outcome_id": outcome.outcome_id}
+
+    def _handle_lookup_memo(args: dict[str, object]) -> object:
+        from ncp.stores.memo import compute_memo_signature
+        sig = args.get("signature")
+        if sig is None:
+            task = str(args.get("task", ""))
+            context = str(args.get("context", ""))
+            sig = compute_memo_signature(task, context)
+        memo = store.lookup_memo(str(sig))
+        if memo is None:
+            return {"found": False, "memo": None}
+        cfg = config
+        if cfg is not None and not cfg.memoization_enabled:
+            return {"found": False, "memo": None}
+        # Apply outcome and verified gating at the handler level
+        if cfg is not None:
+            if float(memo.get("outcome", 0.0)) < cfg.memoization_min_outcome:
+                return {"found": False, "memo": None}
+            if not cfg.memoization_allow_unverified and not bool(memo.get("verified", 0)):
+                return {"found": False, "memo": None}
+        return {"found": True, "memo": dict(memo)}
+
+    def _handle_record_memo(args: dict[str, object]) -> object:
+        from ncp.stores.memo import compute_memo_signature
+        task = str(args.get("task", ""))
+        sig = args.get("signature")
+        if sig is None:
+            sig = compute_memo_signature(task)
+        chunk_ids = [str(c) for c in list(args.get("chunk_ids", []) or [])]
+        result_summary = args.get("result_summary")
+        if result_summary is not None:
+            result_summary = str(result_summary)
+        recorded = store.record_memo(str(sig), task, chunk_ids, result_summary)
+        return {"recorded": recorded, "signature": str(sig)}
+
     # Expose the in-memory fetch-session table for observability/testing of the
     # LRU+TTL pruning without widening the returned handler mapping.
     _handle_get_context.fetch_sessions = sessions  # type: ignore[attr-defined]
@@ -716,6 +874,9 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         "ncp_post_turn": _handle_post_turn,
         "ncp_fetch": _handle_fetch,
         "ncp_record_decision": _handle_record_decision,
+        "ncp_record_outcome": _handle_record_outcome,
+        "ncp_lookup_memo": _handle_lookup_memo,
+        "ncp_record_memo": _handle_record_memo,
     }
 
 

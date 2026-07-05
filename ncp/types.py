@@ -553,3 +553,16 @@ class CalibrationReport:
     dry_run: bool = False
     pipeline_id: str | None = None
     change_log: list[dict] = field(default_factory=list)
+
+
+class OutcomeRecord(NCPModel):
+    """Record of a task outcome for outcome-calibrated reputation (CAP-T3)."""
+
+    outcome_id: str = Field(default_factory=lambda: f"out_{uuid4().hex[:12]}")
+    turn_id: str | None = None
+    chunk_ids: list[str] = Field(default_factory=list)
+    success: bool
+    weight: float = 1.0
+    note: str | None = None
+    created_at: float = Field(default_factory=time.time)
+    consumed: bool = False

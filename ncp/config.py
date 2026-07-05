@@ -54,6 +54,7 @@ DEFAULT_CONFIG = {
         "default_ttl_seconds": 1800,
         "max_per_drain": 3,
         "min_confidence": 0.60,
+        "min_author_reputation": 0.0,
     },
     "observability": {
         "log_level": "info",
@@ -70,6 +71,8 @@ DEFAULT_CONFIG = {
         "trust_propagation_factor": 0.5,
         "dissent_weight": 0.2,
         "diversity_lambda": 1.0,
+        "usage_prior_weight": 1.0,
+        "reputation_weight": 0.0,
     },
     "reputation": {
         "gain": 4.0,
@@ -97,6 +100,13 @@ DEFAULT_CONFIG = {
     },
     "server": {
         "auth_token": "",
+    },
+    "memoization": {
+        "enabled": False,
+        "max_age_hours": 24,
+        "min_outcome": 0.0,
+        "allow_unverified": False,
+        "similarity_threshold": 0.95,
     },
     "identity": {
         # OPT-IN authorship enforcement. When false (default) unsigned writes and
@@ -219,6 +229,14 @@ class NCPConfig:
         return float(self.values.get("retrieval", {}).get("diversity_lambda", 1.0))
 
     @property
+    def usage_prior_weight(self) -> float:
+        return float(self.values.get("retrieval", {}).get("usage_prior_weight", 1.0))
+
+    @property
+    def reputation_weight(self) -> float:
+        return float(self.values.get("retrieval", {}).get("reputation_weight", 0.0))
+
+    @property
     def reputation_gain(self) -> float:
         return float(self.values.get("reputation", {}).get("gain", 4.0))
 
@@ -267,6 +285,10 @@ class NCPConfig:
         return int(self.values.get("whispers", {}).get("default_ttl_seconds", 1800))
 
     @property
+    def whisper_min_author_reputation(self) -> float:
+        return float(self.values.get("whispers", {}).get("min_author_reputation", 0.0))
+
+    @property
     def embedding_enabled(self) -> bool:
         return bool(self.values.get("embedding", {}).get("enabled", False))
 
@@ -294,6 +316,26 @@ class NCPConfig:
     @property
     def retention_max_working_chunks_per_pipeline(self) -> int:
         return int(self.values.get("retention", {}).get("max_working_chunks_per_pipeline", 0))
+
+    @property
+    def memoization_enabled(self) -> bool:
+        return bool(self.values.get("memoization", {}).get("enabled", False))
+
+    @property
+    def memoization_max_age_hours(self) -> int:
+        return int(self.values.get("memoization", {}).get("max_age_hours", 24))
+
+    @property
+    def memoization_min_outcome(self) -> float:
+        return float(self.values.get("memoization", {}).get("min_outcome", 0.0))
+
+    @property
+    def memoization_allow_unverified(self) -> bool:
+        return bool(self.values.get("memoization", {}).get("allow_unverified", False))
+
+    @property
+    def memoization_similarity_threshold(self) -> float:
+        return float(self.values.get("memoization", {}).get("similarity_threshold", 0.95))
 
     @property
     def require_signatures(self) -> bool:

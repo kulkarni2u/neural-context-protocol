@@ -28,7 +28,16 @@ from ncp.stores.retrieval import (
     normalize_result_limit,
     score_trust_recency_candidate,
 )
-from ncp.types import CalibrationReport, ConsolidationReport, ConsciousBlock, NCPResponse, SubconsciousChunk, TurnRecord, Whisper
+from ncp.types import (
+    CalibrationReport,
+    ConsolidationReport,
+    ConsciousBlock,
+    NCPResponse,
+    OutcomeRecord,
+    SubconsciousChunk,
+    TurnRecord,
+    Whisper,
+)
 
 
 SCHEMA = """
@@ -189,6 +198,29 @@ CREATE TABLE IF NOT EXISTS reputation (
 );
 
 CREATE INDEX IF NOT EXISTS idx_reputation_updated ON reputation(last_updated);
+
+CREATE TABLE IF NOT EXISTS outcomes (
+    outcome_id TEXT PRIMARY KEY,
+    turn_id TEXT,
+    chunk_ids TEXT NOT NULL DEFAULT '[]',
+    success INTEGER NOT NULL,
+    weight REAL NOT NULL DEFAULT 1.0,
+    note TEXT,
+    created_at REAL NOT NULL,
+    consumed INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS memo_entries (
+    signature TEXT PRIMARY KEY,
+    task TEXT NOT NULL,
+    result_summary TEXT,
+    chunk_ids TEXT NOT NULL DEFAULT '[]',
+    outcome REAL DEFAULT 0.0,
+    verified INTEGER DEFAULT 0,
+    created_at REAL NOT NULL,
+    last_hit_at REAL NOT NULL DEFAULT 0.0,
+    hit_count INTEGER NOT NULL DEFAULT 0
+);
 """
 
 
@@ -218,6 +250,7 @@ class SQLiteStore(BaseStore):
         from ncp.config import load_config
         try:
             cfg = config or load_config()
+            self.config = cfg
             self.reranker = Reranker(cfg)
             self.retrieval_policy = retrieval_policy or RetrievalPolicy(
                 generation_penalty_base=cfg.retrieval_generation_penalty_base
@@ -226,6 +259,7 @@ class SQLiteStore(BaseStore):
             self.reputation_forget = cfg.reputation_forget
             self.reputation_confidence_k = cfg.reputation_confidence_k
         except Exception:
+            self.config = None
             self.retrieval_policy = retrieval_policy or DEFAULT_RETRIEVAL_POLICY
             self.reputation_gain = 4.0
             self.reputation_forget = 0.99
@@ -443,10 +477,34 @@ class SQLiteStore(BaseStore):
         policy = self.retrieval_policy
         now = time.time()
 
+        # CAP-T4: reputation-weighted retrieval blending
+        blended_trust: dict[str, float] | None = None
+        if self.config is not None and self.config.reputation_weight > 0.0:
+            authors = {str(r["written_by"]) for r in rows}
+            with self._connect() as connection:
+                rep_data = self._load_reputation(connection, authors)
+            rw = self.config.reputation_weight
+            blended_trust = {}
+            for row in rows:
+                cid = str(row["chunk_id"])
+                bt = float(row["base_trust"])
+                written_by = str(row["written_by"])
+                result = rep_data.get(written_by)
+                if result is not None:
+                    rep_conf = result[0] / (result[0] + result[1])
+                    bt = (1.0 - rw) * bt + rw * rep_conf
+                blended_trust[cid] = bt
+
+        def _bt(row: object) -> float:
+            if blended_trust is not None:
+                return blended_trust.get(str(row["chunk_id"]), float(row["base_trust"]))
+            return float(row["base_trust"])
+
         if retrieval_mode == "vector":
             return self._query_vector(
                 rows, embedding=embedding, k=k, min_score=min_score,
                 policy=policy, now=now, diversity_limit=diversity_limit,
+                blended_trust=blended_trust,
             )
 
         candidates: list[SubconsciousChunk] = []
@@ -456,7 +514,7 @@ class SQLiteStore(BaseStore):
                 age_seconds = max(0.0, now - float(row["created_at"]))
                 score = policy.score_no_bm25(
                     age_seconds=age_seconds,
-                    base_trust=float(row["base_trust"]),
+                    base_trust=_bt(row),
                     generation=int(row["generation"]),
                     written_at_drift=float(row["written_at_drift"]) if row["written_at_drift"] is not None else 0.0,
                 )
@@ -485,7 +543,7 @@ class SQLiteStore(BaseStore):
                     bm25_normalized=lexical_candidate.lexical_signal or 0.0,
                     vector_normalized=vector_normalized,
                     age_seconds=age_seconds,
-                    base_trust=float(row["base_trust"]),
+                    base_trust=_bt(row),
                     generation=int(row["generation"]),
                     written_at_drift=float(row["written_at_drift"]) if row["written_at_drift"] is not None else 0.0,
                 )
@@ -507,7 +565,7 @@ class SQLiteStore(BaseStore):
                 hybrid_score = policy.score(
                     bm25_normalized=lexical_signal,
                     age_seconds=age_seconds,
-                    base_trust=float(row["base_trust"]),
+                    base_trust=_bt(row),
                     generation=int(row["generation"]),
                     written_at_drift=float(row["written_at_drift"]) if row["written_at_drift"] is not None else 0.0,
                 )
@@ -599,6 +657,7 @@ class SQLiteStore(BaseStore):
         policy: RetrievalPolicy,
         now: float,
         diversity_limit: int,
+        blended_trust: dict[str, float] | None = None,
     ) -> list[SubconsciousChunk]:
         if embedding is None:
             raise ValueError("retrieval_mode='vector' requires an embedding or embedding adapter")
@@ -611,12 +670,14 @@ class SQLiteStore(BaseStore):
                 continue
             sim = self._cosine_similarity(embedding, row_embedding)
             vector_normalized = max(0.0, min(1.0, sim))
+            cid = str(row["chunk_id"])
+            bt = blended_trust.get(cid, float(row["base_trust"])) if blended_trust else float(row["base_trust"])
             age_seconds = max(0.0, now - float(row["created_at"]))
             score = policy.score_with_vector(
                 bm25_normalized=0.0,
                 vector_normalized=vector_normalized,
                 age_seconds=age_seconds,
-                base_trust=float(row["base_trust"]),
+                base_trust=bt,
                 generation=int(row["generation"]),
                 vector_mix=1.0,
                 written_at_drift=float(row["written_at_drift"]) if row["written_at_drift"] is not None else 0.0,
@@ -707,6 +768,112 @@ class SQLiteStore(BaseStore):
             )
             return cursor.rowcount > 0
 
+    def record_outcome(self, outcome: OutcomeRecord) -> bool:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            chunk_ids = outcome.chunk_ids
+            # Resolve turn_id to chunk_ids if turn_id is provided and chunk_ids is empty
+            if outcome.turn_id and not chunk_ids:
+                rows = connection.execute(
+                    "SELECT chunk_id FROM chunks WHERE caused_by = ? OR conscious_hash = ?",
+                    (outcome.turn_id, outcome.turn_id),
+                ).fetchall()
+                chunk_ids = [str(r["chunk_id"]) for r in rows]
+            connection.execute(
+                """
+                INSERT INTO outcomes (outcome_id, turn_id, chunk_ids, success, weight, note, created_at, consumed)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+                """,
+                (
+                    outcome.outcome_id,
+                    outcome.turn_id,
+                    json.dumps(chunk_ids),
+                    1 if outcome.success else 0,
+                    outcome.weight,
+                    outcome.note,
+                    outcome.created_at,
+                ),
+            )
+            return True
+
+    def record_memo(
+        self,
+        signature: str,
+        task: str,
+        chunk_ids: list[str],
+        result_summary: str | None = None,
+    ) -> bool:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO memo_entries
+                    (signature, task, result_summary, chunk_ids, outcome, verified, created_at,
+                     last_hit_at, hit_count)
+                VALUES (?, ?, ?, ?, 0.0, 0, ?, 0.0, 0)
+                """,
+                (signature, task, result_summary, json.dumps(chunk_ids), time.time()),
+            )
+            return True
+
+    def lookup_memo(self, signature: str) -> dict | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM memo_entries WHERE signature = ?",
+                (signature,),
+            ).fetchone()
+        if row is None:
+            return None
+        # Check staleness
+        max_age = self.config.memoization_max_age_hours if self.config is not None else 24
+        age_seconds = time.time() - float(row["created_at"])
+        if age_seconds > max_age * 3600:
+            return None
+        # Update hit tracking
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE memo_entries SET hit_count = hit_count + 1, last_hit_at = ? WHERE signature = ?",
+                (time.time(), signature),
+            )
+        return dict(row)
+
+    def update_memo_outcome(self, signature: str, outcome: float, verified: bool = False) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE memo_entries SET outcome = ?, verified = ? WHERE signature = ?",
+                (outcome, 1 if verified else 0, signature),
+            )
+            return cursor.rowcount > 0
+
+    def _load_unconsumed_outcomes(self, connection: sqlite3.Connection) -> list[OutcomeRecord]:
+        rows = connection.execute(
+            "SELECT * FROM outcomes WHERE consumed = 0 ORDER BY created_at ASC"
+        ).fetchall()
+        results: list[OutcomeRecord] = []
+        for row in rows:
+            results.append(OutcomeRecord(
+                outcome_id=str(row["outcome_id"]),
+                turn_id=row["turn_id"],
+                chunk_ids=json.loads(str(row["chunk_ids"])),
+                success=bool(row["success"]),
+                weight=float(row["weight"]),
+                note=row["note"],
+                created_at=float(row["created_at"]),
+                consumed=bool(row["consumed"]),
+            ))
+        return results
+
+    def _mark_outcomes_consumed(
+        self, connection: sqlite3.Connection, outcome_ids: list[str]
+    ) -> None:
+        if not outcome_ids:
+            return
+        placeholders = ",".join("?" for _ in outcome_ids)
+        connection.execute(
+            f"UPDATE outcomes SET consumed = 1 WHERE outcome_id IN ({placeholders})",
+            outcome_ids,
+        )
+
     def get_chunks_by_ids(self, ids: Sequence[str]) -> list[SubconsciousChunk]:
         unique_ids = [cid for cid in dict.fromkeys(ids) if cid]
         if not unique_ids:
@@ -766,6 +933,24 @@ class SQLiteStore(BaseStore):
                 max_items=max_items,
                 min_confidence=min_confidence,
             )
+
+            # CAP-T4: whisper gating by author reputation
+            if drained and self.config is not None and self.config.whisper_min_author_reputation > 0.0:
+                threshold = self.config.whisper_min_author_reputation
+                authors = {w.from_agent for w in drained}
+                rep_data = self._load_reputation(connection, authors)
+                filtered: list[Whisper] = []
+                for w in drained:
+                    result = rep_data.get(w.from_agent)
+                    if result is not None:
+                        alpha, beta = result
+                        if alpha / (alpha + beta) >= threshold:
+                            filtered.append(w)
+                    else:
+                        # Unknown author — uniform prior Beta(1,1) = 0.5
+                        if 0.5 >= threshold:
+                            filtered.append(w)
+                drained = filtered
 
             if drained:
                 self._acknowledge_whispers(connection, drained, agent_id=agent_id)
@@ -1169,12 +1354,23 @@ class SQLiteStore(BaseStore):
                             )
                         )
 
+                # CAP-T3: initialize outcome tracking
+                consumed_outcome_ids: list[str] = []
                 if feedback_mode and feedback_rows:
+                    outcomes = self._load_unconsumed_outcomes(connection)
+                    outcome_evidence = None
+                    if outcomes:
+                        from ncp.stores.calibration import compute_outcome_evidence
+                        outcome_evidence = compute_outcome_evidence(outcomes)
+                        consumed_outcome_ids = [o.outcome_id for o in outcomes]
+
                     fb = compute_feedback_updates(
                         feedback_rows,
                         feedback_weight=feedback_weight,
                         propagation_factor=propagation_factor,
                         dissent_weight=dissent_weight,
+                        usage_prior_weight=self.config.usage_prior_weight if self.config is not None else 1.0,
+                        outcome_evidence=outcome_evidence,
                     )
                     updates.extend(fb.updates)
                     report.change_log.extend(fb.change_log)
@@ -1193,6 +1389,7 @@ class SQLiteStore(BaseStore):
                         gain=self.reputation_gain,
                         forget=self.reputation_forget,
                         K_CONF=self.reputation_confidence_k,
+                        outcome_evidence=outcome_evidence,
                     )
                     report.change_log.extend(
                         {
@@ -1222,6 +1419,8 @@ class SQLiteStore(BaseStore):
                             f"WHERE chunk_id IN ({placeholders})",
                             consumed_feedback_ids,
                         )
+                    if consumed_outcome_ids:
+                        self._mark_outcomes_consumed(connection, consumed_outcome_ids)
 
         report.duration_seconds = time.monotonic() - started
         return report

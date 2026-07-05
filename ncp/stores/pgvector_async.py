@@ -48,6 +48,7 @@ from ncp.types import (
     ConsciousBlock,
     ConsolidationReport,
     NCPResponse,
+    OutcomeRecord,
     SubconsciousChunk,
     TurnRecord,
     Whisper,
@@ -112,6 +113,12 @@ class AsyncPgvectorStore(BaseStore):
                 "AsyncPgvectorStore requires psycopg and psycopg_pool. "
                 "Install with: pip install 'neural-context-protocol[pgvector]'"
             ) from exc
+
+        from ncp.config import load_config
+        try:
+            self.config = load_config()
+        except Exception:
+            self.config = None
 
     # ------------------------------------------------------------------
     # Pool lifecycle
@@ -1077,6 +1084,146 @@ class AsyncPgvectorStore(BaseStore):
                 )
                 return cur.rowcount > 0
 
+    async def async_record_outcome(self, outcome: OutcomeRecord) -> bool:
+        """Persist a task outcome via native async DB I/O."""
+        chunk_ids = outcome.chunk_ids
+        async with self._aconnect() as conn:
+            if outcome.turn_id and not chunk_ids:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        self._sql(
+                            "SELECT chunk_id FROM {schema}.{prefix}chunks"
+                            " WHERE caused_by = %s OR conscious_hash = %s"
+                        ),
+                        (outcome.turn_id, outcome.turn_id),
+                    )
+                    rows = await self._afetchall(cur)
+                    chunk_ids = [str(r[0]) for r in rows]
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    self._sql(
+                        "INSERT INTO {schema}.{prefix}outcomes"
+                        " (outcome_id, turn_id, chunk_ids, success, weight, note, created_at, consumed)"
+                        " VALUES (%s, %s, %s, %s, %s, %s, %s, 0)"
+                    ),
+                    (
+                        outcome.outcome_id,
+                        outcome.turn_id,
+                        json.dumps(chunk_ids),
+                        1 if outcome.success else 0,
+                        outcome.weight,
+                        outcome.note,
+                        outcome.created_at,
+                    ),
+                )
+                return cur.rowcount > 0
+
+    async def async_record_memo(
+        self,
+        signature: str,
+        task: str,
+        chunk_ids: list[str],
+        result_summary: str | None = None,
+    ) -> bool:
+        async with self._aconnect() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    self._sql(
+                        """
+                        INSERT INTO {schema}.{prefix}memo_entries
+                            (signature, task, result_summary, chunk_ids, outcome, verified,
+                             created_at, last_hit_at, hit_count)
+                        VALUES (%s, %s, %s, %s, 0.0, 0, %s, 0.0, 0)
+                        ON CONFLICT (signature) DO UPDATE SET
+                            task = EXCLUDED.task,
+                            result_summary = EXCLUDED.result_summary,
+                            chunk_ids = EXCLUDED.chunk_ids,
+                            created_at = EXCLUDED.created_at
+                        """
+                    ),
+                    (signature, task, result_summary, json.dumps(chunk_ids), time.time()),
+                )
+                return cur.rowcount > 0
+
+    async def async_lookup_memo(self, signature: str) -> dict | None:
+        async with self._aconnect() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    self._sql(
+                        "SELECT * FROM {schema}.{prefix}memo_entries WHERE signature = %s"
+                    ),
+                    (signature,),
+                )
+                raw = await cur.fetchone()
+                description = cur.description
+        if raw is None:
+            return None
+        row = self._normalize_row(raw, description)
+        max_age = self.config.memoization_max_age_hours if self.config is not None else 24
+        age_seconds = time.time() - float(row["created_at"])
+        if age_seconds > max_age * 3600:
+            return None
+        async with self._aconnect() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    self._sql(
+                        "UPDATE {schema}.{prefix}memo_entries"
+                        " SET hit_count = hit_count + 1, last_hit_at = %s"
+                        " WHERE signature = %s"
+                    ),
+                    (time.time(), signature),
+                )
+        return dict(row)
+
+    async def async_update_memo_outcome(self, signature: str, outcome: float, verified: bool = False) -> bool:
+        async with self._aconnect() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    self._sql(
+                        "UPDATE {schema}.{prefix}memo_entries"
+                        " SET outcome = %s, verified = %s WHERE signature = %s"
+                    ),
+                    (outcome, 1 if verified else 0, signature),
+                )
+                return cur.rowcount > 0
+
+    async def _aload_unconsumed_outcomes(self, conn: Any) -> list[OutcomeRecord]:
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                self._sql(
+                    "SELECT * FROM {schema}.{prefix}outcomes WHERE consumed = 0 ORDER BY created_at ASC"
+                )
+            )
+            rows = await self._afetchall(cursor)
+        results: list[OutcomeRecord] = []
+        for row in rows:
+            results.append(OutcomeRecord(
+                outcome_id=str(row["outcome_id"]),
+                turn_id=row["turn_id"],
+                chunk_ids=json.loads(str(row["chunk_ids"])),
+                success=bool(row["success"]),
+                weight=float(row["weight"]),
+                note=row["note"],
+                created_at=float(row["created_at"]),
+                consumed=bool(row["consumed"]),
+            ))
+        return results
+
+    async def _amark_outcomes_consumed(
+        self, conn: Any, outcome_ids: list[str]
+    ) -> None:
+        if not outcome_ids:
+            return
+        placeholders = ",".join(["%s"] * len(outcome_ids))
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                self._sql(
+                    f"UPDATE {{schema}}.{{prefix}}outcomes SET consumed = 1"
+                    f" WHERE outcome_id IN ({placeholders})"
+                ),
+                tuple(outcome_ids),
+            )
+
     async def async_drain_whispers(
         self,
         *,
@@ -1091,12 +1238,30 @@ class AsyncPgvectorStore(BaseStore):
                 "AsyncPgvectorStore whisper coordination requires Redis. "
                 "Pass redis_url= or coordination= to enable whispers."
             )
-        return await self._acoordination.drain_whispers(
+        drained = await self._acoordination.drain_whispers(
             agent_id=agent_id,
             pipeline_id=pipeline_id,
             max_items=max_items,
             min_confidence=min_confidence,
         )
+        # CAP-T4: whisper gating by author reputation
+        if drained and self.config is not None and self.config.whisper_min_author_reputation > 0.0:
+            threshold = self.config.whisper_min_author_reputation
+            authors = {w.from_agent for w in drained}
+            async with self._aconnect() as conn:
+                rep_data = await self._aload_reputation(conn, authors)
+            filtered: list[Whisper] = []
+            for w in drained:
+                result = rep_data.get(w.from_agent)
+                if result is not None:
+                    alpha, beta = result
+                    if alpha / (alpha + beta) >= threshold:
+                        filtered.append(w)
+                else:
+                    if 0.5 >= threshold:
+                        filtered.append(w)
+            drained = filtered
+        return drained
 
     async def async_acknowledge_whispers(
         self,
@@ -1786,12 +1951,24 @@ class AsyncPgvectorStore(BaseStore):
                     )
                 )
 
+        # CAP-T3: initialize outcome tracking
+        consumed_outcome_ids: list[str] = []
         if feedback_mode and feedback_rows:
+            outcome_evidence = None
+            async with self._aconnect() as conn:
+                outcomes = await self._aload_unconsumed_outcomes(conn)
+            if outcomes:
+                from ncp.stores.calibration import compute_outcome_evidence
+                outcome_evidence = compute_outcome_evidence(outcomes)
+                consumed_outcome_ids = [o.outcome_id for o in outcomes]
+
             fb = compute_feedback_updates(
                 feedback_rows,
                 feedback_weight=feedback_weight,
                 propagation_factor=propagation_factor,
                 dissent_weight=dissent_weight,
+                usage_prior_weight=self.config.usage_prior_weight if self.config is not None else 1.0,
+                outcome_evidence=outcome_evidence,
             )
             updates.extend(fb.updates)
             report.change_log.extend(fb.change_log)
@@ -1810,6 +1987,7 @@ class AsyncPgvectorStore(BaseStore):
                 gain=self.reputation_gain,
                 forget=self.reputation_forget,
                 K_CONF=self.reputation_confidence_k,
+                outcome_evidence=outcome_evidence,
             )
             report.change_log.extend(
                 {
@@ -1825,7 +2003,7 @@ class AsyncPgvectorStore(BaseStore):
             rep_updates = ()
 
         if not dry_run and (
-            updates or (feedback_mode and (rep_updates or consumed_feedback_ids))
+            updates or (feedback_mode and (rep_updates or consumed_feedback_ids or consumed_outcome_ids))
         ):
             async with self._aconnect() as conn:
                 if updates:
@@ -1851,6 +2029,8 @@ class AsyncPgvectorStore(BaseStore):
                                 ),
                                 tuple(consumed_feedback_ids),
                             )
+                    if consumed_outcome_ids:
+                        await self._amark_outcomes_consumed(conn, consumed_outcome_ids)
 
         report.duration_seconds = time.monotonic() - started
         return report

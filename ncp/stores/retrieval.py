@@ -26,6 +26,37 @@ if TYPE_CHECKING:
 T = TypeVar("T")
 
 
+def apply_reputation_weight(
+    chunks: list[SubconsciousChunk],
+    reputation_lookup: Callable[[str], float | None],
+    *,
+    reputation_weight: float = 0.0,
+) -> list[SubconsciousChunk]:
+    """Blend each chunk's ``base_trust`` with its author's reputation confidence.
+
+    When ``reputation_weight`` is 0.0 (default) every chunk passes through
+    unchanged.  The formula is::
+
+        blended_trust = (1 - reputation_weight) * base_trust
+                        + reputation_weight * reputation_confidence
+
+    If ``reputation_lookup`` returns ``None`` for an author the chunk's
+    ``base_trust`` is kept as-is (no blending for unknown authors).
+    """
+    if reputation_weight <= 0.0:
+        return chunks
+    for chunk in chunks:
+        rep_conf = reputation_lookup(chunk.written_by)
+        if rep_conf is None:
+            continue
+        bt = chunk.base_trust
+        chunk.base_trust = max(
+            0.0,
+            min(1.0, (1.0 - reputation_weight) * bt + reputation_weight * rep_conf),
+        )
+    return chunks
+
+
 @dataclass
 class RetrievalPolicy:
     """Configurable weights for multi-signal retrieval score fusion."""
