@@ -134,3 +134,18 @@ confidence_k = 20
 # on ncp_get_context responses. NCP never routes models itself. Default true;
 # set false to omit the fields entirely.
 # tier_hints_enabled = true
+
+# [drift]
+# CAP-T5: compute drift_score from observable turn history instead of trusting
+# the client's self-reported value (see ncp/drift.py for the exact formula).
+# Default false (opt-in); disabled preserves exact legacy self-reported
+# behavior with no response change. When enabled, ncp_get_context overrides
+# ConsciousBlock.drift_score with the computed value before tiering/adaptive
+# budget consume it, and the response gains a "drift" block showing both the
+# computed score and the original self-reported value.
+# drift_computed_enabled = false
+# drift_window_turns = 5
+# Optional local-embedding cosine-distance blend on top of the always-on
+# lexical baseline. Requires the fastembed-backed [local-embeddings] extra;
+# silently falls back to lexical-only when it is not installed.
+# drift_use_embeddings = false

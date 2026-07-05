@@ -284,6 +284,15 @@ class BaseStore(ABC):
     def resolve_recent_ref(self, ref: str) -> TurnRecord | None:
         """Resolve a recent ref like ``r:sub/<turn_id>``."""
 
+    def recent_turns(self, *, pipeline_id: str | None, limit: int = 20) -> list[TurnRecord]:
+        """CAP-T5: return up to ``limit`` recent turn records, oldest-first.
+
+        Backs computed drift (``ncp/drift.py``). Default no-op implementation
+        for stores that have not opted in -- computed drift then correctly
+        degrades to ``0.0`` (no observable history) rather than erroring.
+        """
+        return []
+
     @abstractmethod
     def log_conscious(self, conscious: ConsciousBlock, *, snapshot_hash: str) -> None:
         """Persist a conscious-block snapshot for audit and goal-version tracking."""
@@ -486,6 +495,11 @@ class BaseStore(ABC):
     async def async_resolve_recent_ref(self, ref: str) -> TurnRecord | None:
         """Asynchronously resolve a recent ref using thread pool."""
         return await anyio.to_thread.run_sync(self.resolve_recent_ref, ref)
+
+    async def async_recent_turns(self, *, pipeline_id: str | None, limit: int = 20) -> list[TurnRecord]:
+        """Asynchronously fetch recent turn records using thread pool."""
+        fn = partial(self.recent_turns, pipeline_id=pipeline_id, limit=limit)
+        return await anyio.to_thread.run_sync(fn)
 
     async def async_log_drift_history(self, *, session_id: str, turn: int, drift_score: float) -> None:
         """Asynchronously persist a drift sensor reading using thread pool."""

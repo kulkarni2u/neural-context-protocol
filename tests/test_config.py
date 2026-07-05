@@ -284,3 +284,52 @@ def test_tier_hints_enabled_config_default_and_overrides(tmp_path: Path) -> None
 
     config = load_config(cwd=project, env={"NCP_TIER_HINTS_ENABLED": "true"})
     assert config.tier_hints_enabled is True
+
+
+def test_drift_config_defaults(tmp_path: Path) -> None:
+    project = tmp_path / "repo"
+    (project / ".git").mkdir(parents=True)
+
+    config = load_config(cwd=project)
+
+    assert config.drift_computed_enabled is False
+    assert config.drift_window_turns == 5
+    assert config.drift_use_embeddings is False
+
+
+def test_drift_config_file_and_env_overrides(tmp_path: Path) -> None:
+    project = tmp_path / "repo"
+    (project / ".git").mkdir(parents=True)
+    (project / ".ncp").mkdir()
+    (project / ".ncp" / "config.toml").write_text(
+        "[drift]\ndrift_computed_enabled = true\n"
+        "drift_window_turns = 8\n"
+        "drift_use_embeddings = true\n"
+    )
+
+    config = load_config(cwd=project)
+    assert config.drift_computed_enabled is True
+    assert config.drift_window_turns == 8
+    assert config.drift_use_embeddings is True
+
+    config = load_config(
+        cwd=project,
+        env={
+            "NCP_DRIFT_COMPUTED_ENABLED": "false",
+            "NCP_DRIFT_WINDOW_TURNS": "3",
+            "NCP_DRIFT_USE_EMBEDDINGS": "false",
+        },
+    )
+    assert config.drift_computed_enabled is False
+    assert config.drift_window_turns == 3
+    assert config.drift_use_embeddings is False
+
+
+def test_drift_window_turns_is_clamped_to_at_least_one(tmp_path: Path) -> None:
+    project = tmp_path / "repo"
+    (project / ".git").mkdir(parents=True)
+    (project / ".ncp").mkdir()
+    (project / ".ncp" / "config.toml").write_text("[drift]\ndrift_window_turns = 0\n")
+
+    config = load_config(cwd=project)
+    assert config.drift_window_turns == 1

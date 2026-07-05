@@ -133,6 +133,18 @@ DEFAULT_CONFIG = {
         # orchestrator can use. Default true; set false to omit the fields.
         "tier_hints_enabled": True,
     },
+    "drift": {
+        # CAP-T5: replace the self-reported ConsciousBlock.drift_score with a
+        # value NCP computes from observable turn history. Default false
+        # (opt-in) -- disabled preserves exact legacy (self-reported) behavior.
+        "drift_computed_enabled": False,
+        "drift_window_turns": 5,
+        # Blend in local-embedding cosine distance alongside the always-on
+        # lexical baseline (see ncp/drift.py). Requires drift_computed_enabled
+        # and the fastembed-backed [local-embeddings] extra; silently falls
+        # back to lexical-only when the adapter is unavailable.
+        "drift_use_embeddings": False,
+    },
     "providers": {
         "pricing": {
             "claude-sonnet-4-20250514": {"input": 3.00, "output": 15.00, "cache_read": 0.30},
@@ -332,6 +344,21 @@ class NCPConfig:
         return bool(self.values.get("tiering", {}).get("tier_hints_enabled", True))
 
     @property
+    def drift_computed_enabled(self) -> bool:
+        """CAP-T5: whether ncp_get_context overrides drift_score with a computed value."""
+        return bool(self.values.get("drift", {}).get("drift_computed_enabled", False))
+
+    @property
+    def drift_window_turns(self) -> int:
+        """CAP-T5: sliding-window size (in turns) computed drift considers."""
+        return max(1, int(self.values.get("drift", {}).get("drift_window_turns", 5)))
+
+    @property
+    def drift_use_embeddings(self) -> bool:
+        """CAP-T5: whether computed drift blends in local-embedding cosine distance."""
+        return bool(self.values.get("drift", {}).get("drift_use_embeddings", False))
+
+    @property
     def whisper_ttl_default(self) -> int:
         return int(self.values.get("whispers", {}).get("default_ttl_seconds", 1800))
 
@@ -508,6 +535,14 @@ def _apply_env_overrides(values: dict[str, Any], env: dict[str, str]) -> None:
         values["budget"]["adaptive_budget_floor_tokens"] = int(env["NCP_ADAPTIVE_BUDGET_FLOOR_TOKENS"])
     if "NCP_ADAPTIVE_BUDGET_CEILING_TOKENS" in env:
         values["budget"]["adaptive_budget_ceiling_tokens"] = int(env["NCP_ADAPTIVE_BUDGET_CEILING_TOKENS"])
+    if "NCP_DRIFT_COMPUTED_ENABLED" in env:
+        val = env["NCP_DRIFT_COMPUTED_ENABLED"].lower()
+        values["drift"]["drift_computed_enabled"] = val in {"true", "1", "yes"}
+    if "NCP_DRIFT_WINDOW_TURNS" in env:
+        values["drift"]["drift_window_turns"] = int(env["NCP_DRIFT_WINDOW_TURNS"])
+    if "NCP_DRIFT_USE_EMBEDDINGS" in env:
+        val = env["NCP_DRIFT_USE_EMBEDDINGS"].lower()
+        values["drift"]["drift_use_embeddings"] = val in {"true", "1", "yes"}
 
 
 def _deep_merge(target: dict[str, Any], updates: dict[str, Any]) -> None:

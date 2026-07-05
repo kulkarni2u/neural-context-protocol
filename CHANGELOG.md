@@ -32,6 +32,27 @@ Audit remediation from `docs/NCP_AUDIT_AND_REMEDIATION_PLAN.md`. One work item
 
 ### Added
 
+- **Computed drift signal** (`ncp/drift.py`, `ncp/mcp/server.py`,
+  `ncp/config.py`, `ncp/stores/base.py`, `ncp/stores/sqlite.py`):
+  `ConsciousBlock.drift_score` was previously pure honor system — an agent
+  (or a `world_check` whisper) could assert any value and nothing verified
+  it. `ncp_get_context` can now compute drift itself from observable turn
+  history: a deterministic Jaccard/BM25-token-overlap score between the
+  current task/slot text and a sliding window (`drift_window_turns`,
+  **default `5`**) of the pipeline's recent turn summaries (`0.0` = on-topic,
+  `1.0` = fully drifted), optionally blended with local-embedding cosine
+  distance (`drift_use_embeddings`, **default `false`**; falls back silently
+  to the lexical score when `fastembed` is not installed — never a hard
+  dependency). Gated by `[drift].drift_computed_enabled` (**default
+  `false`**); when enabled, the computed value overrides `drift_score`
+  *before* CAP-E3 tiering and CAP-C6 adaptive budget consume it, and the
+  response gains a `drift` block (`score`/`method`/`self_reported`/
+  `window_turns`) so the divergence between the claimed and computed values
+  is visible. Disabled (default) reproduces legacy self-reported behavior
+  byte-for-byte. Zero prior turns, empty task text, and very long histories
+  all degrade to a safe, deterministic `0.0`/clamped result rather than
+  erroring. See the formula in `ncp/drift.py` and
+  `docs/NCP_PROTOCOL_SPEC.md` §4e. (CAP-T5, WI-016)
 - **Adaptive per-turn context token budget** (`ncp/adaptive_budget.py`,
   `ncp/mcp/server.py`, `ncp/config.py`): `ncp_get_context` can scale its
   effective token budget to turn difficulty instead of always spending

@@ -87,9 +87,12 @@ Tracking fields (defaults shown):
   slot_age        int   = 0       calls since slot last confirmed
   slot_confidence float = 1.0     0-1, decays if unconfirmed
   goal_version    int   = 1       increments on goal change, broadcast on change
-  drift_score     float = 0.0     0-1, self-reported advisory signal (client-asserted,
-                                  NOT runtime-computed; a computed drift signal is
-                                  future work, WI-016 — see north-star roadmap)
+  drift_score     float = 0.0     0-1, self-reported by default (client-asserted).
+                                  When [drift].drift_computed_enabled is true
+                                  (CAP-T5, WI-016), ncp_get_context instead
+                                  overrides this with a value computed from
+                                  observable turn history and exposes both
+                                  values in a "drift" response block — see §4e.
   intent_anchor   str?  = None    sha256 of original intent at turn 0
 
 History:
@@ -596,6 +599,81 @@ NCP never widens the ceiling itself; it only chooses where inside the fixed
 [floor, ceiling] range to spend for this turn.
 ```
 
+## 4e. Computed Drift (CAP-T5, normative)
+
+```
+Config gate ([drift] table):
+  drift_computed_enabled: bool (default false, OPT-IN) -- disabled reproduces
+                           legacy behavior exactly: ConsciousBlock.drift_score
+                           stays whatever the caller self-reported (or
+                           inherited from the last persisted conscious
+                           snapshot, or 0.0), and no "drift" field is ever
+                           present in the response.
+  drift_window_turns:      int (default 5) -- sliding-window size, in prior
+                           turns, considered when scoring. Clamped to >= 1.
+  drift_use_embeddings:    bool (default false) -- optionally blend local-
+                           embedding cosine distance into the always-on
+                           lexical score (see formula below). Requires the
+                           fastembed-backed [local-embeddings] extra; when
+                           unavailable this silently degrades to the lexical
+                           score with no error.
+
+Why: drift_score was previously a pure honor-system float -- an agent (or a
+world_check whisper) could assert any value and nothing checked it. This
+section replaces that with a value NCP computes from observable turn
+history (ncp/drift.py), while still exposing the self-reported value so the
+two can be compared -- the divergence is the trust signal.
+
+Turn history source: SQLiteStore.recent_turns(pipeline_id, limit) returns up
+to drift_window_turns TurnRecords for the pipeline, oldest-first (backends
+that have not implemented recent_turns default to returning [], which
+degrades to a computed score of 0.0 -- never a crash).
+
+Formula (deterministic lexical baseline; see ncp/drift.py for the reference
+implementation):
+  task_tokens   = normalize_query_terms(task + " " + slot)   # lower().split()
+  window_turns  = last drift_window_turns entries of recent_turns
+  window_tokens = union of normalize_query_terms(f"{task} {slot} {result}")
+                  over window_turns
+  jaccard       = |task_tokens & window_tokens| / |task_tokens | window_tokens|
+  lexical_score = clamp(1 - jaccard, 0.0, 1.0)
+
+  Edge cases score 0.0 (no observable evidence of divergence, not a crash):
+  zero prior turns, or an empty/blank task+slot text.
+
+Optional embedding blend (drift_use_embeddings=true and an adapter is
+available):
+  embedding_distance = 1 - cosine_similarity(embed(task+slot),
+                                              centroid(embed(window turns)))
+  score = 0.5 * embedding_distance + 0.5 * lexical_score
+
+Wiring in ncp_get_context (when drift_computed_enabled is true):
+  1. Hydrate ConsciousBlock as usual (self-reported/inherited drift_score).
+  2. Compute the reading above from the pipeline's recent turns.
+  3. Override ConsciousBlock.drift_score with the computed score BEFORE
+     CAP-E3 tiering, CAP-C6 adaptive budget, and assembly consume it -- so
+     every downstream consumer of drift_score sees the computed value, not
+     the claimed one.
+
+"drift" block shape (present on ncp_get_context, streaming and
+non-streaming, only when drift_computed_enabled is true):
+  {
+    "score":         float,          # the computed value in [0.0, 1.0];
+                                      # this is also what overrides
+                                      # ConsciousBlock.drift_score
+    "method":        "lexical" | "blended",
+    "self_reported": float | null,   # the pre-override drift_score: the
+                                      # caller's explicit drift_score arg, or
+                                      # the value inherited from the last
+                                      # persisted conscious snapshot for this
+                                      # agent/pipeline. null when neither
+                                      # existed (nothing was ever
+                                      # self-reported -- an untouched
+                                      # hardcoded default is not a claim).
+    "window_turns":  int             # the configured drift_window_turns
+  }
+```
+
 ---
 
 ## 5. Trust Boundaries (normative, first-class)
@@ -953,6 +1031,11 @@ adaptive_budget_ceiling_tokens = 2000  # CAP-C6
 
 [tiering]
 tier_hints_enabled = true      # CAP-E3
+
+[drift]
+drift_computed_enabled = false  # CAP-T5: opt-in; see §4e
+drift_window_turns = 5          # CAP-T5
+drift_use_embeddings = false    # CAP-T5: optional local-embedding blend
 
 [chunking]
 max_chunk_tokens = 200

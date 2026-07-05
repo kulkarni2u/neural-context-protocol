@@ -1096,6 +1096,26 @@ class SQLiteStore(BaseStore):
             row = connection.execute("SELECT * FROM turn_records WHERE turn_id = ?", (turn_id,)).fetchone()
         return None if row is None else TurnRecord(**dict(row))
 
+    def recent_turns(self, *, pipeline_id: str | None, limit: int = 20) -> list[TurnRecord]:
+        """CAP-T5: most recent turn records for a pipeline, oldest-first."""
+        capped_limit = max(0, int(limit))
+        if capped_limit == 0:
+            return []
+        with self._connect() as connection:
+            if pipeline_id is None:
+                rows = connection.execute(
+                    "SELECT * FROM turn_records WHERE pipeline_id IS NULL ORDER BY created_at DESC LIMIT ?",
+                    (capped_limit,),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT * FROM turn_records WHERE pipeline_id = ? ORDER BY created_at DESC LIMIT ?",
+                    (pipeline_id, capped_limit),
+                ).fetchall()
+        records = [TurnRecord(**dict(row)) for row in rows]
+        records.reverse()
+        return records
+
     def log_conscious(self, conscious: ConsciousBlock, *, snapshot_hash: str) -> None:
         with self._connect() as connection:
             connection.execute(

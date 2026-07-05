@@ -19,6 +19,7 @@ from ncp.assembler import Assembler
 from ncp.budget import BudgetSnapshot, evaluate_budget
 from ncp.chunker import filter_content
 from ncp.config import NCPConfig, load_config
+from ncp.drift import EmbeddingAdapter, compute_drift
 from ncp.stores.base import BaseStore
 from ncp.stores.factory import create_store
 from ncp.tiering import compute_tier_signal
@@ -71,7 +72,7 @@ MCP_TOOLS: list[dict[str, object]] = [
                 "slot_age": {"type": "integer", "description": "Optional slot age overriding hydrated conscious state."},
                 "slot_confidence": {"type": "number", "description": "Optional slot confidence overriding hydrated conscious state."},
                 "goal_version": {"type": "integer", "description": "Optional goal version overriding hydrated conscious state."},
-                "drift_score": {"type": "number", "description": "Optional drift score overriding hydrated conscious state."},
+                "drift_score": {"type": "number", "description": "Optional drift score overriding hydrated conscious state. Ignored -- and reported back as self_reported -- when [drift].drift_computed_enabled is true; see the response's drift block."},
                 "ctx_used": {"type": "number", "description": "Context window usage ratio 0.0-1.0."},
                 "steps_completed": {"type": "integer", "description": "Completed plan steps for budget pressure."},
                 "steps_total": {"type": "integer", "description": "Total plan steps for budget pressure."},
@@ -450,6 +451,21 @@ def _session_id_from_args(args: dict[str, object]) -> str:
     return DEFAULT_FETCH_SESSION_ID
 
 
+def _build_drift_embedding_adapter(config: NCPConfig) -> EmbeddingAdapter | None:
+    """CAP-T5: best-effort local embedding adapter for the drift blend.
+
+    Built once at handler setup (not per-request) since loading the
+    fastembed model is comparatively expensive. ``None`` -- e.g. fastembed
+    is not installed -- means computed drift silently stays lexical-only.
+    """
+    try:
+        from ncp.adapters.embedding import LocalEmbeddingAdapter
+
+        return LocalEmbeddingAdapter(model=config.embedding_model)
+    except Exception:
+        return None
+
+
 def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[str, ToolHandler]:
     sessions: dict[str, FetchSession] = {}
     sessions_lock = threading.Lock()
@@ -467,6 +483,14 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
     adaptive_budget_floor_tokens = config.adaptive_budget_floor_tokens if config is not None else 300
     adaptive_budget_ceiling_tokens = config.adaptive_budget_ceiling_tokens if config is not None else 2000
     default_context_token_budget = config.context_token_budget if config is not None else 840
+    # CAP-T5: computed drift, opt-in (off by default -- legacy self-reported
+    # drift_score is unchanged when disabled).
+    drift_computed_enabled = config.drift_computed_enabled if config is not None else False
+    drift_window_turns = config.drift_window_turns if config is not None else 5
+    drift_use_embeddings = config.drift_use_embeddings if config is not None else False
+    drift_embedding_adapter: EmbeddingAdapter | None = None
+    if drift_computed_enabled and drift_use_embeddings:
+        drift_embedding_adapter = _build_drift_embedding_adapter(config)
 
     def _budget_snapshot(*, pipeline_id: str | None) -> BudgetSnapshot | None:
         """CAP-E2: read real recorded spend and classify it against the ceiling.
@@ -604,6 +628,49 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         )
         return result.adjusted_tokens, result.to_dict()
 
+    def _apply_computed_drift(
+        conscious: ConsciousBlock,
+        args: dict[str, object],
+    ) -> tuple[ConsciousBlock, dict[str, object] | None]:
+        """CAP-T5: override ``drift_score`` with a computed reading.
+
+        Returns ``(conscious, drift_block)``. When disabled, ``conscious`` is
+        returned unchanged and ``drift_block`` is ``None`` -- exact legacy
+        behavior, no response change. When enabled, ``conscious.drift_score``
+        is overridden with the computed value *before* the caller runs
+        tiering/adaptive-budget/assembly, and ``drift_block`` exposes both the
+        computed score and the original self-reported value (``None`` when
+        nothing was ever self-reported for this agent/pipeline -- an
+        untouched hardcoded default is not a claim) so the two can be
+        compared.
+        """
+        if not drift_computed_enabled:
+            return conscious, None
+
+        had_prior_conscious = (
+            store.load_latest_conscious(pipeline_id=conscious.pipeline_id, agent_id=conscious.agent_id)
+            is not None
+        )
+        self_reported = (
+            conscious.drift_score if ("drift_score" in args or had_prior_conscious) else None
+        )
+        turns_fn = getattr(store, "recent_turns", None)
+        recent_records = (
+            turns_fn(pipeline_id=conscious.pipeline_id, limit=drift_window_turns) if callable(turns_fn) else []
+        )
+        recent_turn_texts = [f"{record.task} {record.slot} {record.result}" for record in recent_records]
+        reading = compute_drift(
+            recent_turn_texts,
+            conscious.task + " " + conscious.slot,
+            window_turns=drift_window_turns,
+            use_embeddings=drift_use_embeddings,
+            embedding_adapter=drift_embedding_adapter,
+        )
+        updated_conscious = conscious.model_copy(update={"drift_score": reading.score})
+        drift_block = reading.to_dict()
+        drift_block["self_reported"] = self_reported
+        return updated_conscious, drift_block
+
     def _handle_get_context(args: dict[str, object]) -> object:
         session_id = _session_id_from_args(args)
         pipeline_id = args.get("pipeline_id")
@@ -619,6 +686,10 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
                     sessions[DEFAULT_FETCH_SESSION_ID] = FetchSession(fetch_count=0, pipeline_id=normalized_pipeline_id)
                 _prune_sessions()
         conscious = _build_conscious_from_args(store, args)
+        # CAP-T5: compute drift from observable turn history and override the
+        # self-reported drift_score *before* budget/tiering/assembly consume
+        # it. No-op (drift_block stays None) when the feature is disabled.
+        conscious, drift_block = _apply_computed_drift(conscious, args)
         budget = _budget_from_args(args, conscious=conscious)
 
         # CAP-E2: pre-flight budget check. In "block" mode an already-exceeded
@@ -678,6 +749,8 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
                 handler_result.update(_tier_signal(stream_result, budget=budget, search_text=search_text).to_dict())
             if budget_tokens_block is not None:
                 handler_result["budget_tokens"] = budget_tokens_block
+            if drift_block is not None:
+                handler_result["drift"] = drift_block
             return StreamResponse(
                 sections=sections,
                 handler_result=handler_result,
@@ -702,6 +775,8 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             response.update(_tier_signal(result, budget=budget, search_text=search_text).to_dict())
         if budget_tokens_block is not None:
             response["budget_tokens"] = budget_tokens_block
+        if drift_block is not None:
+            response["drift"] = drift_block
         return response
 
     def _handle_write_memory(args: dict[str, object]) -> object:

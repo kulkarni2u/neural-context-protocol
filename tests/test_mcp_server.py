@@ -1882,3 +1882,195 @@ class TestAdaptiveBudget:
         second = _content(_handle_request(_call("ncp_get_context", args), handlers))
 
         assert first["budget_tokens"] == second["budget_tokens"]
+
+
+class TestComputedDrift:
+    """CAP-T5: computed drift overrides the self-reported drift_score."""
+
+    def _args(self, **overrides: object) -> dict:
+        base = {
+            "agent_id": "builder",
+            "role": "build",
+            "owns": [],
+            "must_not": [],
+            "task": "test",
+            "slot": "test",
+            "intent": "test",
+            "pipeline_id": "pipe_drift",
+        }
+        base.update(overrides)
+        return base
+
+    def _post_turn(self, handlers, *, pipeline_id: str, turn_id: str, task: str, slot: str, result_summary: str) -> None:
+        posted = _content(_handle_request(
+            _call("ncp_post_turn", {
+                "agent_id": "builder",
+                "role": "build",
+                "task": task,
+                "slot": slot,
+                "intent": "test",
+                "pipeline_id": pipeline_id,
+                "turn_id": turn_id,
+                "result_summary": result_summary,
+                "result_full": result_summary,
+            }),
+            handlers,
+        ))
+        assert posted["posted"] is True
+
+    def test_disabled_by_default_omits_drift_block(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "drift_off.db")
+        handlers = make_handlers(store)
+
+        result = _content(_handle_request(_call("ncp_get_context", self._args()), handlers))
+
+        assert "drift" not in result
+
+    def test_disabled_flag_is_byte_identical_to_no_config(self, tmp_path: Path) -> None:
+        store_a = SQLiteStore(tmp_path / "drift_legacy_a.db")
+        store_b = SQLiteStore(tmp_path / "drift_legacy_b.db")
+        handlers_no_config = make_handlers(store_a)
+
+        config = load_config(cwd=tmp_path)
+        config.values["drift"]["drift_computed_enabled"] = False
+        handlers_explicit_off = make_handlers(store_b, config=config)
+
+        args = self._args(pipeline_id="pipe_drift_legacy", drift_score=0.9)
+        result_no_config = _content(_handle_request(_call("ncp_get_context", args), handlers_no_config))
+        result_explicit_off = _content(_handle_request(_call("ncp_get_context", args), handlers_explicit_off))
+
+        assert result_no_config["context"] == result_explicit_off["context"]
+        assert "drift" not in result_no_config
+        assert "drift" not in result_explicit_off
+
+    def test_zero_prior_turns_computes_zero_drift_without_crashing(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "drift_zero.db")
+        config = load_config(cwd=tmp_path)
+        config.values["drift"]["drift_computed_enabled"] = True
+        handlers = make_handlers(store, config=config)
+
+        result = _content(_handle_request(
+            _call("ncp_get_context", self._args(pipeline_id="pipe_drift_new")),
+            handlers,
+        ))
+
+        assert result["drift"]["score"] == 0.0
+        assert result["drift"]["method"] == "lexical"
+        assert result["drift"]["window_turns"] == 5
+        assert result["drift"]["self_reported"] is None
+
+    def test_self_reported_is_null_when_never_supplied(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "drift_null.db")
+        config = load_config(cwd=tmp_path)
+        config.values["drift"]["drift_computed_enabled"] = True
+        handlers = make_handlers(store, config=config)
+
+        result = _content(_handle_request(
+            _call("ncp_get_context", self._args(pipeline_id="pipe_drift_no_claim")),
+            handlers,
+        ))
+
+        assert result["drift"]["self_reported"] is None
+
+    def test_self_reported_is_exposed_alongside_computed_score(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "drift_self_reported.db")
+        config = load_config(cwd=tmp_path)
+        config.values["drift"]["drift_computed_enabled"] = True
+        handlers = make_handlers(store, config=config)
+
+        result = _content(_handle_request(
+            _call("ncp_get_context", self._args(pipeline_id="pipe_drift_claim", drift_score=0.95)),
+            handlers,
+        ))
+
+        # The client claimed near-total drift; the computed score for a
+        # fresh pipeline with no history is 0.0 -- the divergence is visible.
+        assert result["drift"]["self_reported"] == 0.95
+        assert result["drift"]["score"] == 0.0
+
+    def test_computed_drift_overrides_tiering_and_adaptive_budget_inputs(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "drift_override.db")
+        config = load_config(cwd=tmp_path)
+        config.values["drift"]["drift_computed_enabled"] = True
+        config.values["budget"]["adaptive_budget_enabled"] = True
+        handlers = make_handlers(store, config=config)
+
+        self._post_turn(
+            handlers,
+            pipeline_id="pipe_drift_wired",
+            turn_id="turn_1",
+            task="billing",
+            slot="invoice",
+            result_summary="billing invoice reconciliation",
+        )
+
+        # Client asserts zero drift, but the task has totally changed topic
+        # from the turn history -- computed drift should override it upward
+        # and that higher value should be what tiering/adaptive-budget see.
+        result = _content(_handle_request(
+            _call("ncp_get_context", self._args(
+                pipeline_id="pipe_drift_wired",
+                task="astronomy",
+                slot="telescope",
+                drift_score=0.0,
+            )),
+            handlers,
+        ))
+
+        assert result["drift"]["self_reported"] == 0.0
+        assert result["drift"]["score"] == pytest.approx(1.0)
+        assert result["drift"]["method"] == "lexical"
+        # CAP-E3 tiering read the overridden (high) drift, not the claimed 0.0.
+        assert result["factors"]["drift_score"] == pytest.approx(1.0)
+
+    def test_window_turns_config_is_respected_and_reported(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "drift_window.db")
+        config = load_config(cwd=tmp_path)
+        config.values["drift"]["drift_computed_enabled"] = True
+        config.values["drift"]["drift_window_turns"] = 2
+        handlers = make_handlers(store, config=config)
+
+        for index in range(4):
+            self._post_turn(
+                handlers,
+                pipeline_id="pipe_drift_window",
+                turn_id=f"turn_{index}",
+                task=f"topic_{index}",
+                slot=f"topic_{index}",
+                result_summary=f"topic_{index}",
+            )
+
+        result = _content(_handle_request(
+            _call("ncp_get_context", self._args(pipeline_id="pipe_drift_window", task="topic_0", slot="topic_0")),
+            handlers,
+        ))
+
+        # window_turns=2 means only turn_2/turn_3 (topic_2/topic_3) are in
+        # scope; topic_0 no longer overlaps with the window, so drift is high.
+        assert result["drift"]["window_turns"] == 2
+        assert result["drift"]["score"] == pytest.approx(1.0)
+
+    def test_computed_drift_is_deterministic(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "drift_det.db")
+        config = load_config(cwd=tmp_path)
+        config.values["drift"]["drift_computed_enabled"] = True
+        handlers = make_handlers(store, config=config)
+        args = self._args(pipeline_id="pipe_drift_det")
+
+        first = _content(_handle_request(_call("ncp_get_context", args), handlers))
+        second = _content(_handle_request(_call("ncp_get_context", args), handlers))
+
+        assert first["drift"] == second["drift"]
+
+    def test_drift_use_embeddings_falls_back_to_lexical_without_fastembed(self, tmp_path: Path) -> None:
+        # fastembed is not installed in this environment; enabling the blend
+        # must never raise -- it silently degrades to the lexical method.
+        store = SQLiteStore(tmp_path / "drift_embed_fallback.db")
+        config = load_config(cwd=tmp_path)
+        config.values["drift"]["drift_computed_enabled"] = True
+        config.values["drift"]["drift_use_embeddings"] = True
+        handlers = make_handlers(store, config=config)
+
+        result = _content(_handle_request(_call("ncp_get_context", self._args()), handlers))
+
+        assert result["drift"]["method"] == "lexical"
