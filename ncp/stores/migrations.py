@@ -251,8 +251,14 @@ class MigrationRunner:
                     "Could not acquire advisory lock — another migration may be running"
                 )
             try:
-                cur.execute(substituted)
+                # Delete the version row BEFORE running the DOWN SQL: a DOWN
+                # section may legitimately drop its own schema/version table
+                # (e.g. DROP SCHEMA ... CASCADE), which would make the version
+                # table gone by the time we tried to DELETE from it. Both run in
+                # one transaction, so on success they commit together and on
+                # DOWN failure the rollback restores the version row.
                 cur.execute(f"DELETE FROM {self._vtable()} WHERE version = %s", (version,))
+                cur.execute(substituted)
                 self._conn.commit()
             except Exception as exc:
                 self._conn.rollback()

@@ -115,6 +115,13 @@ Audit remediation from `docs/NCP_AUDIT_AND_REMEDIATION_PLAN.md`. One work item
 
 ### Fixed
 
+- **Migration rollback survives self-dropping DOWN sections**
+  (`ncp/stores/migrations.py`): `MigrationRunner.rollback` now deletes the
+  `ncp_schema_versions` row *before* executing the DOWN SQL, so a DOWN that
+  drops its own schema/version table (e.g. `DROP SCHEMA ... CASCADE`) no longer
+  raises `UndefinedTable` on the follow-up DELETE. Both statements share one
+  transaction, so success commits together and a failed DOWN rolls back and
+  restores the version row.
 - **No score double-counting in `effective_score`** (`ncp/types.py`): the
   pidgin/display score now equals the single-application retrieval relevance from
   `RetrievalPolicy.score` instead of re-multiplying recency, trust, and the
