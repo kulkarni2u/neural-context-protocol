@@ -37,7 +37,7 @@ Three properties make it a bus and not just a store:
 
 - **Bounded reads.** Every agent gets a budget-bounded working context, not the whole history — so the channel scales as turns and agents grow.
 - **Directed signals.** Agents emit whispers to specific peers (handoffs, dissent, drift reports) without broadcasting full state.
-- **Trust-aware transport.** Every message on the bus carries a trust score and drift marker, so a receiving agent knows how much to believe what it reads.
+- **Trust-aware transport.** Every message on the bus carries a trust score and drift marker — self-reported, advisory inputs, not runtime-verified truth — so a receiving agent knows how much to believe what it reads.
 
 The payoff compounds at the organization level as **token capital efficiency** — the business value captured per dollar spent on model reasoning. Because work persists as reusable, trusted state instead of being thrown away at the end of each turn, token spend accrues into shared organizational memory rather than resetting: decisions, evidence, outcomes, trust signals, and cost records that future runs, teams, and pipelines draw on. Future agents — including cheaper or smaller models — stand on prior work without replaying the whole history. That does not make NCP a model router or eval platform; it is the context substrate those loops need. The [Benchmarks](#benchmarks) section quantifies the effect.
 
@@ -196,13 +196,13 @@ The valid layers are `episodic`, `procedural`, `semantic`, `social`, and `reason
 
 Most frameworks treat stored context as equally credible. The bus doesn't. Trust is part of the protocol, so a receiving agent always knows how much to believe a message.
 
-Every memory chunk carries a `base_trust` score and a `written_at_drift` marker. Retrieval scoring discounts chunks written during high-drift periods. The `CoherenceChecker` monitors per-turn `drift_score` and fires alerts when agents start diverging. Agents emit `world_check` whispers to report detected drift back onto the bus.
+Every memory chunk carries a `base_trust` score (derived from its `src` at write time) and a `written_at_drift` marker. Both `base_trust` and `drift_score` are **self-reported, client-asserted advisory inputs** — NCP does not yet compute drift itself. Retrieval scoring discounts chunks written during high-drift periods, and the `CoherenceChecker` reads the per-turn `drift_score` agents report and fires alerts when it crosses threshold. Agents emit `world_check` whispers to report drift back onto the bus. A runtime-computed drift signal is future work — see the [north-star roadmap](./docs/NCP_NORTH_STAR_CAPABILITY_ROADMAP.md) (WI-016).
 
 ```
 ChunkSource:      user_verified | tool_result | agent_inferred | synthesis
-base_trust:       float (0.0–1.0) — weight applied at retrieval time
-drift_score:      float (0.0–1.0) — pipeline coherence, updated per turn
-written_at_drift: float — drift level when this memory was written
+base_trust:       float (0.0–1.0) — advisory weight applied at retrieval time
+drift_score:      float (0.0–1.0) — self-reported coherence signal (advisory; not runtime-computed)
+written_at_drift: float — drift level reported when this memory was written
 ```
 
 The effect: each agent receives context ranked by how much it should believe it, not just by recency.
@@ -213,7 +213,7 @@ Per-chunk trust is only half the story. Trust on the bus also attaches to *who w
 
 ## Agent identity and reputation
 
-In a multi-agent system, "how much do I trust this message" depends on *who sent it*. NCP gives agents real, cryptographic identities and tracks a reputation for each one — so the bus can weight memory by its author's track record, not just the chunk's own trust score.
+In a multi-agent system, "how much do I trust this message" depends on *who sent it*. NCP gives agents real, cryptographic identities, lets them optionally sign what they write, and tracks a reputation for each one. Reputation is computed and displayed by default; it can also weight retrieval and gate whispers, but only when an operator opts in (CAP-T4 — see below).
 
 **Cryptographic identity.** `ncp identity create` generates an [Ed25519](https://ed25519.cr.yp.to/) keypair; the identity ID is derived from the SHA-256 of the public key, and the secret key is written to a `0700` keystore (`~/.ncp/keys`, or `NCP_KEYSTORE_DIR`). Public keys are registered in the store; keys can be listed and revoked.
 
@@ -223,13 +223,20 @@ ncp identity list
 ncp identity revoke <identity_id>
 ```
 
+**Optional authorship signing.** `ncp_write_memory` and `ncp_emit_whisper` accept an optional `signature` over a canonical `written_by | sha256(content) | pipeline_id` payload; NCP verifies it against the author's registered public key, persists the result, and surfaces a `verified` marker in fetch results and the pidgin wire format. This is **opt-in and off by default**: it is gated behind `[identity].require_signatures`, which defaults to `false`, so unsigned writes still work and authorship is *not* authenticated unless an operator turns enforcement on. With `require_signatures = true`, writes that cannot be verified — including those from revoked identities — are rejected.
+
 **Reputation as a Beta posterior.** Each identity carries a Beta distribution `(alpha, beta)` over "produces trustworthy memory." When `ncp calibrate --feedback` runs, the per-chunk trust changes it computes are rolled up to the chunk's author: trust gains become positive evidence, dissent-driven losses become negative evidence. A `forget` factor decays old evidence so reputation tracks recent behavior, and `gain` scales how fast evidence accrues. The reported score is the posterior mean; confidence rises with the number of observations.
 
 ```bash
 ncp reputation             # score, confidence, and observation count per identity
 ```
 
-Tune it under `[reputation]` in `.ncp/config.toml` (`gain`, `forget`, `confidence_k`) or via `NCP_REPUTATION_*`. This is what makes cross-team and cross-org trust credible: an agent that has repeatedly produced disputed memory earns a lower reputation, and the bus can down-weight it accordingly.
+Tune it under `[reputation]` in `.ncp/config.toml` (`gain`, `forget`, `confidence_k`) or via `NCP_REPUTATION_*`. An agent that has repeatedly produced disputed memory earns a lower reputation. Since Sprint 4 that score can also act on the bus — each piece is **opt-in and off by default**:
+
+- **Outcomes as evidence** (CAP-T3) — `ncp_record_outcome` records task success/failure against the chunks (or turn) that informed it; `ncp calibrate --feedback` consumes each outcome exactly once as the primary trust/reputation signal, ahead of the retrieval-count prior (`[retrieval].usage_prior_weight`).
+- **Reputation-weighted retrieval** (CAP-T4) — `[retrieval].reputation_weight` (default `0.0`) blends the author's reputation confidence into chunk trust at ranking time, identically across the SQLite, pgvector, and async pgvector backends.
+- **Whisper gating** (CAP-T4) — `[whispers].min_author_reputation` (default `0.0`) drops whispers from low-reputation authors at drain time. It gates on the *claimed* sender: sender identity is only as strong as `[identity].require_signatures` enforcement, which also stays off by default.
+- **Work memoization** (CAP-C3) — `[memoization].enabled` (default `false`) turns on `ncp_lookup_memo`/`ncp_record_memo`, a signature-keyed memo of completed work. It is lookup-only: NCP surfaces memo hits, misses, and an *estimated* tokens-saved figure in `ncp status`, and the host decides whether a memo lets it skip its own model call.
 
 -----
 
@@ -288,20 +295,20 @@ Use it when you have **3+ agents, 10+ turns, and real shared state to preserve**
 
 ## Benchmarks
 
-| Scenario                               | Baseline       | Baseline tokens | NCP tokens | Reduction  |
-|----------------------------------------|----------------|----------------:|-----------:|-----------:|
-| 4-agent coding pipeline (40 turns)     | raw replay     | 3,426           | 261        | **13.13x** |
-| 4-agent coding pipeline (40 turns)     | sliding window | 377             | 261        | **1.44x**  |
-| 4-agent coding pipeline (40 turns)     | rolling summary| 2,096           | 261        | **8.03x**  |
-| 6-role research pipeline (36 turns)    | raw replay     | 3,277           | 267        | **12.27x** |
-| Cross-host handoff (Claude → OpenCode) | window baseline| 0.0 success     | 0.8 success| **+0.8**   |
-| Needle recall at budget 4              | sliding window | 0.00            | 0.50       | **+0.50**  |
-| Task success at matched budget 400 (12 tasks, mock) | sliding window | 0.00 | 1.00 | **+1.00** |
+| Scenario                               | Baseline       | Baseline tokens | NCP tokens | Result     | Caveat |
+|----------------------------------------|----------------|----------------:|-----------:|-----------:|--------|
+| 4-agent coding pipeline (40 turns)     | sliding window | 377             | 261        | **1.44x**  | Closest accounting comparison for a bounded recent-context baseline. |
+| 4-agent coding pipeline (40 turns)     | raw replay     | 3,426           | 261        | **13.13x** | Worst-case floor; the ratio scales with turn count. |
+| 4-agent coding pipeline (40 turns)     | rolling summary| 2,096           | 261        | **8.03x**  | Token accounting only; does not score summary quality. |
+| 6-role research pipeline (36 turns)    | raw replay     | 3,277           | 267        | **12.27x** | Worst-case floor for a deterministic synthetic research trace. |
+| Cross-host handoff (Claude -> OpenCode)| window baseline| 0.0 success     | 0.8 success| **+0.8**   | Local harness with a noise-only control, not a distributed-host reliability study. |
+| Needle recall at budget 4              | sliding window | 0.00            | 0.50       | **+0.50**  | Synthetic budget-stress recall check. |
+| Task success at matched budget 400 (12 tasks, mock) | sliding window | 0.00 | 1.00 | **+1.00** | Context adequacy with a deterministic mock provider, not live model success. |
 
-MACE multi-agent coordination score (40 turns): **0.9608**
+MACE multi-agent coordination score (40 turns): **0.8915**
 
 Coding benchmark token unit: `chars_div4`; context budget: `340`; pass gate: `true`.
-These are deterministic token-accounting benchmarks. The task-success row measures context adequacy at a matched token budget with a deterministic mock provider — whether the needed fact survives into a budget-bounded context (see [the benchmark doc](./docs/NCP_BENCHMARK_TASK_SUCCESS.md)); run it with a live provider to measure real model task success. Quality-at-matched-budget evaluation also lives in `benchmarks/efficacy/`.
+These are deterministic token-accounting benchmarks. The task-success row measures context adequacy at a matched token budget with a deterministic mock provider — whether the needed fact survives into a budget-bounded context (see [the benchmark doc](./docs/NCP_BENCHMARK_TASK_SUCCESS.md)); run it with a live provider to measure real model task success. Provider-real quality-at-matched-budget evaluation lives in `benchmarks/efficacy/` and compares NCP with sliding-window and rolling-summary controls (see [the efficacy benchmark doc](./docs/NCP_BENCHMARK_EFFICACY_LIVE.md)).
 
 A separate, complementary compression benchmark measures ingestion-time noise reduction on a fixed noisy-payload corpus: **33% aggregate token reduction** (537 → 360, `chars_div4`, pass gate aggregate >= 0.20), ranging from **68%** on duplicate-heavy logs down to **2%** on already-dense stack traces (see [the compression benchmark doc](./docs/NCP_BENCHMARK_COMPRESSION.md)).
 
@@ -312,6 +319,7 @@ python3 benchmarks/coding_pipeline/run.py
 python3 benchmarks/needle/run.py --turns 24 --needles 6 --budget 4
 python3 benchmarks/task_success/run.py            # mock provider, no keys needed
 python3 benchmarks/task_success/run.py --provider anthropic   # live task success
+python3 benchmarks/efficacy/run.py --provider mock --seeds 2  # context adequacy at matched budget
 python3 benchmarks/compression/run.py             # ingestion-time compression
 ```
 
@@ -414,7 +422,10 @@ ncp demo        # run a self-contained demo pipeline
 `ncp calibrate --feedback` runs the self-improvement pass: it boosts chunks that
 keep getting retrieved, penalizes chunks that drew dissent, and propagates the
 net trust change one hop along `caused_by` edges so a cause is credited or
-debited for what it produced. Add `--dry-run` to preview.
+debited for what it produced. Add `--dry-run` to preview. Because this pass
+resets the per-chunk retrieval/dissent counters it consumes, `ncp trust-drift`'s
+"most retrieved" view shows activity since the last calibration, not lifetime
+totals.
 
 -----
 
@@ -438,7 +449,7 @@ ncp explain --cwd /path/to/project
 ```
 
 - `ncp status` shows store and activity metrics.
-- `ncp cost` shows token and USD rollups once turns are logged.
+- `ncp cost` shows token and USD rollups once turns are logged. For provider adapters these are **measured** — actual token usage threaded from the SDK and priced via the `[providers]` table; for the local/mock in-process path they are **estimated** (chars/4) and flagged `cost_source=estimated`.
 - `ncp explain` gives a human-readable runtime summary.
 
 -----
@@ -502,6 +513,7 @@ NCP is the memory bus. In our workflows, Sarathi is one orchestrator that runs o
 - [Protocol spec](./docs/NCP_PROTOCOL_SPEC.md)
 - [HTTP API contract](./docs/NCP_HTTP_API.md)
 - [Benchmark: task success at matched budget](./docs/NCP_BENCHMARK_TASK_SUCCESS.md)
+- [Benchmark: provider-real efficacy](./docs/NCP_BENCHMARK_EFFICACY_LIVE.md)
 - [Benchmark: coding pipeline](./docs/NCP_BENCHMARK_CODING_PIPELINE.md)
 - [Benchmark: needle recall](./docs/NCP_BENCHMARK_NEEDLE_RECALL.md)
 - [Benchmark: matched-budget efficacy](./docs/NCP_BENCHMARK_MATCHED_BUDGET_EFFICACY.md)

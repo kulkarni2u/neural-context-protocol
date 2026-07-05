@@ -32,31 +32,32 @@ def test_chunk_accepts_valid_embedding() -> None:
     assert len(chunk.embedding) == _EMBEDDING_DIM  # type: ignore[arg-type]
 
 
-def test_chunk_rejects_wrong_dimension_embedding() -> None:
-    with pytest.raises(Exception, match="1536"):
-        SubconsciousChunk(layer="semantic", content="hello", src="synthesis", embedding=[0.1] * 10)
+def test_chunk_accepts_local_embedding_dimensions() -> None:
+    chunk = SubconsciousChunk(
+        layer="semantic", content="hello", src="synthesis", embedding=[0.1] * 10
+    )
+    assert len(chunk.embedding) == 10  # type: ignore[arg-type]
 
 
 def test_chunk_rejects_zero_dimension_embedding() -> None:
-    with pytest.raises(Exception, match="1536"):
+    with pytest.raises(Exception, match="non-empty"):
         SubconsciousChunk(layer="semantic", content="hello", src="synthesis", embedding=[])
 
 
 # ---------------------------------------------------------------------------
-# SQLite: vector mode raises ValueError
+# SQLite: vector mode is brute-force cosine
 # ---------------------------------------------------------------------------
 
 
-def test_sqlite_vector_mode_raises(tmp_path: pytest.TempdirFactory) -> None:
+def test_sqlite_vector_mode_requires_embedding(tmp_path: pytest.TempdirFactory) -> None:
     store = SQLiteStore(tmp_path / "store.db")
-    with pytest.raises(ValueError, match="pgvector"):
+    with pytest.raises(ValueError, match="embedding"):
         store.query("test", retrieval_mode="vector")
 
 
-def test_sqlite_vector_mode_raises_with_embedding(tmp_path: pytest.TempdirFactory) -> None:
+def test_sqlite_vector_mode_accepts_embedding(tmp_path: pytest.TempdirFactory) -> None:
     store = SQLiteStore(tmp_path / "store.db")
-    with pytest.raises(ValueError, match="pgvector"):
-        store.query("test", retrieval_mode="vector", embedding=_vec())
+    assert store.query("test", retrieval_mode="vector", embedding=_vec()) == []
 
 
 def test_sqlite_unknown_mode_still_raises(tmp_path: pytest.TempdirFactory) -> None:

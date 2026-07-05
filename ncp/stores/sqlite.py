@@ -23,12 +23,23 @@ from ncp.stores.retrieval import (
     DEFAULT_RETRIEVAL_POLICY,
     RetrievalPolicy,
     apply_diversity_limit,
+    blend_trust,
     build_lexical_candidates,
     normalize_query_terms,
     normalize_result_limit,
     score_trust_recency_candidate,
 )
-from ncp.types import CalibrationReport, ConsolidationReport, ConsciousBlock, NCPResponse, SubconsciousChunk, TurnRecord, Whisper
+from ncp.tokens import estimate_tokens
+from ncp.types import (
+    CalibrationReport,
+    ConsolidationReport,
+    ConsciousBlock,
+    NCPResponse,
+    OutcomeRecord,
+    SubconsciousChunk,
+    TurnRecord,
+    Whisper,
+)
 
 
 SCHEMA = """
@@ -62,7 +73,9 @@ CREATE TABLE IF NOT EXISTS chunks (
     retrieval_count INTEGER DEFAULT 0,
     last_retrieved_at REAL,
     written_at_drift REAL DEFAULT 0.0,
-    dissent_count INTEGER DEFAULT 0
+    dissent_count INTEGER DEFAULT 0,
+    verified INTEGER DEFAULT 0,
+    embedding BLOB
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
@@ -101,6 +114,8 @@ CREATE TABLE IF NOT EXISTS whispers (
     payload TEXT NOT NULL,
     confidence REAL NOT NULL,
     ref TEXT,
+    dissent_target TEXT,
+    verified INTEGER DEFAULT 0,
     created_at REAL NOT NULL,
     expires_at REAL NOT NULL
 );
@@ -143,7 +158,8 @@ CREATE TABLE IF NOT EXISTS cost_log (
     cache_read_tokens INTEGER DEFAULT 0,
     cost_usd REAL NOT NULL,
     latency_ms INTEGER,
-    logged_at REAL NOT NULL
+    logged_at REAL NOT NULL,
+    cost_source TEXT NOT NULL DEFAULT 'measured'
 );
 
 CREATE INDEX IF NOT EXISTS idx_chunks_pipeline ON chunks(pipeline_id, scope, zone);
@@ -184,6 +200,35 @@ CREATE TABLE IF NOT EXISTS reputation (
 );
 
 CREATE INDEX IF NOT EXISTS idx_reputation_updated ON reputation(last_updated);
+
+CREATE TABLE IF NOT EXISTS outcomes (
+    outcome_id TEXT PRIMARY KEY,
+    turn_id TEXT,
+    chunk_ids TEXT NOT NULL DEFAULT '[]',
+    success INTEGER NOT NULL,
+    weight REAL NOT NULL DEFAULT 1.0,
+    note TEXT,
+    created_at REAL NOT NULL,
+    consumed INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS memo_entries (
+    signature TEXT PRIMARY KEY,
+    task TEXT NOT NULL,
+    result_summary TEXT,
+    chunk_ids TEXT NOT NULL DEFAULT '[]',
+    outcome REAL DEFAULT 0.0,
+    verified INTEGER DEFAULT 0,
+    created_at REAL NOT NULL,
+    last_hit_at REAL NOT NULL DEFAULT 0.0,
+    hit_count INTEGER NOT NULL DEFAULT 0,
+    output_tokens_est INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS memo_stats (
+    stat_key TEXT PRIMARY KEY,
+    stat_value INTEGER NOT NULL DEFAULT 0
+);
 """
 
 
@@ -199,6 +244,7 @@ class SQLiteStore(BaseStore):
         max_working_chunks_per_pipeline: int = 0,
         retrieval_policy: RetrievalPolicy | None = None,
         config: NCPConfig | None = None,
+        embedding_adapter: object | None = None,
     ) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -206,11 +252,13 @@ class SQLiteStore(BaseStore):
         self.gc_threshold = gc_threshold
         self.max_working_chunks_per_pipeline = max_working_chunks_per_pipeline
         self.retention_evictions = 0
+        self._embedding_adapter = embedding_adapter
 
         from ncp.stores.rerank import Reranker
         from ncp.config import load_config
         try:
             cfg = config or load_config()
+            self.config = cfg
             self.reranker = Reranker(cfg)
             self.retrieval_policy = retrieval_policy or RetrievalPolicy(
                 generation_penalty_base=cfg.retrieval_generation_penalty_base
@@ -219,6 +267,7 @@ class SQLiteStore(BaseStore):
             self.reputation_forget = cfg.reputation_forget
             self.reputation_confidence_k = cfg.reputation_confidence_k
         except Exception:
+            self.config = None
             self.retrieval_policy = retrieval_policy or DEFAULT_RETRIEVAL_POLICY
             self.reputation_gain = 4.0
             self.reputation_forget = 0.99
@@ -236,11 +285,12 @@ class SQLiteStore(BaseStore):
     @contextmanager
     def _connect(self) -> sqlite3.Connection:
         try:
-            connection = sqlite3.connect(self.path)
+            connection = sqlite3.connect(self.path, timeout=5.0)
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA journal_mode=WAL;")
             connection.execute("PRAGMA synchronous=NORMAL;")
             connection.execute("PRAGMA foreign_keys=ON;")
+            connection.execute("PRAGMA busy_timeout=5000;")
             connection.execute("PRAGMA cache_size=-64000;")
         except sqlite3.Error as exc:
             raise NCPStoreUnavailableError(
@@ -269,6 +319,12 @@ class SQLiteStore(BaseStore):
                 "ALTER TABLE chunks ADD COLUMN last_retrieved_at REAL",
                 "ALTER TABLE chunks ADD COLUMN written_at_drift REAL DEFAULT 0.0",
                 "ALTER TABLE chunks ADD COLUMN dissent_count INTEGER DEFAULT 0",
+                "ALTER TABLE whispers ADD COLUMN dissent_target TEXT",  # WI-007(b)
+                "ALTER TABLE cost_log ADD COLUMN cost_source TEXT NOT NULL DEFAULT 'measured'",  # CAP-E1
+                "ALTER TABLE chunks ADD COLUMN verified INTEGER DEFAULT 0",  # CAP-T1/WI-013
+                "ALTER TABLE whispers ADD COLUMN verified INTEGER DEFAULT 0",  # CAP-T1/WI-013
+                "ALTER TABLE chunks ADD COLUMN embedding BLOB",  # CAP-C4
+                "ALTER TABLE memo_entries ADD COLUMN output_tokens_est INTEGER NOT NULL DEFAULT 0",  # S4.1 memo telemetry
                 "CREATE TABLE IF NOT EXISTS drift_history (session_id TEXT NOT NULL, turn INTEGER NOT NULL, drift_score REAL NOT NULL, ts REAL NOT NULL)",
                 "CREATE INDEX IF NOT EXISTS idx_drift_session ON drift_history(session_id, turn)",
                 "CREATE TABLE IF NOT EXISTS identities (identity_id TEXT PRIMARY KEY, public_key TEXT NOT NULL, alg TEXT NOT NULL DEFAULT 'ed25519', label TEXT, created_at REAL NOT NULL, revoked_at REAL)",
@@ -283,20 +339,53 @@ class SQLiteStore(BaseStore):
 
     def write(self, chunk: SubconsciousChunk) -> bool:
         chunk = self._validate_chunk_for_write(chunk)
+        if self._embedding_adapter is not None and chunk.embedding is None:
+            chunk = chunk.model_copy(
+                update={"embedding": self._embedding_adapter.embed(chunk.content)}
+            )
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             self._soft_gc(connection)
             self._assert_src_immutable(connection, chunk)
             if self._is_duplicate(connection, chunk):
                 return False
             connection.execute(
                 """
-                INSERT OR REPLACE INTO chunks (
+                INSERT INTO chunks (
                     chunk_id, pipeline_id, scope, zone, layer, chunk_type, content, src,
                     written_by, caused_by, conscious_hash, evidence_id, version, supersedes,
                     source_refs, schema_version, created_at, base_trust, generation,
                     result_confidence, result_attempts, conditions, valid_while, expiry, owner, meta,
-                    written_at_drift
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    written_at_drift, verified, embedding
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(chunk_id) DO UPDATE SET
+                    pipeline_id = excluded.pipeline_id,
+                    scope = excluded.scope,
+                    zone = excluded.zone,
+                    layer = excluded.layer,
+                    chunk_type = excluded.chunk_type,
+                    content = excluded.content,
+                    src = excluded.src,
+                    written_by = excluded.written_by,
+                    caused_by = excluded.caused_by,
+                    conscious_hash = excluded.conscious_hash,
+                    evidence_id = excluded.evidence_id,
+                    version = excluded.version,
+                    supersedes = excluded.supersedes,
+                    source_refs = excluded.source_refs,
+                    schema_version = excluded.schema_version,
+                    base_trust = excluded.base_trust,
+                    generation = excluded.generation,
+                    result_confidence = excluded.result_confidence,
+                    result_attempts = excluded.result_attempts,
+                    conditions = excluded.conditions,
+                    valid_while = excluded.valid_while,
+                    expiry = excluded.expiry,
+                    owner = excluded.owner,
+                    meta = excluded.meta,
+                    written_at_drift = excluded.written_at_drift,
+                    verified = excluded.verified,
+                    embedding = excluded.embedding
                 """,
                 (
                     chunk.chunk_id,
@@ -326,12 +415,33 @@ class SQLiteStore(BaseStore):
                     chunk.owner,
                     json.dumps({"raw_ref": chunk.raw_ref} if chunk.raw_ref else {}),
                     chunk.written_at_drift,
+                    1 if chunk.verified else 0,
+                    self._encode_embedding(chunk.embedding),
                 ),
             )
             self._hard_gc(connection, pipeline_id=chunk.pipeline_id)
             if self.max_working_chunks_per_pipeline > 0 and chunk.zone == "working":
                 self._enforce_retention(connection, pipeline_id=chunk.pipeline_id)
             return True
+
+    @staticmethod
+    def _cosine_similarity(a: list[float], b: list[float]) -> float:
+        if len(a) != len(b):
+            raise ValueError(
+                f"dimension mismatch: query has {len(a)} dims, stored has {len(b)} dims"
+            )
+        dot = sum(av * bv for av, bv in zip(a, b, strict=True))
+        norm_a = sum(av * av for av in a) ** 0.5
+        norm_b = sum(bv * bv for bv in b) ** 0.5
+        if norm_a == 0.0 or norm_b == 0.0:
+            return 0.0
+        return dot / (norm_a * norm_b)
+
+    @staticmethod
+    def _encode_embedding(value: list[float] | None) -> bytes | None:
+        if value is None:
+            return None
+        return json.dumps([float(item) for item in value]).encode("utf-8")
 
     def query(
         self,
@@ -353,10 +463,14 @@ class SQLiteStore(BaseStore):
             raise ValueError(
                 f"Unknown retrieval_mode {retrieval_mode!r}; expected one of {_VALID_RETRIEVAL_MODES}"
             )
-        if retrieval_mode == "vector":
-            raise ValueError(
-                "retrieval_mode='vector' requires pgvector; SQLite does not support ANN search"
-            )
+        if (
+            embedding is None
+            and self._embedding_adapter is not None
+            and retrieval_mode in {"hybrid", "vector"}
+        ):
+            embedding = self._embedding_adapter.embed(text)
+        if retrieval_mode == "vector" and embedding is None:
+            raise ValueError("retrieval_mode='vector' requires an embedding or embedding adapter")
 
         with self._connect() as connection:
             rows = self._load_query_rows(
@@ -371,6 +485,35 @@ class SQLiteStore(BaseStore):
 
         policy = self.retrieval_policy
         now = time.time()
+
+        # CAP-T4: reputation-weighted retrieval blending
+        blended_trust: dict[str, float] | None = None
+        if self.config is not None and self.config.reputation_weight > 0.0:
+            authors = {str(r["written_by"]) for r in rows}
+            with self._connect() as connection:
+                rep_data = self._load_reputation(connection, authors)
+            rw = self.config.reputation_weight
+            blended_trust = {
+                str(row["chunk_id"]): blend_trust(
+                    float(row["base_trust"]),
+                    rep_data.get(str(row["written_by"])),
+                    rw,
+                )
+                for row in rows
+            }
+
+        def _bt(row: object) -> float:
+            if blended_trust is not None:
+                return blended_trust.get(str(row["chunk_id"]), float(row["base_trust"]))
+            return float(row["base_trust"])
+
+        if retrieval_mode == "vector":
+            return self._query_vector(
+                rows, embedding=embedding, k=k, min_score=min_score,
+                policy=policy, now=now, diversity_limit=diversity_limit,
+                blended_trust=blended_trust,
+            )
+
         candidates: list[SubconsciousChunk] = []
 
         if retrieval_mode == "trust_recency":
@@ -378,7 +521,7 @@ class SQLiteStore(BaseStore):
                 age_seconds = max(0.0, now - float(row["created_at"]))
                 score = policy.score_no_bm25(
                     age_seconds=age_seconds,
-                    base_trust=float(row["base_trust"]),
+                    base_trust=_bt(row),
                     generation=int(row["generation"]),
                     written_at_drift=float(row["written_at_drift"]) if row["written_at_drift"] is not None else 0.0,
                 )
@@ -386,6 +529,35 @@ class SQLiteStore(BaseStore):
                     continue
                 chunk = self._row_to_chunk(row)
                 chunk.relevance = max(0.0, min(1.0, score))
+                candidates.append(chunk)
+        elif embedding is not None:
+            lexical_candidates = build_lexical_candidates(
+                text,
+                [str(row["content"]) for row in rows],
+            )
+            for row, lexical_candidate in zip(rows, lexical_candidates, strict=True):
+                row_embedding = self._decode_embedding(
+                    row["embedding"] if "embedding" in row.keys() else None
+                )
+                vector_normalized: float | None = None
+                if row_embedding is not None:
+                    sim = self._cosine_similarity(embedding, row_embedding)
+                    vector_normalized = max(0.0, min(1.0, sim))
+                if lexical_candidate.lexical_signal is None and vector_normalized is None:
+                    continue
+                age_seconds = max(0.0, now - float(row["created_at"]))
+                hybrid_score = policy.score_with_vector(
+                    bm25_normalized=lexical_candidate.lexical_signal or 0.0,
+                    vector_normalized=vector_normalized,
+                    age_seconds=age_seconds,
+                    base_trust=_bt(row),
+                    generation=int(row["generation"]),
+                    written_at_drift=float(row["written_at_drift"]) if row["written_at_drift"] is not None else 0.0,
+                )
+                if hybrid_score < min_score:
+                    continue
+                chunk = self._row_to_chunk(row)
+                chunk.relevance = max(0.0, min(1.0, hybrid_score))
                 candidates.append(chunk)
         else:
             for row, lexical_signal in self._fts_lexical_candidates(
@@ -400,7 +572,7 @@ class SQLiteStore(BaseStore):
                 hybrid_score = policy.score(
                     bm25_normalized=lexical_signal,
                     age_seconds=age_seconds,
-                    base_trust=float(row["base_trust"]),
+                    base_trust=_bt(row),
                     generation=int(row["generation"]),
                     written_at_drift=float(row["written_at_drift"]) if row["written_at_drift"] is not None else 0.0,
                 )
@@ -464,6 +636,87 @@ class SQLiteStore(BaseStore):
 
         return results
 
+    @staticmethod
+    def _decode_embedding(value: object) -> list[float] | None:
+        if value is None:
+            return None
+        if isinstance(value, list):
+            return value
+        if isinstance(value, memoryview):
+            value = value.tobytes()
+        if isinstance(value, bytes):
+            value = value.decode("utf-8")
+        try:
+            parsed = json.loads(str(value))
+            if isinstance(parsed, list) and all(isinstance(v, (int, float)) for v in parsed):
+                return [float(v) for v in parsed]
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+        return None
+
+    def _query_vector(
+        self,
+        rows: list[sqlite3.Row],
+        *,
+        embedding: list[float] | None,
+        k: int,
+        min_score: float,
+        policy: RetrievalPolicy,
+        now: float,
+        diversity_limit: int,
+        blended_trust: dict[str, float] | None = None,
+    ) -> list[SubconsciousChunk]:
+        if embedding is None:
+            raise ValueError("retrieval_mode='vector' requires an embedding or embedding adapter")
+        candidates: list[SubconsciousChunk] = []
+        for row in rows:
+            row_embedding = self._decode_embedding(
+                row["embedding"] if "embedding" in row.keys() else None
+            )
+            if row_embedding is None:
+                continue
+            sim = self._cosine_similarity(embedding, row_embedding)
+            vector_normalized = max(0.0, min(1.0, sim))
+            cid = str(row["chunk_id"])
+            bt = blended_trust.get(cid, float(row["base_trust"])) if blended_trust else float(row["base_trust"])
+            age_seconds = max(0.0, now - float(row["created_at"]))
+            score = policy.score_with_vector(
+                bm25_normalized=0.0,
+                vector_normalized=vector_normalized,
+                age_seconds=age_seconds,
+                base_trust=bt,
+                generation=int(row["generation"]),
+                vector_mix=1.0,
+                written_at_drift=float(row["written_at_drift"]) if row["written_at_drift"] is not None else 0.0,
+            )
+            if score < min_score:
+                continue
+            chunk = self._row_to_chunk(row)
+            chunk.relevance = max(0.0, min(1.0, score))
+            candidates.append(chunk)
+
+        ranked = sorted(candidates, key=lambda c: c.relevance, reverse=True)
+        result_limit = normalize_result_limit(k)
+        results = apply_diversity_limit(
+            ranked,
+            k=result_limit,
+            diversity_limit=diversity_limit,
+            author_getter=lambda chunk: str(chunk.written_by),
+        )
+        if results:
+            now_val = time.time()
+            placeholders = ",".join("?" * len(results))
+            with self._connect() as connection:
+                connection.execute(
+                    f"UPDATE chunks SET retrieval_count = retrieval_count + 1,"
+                    f" last_retrieved_at = ? WHERE chunk_id IN ({placeholders})",
+                    [now_val] + [c.chunk_id for c in results],
+                )
+            for chunk in results:
+                chunk.retrieval_count += 1
+                chunk.last_retrieved_at = now_val
+        return results
+
     def tombstone(self, chunk_id: str, *, forward_ref: str | None = None, ttl_seconds: int = 86400) -> None:
         with self._connect() as connection:
             connection.execute("DELETE FROM chunks WHERE chunk_id = ?", (chunk_id,))
@@ -522,6 +775,148 @@ class SQLiteStore(BaseStore):
             )
             return cursor.rowcount > 0
 
+    def record_outcome(self, outcome: OutcomeRecord) -> bool:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            chunk_ids = outcome.chunk_ids
+            # Resolve turn_id to chunk_ids if turn_id is provided and chunk_ids is empty
+            if outcome.turn_id and not chunk_ids:
+                rows = connection.execute(
+                    "SELECT chunk_id FROM chunks WHERE caused_by = ? OR conscious_hash = ?",
+                    (outcome.turn_id, outcome.turn_id),
+                ).fetchall()
+                chunk_ids = [str(r["chunk_id"]) for r in rows]
+            connection.execute(
+                """
+                INSERT INTO outcomes (outcome_id, turn_id, chunk_ids, success, weight, note, created_at, consumed)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+                """,
+                (
+                    outcome.outcome_id,
+                    outcome.turn_id,
+                    json.dumps(chunk_ids),
+                    1 if outcome.success else 0,
+                    outcome.weight,
+                    outcome.note,
+                    outcome.created_at,
+                ),
+            )
+            return True
+
+    def record_memo(
+        self,
+        signature: str,
+        task: str,
+        chunk_ids: list[str],
+        result_summary: str | None = None,
+        output_tokens_est: int | None = None,
+    ) -> bool:
+        if output_tokens_est is None:
+            # No real token count available: estimate over the stored result.
+            output_tokens_est = estimate_tokens(result_summary) if result_summary else 0
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO memo_entries
+                    (signature, task, result_summary, chunk_ids, outcome, verified, created_at,
+                     last_hit_at, hit_count, output_tokens_est)
+                VALUES (?, ?, ?, ?, 0.0, 0, ?, 0.0, 0, ?)
+                """,
+                (signature, task, result_summary, json.dumps(chunk_ids), time.time(), max(0, int(output_tokens_est))),
+            )
+            return True
+
+    def lookup_memo(self, signature: str) -> dict | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM memo_entries WHERE signature = ?",
+                (signature,),
+            ).fetchone()
+        if row is None:
+            self._bump_memo_miss()
+            return None
+        # Check staleness
+        max_age = self.config.memoization_max_age_hours if self.config is not None else 24
+        age_seconds = time.time() - float(row["created_at"])
+        if age_seconds > max_age * 3600:
+            self._bump_memo_miss()
+            return None
+        # Update hit tracking
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE memo_entries SET hit_count = hit_count + 1, last_hit_at = ? WHERE signature = ?",
+                (time.time(), signature),
+            )
+        return dict(row)
+
+    def _bump_memo_miss(self) -> None:
+        """Increment the S4.1 memoization miss counter."""
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO memo_stats (stat_key, stat_value) VALUES ('misses', 1)"
+                " ON CONFLICT(stat_key) DO UPDATE SET stat_value = stat_value + 1"
+            )
+
+    def memo_stats(self) -> dict[str, int]:
+        """Aggregate memoization telemetry: hits, misses, entries, tokens saved.
+
+        ``estimated_tokens_saved`` is an estimate: SUM(hit_count * output_tokens_est).
+        """
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) AS entry_count,"
+                " COALESCE(SUM(hit_count), 0) AS hits,"
+                " COALESCE(SUM(hit_count * output_tokens_est), 0) AS tokens_saved"
+                " FROM memo_entries"
+            ).fetchone()
+            miss_row = connection.execute(
+                "SELECT stat_value FROM memo_stats WHERE stat_key = 'misses'"
+            ).fetchone()
+        return {
+            "hits": int(row["hits"]),
+            "misses": int(miss_row["stat_value"]) if miss_row is not None else 0,
+            "entry_count": int(row["entry_count"]),
+            "estimated_tokens_saved": int(row["tokens_saved"]),
+        }
+
+    def update_memo_outcome(self, signature: str, outcome: float, verified: bool = False) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE memo_entries SET outcome = ?, verified = ? WHERE signature = ?",
+                (outcome, 1 if verified else 0, signature),
+            )
+            return cursor.rowcount > 0
+
+    def _load_unconsumed_outcomes(self, connection: sqlite3.Connection) -> list[OutcomeRecord]:
+        rows = connection.execute(
+            "SELECT * FROM outcomes WHERE consumed = 0 ORDER BY created_at ASC"
+        ).fetchall()
+        results: list[OutcomeRecord] = []
+        for row in rows:
+            results.append(OutcomeRecord(
+                outcome_id=str(row["outcome_id"]),
+                turn_id=row["turn_id"],
+                chunk_ids=json.loads(str(row["chunk_ids"])),
+                success=bool(row["success"]),
+                weight=float(row["weight"]),
+                note=row["note"],
+                created_at=float(row["created_at"]),
+                consumed=bool(row["consumed"]),
+            ))
+        return results
+
+    def _mark_outcomes_consumed(
+        self, connection: sqlite3.Connection, outcome_ids: list[str]
+    ) -> None:
+        if not outcome_ids:
+            return
+        placeholders = ",".join("?" for _ in outcome_ids)
+        connection.execute(
+            f"UPDATE outcomes SET consumed = 1 WHERE outcome_id IN ({placeholders})",
+            outcome_ids,
+        )
+
     def get_chunks_by_ids(self, ids: Sequence[str]) -> list[SubconsciousChunk]:
         unique_ids = [cid for cid in dict.fromkeys(ids) if cid]
         if not unique_ids:
@@ -530,8 +925,9 @@ class SQLiteStore(BaseStore):
         with self._connect() as connection:
             rows = connection.execute(
                 f"SELECT * FROM chunks WHERE chunk_id IN ({placeholders})"
-                " AND chunk_id NOT IN (SELECT chunk_id FROM tombstones)",
-                unique_ids,
+                " AND chunk_id NOT IN (SELECT chunk_id FROM tombstones)"
+                " AND (expiry IS NULL OR expiry > ?)",  # WI-006
+                [*unique_ids, time.time()],
             ).fetchall()
         return [self._row_to_chunk(row) for row in rows]
 
@@ -543,8 +939,8 @@ class SQLiteStore(BaseStore):
                 """
                 INSERT OR REPLACE INTO whispers (
                     whisper_id, pipeline_id, from_agent, target, whisper_type,
-                    payload, confidence, ref, created_at, expires_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    payload, confidence, ref, dissent_target, verified, created_at, expires_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     whisper.whisper_id,
@@ -555,6 +951,8 @@ class SQLiteStore(BaseStore):
                     whisper.payload,
                     whisper.confidence,
                     whisper.ref,
+                    whisper.dissent_target,
+                    1 if whisper.verified else 0,
                     whisper.created_at,
                     whisper.created_at + whisper.ttl_seconds,
                 ),
@@ -578,6 +976,24 @@ class SQLiteStore(BaseStore):
                 max_items=max_items,
                 min_confidence=min_confidence,
             )
+
+            # CAP-T4: whisper gating by author reputation
+            if drained and self.config is not None and self.config.whisper_min_author_reputation > 0.0:
+                threshold = self.config.whisper_min_author_reputation
+                authors = {w.from_agent for w in drained}
+                rep_data = self._load_reputation(connection, authors)
+                filtered: list[Whisper] = []
+                for w in drained:
+                    result = rep_data.get(w.from_agent)
+                    if result is not None:
+                        alpha, beta = result
+                        if alpha / (alpha + beta) >= threshold:
+                            filtered.append(w)
+                    else:
+                        # Unknown author — uniform prior Beta(1,1) = 0.5
+                        if 0.5 >= threshold:
+                            filtered.append(w)
+                drained = filtered
 
             if drained:
                 self._acknowledge_whispers(connection, drained, agent_id=agent_id)
@@ -710,8 +1126,8 @@ class SQLiteStore(BaseStore):
                 """
                 INSERT OR REPLACE INTO cost_log (
                     turn_id, pipeline_id, agent_id, model, input_tokens, output_tokens,
-                    cache_read_tokens, cost_usd, latency_ms, logged_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    cache_read_tokens, cost_usd, latency_ms, logged_at, cost_source
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     response.turn_id,
@@ -724,6 +1140,7 @@ class SQLiteStore(BaseStore):
                     response.cost_usd,
                     response.latency_ms,
                     time.time(),
+                    getattr(response, "cost_source", "measured"),
                 ),
             )
 
@@ -738,14 +1155,15 @@ class SQLiteStore(BaseStore):
         pipeline_id: str | None = None,
         turn_id: str,
         latency_ms: int = 0,
+        cost_source: str = "estimated",
     ) -> None:
         with self._connect() as connection:
             connection.execute(
                 """
                 INSERT OR REPLACE INTO cost_log (
                     turn_id, pipeline_id, agent_id, model, input_tokens, output_tokens,
-                    cache_read_tokens, cost_usd, latency_ms, logged_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    cache_read_tokens, cost_usd, latency_ms, logged_at, cost_source
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     turn_id,
@@ -758,6 +1176,7 @@ class SQLiteStore(BaseStore):
                     cost_usd,
                     latency_ms,
                     time.time(),
+                    cost_source,
                 ),
             )
 
@@ -805,6 +1224,8 @@ class SQLiteStore(BaseStore):
         report = ConsolidationReport(dry_run=dry_run, pipeline_id=pipeline_id)
 
         with self._connect() as connection:
+            if not dry_run:
+                connection.execute("BEGIN IMMEDIATE")
             query = "SELECT * FROM chunks WHERE chunk_id NOT IN (SELECT chunk_id FROM tombstones)"
             params: list = []
             if pipeline_id is not None:
@@ -812,28 +1233,26 @@ class SQLiteStore(BaseStore):
                 params.append(pipeline_id)
             rows = connection.execute(query, params).fetchall()
 
-        all_chunks = [self._row_to_chunk(row) for row in rows]
-        eligible = [c for c in all_chunks if c.base_trust >= trust_floor]
-        report.skipped += len(all_chunks) - len(eligible)
-        clusters = cluster_by_tags(eligible)
-        report.clusters_scanned = len(clusters)
+            all_chunks = [self._row_to_chunk(row) for row in rows]
+            eligible = [c for c in all_chunks if c.base_trust >= trust_floor]
+            report.skipped += len(all_chunks) - len(eligible)
+            clusters = cluster_by_tags(eligible)
+            report.clusters_scanned = len(clusters)
 
-        for cluster in clusters:
-            candidates = find_merge_candidates(cluster, similarity_threshold=similarity_threshold)
-            for keeper, losers in candidates:
-                loser_ids = [c.chunk_id for c in losers]
-                report.merge_log.append({
-                    "kept": keeper.chunk_id,
-                    "merged": loser_ids,
-                    "layer": keeper.layer,
-                    "zone": keeper.zone,
-                    "pipeline_id": keeper.pipeline_id,
-                })
-                if not dry_run:
-                    supersedes_json = json.dumps(loser_ids)
-                    new_gen = keeper.generation + 1
-                    with self._connect() as connection:
-                        connection.execute("BEGIN IMMEDIATE")
+            for cluster in clusters:
+                candidates = find_merge_candidates(cluster, similarity_threshold=similarity_threshold)
+                for keeper, losers in candidates:
+                    loser_ids = [c.chunk_id for c in losers]
+                    report.merge_log.append({
+                        "kept": keeper.chunk_id,
+                        "merged": loser_ids,
+                        "layer": keeper.layer,
+                        "zone": keeper.zone,
+                        "pipeline_id": keeper.pipeline_id,
+                    })
+                    if not dry_run:
+                        supersedes_json = json.dumps(loser_ids)
+                        new_gen = keeper.generation + 1
                         for loser_id in loser_ids:
                             connection.execute("DELETE FROM chunks WHERE chunk_id = ?", (loser_id,))
                             connection.execute(
@@ -845,16 +1264,16 @@ class SQLiteStore(BaseStore):
                             "UPDATE chunks SET generation = ?, supersedes = ? WHERE chunk_id = ?",
                             (new_gen, supersedes_json, keeper.chunk_id),
                         )
-                report.merged += 1
-                report.tombstoned += len(loser_ids)
+                    report.merged += 1
+                    report.tombstoned += len(loser_ids)
 
-            report.skipped += sum(
-                1 for c in cluster
-                if not any(
-                    c.chunk_id == k.chunk_id or c.chunk_id in [m.chunk_id for m in ls]
-                    for k, ls in candidates
+                report.skipped += sum(
+                    1 for c in cluster
+                    if not any(
+                        c.chunk_id == k.chunk_id or c.chunk_id in [m.chunk_id for m in ls]
+                        for k, ls in candidates
+                    )
                 )
-            )
 
         if not dry_run and report.merged > 0:
             self._emit_consolidation_whisper(pipeline_id=pipeline_id)
@@ -941,6 +1360,7 @@ class SQLiteStore(BaseStore):
                 updates: list[tuple[float, str]] = []
                 feedback_rows: list[FeedbackRow] = []
                 chunk_author: dict[str, str] = {}
+                consumed_feedback_ids: list[str] = []
                 for row in rows:
                     cid = str(row["chunk_id"])
                     src = str(row["src"])
@@ -977,17 +1397,29 @@ class SQLiteStore(BaseStore):
                             )
                         )
 
+                # CAP-T3: initialize outcome tracking
+                consumed_outcome_ids: list[str] = []
                 if feedback_mode and feedback_rows:
+                    outcomes = self._load_unconsumed_outcomes(connection)
+                    outcome_evidence = None
+                    if outcomes:
+                        from ncp.stores.calibration import compute_outcome_evidence
+                        outcome_evidence = compute_outcome_evidence(outcomes)
+                        consumed_outcome_ids = [o.outcome_id for o in outcomes]
+
                     fb = compute_feedback_updates(
                         feedback_rows,
                         feedback_weight=feedback_weight,
                         propagation_factor=propagation_factor,
                         dissent_weight=dissent_weight,
+                        usage_prior_weight=self.config.usage_prior_weight if self.config is not None else 1.0,
+                        outcome_evidence=outcome_evidence,
                     )
                     updates.extend(fb.updates)
                     report.change_log.extend(fb.change_log)
                     report.feedback_adjusted += fb.adjusted
                     report.skipped += fb.skipped
+                    consumed_feedback_ids = fb.consumed_chunk_ids
 
                     prior = self._load_reputation(
                         connection,
@@ -1000,6 +1432,7 @@ class SQLiteStore(BaseStore):
                         gain=self.reputation_gain,
                         forget=self.reputation_forget,
                         K_CONF=self.reputation_confidence_k,
+                        outcome_evidence=outcome_evidence,
                     )
                     report.change_log.extend(
                         {
@@ -1022,6 +1455,15 @@ class SQLiteStore(BaseStore):
                         )
                 if feedback_mode and not dry_run:
                     self._upsert_reputation_updates(connection, rep_updates, now=now)
+                    if consumed_feedback_ids:
+                        placeholders = ",".join("?" for _ in consumed_feedback_ids)
+                        connection.execute(
+                            f"UPDATE chunks SET retrieval_count = 0, dissent_count = 0 "
+                            f"WHERE chunk_id IN ({placeholders})",
+                            consumed_feedback_ids,
+                        )
+                    if consumed_outcome_ids:
+                        self._mark_outcomes_consumed(connection, consumed_outcome_ids)
 
         report.duration_seconds = time.monotonic() - started
         return report
@@ -1048,9 +1490,51 @@ class SQLiteStore(BaseStore):
                 (session_id, turn, drift_score, time.time()),
             )
 
-    def resolve_identity(self, agent_id: str, *, pipeline_id: str | None = None) -> str:
-        del pipeline_id
+    def resolve_identity(
+        self,
+        agent_id: str,
+        *,
+        pipeline_id: str | None = None,
+        signature: str | None = None,
+        content: str | None = None,
+    ) -> str:
+        """Resolve the authenticated author of a write.
+
+        When a ``signature`` and ``content`` are supplied and the signature
+        verifies against the stored (non-revoked) public key for ``agent_id``,
+        the verified identity is returned. Otherwise the claimed ``agent_id`` is
+        returned unchanged (the unsigned/legacy path), preserving prior behavior.
+        """
+
+        if signature is not None and content is not None:
+            from ncp.identity import canonical_authorship_payload
+
+            payload = canonical_authorship_payload(agent_id, content, pipeline_id)
+            if self.verify_authorship(agent_id, payload, signature):
+                return agent_id
         return agent_id
+
+    def verify_authorship(
+        self, identity_id: str, payload: bytes | str, signature: str
+    ) -> bool:
+        """Verify a signature over ``payload`` for ``identity_id``.
+
+        Returns ``False`` for unknown or revoked identities and for any
+        signature that does not verify against the stored public key.
+        """
+
+        from ncp.identity import verify_signature
+
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT public_key, revoked_at FROM identities WHERE identity_id = ?",
+                (identity_id,),
+            ).fetchone()
+        if row is None:
+            return False
+        if row["revoked_at"] is not None:
+            return False
+        return verify_signature(str(row["public_key"]), payload, signature)
 
     def register_identity(
         self,
@@ -1866,6 +2350,9 @@ class SQLiteStore(BaseStore):
         if scope is not None:
             clauses.append("scope = ?")
             params.append(scope)
+        # WI-006: never surface chunks whose expiry has passed.
+        clauses.append("(expiry IS NULL OR expiry > ?)")
+        params.append(time.time())
         return connection.execute(
             f"SELECT * FROM chunks WHERE {' AND '.join(clauses)} ORDER BY created_at DESC",
             params,
@@ -1903,6 +2390,9 @@ class SQLiteStore(BaseStore):
         if scope is not None:
             clauses.append("chunks.scope = ?")
             params.append(scope)
+        # WI-006: exclude expired chunks from lexical retrieval.
+        clauses.append("(chunks.expiry IS NULL OR chunks.expiry > ?)")
+        params.append(time.time())
 
         try:
             with self._connect() as connection:
@@ -1940,6 +2430,7 @@ class SQLiteStore(BaseStore):
     def _row_to_chunk(self, row: sqlite3.Row) -> SubconsciousChunk:
         created_at = float(row["created_at"])
         meta = json.loads(row["meta"]) if row["meta"] else {}
+        embedding = self._decode_embedding(row["embedding"] if "embedding" in row.keys() else None)
         chunk = SubconsciousChunk(
             chunk_id=str(row["chunk_id"]),
             layer=str(row["layer"]),
@@ -1970,6 +2461,8 @@ class SQLiteStore(BaseStore):
             retrieval_count=int(row["retrieval_count"]) if row["retrieval_count"] is not None else 0,
             last_retrieved_at=float(row["last_retrieved_at"]) if row["last_retrieved_at"] is not None else None,
             dissent_count=int(row["dissent_count"]) if row["dissent_count"] is not None else 0,
+            verified=bool(row["verified"]) if "verified" in row.keys() and row["verified"] is not None else False,
+            embedding=embedding,
         )
         return chunk
 
@@ -1983,9 +2476,11 @@ class SQLiteStore(BaseStore):
             confidence=float(row["confidence"]),
             whisper_id=str(row["whisper_id"]),
             ref=row["ref"],
+            dissent_target=row["dissent_target"] if "dissent_target" in row.keys() else None,
             created_at=float(row["created_at"]),
             ttl_seconds=ttl_seconds,
             pipeline_id=row["pipeline_id"],
+            verified=bool(row["verified"]) if "verified" in row.keys() and row["verified"] is not None else False,
         )
 
     def _select_whispers(
@@ -2095,8 +2590,14 @@ class SQLiteStore(BaseStore):
         connection.execute("DELETE FROM tombstones WHERE expires_at <= ?", (now,))
         connection.execute("DELETE FROM whispers WHERE expires_at <= ?", (now,))
         connection.execute("DELETE FROM turn_records WHERE expires_at <= ?", (now,))
+        # WI-006: reclaim chunks whose expiry has passed.
+        connection.execute("DELETE FROM chunks WHERE expiry IS NOT NULL AND expiry <= ?", (now,))
 
     def _hard_gc(self, connection: sqlite3.Connection, *, pipeline_id: str | None) -> None:
+        # WI-006: drop expired chunks before evaluating overflow capacity.
+        connection.execute(
+            "DELETE FROM chunks WHERE expiry IS NOT NULL AND expiry <= ?", (time.time(),)
+        )
         clauses = ["zone = 'working'"]
         params: list[object] = []
         if pipeline_id is not None:

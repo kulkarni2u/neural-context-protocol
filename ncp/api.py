@@ -4,13 +4,16 @@ from __future__ import annotations
 
 from pathlib import Path
 import time
+from uuid import uuid4
 
 from ncp.adapters.base import BaseAdapter
 from ncp.adapters.local import LocalAdapter
 from ncp.assembler import Assembler
 from ncp.config import NCPConfig, load_config
+from ncp.costs import calculate_cost
 from ncp.stores.base import BaseStore
 from ncp.stores.factory import create_store
+from ncp.tokens import estimate_tokens
 from ncp.types import BudgetContext, ConsciousBlock, NCPResponse, SubconsciousChunk, Whisper
 
 _CONFIG: NCPConfig | None = None
@@ -147,6 +150,7 @@ def run(
         turn=turn,
         content=content,
         start=start,
+        config=resolved_config,
     )
     assembler.post_turn(
         conscious=agent,
@@ -200,6 +204,7 @@ def stream(
         turn=turn,
         content=content,
         start=start,
+        config=resolved_config,
     )
     assembler.post_turn(
         conscious=agent,
@@ -217,14 +222,47 @@ def _build_response(
     turn: str,
     content: str,
     start: float,
+    config: NCPConfig | None = None,
 ) -> NCPResponse:
+    model = adapter.model_name
+    usage = getattr(adapter, "last_usage", None)
+
+    if usage is not None:
+        # Real provider reported authoritative token counts: bill them.
+        input_tokens = usage.input_tokens
+        output_tokens = usage.output_tokens
+        cache_read_tokens = usage.cache_read_tokens
+        cost_source = "measured"
+        pricing = config.pricing if config is not None else None
+        try:
+            cost_usd = calculate_cost(
+                model=model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cache_read_tokens=cache_read_tokens,
+                pricing=pricing,
+            ).total_cost_usd
+        except KeyError:
+            # Real tokens but no pricing entry for this model; leave cost unpriced.
+            cost_usd = 0.0
+    else:
+        # Local/mock/in-process path: tokens are a chars/4 estimate, not
+        # authoritative, and are never priced.
+        input_tokens = estimate_tokens(context + "\n" + turn)
+        output_tokens = estimate_tokens(content)
+        cache_read_tokens = 0
+        cost_usd = 0.0
+        cost_source = "estimated"
+
     return NCPResponse(
         content=content,
-        input_tokens=len((context + "\n" + turn).split()),
-        output_tokens=len(content.split()),
-        cost_usd=0.0,
-        model=adapter.__class__.__name__.lower(),
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cache_read_tokens=cache_read_tokens,
+        cost_usd=cost_usd,
+        model=model,
         pipeline_id=agent.pipeline_id,
-        turn_id=f"turn_{int(time.time() * 1000)}",
+        turn_id=f"turn_{int(time.time() * 1000)}_{uuid4().hex[:8]}",
         latency_ms=int((time.perf_counter() - start) * 1000),
+        cost_source=cost_source,
     )

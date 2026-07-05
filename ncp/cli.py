@@ -164,7 +164,7 @@ def _render_config_template(
             '# Bearer token required for HTTP requests when set. The server requires no\n'
             '# token on loopback (127.0.0.1/localhost/::1) by default, but you must set\n'
             '# this (or NCP_AUTH_TOKEN, or `ncp serve --auth-token`) before binding to a\n'
-            '# non-loopback host. `ncp init` generates a random token here automatically.\n'
+            '# non-loopback host. `ncp init --store pgvector` generates one automatically.\n'
             '# auth_token = ""',
             f'[server]\nauth_token = "{auth_token}"',
             1,
@@ -643,12 +643,13 @@ def init_command(  # noqa: C901
 
     # ── Write config.toml ─────────────────────────────────────────────────────
     if not config_path.exists():
+        auth_token = secrets.token_urlsafe(32) if store_type != "sqlite" else None
         config_path.write_text(
             _render_config_template(
                 store_type=store_type,
                 pg_dsn=resolved_pg_dsn,
                 redis_url=resolved_redis_url,
-                auth_token=secrets.token_urlsafe(32),
+                auth_token=auth_token,
             )
         )
         console.print(f"Wrote [bold].ncp/config.toml[/bold] (store: {store_type})")
@@ -731,11 +732,27 @@ def status_command(cwd: Path, pipeline_id: str | None, json_output: bool) -> Non
         detail = store.status_detail(pipeline_id=pipeline_id)
     except NCPStoreUnavailableError as exc:
         raise click.ClickException(str(exc)) from exc
+
+    # S4.1: memoization telemetry — shown only when memoization is enabled or
+    # has recorded any data, so default output stays unchanged.
+    memo_stats: dict[str, int] | None = None
+    memo_stats_fn = getattr(store, "memo_stats", None)
+    if callable(memo_stats_fn):
+        try:
+            memo_stats = {str(k): int(v) for k, v in memo_stats_fn().items()}
+        except Exception:
+            memo_stats = None
+    show_memo = memo_stats is not None and (
+        config.memoization_enabled or any(memo_stats.values())
+    )
+
     payload = {
         "store_path": _store_display(config),
         "pipeline_id": pipeline_id,
         **detail,
     }
+    if show_memo:
+        payload["memoization"] = memo_stats
     if json_output:
         console.print_json(data=payload)
         return
@@ -756,6 +773,19 @@ def status_command(cwd: Path, pipeline_id: str | None, json_output: bool) -> Non
     table.add_row("Cost USD", f"{float(overview['cost_usd_total']):.4f}")
     table.add_row("Last activity", _format_ts(overview["last_activity_at"]))  # type: ignore[arg-type]
     console.print(table)
+
+    if show_memo and memo_stats is not None:
+        memo_table = Table(title="Memoization (CAP-C3)", box=box.MINIMAL_DOUBLE_HEAD)
+        memo_table.add_column("Metric")
+        memo_table.add_column("Value", justify="right")
+        memo_table.add_row("Memo hits", str(memo_stats.get("hits", 0)))
+        memo_table.add_row("Memo misses", str(memo_stats.get("misses", 0)))
+        memo_table.add_row("Memo entries", str(memo_stats.get("entry_count", 0)))
+        memo_table.add_row(
+            "Tokens saved (estimate)",
+            str(memo_stats.get("estimated_tokens_saved", 0)),
+        )
+        console.print(memo_table)
 
     layer_counts = detail["layer_counts"]
     if layer_counts:
@@ -1677,7 +1707,13 @@ def precedents_command(
 @click.option("--top-k", default=10, show_default=True, type=click.IntRange(1, 50), help="Number of top rising/falling chunks to show.")
 @click.option("--json-output", is_flag=True, help="Emit machine-readable JSON instead of tables.")
 def trust_drift_command(cwd: Path, pipeline_id: str | None, top_k: int, json_output: bool) -> None:
-    """Show trust-drift observability: which chunks are gaining or losing trust."""
+    """Show trust-drift observability: which chunks are gaining or losing trust.
+
+    Note: because ``ncp calibrate --feedback`` resets the per-chunk
+    retrieval/dissent watermarks it consumes, the "most retrieved" and "most
+    dissented" views reflect activity SINCE THE LAST CALIBRATION, not lifetime
+    totals.
+    """
 
     from rich.panel import Panel
 

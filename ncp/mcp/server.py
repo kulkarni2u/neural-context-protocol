@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -19,7 +19,7 @@ from ncp.chunker import filter_content
 from ncp.config import NCPConfig, load_config
 from ncp.stores.base import BaseStore
 from ncp.stores.factory import create_store
-from ncp.types import BudgetContext, ConsciousBlock, NCPResponse, SubconsciousChunk, Whisper
+from ncp.types import BudgetContext, ConsciousBlock, NCPResponse, OutcomeRecord, SubconsciousChunk, Whisper
 from ncp.version import __version__
 
 
@@ -95,6 +95,15 @@ MCP_TOOLS: list[dict[str, object]] = [
                 "chunk_id": {"type": "string", "description": "Optional chunk ID (auto-generated if omitted)"},
                 "pipeline_id": {"type": "string"},
                 "base_trust": {"type": "number", "description": "Optional explicit trust score 0.0-1.0; otherwise derived from src."},
+                "signature": {
+                    "type": "string",
+                    "description": (
+                        "Optional base64 Ed25519 signature over the canonical authorship "
+                        "payload (written_by | sha256(content) | pipeline_id). When present it "
+                        "is verified and recorded. Required only if [identity].require_signatures "
+                        "is enabled, in which case an unverifiable write is rejected."
+                    ),
+                },
             },
             "required": ["content", "layer", "src"],
         },
@@ -128,13 +137,25 @@ MCP_TOOLS: list[dict[str, object]] = [
                         "penalty along its caused_by edge during feedback calibration."
                     ),
                 },
+                "signature": {
+                    "type": "string",
+                    "description": (
+                        "Optional base64 Ed25519 signature over the canonical authorship payload "
+                        "(from | sha256(payload) | pipeline_id). Verified and recorded when present; "
+                        "required only if [identity].require_signatures is enabled."
+                    ),
+                },
             },
             "required": ["from", "target", "type", "payload", "confidence"],
         },
     },
     {
         "name": "ncp_post_turn",
-        "description": "Record the completed turn, update conscious state, log cost, and acknowledge consumed whispers.",
+        "description": (
+            "Record the completed turn, update conscious state, log cost, and acknowledge "
+            "consumed whispers. Optionally persists memory_chunks; any writes suppressed by "
+            "deduplication are reported in the response's suppressed_chunk_ids list."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -154,6 +175,25 @@ MCP_TOOLS: list[dict[str, object]] = [
                 "cost_usd": {"type": "number"},
                 "latency_ms": {"type": "integer"},
                 "ack_whisper_ids": {"type": "array", "items": {"type": "string"}},
+                "memory_chunks": {
+                    "type": "array",
+                    "description": (
+                        "Optional subconscious chunks to persist with this turn. Chunks whose "
+                        "write is suppressed (e.g. near-duplicate content) are listed in the "
+                        "response's suppressed_chunk_ids."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "content": {"type": "string", "description": "Content (max 2000 chars)"},
+                            "layer": {"type": "string", "enum": ["episodic", "procedural", "semantic", "social", "reasoning_trace"]},
+                            "src": {"type": "string", "enum": ["user_verified", "tool_result", "agent_inferred", "synthesis", "subcon_retrieved"]},
+                            "chunk_id": {"type": "string", "description": "Optional chunk ID (auto-generated if omitted)"},
+                            "written_by": {"type": "string", "description": "Agent writing this chunk (defaults to agent_id)"},
+                        },
+                        "required": ["content", "layer", "src"],
+                    },
+                },
             },
             "required": ["agent_id", "role", "task", "slot", "intent", "result_summary", "result_full"],
         },
@@ -215,6 +255,106 @@ MCP_TOOLS: list[dict[str, object]] = [
             "required": ["decision", "rationale", "agent_id"],
         },
     },
+    {
+        "name": "ncp_record_outcome",
+        "description": (
+            "Record a task outcome for outcome-calibrated reputation (CAP-T3). "
+            "Provide either chunk_ids (explicit) or turn_id (resolved to chunk_ids). "
+            "Success=True increases author reputation; success=False decreases it."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "success": {
+                    "type": "boolean",
+                    "description": "Whether the outcome was successful",
+                },
+                "chunk_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Chunk IDs that contributed to this outcome. Exclusive with turn_id.",
+                },
+                "turn_id": {
+                    "type": "string",
+                    "description": "Turn ID to resolve to chunk_ids. Exclusive with chunk_ids.",
+                },
+                "outcome_id": {
+                    "type": "string",
+                    "description": "Optional custom outcome_id. Auto-generated if omitted.",
+                },
+                "weight": {
+                    "type": "number",
+                    "description": "Evidence weight multiplier (default 1.0). Higher = stronger signal.",
+                },
+                "note": {
+                    "type": "string",
+                    "description": "Optional human-readable note about this outcome.",
+                },
+            },
+        },
+    },
+    {
+        "name": "ncp_lookup_memo",
+        "description": (
+            "Look up a previously recorded work memo by task+context signature (CAP-C3). "
+            "Returns the memo if found, not stale, and meeting minimum outcome/verified criteria. "
+            "Provide either task+context or an explicit signature."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "description": "Task description for signature computation (ignored if signature is provided)",
+                },
+                "context": {
+                    "type": "string",
+                    "description": "Optional context string for signature computation",
+                },
+                "signature": {
+                    "type": "string",
+                    "description": "Explicit memo signature (overrides task+context hash)",
+                },
+            },
+        },
+    },
+    {
+        "name": "ncp_record_memo",
+        "description": (
+            "Record a work memo for CAP-C3 semantic memoization. "
+            "Stores a signature-keyed entry that can be looked up later to skip redundant work."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "description": "Task description for signature computation (ignored if signature is provided)",
+                },
+                "chunk_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Chunk IDs produced by this work",
+                },
+                "result_summary": {
+                    "type": "string",
+                    "description": "Optional summary of the work result",
+                },
+                "signature": {
+                    "type": "string",
+                    "description": "Explicit memo signature (overrides task+context hash)",
+                },
+                "output_tokens_est": {
+                    "type": "integer",
+                    "description": (
+                        "Optional real output token count of the memoized work; "
+                        "estimated from result_summary when omitted"
+                    ),
+                },
+            },
+            "required": ["task", "chunk_ids"],
+        },
+    },
 ]
 
 
@@ -222,6 +362,8 @@ def _encode_fetch_results(chunks: list[SubconsciousChunk]) -> str:
     lines = [f"ncp_fetch:results k:{len(chunks)}"]
     for chunk in chunks:
         header = f"chunk:{chunk.chunk_id} layer:{chunk.layer} score:{chunk.relevance:.2f}"
+        if chunk.verified:
+            header += " verified:1"
         if chunk.raw_ref:
             header += f" raw_ref:{chunk.raw_ref}"
         lines.append(header)
@@ -229,10 +371,46 @@ def _encode_fetch_results(chunks: list[SubconsciousChunk]) -> str:
     return "\n".join(lines)
 
 
+def _verify_authorship(
+    store: BaseStore,
+    *,
+    identity_id: str,
+    content: str,
+    pipeline_id: str | None,
+    signature: str | None,
+) -> bool:
+    """Verify an optional authorship signature via the store.
+
+    Returns ``False`` when no signature is supplied, the store cannot verify, or
+    verification fails (unknown/revoked identity or bad signature). Never raises.
+    """
+
+    if signature is None:
+        return False
+    verifier = getattr(store, "verify_authorship", None)
+    if not callable(verifier):
+        return False
+    from ncp.identity import canonical_authorship_payload
+
+    payload = canonical_authorship_payload(identity_id, content, pipeline_id)
+    try:
+        return bool(verifier(identity_id, payload, signature))
+    except Exception:
+        return False
+
+
 @dataclass
 class FetchSession:
     fetch_count: int = 0
     pipeline_id: str | None = None
+    last_access: float = field(default_factory=time.monotonic)
+
+
+# Bound the in-memory fetch-session table so a client rotating session_ids
+# cannot grow it without limit. Entries older than the TTL are dropped; if the
+# table still exceeds the cap, the least-recently-accessed entries are evicted.
+_FETCH_SESSION_MAX = 1024
+_FETCH_SESSION_TTL_SECONDS = 3600.0
 
 
 @dataclass
@@ -263,9 +441,29 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
     sessions_lock = threading.Lock()
     coordination = getattr(store, "coordination", None)
     default_whisper_ttl = config.whisper_ttl_default if config is not None else 1800
+    require_signatures = config.require_signatures if config is not None else False
+
+    def _prune_sessions() -> None:
+        # Caller must hold sessions_lock. Drop expired entries, then LRU-evict
+        # down to the cap so rotating session_ids cannot grow the table forever.
+        now = time.monotonic()
+        expired = [
+            sid
+            for sid, sess in sessions.items()
+            if now - sess.last_access > _FETCH_SESSION_TTL_SECONDS
+        ]
+        for sid in expired:
+            del sessions[sid]
+        if len(sessions) > _FETCH_SESSION_MAX:
+            for sid in sorted(sessions, key=lambda s: sessions[s].last_access)[
+                : len(sessions) - _FETCH_SESSION_MAX
+            ]:
+                del sessions[sid]
 
     def _fetch_budget_remaining(session_id: str) -> int:
         if coordination is not None:
+            if hasattr(coordination, "fetch_budget_remaining"):
+                return int(coordination.fetch_budget_remaining(session_id))
             return 3
         with sessions_lock:
             session = sessions.get(session_id, FetchSession())
@@ -305,9 +503,10 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
                 sessions[session_id] = FetchSession(fetch_count=0, pipeline_id=normalized_pipeline_id)
                 if session_id != DEFAULT_FETCH_SESSION_ID:
                     sessions[DEFAULT_FETCH_SESSION_ID] = FetchSession(fetch_count=0, pipeline_id=normalized_pipeline_id)
+                _prune_sessions()
         conscious = _build_conscious_from_args(store, args)
         budget = _budget_from_args(args, conscious=conscious)
-        assembler = Assembler(store=store)
+        assembler = Assembler(store=store, config=config)
         stream = bool(args.get("stream", False))
         try:
             caller_k: int | None = max(1, int(args["k"])) if "k" in args else None  # type: ignore[arg-type]
@@ -366,6 +565,23 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         fr = filter_content(raw_content)
         content = fr.filtered
 
+        # CAP-T1/WI-013: opt-in authorship verification. The client signs over the
+        # canonical (written_by | sha256(raw_content) | pipeline_id) payload, so we
+        # verify against the raw content it sent (not the post-filter content).
+        signature = args.get("signature")
+        verified = _verify_authorship(
+            store,
+            identity_id=written_by,
+            content=raw_content,
+            pipeline_id=None if pipeline_id is None else str(pipeline_id),
+            signature=None if signature is None else str(signature),
+        )
+        if require_signatures and not verified:
+            raise ValueError(
+                "ncp_write_memory rejected: require_signatures is enabled and authorship "
+                "could not be verified (missing/invalid signature or revoked identity)."
+            )
+
         kwargs: dict = {
             "content": content,
             "layer": str(args["layer"]),
@@ -374,6 +590,7 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             "pipeline_id": pipeline_id,
             "base_trust": _trust_from_args(args),
             "written_at_drift": 0.0 if latest is None else latest.drift_score,
+            "verified": verified,
         }
         if (chunk_id := args.get("chunk_id")):
             kwargs["chunk_id"] = str(chunk_id)
@@ -397,6 +614,8 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         chunk = SubconsciousChunk(**kwargs)
         ok = store.write(chunk)
         result: dict[str, object] = {"written": ok, "chunk_id": chunk.chunk_id}
+        if signature is not None:
+            result["verified"] = verified
         if fr.was_filtered:
             result["filtered"] = True
             result["reduction_ratio"] = round(fr.reduction_ratio, 3)
@@ -412,25 +631,44 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         except (TypeError, ValueError):
             ttl_seconds = default_whisper_ttl
         ref = args.get("ref")
+        from_agent = str(args["from"])
+        pipeline_id = args.get("pipeline_id")
+        # CAP-T1/WI-013: sign whispers over (from | sha256(payload) | pipeline_id).
+        signature = args.get("signature")
+        verified = _verify_authorship(
+            store,
+            identity_id=from_agent,
+            content=payload,
+            pipeline_id=None if pipeline_id is None else str(pipeline_id),
+            signature=None if signature is None else str(signature),
+        )
+        if require_signatures and not verified:
+            raise ValueError(
+                "ncp_emit_whisper rejected: require_signatures is enabled and authorship "
+                "could not be verified (missing/invalid signature or revoked identity)."
+            )
         whisper = Whisper(
-            from_agent=str(args["from"]),
+            from_agent=from_agent,
             target=str(args["target"]),
             whisper_type=whisper_type,
             payload=payload,
             confidence=float(args["confidence"]),
-            pipeline_id=args.get("pipeline_id"),
+            pipeline_id=pipeline_id,
             ttl_seconds=ttl_seconds,
             ref=None if ref is None else str(ref),
+            verified=verified,
         )
         store.emit_whisper(whisper)
         result: dict[str, object] = {"emitted": True}
+        if signature is not None:
+            result["verified"] = verified
         if whisper_type == "dissent" and ref:
             result["dissent_recorded"] = store.record_dissent(str(ref))
         return result
 
     def _handle_post_turn(args: dict[str, object]) -> object:
         conscious = _build_conscious_from_args(store, args)
-        assembler = Assembler(store=store)
+        assembler = Assembler(store=store, config=config)
         response = NCPResponse(
             content=str(args["result_full"]),
             turn_id=str(args.get("turn_id") or f"turn_{int(time.time() * 1000)}"),
@@ -443,14 +681,33 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             latency_ms=_int_arg(args, "latency_ms", 0),
         )
         ack_ids = [str(item) for item in list(args.get("ack_whisper_ids", []) or [])]
+        memory_chunks: list[SubconsciousChunk] = []
+        for item in list(args.get("memory_chunks", []) or []):
+            if not isinstance(item, dict):
+                raise ValueError("ncp_post_turn: memory_chunks items must be objects")
+            chunk_kwargs: dict = {
+                "content": str(item["content"]),
+                "layer": str(item["layer"]),
+                "src": str(item["src"]),
+                "written_by": str(item.get("written_by") or conscious.agent_id),
+                "pipeline_id": conscious.pipeline_id,
+            }
+            if (chunk_id := item.get("chunk_id")):
+                chunk_kwargs["chunk_id"] = str(chunk_id)
+            memory_chunks.append(SubconsciousChunk(**chunk_kwargs))
         record = assembler.post_turn(
             conscious=conscious,
             response=response,
             result_summary=str(args["result_summary"]),
             result_full=str(args["result_full"]),
+            memory_chunks=memory_chunks or None,
             ack_whisper_ids=ack_ids,
         )
-        return {"posted": True, "turn_id": record.turn_id, "acknowledged_whisper_ids": ack_ids}
+        result: dict[str, object] = {"posted": True, "turn_id": record.turn_id, "acknowledged_whisper_ids": ack_ids}
+        # WI-007(a): surface dedup-suppressed memory writes to the host.
+        if record.suppressed_chunk_ids:
+            result["suppressed_chunk_ids"] = record.suppressed_chunk_ids
+        return result
 
     def _handle_fetch(args: dict[str, object]) -> object:
         session_id = _session_id_from_args(args)
@@ -474,11 +731,14 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
                 if session.fetch_count >= 3:
                     raise ValueError("ncp_fetch limit reached: max 3 per session")
                 session.fetch_count += 1
+                session.last_access = time.monotonic()
                 if pipeline_id is not None:
                     session.pipeline_id = str(pipeline_id)
                 effective_pipeline_id = session.pipeline_id
+                _prune_sessions()
         try:
-            k = max(1, int(args.get("k", 2)))
+            # Clamp to the schema max (4); a client asking for k=500 gets 4.
+            k = min(4, max(1, int(args.get("k", 2))))
         except (ValueError, TypeError):
             k = 2
         try:
@@ -545,6 +805,99 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             "evidence_count": len(evidence_refs),
         }
 
+    def _handle_record_outcome(args: dict[str, object]) -> object:
+        success_raw = args.get("success")
+        if success_raw is None:
+            raise ValueError("ncp_record_outcome requires 'success' (boolean)")
+        if not isinstance(success_raw, bool):
+            raise ValueError("ncp_record_outcome 'success' must be a boolean")
+        success: bool = success_raw
+
+        chunk_ids: list[str] = [str(c) for c in (args.get("chunk_ids") or [])]
+        turn_id: str | None = args.get("turn_id")
+        if not isinstance(turn_id, str) and turn_id is not None:
+            raise ValueError("ncp_record_outcome 'turn_id' must be a string or null")
+        outcome_id: str | None = args.get("outcome_id")
+        if outcome_id is not None and not isinstance(outcome_id, str):
+            raise ValueError("ncp_record_outcome 'outcome_id' must be a string or null")
+        weight = float(args.get("weight", 1.0) or 1.0)
+        note: str | None = args.get("note")
+        if note is not None and not isinstance(note, str):
+            raise ValueError("ncp_record_outcome 'note' must be a string or null")
+
+        outcome = OutcomeRecord(
+            outcome_id=outcome_id or f"out_{int(time.time() * 1000)}",
+            turn_id=turn_id,
+            chunk_ids=chunk_ids,
+            success=success,
+            weight=weight,
+            note=note,
+        )
+        recorded = store.record_outcome(outcome)
+        return {"recorded": recorded, "outcome_id": outcome.outcome_id}
+
+    def _memo_counters() -> dict[str, int] | None:
+        """Cheap hits/misses totals for hosts (S4.1 memoization telemetry)."""
+        stats_fn = getattr(store, "memo_stats", None)
+        if not callable(stats_fn):
+            return None
+        try:
+            stats = stats_fn()
+        except Exception:
+            return None
+        return {"hits": int(stats.get("hits", 0)), "misses": int(stats.get("misses", 0))}
+
+    def _handle_lookup_memo(args: dict[str, object]) -> object:
+        from ncp.stores.memo import compute_memo_signature
+        sig = args.get("signature")
+        if sig is None:
+            task = str(args.get("task", ""))
+            context = str(args.get("context", ""))
+            sig = compute_memo_signature(task, context)
+        memo = store.lookup_memo(str(sig))
+        result: dict[str, object] = {"found": False, "memo": None}
+        cfg = config
+        if memo is not None and (cfg is None or cfg.memoization_enabled):
+            # Apply outcome and verified gating at the handler level
+            gated = False
+            if cfg is not None:
+                if float(memo.get("outcome", 0.0)) < cfg.memoization_min_outcome:
+                    gated = True
+                elif not cfg.memoization_allow_unverified and not bool(memo.get("verified", 0)):
+                    gated = True
+            if not gated:
+                result = {"found": True, "memo": dict(memo)}
+        counters = _memo_counters()
+        if counters is not None:
+            result["stats"] = counters
+        return result
+
+    def _handle_record_memo(args: dict[str, object]) -> object:
+        from ncp.stores.memo import compute_memo_signature
+        task = str(args.get("task", ""))
+        sig = args.get("signature")
+        if sig is None:
+            sig = compute_memo_signature(task)
+        chunk_ids = [str(c) for c in list(args.get("chunk_ids", []) or [])]
+        result_summary = args.get("result_summary")
+        if result_summary is not None:
+            result_summary = str(result_summary)
+        output_tokens_est: int | None = None
+        raw_tokens = args.get("output_tokens_est")
+        if raw_tokens is not None:
+            try:
+                output_tokens_est = max(0, int(raw_tokens))  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                output_tokens_est = None
+        recorded = store.record_memo(
+            str(sig), task, chunk_ids, result_summary, output_tokens_est
+        )
+        return {"recorded": recorded, "signature": str(sig)}
+
+    # Expose the in-memory fetch-session table for observability/testing of the
+    # LRU+TTL pruning without widening the returned handler mapping.
+    _handle_get_context.fetch_sessions = sessions  # type: ignore[attr-defined]
+
     return {
         "ncp_get_context": _handle_get_context,
         "ncp_write_memory": _handle_write_memory,
@@ -552,6 +905,9 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         "ncp_post_turn": _handle_post_turn,
         "ncp_fetch": _handle_fetch,
         "ncp_record_decision": _handle_record_decision,
+        "ncp_record_outcome": _handle_record_outcome,
+        "ncp_lookup_memo": _handle_lookup_memo,
+        "ncp_record_memo": _handle_record_memo,
     }
 
 

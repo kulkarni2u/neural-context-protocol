@@ -22,6 +22,7 @@ policy-pack/
 SARATHI.md
 capture.pcap
 benchmarks/mace/results/
+benchmarks/efficacy/efficacy_results.json
 
 # Internal working docs (local only, not tracked)
 docs/CLAUDE_STABILIZATION.md

@@ -8,11 +8,9 @@ recent transcript entries — drops them once enough filler turns accumulate.
 NCP, by contrast, retrieves by relevance/conditions rather than recency, so
 the planted facts can survive into a budget-matched context.
 
-Scoring is deterministic and reused (in spirit) from
-``benchmarks/efficacy/run.py``: success requires the response to name the
+Scoring is deterministic: success requires the response to name the
 approved-path slug AND to not propose any dead-end slug except in a negation
-context (e.g. "will not use X", "X was rejected"). The negation-window logic
-is reimplemented locally to keep this package self-contained.
+context (e.g. "will not use X", "X was rejected").
 """
 
 from __future__ import annotations
@@ -21,8 +19,7 @@ from dataclasses import dataclass, field
 
 
 # ---------------------------------------------------------------------------
-# Negation handling (local reimplementation of efficacy's
-# ``_mentions_dead_end_as_retry``, kept in sync by convention).
+# Negation handling shared by task-success and efficacy benchmarks.
 # ---------------------------------------------------------------------------
 
 NEGATION_MARKERS: tuple[str, ...] = (

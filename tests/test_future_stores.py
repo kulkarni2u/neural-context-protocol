@@ -80,6 +80,13 @@ class _FakeCursor:
         if "DELETE FROM" in normalized and "chunks WHERE chunk_id = %s" in normalized:
             self._db.chunks.pop(str(params[0]), None)
             return
+        if "DELETE FROM" in normalized and "chunks WHERE expiry IS NOT NULL AND expiry <= %s" in normalized:
+            cutoff = float(params[0])
+            for cid, row in list(self._db.chunks.items()):
+                exp = row.get("expiry")
+                if exp is not None and float(exp) <= cutoff:
+                    del self._db.chunks[cid]
+            return
         if "DELETE FROM" in normalized and "WHERE expires_at <= %s" in normalized:
             expires_at = float(params[0])
             if "tombstones" in normalized:
@@ -241,10 +248,20 @@ class _FakeCursor:
             index += 1
         if "scope = %s" in normalized:
             scope = params[index]
+            index += 1
+        # WI-006: the read paths append "(expiry IS NULL OR expiry > %s)" as the
+        # final clause/param; honor it so the fake mirrors real expiry filtering.
+        expiry_cutoff = None
+        if "expiry IS NULL OR expiry >" in normalized and len(params) > index:
+            expiry_cutoff = float(params[index])
         rows: list[dict[str, object]] = []
         for row in self._db.chunks.values():
             if row["zone"] != zone:
                 continue
+            if expiry_cutoff is not None:
+                exp = row.get("expiry")
+                if exp is not None and float(exp) <= expiry_cutoff:
+                    continue
             if layer is not None and row["layer"] != layer:
                 continue
             if pipeline_id is None:

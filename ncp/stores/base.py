@@ -8,7 +8,16 @@ from functools import partial
 
 import anyio
 
-from ncp.types import CalibrationReport, ConsolidationReport, ConsciousBlock, NCPResponse, SubconsciousChunk, TurnRecord, Whisper
+from ncp.types import (
+    CalibrationReport,
+    ConsolidationReport,
+    ConsciousBlock,
+    NCPResponse,
+    OutcomeRecord,
+    SubconsciousChunk,
+    TurnRecord,
+    Whisper,
+)
 
 
 class NCPStoreError(RuntimeError):
@@ -56,9 +65,9 @@ class BaseStore(ABC):
         - ``"trust_recency"``: recency + trust only; BM25 and the
           term-overlap filter are skipped.  Use this for non-BM25
           backends that perform their own similarity search.
-        - ``"vector"``: cosine ANN search using stored embeddings.
-          Requires ``embedding`` to be provided.  Only supported on
-          the pgvector backend; raises ``ValueError`` on SQLite.
+        - ``"vector"``: cosine search using stored embeddings.
+          Requires ``embedding`` to be provided or an embedding adapter
+          configured.  Pgvector uses ANN; SQLite uses a brute-force scan.
 
         ``diversity_limit`` caps the number of results per author
         (``written_by``).  Default 2 preserves existing behavior.
@@ -90,6 +99,90 @@ class BaseStore(ABC):
         backends that do not implement this return False.
         """
         return False
+
+    def record_outcome(self, outcome: OutcomeRecord) -> bool:
+        """Persist a task outcome for outcome-calibrated reputation (CAP-T3).
+
+        Accepts an ``OutcomeRecord`` with either ``turn_id`` (will resolve to
+        the chunks that turn wrote + retrieved) or ``chunk_ids``.  The outcome
+        evidence feeds into calibration as the primary trust signal in place of
+        retrieval counts.  Backends that do not implement this return False.
+        """
+        return False
+
+    async def async_record_outcome(self, outcome: OutcomeRecord) -> bool:
+        """Asynchronously record a task outcome."""
+        return await anyio.to_thread.run_sync(self.record_outcome, outcome)
+
+    # ------------------------------------------------------------------
+    # CAP-C3: Memoization
+
+    def record_memo(
+        self,
+        signature: str,
+        task: str,
+        chunk_ids: list[str],
+        result_summary: str | None = None,
+        output_tokens_est: int | None = None,
+    ) -> bool:
+        """Persist a work memo for CAP-C3 semantic memoization.
+
+        ``output_tokens_est`` records how many output tokens a memo hit is
+        estimated to save; when None, backends estimate it from the stored
+        result via ``ncp.tokens.estimate_tokens``. Returns True on success.
+        Backends that do not implement this return False.
+        """
+        return False
+
+    def lookup_memo(self, signature: str) -> dict | None:
+        """Return a memo entry if found and not stale, or None.
+
+        Backends that do not implement this return None.
+        """
+        return None
+
+    def update_memo_outcome(self, signature: str, outcome: float, verified: bool = False) -> bool:
+        """Update outcome and verified flag on an existing memo entry.
+
+        Returns True if the row was found and updated. Backends that do
+        not implement this return False.
+        """
+        return False
+
+    def memo_stats(self) -> dict[str, int]:
+        """Aggregate memoization telemetry (S4.1).
+
+        Returns ``hits`` (total per-entry hit_count), ``misses`` (lookups
+        that returned None), ``entry_count``, and ``estimated_tokens_saved``
+        — an estimate computed as SUM(hit_count * output_tokens_est).
+        Backends that do not implement memoization return zeros.
+        """
+        return {"hits": 0, "misses": 0, "entry_count": 0, "estimated_tokens_saved": 0}
+
+    async def async_memo_stats(self) -> dict[str, int]:
+        """Asynchronously fetch aggregate memoization telemetry."""
+        return await anyio.to_thread.run_sync(self.memo_stats)
+
+    async def async_record_memo(
+        self,
+        signature: str,
+        task: str,
+        chunk_ids: list[str],
+        result_summary: str | None = None,
+        output_tokens_est: int | None = None,
+    ) -> bool:
+        """Asynchronously record a work memo."""
+        return await anyio.to_thread.run_sync(
+            self.record_memo, signature, task, chunk_ids, result_summary, output_tokens_est
+        )
+
+    async def async_lookup_memo(self, signature: str) -> dict | None:
+        """Asynchronously look up a memo by signature."""
+        return await anyio.to_thread.run_sync(self.lookup_memo, signature)
+
+    async def async_update_memo_outcome(self, signature: str, outcome: float, verified: bool = False) -> bool:
+        """Asynchronously update memo outcome."""
+        return await anyio.to_thread.run_sync(self.update_memo_outcome, signature, outcome, verified)
 
     # ------------------------------------------------------------------
     # Whisper queue

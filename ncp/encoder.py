@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from collections.abc import Sequence
 
 from .types import BudgetContext, ConsciousBlock, SubconsciousChunk, Whisper
+
+
+_WIRE_LINE_RE = re.compile(
+    r"^(?:\[NCP:|chunk:|wsp(?:\s|$)|src:|trust:|from:|to:|t:|c:|age:)"
+)
 
 
 def _fmt_float(value: float) -> str:
@@ -22,7 +28,19 @@ def _fmt_recent_list(values: Sequence[str]) -> str:
 
 
 def _indent_block(value: str) -> str:
-    return "\n".join(f"  {line}" for line in value.splitlines() or [""])
+    return "\n".join(f"  {_escape_wire_line(line)}" for line in value.splitlines() or [""])
+
+
+def _escape_wire_line(line: str) -> str:
+    leading = line[: len(line) - len(line.lstrip())]
+    stripped = line.lstrip()
+    if _WIRE_LINE_RE.match(stripped):
+        return f"{leading}\\{stripped}"
+    return line
+
+
+def _escape_payload_value(value: str) -> str:
+    return "\\n".join(_escape_wire_line(line) for line in value.splitlines() or [""])
 
 
 def _fmt_age_bucket(age_seconds: int) -> str:
@@ -37,10 +55,10 @@ def _fmt_age_bucket(age_seconds: int) -> str:
 
 def _fmt_payload_value(value: object) -> str:
     if isinstance(value, list):
-        return f"[{','.join(str(item) for item in value)}]"
+        return f"[{','.join(_escape_payload_value(str(item)) for item in value)}]"
     if isinstance(value, dict):
-        return json.dumps(value, separators=(",", ":"))
-    return str(value)
+        return _escape_payload_value(json.dumps(value, separators=(",", ":")))
+    return _escape_payload_value(str(value))
 
 
 class PidginEncoder:
@@ -119,6 +137,10 @@ class PidginEncoder:
                 f"src:{chunk.src}",
                 f"trust:{_fmt_float(chunk.base_trust)}",
             ]
+            if chunk.verified:
+                parts.append("verified:1")
+            if chunk.distilled:
+                parts.append("distilled:1")
             if chunk.raw_ref:
                 parts.append(f"raw_ref:{chunk.raw_ref}")
             lines.append(" ".join(parts))
@@ -152,4 +174,8 @@ class PidginEncoder:
             return [_indent_block(payload)]
         if not isinstance(parsed, dict):
             return [_indent_block(str(parsed))]
-        return [f"  {key}:{_fmt_payload_value(value)}" for key, value in parsed.items() if value not in (None, "", [])]
+        return [
+            f"  {_escape_wire_line(f'{_escape_payload_value(str(key))}:{_fmt_payload_value(value)}')}"
+            for key, value in parsed.items()
+            if value not in (None, "", [])
+        ]

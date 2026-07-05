@@ -1,5 +1,5 @@
 {
-  "benchmark": "matched_budget_efficacy",
+  "benchmark": "provider_real_efficacy",
   "task_shape": "two_call_continuation",
   "token_unit": "word_split",
   "target_budget": {
@@ -8,7 +8,7 @@
   },
   "providers": [
     {
-      "provider": "claude-cli",
+      "provider": "anthropic",
       "strategies": [
         {
           "name": "ncp",
@@ -40,5 +40,5 @@
       ]
     }
   ],
-  "_note": "Template remains the future matched-budget target artifact. The current live harness in benchmarks/efficacy/run.py emits benchmark=window_control_efficacy until true budget matching is implemented."
+  "_note": "The live harness in benchmarks/efficacy/run.py emits this benchmark id with ncp, sliding_window, and rolling_summary conditions at the same requested budget. Mock mode is deterministic and keyless; anthropic mode is live and records a skip when ANTHROPIC_API_KEY is unset."
 }

@@ -191,7 +191,7 @@ class TestToolsList:
         resp = _handle_request(_req("tools/list"), {})
         result = _result(resp)
         names = [t["name"] for t in result["tools"]]
-        assert names == ["ncp_get_context", "ncp_write_memory", "ncp_emit_whisper", "ncp_post_turn", "ncp_fetch", "ncp_record_decision"]
+        assert names == ["ncp_get_context", "ncp_write_memory", "ncp_emit_whisper", "ncp_post_turn", "ncp_fetch", "ncp_record_decision", "ncp_record_outcome", "ncp_lookup_memo", "ncp_record_memo"]
 
     def test_tool_names_match_constants(self) -> None:
         resp = _handle_request(_req("tools/list"), {})
@@ -257,6 +257,39 @@ class TestGetContext:
                 "intent": "test_bound",
                 "pipeline_id": "pipe_mcp",
                 "max_tokens": 200,
+            }),
+            handlers,
+        )
+
+        result = _content(resp)
+        assert estimate_tokens(result["context"]) <= 200
+        assert "[NCP:BUDGET]" in result["context"]
+        assert "[NCP:CONSCIOUS]" in result["context"]
+
+    def test_get_context_uses_config_token_budget_when_max_tokens_omitted(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "config_budget.db")
+        for index in range(4):
+            store.write(SubconsciousChunk(
+                chunk_id=f"config_budget_{index}",
+                content=" ".join(["config budget mcp context"] + [f"detail_{index}_{j}" for j in range(120)]),
+                layer="semantic",
+                src="tool_result",
+                pipeline_id="pipe_mcp",
+            ))
+        config = load_config(cwd=tmp_path)
+        config.values["budget"]["context_token_budget"] = 200
+        handlers = make_handlers(store, config=config)
+
+        resp = _handle_request(
+            _call("ncp_get_context", {
+                "agent_id": "builder",
+                "role": "build",
+                "owns": [],
+                "must_not": [],
+                "task": "config_budget",
+                "slot": "context",
+                "intent": "test_config_bound",
+                "pipeline_id": "pipe_mcp",
             }),
             handlers,
         )
@@ -378,6 +411,54 @@ class TestGetContext:
             handlers,
         ))
         assert "recent:[r:sub/turn_builder]" in second["context"]
+
+    def test_post_turn_reports_dedup_suppressed_memory_chunks(self, tmp_path: Path) -> None:
+        # WI-007(a): a memory chunk suppressed by the store's dedup check is
+        # surfaced in the ncp_post_turn response, not silently dropped.
+        store = SQLiteStore(tmp_path / "test.db")
+        handlers = make_handlers(store)
+        content = "the deployment pipeline validates artifacts before every release"
+        store.write(SubconsciousChunk(
+            chunk_id="sub_seed",
+            layer="semantic",
+            content=content,
+            src="tool_result",
+            pipeline_id="pipe_1",
+        ))
+
+        posted = _content(_handle_request(
+            _call("ncp_post_turn", {
+                "agent_id": "builder",
+                "role": "build",
+                "task": "test",
+                "slot": "test",
+                "intent": "test",
+                "pipeline_id": "pipe_1",
+                "turn_id": "turn_dedup",
+                "result_summary": "summary",
+                "result_full": "full result",
+                "memory_chunks": [
+                    {
+                        "chunk_id": "sub_fresh",
+                        "content": "rollbacks require a signed approval from the release captain",
+                        "layer": "semantic",
+                        "src": "tool_result",
+                    },
+                    {
+                        "chunk_id": "sub_dup",
+                        "content": content,
+                        "layer": "semantic",
+                        "src": "tool_result",
+                    },
+                ],
+            }),
+            handlers,
+        ))
+
+        assert posted["posted"] is True
+        assert posted["suppressed_chunk_ids"] == ["sub_dup"]
+        persisted = store.query("rollbacks signed approval release captain", pipeline_id="pipe_1")
+        assert any(chunk.chunk_id == "sub_fresh" for chunk in persisted)
 
     def test_rejects_newline_in_structural_field(self, tmp_path: Path) -> None:
         store = SQLiteStore(tmp_path / "test.db")
@@ -743,6 +824,58 @@ class TestFetch:
         result = _content(resp)
         assert "Paris" in result["result"]
         assert result["result"].startswith("ncp_fetch:results")
+
+    def test_fetch_k_clamped_to_schema_max(self, tmp_path: Path) -> None:
+        # WI-005: an over-large k must be clamped to the schema max (4) so a
+        # client asking for k=500 cannot pull an unbounded read.
+        store = SQLiteStore(tmp_path / "test.db")
+        for i in range(8):
+            store.write(SubconsciousChunk(
+                content=f"shared marker chunk number {i}",
+                layer="semantic", src="tool_result", written_by="executor",
+            ))
+        handlers = make_handlers(store)
+        _handle_request(
+            _call("ncp_get_context", {
+                "agent_id": "builder", "role": "build", "owns": [], "must_not": [],
+                "task": "test", "slot": "test", "intent": "test",
+            }),
+            handlers,
+        )
+        captured: dict = {}
+        original_query = store.query
+
+        def spy(*args, **kwargs):
+            captured["k"] = kwargs.get("k")
+            return original_query(*args, **kwargs)
+
+        store.query = spy  # type: ignore[method-assign]
+        resp = _handle_request(
+            _call("ncp_fetch", {"query": "shared marker chunk", "k": 500}),
+            handlers,
+        )
+        result = _content(resp)
+        assert captured["k"] == 4
+        # The store was never asked for more than 4, so at most 4 are served.
+        assert result["result"].startswith("ncp_fetch:results")
+
+    def test_fetch_sessions_dict_is_bounded(self, tmp_path: Path, monkeypatch) -> None:
+        # WI-005: rotating session_ids must not grow the in-memory table forever.
+        from ncp.mcp import server as server_mod
+
+        monkeypatch.setattr(server_mod, "_FETCH_SESSION_MAX", 5)
+        store = SQLiteStore(tmp_path / "test.db")
+        handlers = make_handlers(store)
+        for i in range(50):
+            _handle_request(
+                _call("ncp_get_context", {
+                    "agent_id": f"agent_{i}", "role": "build", "owns": [], "must_not": [],
+                    "task": "t", "slot": "s", "intent": "i",
+                }),
+                handlers,
+            )
+        sessions = handlers["ncp_get_context"].fetch_sessions
+        assert len(sessions) <= 5
 
     def test_no_results(self, tmp_path: Path) -> None:
         store = SQLiteStore(tmp_path / "test.db")

@@ -100,13 +100,26 @@ def test_cli_init_preserves_existing_config(tmp_path: Path) -> None:
     assert "Existing config preserved" in second.output
 
 
-def test_cli_init_generates_auth_token(tmp_path: Path) -> None:
+def test_cli_init_skips_auth_token_for_sqlite_loopback_quickstart(tmp_path: Path) -> None:
     runner = CliRunner()
 
     result = runner.invoke(main, ["init", "--cwd", str(tmp_path)])
 
     assert result.exit_code == 0
     config_text = (tmp_path / ".ncp" / "config.toml").read_text()
+    match = re.search(r'^\s*auth_token\s*=\s*"(.+)"', config_text, re.MULTILINE)
+    assert match is None
+    assert '# auth_token = ""' in config_text
+
+
+def test_cli_init_generates_auth_token_for_pgvector(tmp_path: Path) -> None:
+    runner = CliRunner()
+
+    result = runner.invoke(main, ["init", "--cwd", str(tmp_path), "--store", "pgvector"])
+
+    assert result.exit_code == 0
+    config_path = tmp_path / ".ncp" / "config.toml"
+    config_text = config_path.read_text()
     match = re.search(r'^\s*auth_token\s*=\s*"(.+)"', config_text, re.MULTILINE)
     assert match is not None
     assert match.group(1)
@@ -115,14 +128,14 @@ def test_cli_init_generates_auth_token(tmp_path: Path) -> None:
 def test_cli_init_does_not_regenerate_auth_token(tmp_path: Path) -> None:
     runner = CliRunner()
 
-    first = runner.invoke(main, ["init", "--cwd", str(tmp_path)])
+    first = runner.invoke(main, ["init", "--cwd", str(tmp_path), "--store", "pgvector"])
     config_path = tmp_path / ".ncp" / "config.toml"
     first_text = config_path.read_text()
     first_match = re.search(r'^\s*auth_token\s*=\s*"(.+)"', first_text, re.MULTILINE)
     assert first.exit_code == 0
     assert first_match is not None
 
-    second = runner.invoke(main, ["init", "--cwd", str(tmp_path)])
+    second = runner.invoke(main, ["init", "--cwd", str(tmp_path), "--store", "pgvector"])
     second_text = config_path.read_text()
     second_match = re.search(r'^\s*auth_token\s*=\s*"(.+)"', second_text, re.MULTILINE)
 
@@ -186,6 +199,49 @@ def test_cli_status_json_and_cost_command(tmp_path: Path) -> None:
     assert cost_payload["pipeline_id"] == "pipe_cli"
     assert cost_payload["summary"]["cost_usd_total"] == 0.021
     assert cost_payload["recent_entries"][0]["turn_id"] == "turn_cost_cli"
+
+
+def test_cli_status_hides_memoization_by_default(tmp_path: Path) -> None:
+    """Memo telemetry must not change default status output (S4.1)."""
+    runner = CliRunner()
+    runner.invoke(main, ["init", "--cwd", str(tmp_path)])
+
+    result = runner.invoke(main, ["status", "--cwd", str(tmp_path)])
+
+    assert result.exit_code == 0
+    assert "Memoization" not in result.output
+
+    json_result = runner.invoke(main, ["status", "--cwd", str(tmp_path), "--json-output"])
+    assert json_result.exit_code == 0
+    assert "memoization" not in json.loads(json_result.output)
+
+
+def test_cli_status_surfaces_memoization_telemetry(tmp_path: Path) -> None:
+    """`ncp status` shows memo hits/misses/estimated tokens saved (S4.1)."""
+    from ncp.stores.memo import compute_memo_signature
+    from ncp.tokens import estimate_tokens
+
+    runner = CliRunner()
+    runner.invoke(main, ["init", "--cwd", str(tmp_path)])
+    store = SQLiteStore(tmp_path / ".ncp" / "store.db")
+    sig = compute_memo_signature("cli_status_task")
+    result_summary = "cli status memoized result summary"
+    store.record_memo(sig, "cli_status_task", [], result_summary)
+    assert store.lookup_memo(sig) is not None  # hit 1
+    assert store.lookup_memo(sig) is not None  # hit 2
+    assert store.lookup_memo("missing_signature") is None  # miss 1
+
+    json_result = runner.invoke(main, ["status", "--cwd", str(tmp_path), "--json-output"])
+    assert json_result.exit_code == 0
+    memo_payload = json.loads(json_result.output)["memoization"]
+    assert memo_payload["hits"] == 2
+    assert memo_payload["misses"] == 1
+    assert memo_payload["entry_count"] == 1
+    assert memo_payload["estimated_tokens_saved"] == 2 * estimate_tokens(result_summary)
+
+    table_result = runner.invoke(main, ["status", "--cwd", str(tmp_path)])
+    assert table_result.exit_code == 0
+    assert "Memoization" in table_result.output
 
 
 def test_cli_calibrate_feedback_runs_self_improvement_pass(tmp_path: Path) -> None:
@@ -456,8 +512,8 @@ def test_cli_serve_auth_token_resolution_order(monkeypatch: object, tmp_path: Pa
 
     config_path = tmp_path / ".ncp" / "config.toml"
     config_text = config_path.read_text()
-    config_text = re.sub(
-        r'auth_token = ".*"', 'auth_token = "config-token"', config_text
+    config_text = config_text.replace(
+        '# auth_token = ""', '[server]\nauth_token = "config-token"'
     )
     config_path.write_text(config_text)
 

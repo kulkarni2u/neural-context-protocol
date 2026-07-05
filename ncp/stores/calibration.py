@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from ncp.types import OutcomeRecord
+
 
 @dataclass(frozen=True)
 class FeedbackRow:
@@ -28,6 +30,7 @@ class FeedbackResult:
 
     updates: list[tuple[float, str]] = field(default_factory=list)  # (new_trust, chunk_id)
     change_log: list[dict] = field(default_factory=list)
+    consumed_chunk_ids: list[str] = field(default_factory=list)
     adjusted: int = 0
     skipped: int = 0
 
@@ -53,12 +56,22 @@ def compute_feedback_updates(
     feedback_weight: float,
     propagation_factor: float,
     dissent_weight: float = 0.2,
+    usage_prior_weight: float = 1.0,
+    outcome_evidence: dict[str, float] | None = None,
 ) -> FeedbackResult:
-    """Compute net trust deltas from retrieval feedback and dissent, with 1-hop propagation.
+    """Compute net trust deltas from retrieval feedback, dissent, and outcomes.
 
-    Each chunk earns a net delta combining two signals:
-    - Positive: retrieved ``rc`` times → ``+feedback_weight * min(1, rc/10)``.
-    - Negative: disputed ``dc`` times → ``-dissent_weight * min(1, dc/3)``.
+    WHEN ``outcome_evidence`` is present (CAP-T3), outcome evidence becomes the
+    PRIMARY signal for per-chunk trust deltas.  Each chunk's net delta combines:
+
+    - Outcome evidence: ``outcome_evidence[chunk_id]`` (positive for success,
+      negative for failure, scaled by weight).  Applied at full strength.
+    - Retrieval usage (weak prior): ``+feedback_weight * min(1, rc/10) * usage_prior_weight``
+      when outcome evidence is present, else at full ``usage_prior_weight``.
+    - Dissent penalty: ``-dissent_weight * min(1, dc/3)`` (always at full).
+
+    When ``outcome_evidence`` is empty/None the function behaves exactly as
+    before (retrieval counts drive the update at their full weight).
 
     Propagation: a fraction (``propagation_factor``) of each chunk's net delta
     flows one hop to its ``caused_by`` parent — crediting a cause for useful
@@ -73,16 +86,30 @@ def compute_feedback_updates(
     base_trust = {row.chunk_id: row.base_trust for row in rows}
     retrieval_count = {row.chunk_id: row.retrieval_count for row in rows}
     dissent_count = {row.chunk_id: row.dissent_count for row in rows}
+    outcome_evidence = outcome_evidence or {}
 
     direct: dict[str, float] = {}
     for row in rows:
+        cid = row.chunk_id
         delta = 0.0
+
+        # Outcome evidence is the primary signal (CAP-T3)
+        outcome_delta = outcome_evidence.get(cid, 0.0)
+        if outcome_delta != 0.0:
+            delta += outcome_delta
+
+        # Retrieval usage becomes a weak prior when outcomes are present
         if row.retrieval_count > 0:
-            delta += feedback_weight * min(1.0, row.retrieval_count / 10)
+            retrieval_boost = feedback_weight * min(1.0, row.retrieval_count / 10)
+            if outcome_evidence:
+                retrieval_boost *= usage_prior_weight
+            delta += retrieval_boost
+
         if row.dissent_count > 0:
             delta -= dissent_weight * min(1.0, row.dissent_count / _DISSENT_SATURATION)
+
         if delta != 0.0:
-            direct[row.chunk_id] = delta
+            direct[cid] = delta
 
     total: dict[str, float] = dict(direct)
     if propagation_factor > 0.0:
@@ -95,6 +122,9 @@ def compute_feedback_updates(
                 total[parent] = total.get(parent, 0.0) + delta * propagation_factor
 
     result = FeedbackResult()
+    result.consumed_chunk_ids = [
+        row.chunk_id for row in rows if row.retrieval_count > 0 or row.dissent_count > 0
+    ]
     adjusted_ids: set[str] = set()
     for chunk_id, delta in total.items():
         old_trust = base_trust[chunk_id]
@@ -109,7 +139,14 @@ def compute_feedback_updates(
         if chunk_id in direct:
             rc = retrieval_count.get(chunk_id, 0)
             dc = dissent_count.get(chunk_id, 0)
-            if rc > 0 and dc > 0:
+            oe = outcome_evidence.get(chunk_id, 0.0)
+            if oe > 0:
+                entry["reason"] = "outcome_success"
+                entry["outcome_evidence"] = oe
+            elif oe < 0:
+                entry["reason"] = "outcome_failure"
+                entry["outcome_evidence"] = oe
+            elif rc > 0 and dc > 0:
                 entry["reason"] = "mixed_feedback"
                 entry["retrieval_count"] = rc
                 entry["dissent_count"] = dc
@@ -130,6 +167,20 @@ def compute_feedback_updates(
     return result
 
 
+def compute_outcome_evidence(outcomes: list[OutcomeRecord]) -> dict[str, float]:
+    """Aggregate outcome evidence into per-chunk deltas.
+
+    Returns ``{chunk_id: net_delta}`` where success outcomes contribute
+    ``+weight`` and failures contribute ``-weight``.
+    """
+    evidence: dict[str, float] = {}
+    for out in outcomes:
+        delta = out.weight if out.success else -out.weight
+        for cid in out.chunk_ids:
+            evidence[cid] = evidence.get(cid, 0.0) + delta
+    return evidence
+
+
 def rollup_reputation(
     change_log: list[dict],
     chunk_author: dict[str, str],
@@ -138,9 +189,15 @@ def rollup_reputation(
     gain: float,
     forget: float,
     K_CONF: int = 20,
+    outcome_evidence: dict[str, float] | None = None,
 ) -> tuple[ReputationUpdate, ...]:
-    """Roll chunk trust deltas up to per-identity Beta posterior updates."""
+    """Roll chunk trust deltas up to per-identity Beta posterior updates.
 
+    When ``outcome_evidence`` is provided (CAP-T3), it is also reflected in
+    the evidence counts so the reputation rollup correctly captures outcome-
+    based evidence in addition to retrieval/dissent-based deltas.
+    """
+    outcome_evidence = outcome_evidence or {}
     del K_CONF  # Readers derive confidence from obs_count; keep the spec-level API.
 
     pos: dict[str, float] = {}
@@ -164,6 +221,18 @@ def rollup_reputation(
             neg[identity_id] = neg.get(identity_id, 0.0) + (-delta)
         else:
             continue
+        obs[identity_id] = obs.get(identity_id, 0) + 1
+
+    # Fold raw outcome evidence into reputation even when the chunk trust did
+    # not move (e.g. already clamped at 1.0).
+    for chunk_id, oe_delta in outcome_evidence.items():
+        identity_id = chunk_author.get(chunk_id)
+        if identity_id is None:
+            continue
+        if oe_delta > 0:
+            pos[identity_id] = pos.get(identity_id, 0.0) + oe_delta
+        elif oe_delta < 0:
+            neg[identity_id] = neg.get(identity_id, 0.0) + (-oe_delta)
         obs[identity_id] = obs.get(identity_id, 0) + 1
 
     updates: list[ReputationUpdate] = []

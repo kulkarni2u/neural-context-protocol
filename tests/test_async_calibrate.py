@@ -246,7 +246,7 @@ async def test_async_calibrate_feedback_mode_boosts_trust() -> None:
         retrieval_count=5,
     )
     store = _make_store()
-    store._test_cursor.fetchall = AsyncMock(side_effect=[[row], []])
+    store._test_cursor.fetchall = AsyncMock(side_effect=[[row], [], []])
 
     report = await store.async_calibrate(feedback_mode=True, feedback_weight=0.15)
 
@@ -269,7 +269,7 @@ async def test_async_calibrate_feedback_mode_rolls_up_reputation() -> None:
         written_by="agent_async",
     )
     store = _make_store()
-    store._test_cursor.fetchall = AsyncMock(side_effect=[[row], []])
+    store._test_cursor.fetchall = AsyncMock(side_effect=[[row], [], []])
 
     report = await store.async_calibrate(feedback_mode=True, feedback_weight=0.15)
 

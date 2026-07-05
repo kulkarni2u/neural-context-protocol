@@ -3,7 +3,7 @@ from __future__ import annotations
 from os import environ
 import warnings
 
-from ncp.adapters.base import BaseAdapter
+from ncp.adapters.base import BaseAdapter, TokenUsage
 
 
 class CohereAdapter(BaseAdapter):
@@ -58,4 +58,16 @@ class CohereAdapter(BaseAdapter):
             ),
             provider="Cohere",
         )
+        self.last_usage = self._usage_from_cohere(resp)
         return self._coerce_text(resp.text, provider="Cohere")
+
+    @staticmethod
+    def _usage_from_cohere(resp: object) -> TokenUsage | None:
+        meta = getattr(resp, "meta", None)
+        tokens = getattr(meta, "tokens", None) if meta is not None else None
+        if tokens is None:
+            return None
+        return TokenUsage(
+            input_tokens=int(getattr(tokens, "input_tokens", 0) or 0),
+            output_tokens=int(getattr(tokens, "output_tokens", 0) or 0),
+        )

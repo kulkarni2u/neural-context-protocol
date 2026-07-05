@@ -1,10 +1,28 @@
 from pathlib import Path
 
 import ncp
+from ncp.adapters.base import BaseAdapter, TokenUsage
 from ncp.adapters.local import LocalAdapter
 from ncp.config import NCPConfig
+from ncp.costs import calculate_cost
 from ncp.stores.sqlite import SQLiteStore
 from ncp.types import AlertPayload, BudgetContext, SubconsciousChunk, Whisper
+
+
+class _MeteredMockAdapter(BaseAdapter):
+    """Mock provider adapter that reports real token usage like a live SDK."""
+
+    def __init__(self, *, input_tokens: int, output_tokens: int, model: str = "gpt-4o") -> None:
+        self._model = model
+        self._input_tokens = input_tokens
+        self._output_tokens = output_tokens
+
+    def call(self, ncp_context: str, user_turn: str) -> str:
+        self.last_usage = TokenUsage(
+            input_tokens=self._input_tokens,
+            output_tokens=self._output_tokens,
+        )
+        return "mock_provider_response"
 
 
 def test_agent_creates_conscious_block_template() -> None:
@@ -147,3 +165,84 @@ def test_get_context_degrades_gracefully_on_empty_store(tmp_path: Path) -> None:
     assert "[NCP:BUDGET]" in context
     assert "t:sensor" not in context
     assert "drift_score_sample" not in context
+
+
+def _cape1_agent() -> object:
+    return ncp.agent(
+        id="executor",
+        role="build",
+        owns=["implementation"],
+        must_not=["planning"],
+        task="cost_accounting",
+        slot="meter_tokens",
+        intent="record_real_cost",
+    )
+
+
+def test_run_records_real_provider_tokens_and_priced_cost(tmp_path: Path) -> None:
+    project = tmp_path / "repo"
+    (project / ".git").mkdir(parents=True)
+    ncp.configure(cwd=project)
+    store = SQLiteStore(project / ".ncp" / "store.db")
+    adapter = _MeteredMockAdapter(input_tokens=1234, output_tokens=567, model="gpt-4o")
+
+    response = ncp.run(agent=_cape1_agent(), turn="do the work", adapter=adapter, store=store)
+
+    expected = calculate_cost(
+        model="gpt-4o", input_tokens=1234, output_tokens=567
+    ).total_cost_usd
+    assert response.input_tokens == 1234
+    assert response.output_tokens == 567
+    assert response.model == "gpt-4o"
+    assert response.cost_source == "measured"
+    assert response.cost_usd == expected
+    assert expected > 0.0
+    # The real priced cost is persisted, not the fabricated 0.0.
+    assert store.status()["cost_usd_total"] == expected
+
+
+def test_local_adapter_turn_is_marked_estimated_not_authoritative(tmp_path: Path) -> None:
+    project = tmp_path / "repo"
+    (project / ".git").mkdir(parents=True)
+    ncp.configure(cwd=project)
+    store = SQLiteStore(project / ".ncp" / "store.db")
+
+    response = ncp.run(
+        agent=_cape1_agent(), turn="finish the slice", adapter=LocalAdapter(), store=store
+    )
+
+    assert response.cost_source == "estimated"
+    assert response.cost_usd == 0.0
+
+
+def test_rapid_turns_do_not_overwrite_cost_log_rows(tmp_path: Path, monkeypatch) -> None:
+    project = tmp_path / "repo"
+    (project / ".git").mkdir(parents=True)
+    ncp.configure(cwd=project)
+    store = SQLiteStore(project / ".ncp" / "store.db")
+
+    # Force both turns onto the same millisecond so only the uuid suffix differs.
+    monkeypatch.setattr("ncp.api.time.time", lambda: 1_700_000_000.0)
+
+    first = ncp.run(
+        agent=_cape1_agent(),
+        turn="turn one",
+        adapter=_MeteredMockAdapter(input_tokens=100, output_tokens=50),
+        store=store,
+    )
+    second = ncp.run(
+        agent=_cape1_agent(),
+        turn="turn two",
+        adapter=_MeteredMockAdapter(input_tokens=200, output_tokens=80),
+        store=store,
+    )
+
+    assert first.turn_id != second.turn_id
+    summary = store.cost_summary(limit=10)
+    turn_ids = {entry["turn_id"] for entry in summary["recent_entries"]}
+    assert first.turn_id in turn_ids
+    assert second.turn_id in turn_ids
+    # Both rows survive and the rollup sums them (no INSERT OR REPLACE clobber).
+    expected_total = first.cost_usd + second.cost_usd
+    assert summary["summary"]["cost_usd_total"] == expected_total
+    assert store.status()["cost_usd_total"] == expected_total

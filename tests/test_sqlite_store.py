@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -44,6 +45,216 @@ def test_sqlite_store_write_query_and_restart(tmp_path: Path) -> None:
 
     assert [result.chunk_id for result in results] == ["sub_auth"]
     assert results[0].pipeline_id == "pipe_1"
+
+
+def test_sqlite_connections_set_busy_timeout(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "store.db")
+
+    with store._connect() as connection:
+        timeout_ms = connection.execute("PRAGMA busy_timeout").fetchone()[0]
+
+    assert timeout_ms >= 5000
+
+
+def test_sqlite_embedding_column_added_via_schema_migration(tmp_path: Path) -> None:
+    store_path = tmp_path / "store.db"
+    SQLiteStore(store_path)
+
+    import sqlite3
+    connection = sqlite3.connect(store_path)
+    cols = {row[1] for row in connection.execute("PRAGMA table_info(chunks)").fetchall()}
+    connection.close()
+
+    assert "embedding" in cols, f"columns: {cols}"
+
+
+def test_sqlite_embedding_defaults_to_none_when_adapter_not_configured(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "store.db")
+    chunk = SubconsciousChunk(
+        chunk_id="sub_emb_none",
+        layer="semantic",
+        content="default embedding test",
+        src="tool_result",
+    )
+    assert store.write(chunk) is True
+
+    import sqlite3
+    connection = sqlite3.connect(store.path)
+    connection.row_factory = sqlite3.Row
+    row = connection.execute(
+        "SELECT embedding FROM chunks WHERE chunk_id = ?", ("sub_emb_none",)
+    ).fetchone()
+    connection.close()
+    assert row["embedding"] is None
+
+
+def test_sqlite_embedding_stores_and_retrieves_blob(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "store.db")
+    vec = [0.1, 0.2, 0.3]
+    chunk = SubconsciousChunk(
+        chunk_id="sub_emb_stored",
+        layer="semantic",
+        content="embedding blob round-trip",
+        src="tool_result",
+        embedding=vec,
+    )
+    assert store.write(chunk) is True
+
+    import sqlite3
+    connection = sqlite3.connect(store.path)
+    connection.row_factory = sqlite3.Row
+    row = connection.execute(
+        "SELECT embedding FROM chunks WHERE chunk_id = ?", ("sub_emb_stored",)
+    ).fetchone()
+    connection.close()
+    import json
+    loaded = json.loads(row["embedding"].decode("utf-8"))
+    assert loaded == vec
+
+
+def test_sqlite_vector_mode_ranks_by_cosine(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "store.db")
+    store.write(SubconsciousChunk(
+        chunk_id="sub_close", layer="semantic",
+        content="close match", src="tool_result",
+        embedding=[0.9, 0.1, 0.0],
+    ))
+    store.write(SubconsciousChunk(
+        chunk_id="sub_far", layer="semantic",
+        content="far match", src="tool_result",
+        embedding=[0.1, 0.9, 0.0],
+    ))
+    results = store.query(
+        "unrelated query text",
+        k=2,
+        min_score=0.0,
+        retrieval_mode="vector",
+        embedding=[0.95, 0.05, 0.0],
+    )
+
+    assert [chunk.chunk_id for chunk in results] == ["sub_close", "sub_far"]
+
+
+class _TinySemanticAdapter:
+    def embed(self, text: str) -> list[float]:
+        lowered = text.lower()
+        if any(term in lowered for term in ("feline", "cat", "sofa", "couch")):
+            return [1.0, 0.0, 0.0]
+        if any(term in lowered for term in ("automobile", "brake", "vehicle")):
+            return [0.0, 1.0, 0.0]
+        return [0.0, 0.0, 1.0]
+
+
+def test_sqlite_local_embeddings_retrieve_zero_lexical_overlap_paraphrase(
+    tmp_path: Path,
+) -> None:
+    disabled = SQLiteStore(tmp_path / "disabled.db")
+    enabled = SQLiteStore(tmp_path / "enabled.db", embedding_adapter=_TinySemanticAdapter())
+    for store in (disabled, enabled):
+        store.write(
+            SubconsciousChunk(
+                chunk_id="sub_animal",
+                layer="semantic",
+                content="feline lounges on sofa",
+                src="tool_result",
+            )
+        )
+        store.write(
+            SubconsciousChunk(
+                chunk_id="sub_vehicle",
+                layer="semantic",
+                content="automobile brake repair",
+                src="tool_result",
+            )
+        )
+
+    assert disabled.query("cat rests couch", k=2, min_score=0.01) == []
+
+    results = enabled.query("cat rests couch", k=2, min_score=0.01)
+    assert results
+    assert results[0].chunk_id == "sub_animal"
+    assert results[0].embedding == [1.0, 0.0, 0.0]
+
+
+def test_sqlite_store_preserves_default_behavior_when_no_embedding(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "store.db")
+    store.write(SubconsciousChunk(
+        chunk_id="sub_default_hybrid", layer="semantic",
+        content="standard retrieval content for testing",
+        src="tool_result",
+    ))
+    results = store.query("standard retrieval", k=4, min_score=0.0)
+    assert len(results) == 1
+    assert results[0].chunk_id == "sub_default_hybrid"
+    assert results[0].relevance > 0.0
+
+
+def test_sqlite_rewrite_preserves_feedback_counters_and_created_at(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "store.db")
+    original = SubconsciousChunk(
+        chunk_id="sub_rewrite",
+        layer="semantic",
+        content="first write about retry accounting",
+        src="tool_result",
+        pipeline_id="pipe_1",
+    )
+    replacement = SubconsciousChunk(
+        chunk_id="sub_rewrite",
+        layer="semantic",
+        content="replacement write about billing reconciliation",
+        src="tool_result",
+        pipeline_id="pipe_1",
+        base_trust=0.8,
+    )
+    assert store.write(original) is True
+    with store._connect() as connection:
+        connection.execute(
+            "UPDATE chunks SET created_at = ?, retrieval_count = ?, dissent_count = ? WHERE chunk_id = ?",
+            (123.0, 7, 2, "sub_rewrite"),
+        )
+
+    assert store.write(replacement) is True
+
+    with store._connect() as connection:
+        row = connection.execute(
+            "SELECT content, base_trust, created_at, retrieval_count, dissent_count "
+            "FROM chunks WHERE chunk_id = ?",
+            ("sub_rewrite",),
+        ).fetchone()
+    assert row["content"] == replacement.content
+    assert row["base_trust"] == pytest.approx(0.8)
+    assert row["created_at"] == pytest.approx(123.0)
+    assert row["retrieval_count"] == 7
+    assert row["dissent_count"] == 2
+
+
+def test_sqlite_concurrent_unique_writes_do_not_raise_store_unavailable(tmp_path: Path) -> None:
+    store_path = tmp_path / "store.db"
+    SQLiteStore(store_path)
+
+    def write_one(index: int) -> bool:
+        store = SQLiteStore(store_path)
+        return store.write(
+            SubconsciousChunk(
+                chunk_id=f"sub_concurrent_{index}",
+                layer="semantic",
+                content=" ".join(f"unique_concurrent_{index}_{token}" for token in range(20)),
+                src="tool_result",
+                pipeline_id="pipe_1",
+            )
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(write_one, range(24)))
+
+    assert all(results)
+    restarted = SQLiteStore(store_path)
+    with restarted._connect() as connection:
+        row = connection.execute(
+            "SELECT COUNT(*) AS count FROM chunks WHERE pipeline_id = ?",
+            ("pipe_1",),
+        ).fetchone()
+    assert row["count"] == 24
 
 
 def test_sqlite_store_query_filters_zero_score_noise_and_uses_effective_score(tmp_path: Path) -> None:
@@ -374,3 +585,58 @@ def test_sqlite_store_status_detail_and_cost_summary(tmp_path: Path) -> None:
     assert costs["by_agent"][0]["agent_id"] == "planner"
     assert costs["by_model"][0]["model"] == "claude_sonnet"
     assert costs["recent_entries"][0]["turn_id"] == "turn_cost_alpha"
+
+
+def test_sqlite_expired_chunk_absent_from_reads_and_gc(tmp_path: Path) -> None:
+    # WI-006: a chunk past its expiry must not be retrieved, fetched by id, or
+    # listed in the working zone, and GC must reclaim it from the table.
+    import sqlite3
+    import time
+
+    store_path = tmp_path / "store.db"
+    store = SQLiteStore(store_path)
+
+    expired = SubconsciousChunk(
+        chunk_id="sub_expired",
+        layer="procedural",
+        content="stale proven fact about bearer token rotation",
+        src="tool_result",
+        pipeline_id="pipe_exp",
+        expiry=time.time() - 3600,
+    )
+    live = SubconsciousChunk(
+        chunk_id="sub_live",
+        layer="procedural",
+        content="current fact about bearer token rotation",
+        src="tool_result",
+        pipeline_id="pipe_exp",
+        expiry=time.time() + 3600,
+    )
+    assert store.write(expired) is True
+    assert store.write(live) is True
+
+    # Not retrievable via query.
+    ids = [c.chunk_id for c in store.query("bearer token rotation", pipeline_id="pipe_exp")]
+    assert "sub_expired" not in ids
+    assert "sub_live" in ids
+
+    # Not fetchable by id.
+    fetched = {c.chunk_id for c in store.get_chunks_by_ids(["sub_expired", "sub_live"])}
+    assert fetched == {"sub_live"}
+
+    # Not present in the working zone.
+    zone_ids = {c.chunk_id for c in store.get_working_zone(pipeline_id="pipe_exp")}
+    assert "sub_expired" not in zone_ids
+
+    # A soft-GC-triggering write physically reclaims the expired row.
+    store.write(SubconsciousChunk(
+        chunk_id="sub_trigger", layer="procedural",
+        content="unrelated trigger chunk", src="tool_result", pipeline_id="pipe_exp",
+    ))
+    connection = sqlite3.connect(store_path)
+    remaining = {
+        row[0]
+        for row in connection.execute("SELECT chunk_id FROM chunks").fetchall()
+    }
+    connection.close()
+    assert "sub_expired" not in remaining

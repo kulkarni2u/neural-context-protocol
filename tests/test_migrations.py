@@ -363,7 +363,6 @@ def test_migration_apply_and_rollback_live(tmp_path: Path) -> None:
         f"-- UP\nCREATE SCHEMA IF NOT EXISTS {schema};\n"
         f"CREATE TABLE IF NOT EXISTS {schema}.{prefix}mig_test (id SERIAL PRIMARY KEY);\n"
         f"-- DOWN\nDROP TABLE IF EXISTS {schema}.{prefix}mig_test CASCADE;\n"
-        f"DROP SCHEMA IF EXISTS {schema} CASCADE;\n"
     )
     _sql_file(tmp_path, "001_mig_test.sql", content)
 
@@ -388,4 +387,10 @@ def test_migration_apply_and_rollback_live(tmp_path: Path) -> None:
         assert result["rolled_back"] is True
         assert runner.applied_versions() == {}
     finally:
+        try:
+            with conn.cursor() as cleanup_cur:
+                cleanup_cur.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+                conn.commit()
+        except Exception:
+            conn.rollback()
         conn.close()

@@ -15,10 +15,11 @@ import anyio
 
 from ncp.coherence import CoherenceChecker
 from ncp.config import NCPConfig
+from ncp.distill import distill_chunk
 from ncp.encoder import PidginEncoder
 from ncp.middleware.base import MiddlewarePipeline
 from ncp.stores.base import BaseStore
-from ncp.stores.retrieval import DEFAULT_RETRIEVAL_POLICY, build_lexical_candidates, normalize_query_terms
+from ncp.stores.retrieval import DEFAULT_RETRIEVAL_POLICY, apply_mmr_selection, build_lexical_candidates, normalize_query_terms
 from ncp.tokens import estimate_tokens
 from ncp.types import BudgetContext, ConsciousBlock, NCPResponse, SubconsciousChunk, TurnRecord, Whisper
 
@@ -73,6 +74,9 @@ class Assembler:
         self._whisper_cap_critical = config.whisper_cap_critical if config else 1
         self._edge_expansion = config.edge_expansion_enabled if config else True
         self._edge_expansion_decay = config.edge_expansion_decay if config else 0.7
+        self._diversity_lambda = config.diversity_lambda if config else 1.0
+        self._distillation_enabled = config.distillation_enabled if config else False
+        self._distillation_min_chunk_tokens = config.distillation_min_chunk_tokens if config else 120
 
     # ------------------------------------------------------------------
     # Step 0-5: assemble
@@ -109,6 +113,7 @@ class Assembler:
             budget=budget,
             k=chunk_cap,
             diversity_limit=diversity_limit,
+            diversity_lambda=self._diversity_lambda,
         )
         subconscious = self._cold_start_bootstrap(hydrated, subconscious)
         if self._edge_expansion:
@@ -116,12 +121,20 @@ class Assembler:
             subconscious = [*subconscious, *expanded]
             recent_chunks, subconscious = self._suppress_superseded(recent_chunks, subconscious)
         deduped_chunks = self._dedupe_chunks([*recent_chunks, *subconscious])
-        combined_chunks = self._split_recent_and_retrieved_chunks(
-            recent_chunks=recent_chunks,
-            retrieved_chunks=subconscious,
-            chunk_cap=chunk_cap,
-            budget=budget,
-        )
+        if self._diversity_lambda < 1.0:
+            combined_chunks = self._mmr_select_chunks(
+                deduped_chunks,
+                query_text=search_text,
+                diversity_lambda=self._diversity_lambda,
+                chunk_cap=chunk_cap,
+            )
+        else:
+            combined_chunks = self._split_recent_and_retrieved_chunks(
+                recent_chunks=recent_chunks,
+                retrieved_chunks=subconscious,
+                chunk_cap=chunk_cap,
+                budget=budget,
+            )
         combined_ids = {chunk.chunk_id for chunk in combined_chunks}
         evicted_high_relevance = [
             (chunk.chunk_id, float(chunk.relevance))
@@ -149,6 +162,7 @@ class Assembler:
                 chunks=combined_chunks,
                 whispers=combined_whispers,
                 max_tokens=max(1, effective_max_tokens),
+                query_text=search_text,
             )
             kept_chunk_ids = {chunk.chunk_id for chunk in combined_chunks}
             evicted_ids = {chunk_id for chunk_id, _ in evicted_high_relevance}
@@ -314,9 +328,14 @@ class Assembler:
         if ack_whisper_ids:
             self.store.acknowledge_whispers(ack_whisper_ids, agent_id=conscious.agent_id)
 
+        suppressed_chunk_ids: list[str] = []
         for chunk in memory_chunks or []:
             chunk = self.middleware.pre_write(chunk)
-            self._write_with_retry(chunk)
+            # WI-007(a): surface dedup-suppressed writes to the caller instead
+            # of silently dropping them.
+            if not self._write_with_retry(chunk):
+                suppressed_chunk_ids.append(chunk.chunk_id)
+        record.suppressed_chunk_ids = suppressed_chunk_ids
 
         return record
 
@@ -343,6 +362,14 @@ class Assembler:
         updated_conscious = conscious.model_copy(update={"recent": updated_recent})
         snapshot_hash = sha256(updated_conscious.model_dump_json().encode("utf-8")).hexdigest()
 
+        # WI-007(a): start_soon cannot consume return values, so track
+        # dedup-suppressed writes via a shared list populated by a closure.
+        suppressed_chunk_ids: list[str] = []
+
+        async def _write_and_track(chunk: SubconsciousChunk) -> None:
+            if not await self._alog_write_with_retry(chunk):
+                suppressed_chunk_ids.append(chunk.chunk_id)
+
         async with anyio.create_task_group() as tg:
             tg.start_soon(self._alog_turn_record, record)
             tg.start_soon(self._alog_conscious, updated_conscious, snapshot_hash)
@@ -351,8 +378,9 @@ class Assembler:
                 tg.start_soon(self._aacknowledge_whispers, ack_whisper_ids, conscious.agent_id)
             for chunk in memory_chunks or []:
                 chunk = self.middleware.pre_write(chunk)
-                tg.start_soon(self._alog_write_with_retry, chunk)
+                tg.start_soon(_write_and_track, chunk)
 
+        record.suppressed_chunk_ids = suppressed_chunk_ids
         return record
 
     # ------------------------------------------------------------------
@@ -412,16 +440,18 @@ class Assembler:
         budget: BudgetContext | None = None,
         k: int | None = None,
         diversity_limit: int | None = None,
+        diversity_lambda: float | None = None,
     ) -> list[SubconsciousChunk]:
         if k is None:
             k = 2 if (budget is not None and budget.pressure == "critical") else 4
+        store_k = k * 3 if (diversity_lambda is not None and diversity_lambda < 1.0) else k
         search_text = query_text or f"{conscious.task} {conscious.slot}"
         extra: dict = {}
         if diversity_limit is not None:
             extra["diversity_limit"] = diversity_limit
         return self.store.query(
             search_text,
-            k=k,
+            k=store_k,
             pipeline_id=conscious.pipeline_id,
             zone="working",
             fallback_to_trust_recency=True,
@@ -581,6 +611,21 @@ class Assembler:
                 break
         return selected
 
+    def _mmr_select_chunks(
+        self,
+        chunks: list[SubconsciousChunk],
+        *,
+        query_text: str,
+        diversity_lambda: float,
+        chunk_cap: int,
+    ) -> list[SubconsciousChunk]:
+        return apply_mmr_selection(
+            chunks,
+            query_text=query_text,
+            diversity_lambda=diversity_lambda,
+            chunk_cap=chunk_cap,
+        )
+
     def _fit_token_budget(
         self,
         *,
@@ -589,6 +634,7 @@ class Assembler:
         chunks: list[SubconsciousChunk],
         whispers: list[Whisper],
         max_tokens: int,
+        query_text: str,
     ) -> tuple[list[SubconsciousChunk], list[Whisper]]:
         fitted_whispers = self._fit_whispers_to_budget(
             conscious=conscious,
@@ -607,7 +653,61 @@ class Assembler:
             )
             if estimate_tokens(candidate) <= max_tokens:
                 fitted_chunks.append(chunk)
+                continue
+            distilled = self._distill_for_budget(
+                conscious=conscious,
+                budget=budget,
+                fitted_chunks=fitted_chunks,
+                fitted_whispers=fitted_whispers,
+                chunk=chunk,
+                max_tokens=max_tokens,
+                query_text=query_text,
+            )
+            if distilled is not None:
+                fitted_chunks.append(distilled)
         return fitted_chunks, fitted_whispers
+
+    def _distill_for_budget(
+        self,
+        *,
+        conscious: ConsciousBlock,
+        budget: BudgetContext,
+        fitted_chunks: list[SubconsciousChunk],
+        fitted_whispers: list[Whisper],
+        chunk: SubconsciousChunk,
+        max_tokens: int,
+        query_text: str,
+    ) -> SubconsciousChunk | None:
+        if not self._distillation_enabled:
+            return None
+        if estimate_tokens(chunk.content) < self._distillation_min_chunk_tokens:
+            return None
+        base_context = self.encoder.assemble(
+            conscious=conscious,
+            chunks=fitted_chunks,
+            whispers=fitted_whispers,
+            budget=budget,
+        )
+        remaining = max_tokens - estimate_tokens(base_context)
+        if remaining <= 0:
+            return None
+        distilled_content = distill_chunk(
+            chunk.content,
+            query_text,
+            max_tokens=max(1, remaining),
+        )
+        if not distilled_content or distilled_content == chunk.content:
+            return None
+        distilled = chunk.model_copy(update={"content": distilled_content, "distilled": True})
+        candidate = self.encoder.assemble(
+            conscious=conscious,
+            chunks=[*fitted_chunks, distilled],
+            whispers=fitted_whispers,
+            budget=budget,
+        )
+        if estimate_tokens(candidate) <= max_tokens:
+            return distilled
+        return None
 
     def _fit_whispers_to_budget(
         self,
@@ -653,11 +753,13 @@ class Assembler:
             return 1
         return 2
 
-    def _write_with_retry(self, chunk: SubconsciousChunk, *, retries: int = 2, backoff_ms: int = 50) -> None:
+    def _write_with_retry(self, chunk: SubconsciousChunk, *, retries: int = 2, backoff_ms: int = 50) -> bool:
+        # WI-007(a): return whether the chunk was actually persisted. A
+        # deduplication-suppressed write returns False (deterministic — not
+        # retried) so callers do not treat silent data loss as success.
         for attempt in range(retries + 1):
             try:
-                self.store.write(chunk)
-                return
+                return bool(self.store.write(chunk))
             except Exception:
                 if attempt < retries:
                     time.sleep(backoff_ms / 1000)
@@ -665,6 +767,7 @@ class Assembler:
                 raise RuntimeError(
                     f"Failed to persist chunk after {retries + 1} attempts: {chunk.chunk_id}"
                 ) from None
+        return False
 
     # ------------------------------------------------------------------
     # Async helpers for post_turn_async
@@ -682,11 +785,12 @@ class Assembler:
     async def _aacknowledge_whispers(self, whisper_ids: list[str], agent_id: str) -> None:
         await self.store.async_acknowledge_whispers(whisper_ids, agent_id=agent_id)
 
-    async def _alog_write_with_retry(self, chunk: SubconsciousChunk, *, retries: int = 2, backoff_ms: int = 50) -> None:
+    async def _alog_write_with_retry(self, chunk: SubconsciousChunk, *, retries: int = 2, backoff_ms: int = 50) -> bool:
+        # WI-007(a): mirror the sync path — surface a dedup-suppressed write as
+        # False rather than swallowing it as success.
         for attempt in range(retries + 1):
             try:
-                await self.store.async_write(chunk)
-                return
+                return bool(await self.store.async_write(chunk))
             except Exception:
                 if attempt < retries:
                     await anyio.sleep(backoff_ms / 1000)
@@ -694,6 +798,7 @@ class Assembler:
                 raise RuntimeError(
                     f"Failed to persist chunk after {retries + 1} attempts: {chunk.chunk_id}"
                 ) from None
+        return False
 
     # ------------------------------------------------------------------
     # Drift feedback loop
@@ -715,7 +820,11 @@ class Assembler:
                     data = payload
                 else:
                     continue
-                detected_drift = float(data.get("detected_drift", 0.0))
+                # WI-007(c): a world_check without detected_drift must not zero
+                # the agent's drift — skip it instead of defaulting to 0.0.
+                if "detected_drift" not in data:
+                    continue
+                detected_drift = float(data["detected_drift"])
                 if 0.0 <= detected_drift <= 1.0:
                     conscious = conscious.model_copy(update={"drift_score": detected_drift})
                 break

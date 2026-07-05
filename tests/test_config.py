@@ -99,7 +99,7 @@ def test_embedding_config_defaults(tmp_path) -> None:
     config = load_config(cwd=project)
     assert config.embedding_enabled is False
     assert config.embedding_provider == "local"
-    assert config.embedding_model == "sentence-transformers/all-MiniLM-L6-v2"
+    assert config.embedding_model == "BAAI/bge-small-en-v1.5"
 
 
 def test_embedding_config_toml_override(tmp_path) -> None:
@@ -129,3 +129,44 @@ def test_embedding_config_env_overrides(tmp_path) -> None:
     assert config.embedding_enabled is True
     assert config.embedding_provider == "openai"
     assert config.embedding_model == "text-embedding-3-small"
+
+
+def test_retrieval_diversity_lambda_defaults_and_overrides(tmp_path) -> None:
+    project = tmp_path / "repo"
+    (project / ".git").mkdir(parents=True)
+    (project / ".ncp").mkdir()
+
+    assert load_config(cwd=project).diversity_lambda == 1.0
+
+    (project / ".ncp" / "config.toml").write_text("[retrieval]\ndiversity_lambda = 0.7\n")
+    assert load_config(cwd=project).diversity_lambda == pytest.approx(0.7)
+
+    config = load_config(cwd=project, env={"NCP_DIVERSITY_LAMBDA": "0.8"})
+    assert config.diversity_lambda == pytest.approx(0.8)
+
+
+def test_distillation_config_defaults_and_overrides(tmp_path) -> None:
+    project = tmp_path / "repo"
+    (project / ".git").mkdir(parents=True)
+    (project / ".ncp").mkdir()
+
+    config = load_config(cwd=project)
+    assert config.distillation_enabled is False
+    assert config.distillation_min_chunk_tokens == 120
+
+    (project / ".ncp" / "config.toml").write_text(
+        "[distillation]\nenabled = true\nmin_chunk_tokens = 32\n"
+    )
+    config = load_config(cwd=project)
+    assert config.distillation_enabled is True
+    assert config.distillation_min_chunk_tokens == 32
+
+    config = load_config(
+        cwd=project,
+        env={
+            "NCP_DISTILLATION_ENABLED": "false",
+            "NCP_DISTILLATION_MIN_CHUNK_TOKENS": "64",
+        },
+    )
+    assert config.distillation_enabled is False
+    assert config.distillation_min_chunk_tokens == 64

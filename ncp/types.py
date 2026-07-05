@@ -1,5 +1,4 @@
 import json
-import math
 import time
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -207,21 +206,26 @@ class SubconsciousChunk(NCPModel):
     last_retrieved_at: float | None = None
     dissent_count: int = 0
 
+    # CAP-T1/WI-013: authorship verification status. True only when a valid
+    # Ed25519 signature over the canonical authorship payload was verified at
+    # ingest. Default false keeps existing unsigned rows/tests unaffected.
+    verified: bool = False
+    distilled: bool = False
+
     embedding: list[float] | None = None
 
     @property
     def effective_score(self) -> float:
         """Presentation-layer score written into the pidgin wire format.
 
-        ``relevance`` is already a fused retrieval score from RetrievalPolicy
-        (BM25 + recency + trust). This property applies a second recency decay
-        and trust weight so the encoded score reflects the chunk's freshness and
-        credibility at display time, which may differ from when it was retrieved.
-        Retrieval ranking uses ``relevance``; the pidgin encoder uses this value.
+        ``relevance`` is already a fully fused single-application retrieval
+        score from ``RetrievalPolicy.score`` (BM25 + recency + w_trust*base_trust
+        + generation penalty), applied exactly once. The pidgin/display score IS
+        that retrieval relevance -- there is no second trust/recency/generation
+        multiplication here, so the displayed score stays comparable to the
+        ranking score.
         """
-        decay = math.exp(-0.693 * self.age_seconds / 14400)
-        generation_penalty = 0.9 ** self.generation
-        return self.relevance * decay * self.base_trust * generation_penalty
+        return self.relevance
 
     @field_validator("chunk_id", "written_by")
     @classmethod
@@ -277,8 +281,8 @@ class SubconsciousChunk(NCPModel):
     @field_validator("embedding")
     @classmethod
     def _embedding_dimensions(cls, value: list[float] | None) -> list[float] | None:
-        if value is not None and len(value) != 1536:
-            raise ValueError(f"embedding must have exactly 1536 dimensions, got {len(value)}")
+        if value is not None and len(value) == 0:
+            raise ValueError("embedding must be a non-empty vector")
         return value
 
     @model_validator(mode="after")
@@ -332,6 +336,8 @@ class Whisper(NCPModel):
     ttl_seconds: int = 1800
     pipeline_id: str | None = None
     dissent_target: str | None = None
+    # CAP-T1/WI-013: authorship verification status (see SubconsciousChunk).
+    verified: bool = False
 
     @field_validator("from_agent", "target", "whisper_id")
     @classmethod
@@ -436,6 +442,9 @@ class TurnRecord(NCPModel):
     result_full: str
     created_at: float = Field(default_factory=time.time)
     expires_at: float | None = None
+    # WI-007(a): chunk_ids whose memory writes were suppressed (e.g. by dedup)
+    # during post_turn. Response-surface metadata, not persisted as a column.
+    suppressed_chunk_ids: list[str] = Field(default_factory=list)
 
     @field_validator("turn_id", "agent_id", "task", "slot")
     @classmethod
@@ -485,6 +494,9 @@ class NCPResponse(NCPModel):
     pipeline_id: str | None = None
     turn_id: str
     latency_ms: int
+    # Provenance of the token/cost figures: "measured" when threaded from a real
+    # provider usage object, "estimated" for the local/mock chars-div-4 fallback.
+    cost_source: Literal["measured", "estimated"] = "measured"
 
     @field_validator("model", "turn_id")
     @classmethod
@@ -541,3 +553,16 @@ class CalibrationReport:
     dry_run: bool = False
     pipeline_id: str | None = None
     change_log: list[dict] = field(default_factory=list)
+
+
+class OutcomeRecord(NCPModel):
+    """Record of a task outcome for outcome-calibrated reputation (CAP-T3)."""
+
+    outcome_id: str = Field(default_factory=lambda: f"out_{uuid4().hex[:12]}")
+    turn_id: str | None = None
+    chunk_ids: list[str] = Field(default_factory=list)
+    success: bool
+    weight: float = 1.0
+    note: str | None = None
+    created_at: float = Field(default_factory=time.time)
+    consumed: bool = False

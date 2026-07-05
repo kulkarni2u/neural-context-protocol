@@ -4,6 +4,223 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [Unreleased]
 
+Audit remediation from `docs/NCP_AUDIT_AND_REMEDIATION_PLAN.md`. One work item
+(`WI-###`) per commit; each addresses a finding (`F-*`) from the audit.
+
+### Chore
+
+- **Stop committing the efficacy benchmark artifact**
+  (`benchmarks/efficacy/efficacy_results.json`, `.gitignore`): remove the
+  generated artifact from version control so the git tree stays clean after
+  every `run.py` invocation. The smoke test now asserts the artifact is
+  *written* rather than matching a committed file. (HK-003)
+
+### Security
+
+- **Opt-in Ed25519 signing and verification of chunk/whisper authorship**
+  (`ncp/identity.py`, `ncp/config.py`, `ncp/mcp/server.py`, `ncp/types.py`,
+  `ncp/encoder.py`, `ncp/stores/sqlite.py`, `ncp/stores/pgvector.py`,
+  `ncp/migrations/008_add_verification_status.sql`): `sign()`/`verify_signature()`
+  operate over a canonical `written_by | sha256(content) | pipeline_id` payload;
+  `ncp_write_memory` and `ncp_emit_whisper` accept an optional `signature`,
+  verify it on ingest, persist the result to a new additive `verified` column
+  (pgvector migration `008`), honor `revoked_at`, and expose the verified marker
+  in fetch results and the pidgin encoding. Gated behind
+  `[identity].require_signatures` (**default false**) so unsigned writes keep
+  working exactly as before; enforcement only rejects unverifiable writes/emits
+  when the flag is enabled. (CAP-T1, WI-013)
+
+### Added
+
+- **Outcome-calibrated reputation** (`ncp/types.py`, `ncp/stores/base.py`,
+  `ncp/stores/calibration.py`, `ncp/stores/sqlite.py`, `ncp/stores/pgvector.py`,
+  `ncp/stores/pgvector_async.py`, `ncp/mcp/server.py`,
+  `ncp/migrations/009_add_outcomes_table.sql`): new `ncp_record_outcome` MCP
+  tool persists task success/failure evidence (`OutcomeRecord`, additive
+  `outcomes` table, pgvector migration `009`) keyed by `turn_id` or explicit
+  `chunk_ids`. `ncp calibrate --feedback` consumes unconsumed outcomes as the
+  primary trust signal (with `[retrieval].usage_prior_weight` scaling the old
+  retrieval-count prior) and marks them consumed, so re-running with no new
+  outcomes is idempotent. Implemented across all three store backends. (CAP-T3)
+- **Reputation-weighted retrieval and whisper gating** (`ncp/stores/retrieval.py`,
+  `ncp/stores/sqlite.py`, `ncp/stores/pgvector.py`, `ncp/stores/pgvector_async.py`,
+  `ncp/config.py`): `[retrieval].reputation_weight` (**default `0.0`**, off)
+  blends each author's Beta-reputation confidence into chunk `base_trust` at
+  query time — `(1-w)·base_trust + w·(alpha/(alpha+beta))`, unknown authors
+  unchanged — and `[whispers].min_author_reputation` (**default `0.0`**, off)
+  makes `drain_whispers` drop whispers whose author's reputation confidence is
+  below the threshold. Defaults preserve exact prior behavior. (CAP-T4)
+- **Semantic work memoization** (`ncp/stores/memo.py`, `ncp/stores/base.py`,
+  `ncp/stores/sqlite.py`, `ncp/stores/pgvector.py`, `ncp/stores/pgvector_async.py`,
+  `ncp/mcp/server.py`, `ncp/config.py`): opt-in `ncp_lookup_memo` /
+  `ncp_record_memo` MCP tools keyed by a normalized task+context SHA-256
+  signature (additive `memo_entries` table). Lookups are gated by
+  `[memoization]` config (`enabled` **default `false`**, staleness
+  `max_age_hours`, `min_outcome` floor, `allow_unverified`) and are
+  advisory-only: the host decides whether a returned memo lets it skip its
+  model call. (CAP-C3)
+- **Sprint 4.1 cleanup** (`ncp/stores/pgvector_async.py`,
+  `ncp/stores/retrieval.py`, `ncp/stores/sqlite.py`, `ncp/stores/pgvector.py`,
+  `ncp/cli.py`, `ncp/mcp/server.py`, `ncp/migrations/010_add_memo_telemetry.sql`):
+  port CAP-T4 reputation-weighted retrieval to `AsyncPgvectorStore.async_query`
+  for sync/async ranking parity; consolidate the blending formula into a single
+  shared `blend_trust` helper used by every backend; and surface memoization
+  telemetry — memo hits, misses, and estimated tokens saved
+  (`SUM(hit_count · output_tokens_est)`, an estimate) — in `ncp status` and
+  `ncp_lookup_memo` responses via an additive `output_tokens_est` column and
+  `memo_stats` counter table (pgvector migration `010`). Status output is
+  unchanged unless memoization is enabled or has data. (S4.1)
+- **Local semantic embeddings for the SQLite tier** (`ncp/adapters/embedding.py`,
+  `ncp/stores/sqlite.py`, `ncp/stores/factory.py`, `ncp/config.py`): add an
+  opt-in `local-embeddings` extra backed by fastembed, persist SQLite chunk
+  embeddings in an additive BLOB column, and use brute-force cosine fusion for
+  SQLite hybrid/vector retrieval when `[embedding].enabled = true`. Defaults
+  stay off; local embeddings fail fast with an install hint when the optional
+  extra is missing. (CAP-C4)
+- **Redundancy-aware MMR context selection** (`ncp/assembler.py`,
+  `ncp/stores/retrieval.py`, `ncp/stores/consolidation.py`, `ncp/config.py`):
+  add opt-in Maximal Marginal Relevance selection before token-budget fitting,
+  using BM25 similarity by default and embedding cosine when chunk embeddings
+  are present. `[retrieval].diversity_lambda` defaults to `1.0` so existing
+  relevance ordering is unchanged; `0.7` is documented as a starting point for
+  reducing near-duplicate context. (CAP-C1)
+- **Query-aware extractive distillation** (`ncp/distill.py`, `ncp/assembler.py`,
+  `ncp/encoder.py`, `ncp/config.py`): add opt-in assembly-time distillation for
+  oversized chunks that fail the context budget, selecting query-relevant
+  sentences/lines without mutating stored content. Distilled chunks carry a
+  `distilled:1` pidgin marker, and `[distillation].enabled` defaults to
+  `false` so existing fit/drop behavior is unchanged. (CAP-C2)
+- **Provider-real matched-budget efficacy benchmark** (`benchmarks/efficacy/`,
+  `docs/NCP_BENCHMARK_EFFICACY_LIVE.md`): replace the old single-scenario
+  window-control harness with a task-set benchmark that compares `ncp`,
+  `sliding_window`, and `rolling_summary` at the same requested budget. The
+  default `mock` provider is deterministic and keyless; `anthropic` is live and
+  writes an explicit skip artifact when `ANTHROPIC_API_KEY` is unset. The
+  harness replaces the old `--continuation-adapter`/`--attempts` flags with
+  `--provider`/`--seeds`. (CAP-E4)
+- **Real per-provider token and USD cost accounting** (`ncp/api.py`,
+  `ncp/adapters/base.py`, `ncp/adapters/*.py`, `ncp/costs.py`, `ncp/types.py`,
+  `ncp/stores/sqlite.py`): adapters now capture the provider response's real
+  `input`/`output`/`cache_read` token usage (`BaseAdapter.last_usage`), which
+  `_build_response` prices via the `[providers]` table instead of fabricating
+  telemetry from whitespace word counts and a hardcoded `cost_usd=0.0`. The
+  local/mock path stays a `chars/4` estimate flagged via a new additive
+  `cost_source` field (`"measured"`/`"estimated"`; defaults to `"measured"`,
+  persisted to `cost_log`). Turn ids gain a `uuid4` suffix
+  (`turn_{ms}_{uuid}`) so two rapid turns no longer overwrite each other's
+  `cost_log` row under `INSERT OR REPLACE`. (CAP-E1)
+- **MIT `LICENSE` file** (`LICENSE`): add the MIT license text with the correct
+  copyright holder to match the badge, `pyproject` `license` metadata, and README
+  footer. (WI-012, F-C5)
+
+### Fixed
+
+- **Migration rollback survives self-dropping DOWN sections**
+  (`ncp/stores/migrations.py`): `MigrationRunner.rollback` now deletes the
+  `ncp_schema_versions` row *before* executing the DOWN SQL, so a DOWN that
+  drops its own schema/version table (e.g. `DROP SCHEMA ... CASCADE`) no longer
+  raises `UndefinedTable` on the follow-up DELETE. Both statements share one
+  transaction, so success commits together and a failed DOWN rolls back and
+  restores the version row.
+- **No score double-counting in `effective_score`** (`ncp/types.py`): the
+  pidgin/display score now equals the single-application retrieval relevance from
+  `RetrievalPolicy.score` instead of re-multiplying recency, trust, and the
+  generation penalty a second time, so the displayed score stays comparable to
+  the ranking score. (WI-008, F-B6)
+- **Idempotent calibration feedback** (`ncp/stores/calibration.py`,
+  `ncp/stores/sqlite.py`, `ncp/stores/pgvector.py`,
+  `ncp/stores/pgvector_async.py`): `ncp calibrate --feedback` now computes trust
+  boosts from the *delta* since the last pass via per-chunk
+  retrieval/dissent watermarks, so re-running it with no new activity no longer
+  walks `base_trust` monotonically toward 1.0/0.0. Reputation rollup consumes the
+  same deltas. (WI-003, F-B1)
+- **MCP path honors the config token budget** (`ncp/mcp/server.py`): both
+  `Assembler` constructions now receive the loaded `config`, so
+  `context_token_budget` applies over `/mcp` even when the client omits
+  `max_tokens`. (WI-004, F-B2)
+- **SQLite write hardening** (`ncp/stores/sqlite.py`): add `PRAGMA busy_timeout`
+  and wrap the check-then-insert `write()` path in `BEGIN IMMEDIATE`; a same-`src`
+  rewrite now preserves `created_at`/`retrieval_count`/`dissent_count` instead of
+  clobbering them, so concurrent writers no longer raise `SQLITE_BUSY` and
+  feedback history survives. (WI-009, F-C1/F-C2)
+- **Unauthenticated loopback quickstart** (`ncp/cli.py`,
+  `ncp/templates/config.toml.example`): `ncp init` no longer auto-mints an
+  `auth_token` for loopback SQLite, so the documented "init → copy config →
+  connect" flow no longer 401s against its own server. (WI-010, F-C3)
+
+- **Bounded `ncp_fetch` reads** (`ncp/mcp/server.py`,
+  `ncp/stores/redis_coordination.py`): clamp the per-fetch `k` to the schema max
+  (4) so a `k=500` request serves at most 4 chunks; report the real Redis-mode
+  `fetch_budget_remaining` instead of a hardcoded 3 (new
+  `RedisCoordination.fetch_budget_remaining`); and bound the in-memory fetch
+  session table with an LRU cap + TTL so rotating `session_id`s can't grow it
+  without limit. The per-session cap redesign is deferred (needs verified
+  identity, CAP-T1). (WI-005, F-B3)
+
+- **Enforced chunk expiry at read and GC** (`ncp/stores/sqlite.py`,
+  `ncp/stores/pgvector.py`, `ncp/stores/pgvector_async.py`): all retrieval read
+  paths (`query`, FTS/lexical, vector, `get_chunks_by_ids`, working-zone loads)
+  now exclude chunks whose `expiry` has passed (`expiry IS NULL OR expiry >
+  now`), and soft/hard GC physically reclaim expired chunks — so an expired
+  "proven" fact is no longer served forever. (WI-006, F-B4)
+
+- **Stopped silent data loss** (`ncp/assembler.py`, `ncp/stores/sqlite.py`,
+  `ncp/stores/pgvector.py`, `ncp/migrations/007_add_whisper_dissent_target.sql`):
+  (a) `Assembler._write_with_retry` now returns whether the chunk was persisted,
+  so a deduplication-suppressed write is reported instead of treated as success;
+  (b) `dissent_target` is now a real column on the SQLite and pgvector `whispers`
+  schema (new migration `007`) and round-trips through emit/read; (c) a
+  `world_check` whisper missing `detected_drift` is skipped instead of silently
+  zeroing the agent's drift. (WI-007, F-B5)
+
+- **Dedup-suppressed writes surfaced end to end from `post_turn`**
+  (`ncp/types.py`, `ncp/assembler.py`, `ncp/mcp/server.py`): `post_turn` and
+  `post_turn_async` now collect the chunk_ids whose memory write returned
+  `False` into a new `TurnRecord.suppressed_chunk_ids` field, `ncp_post_turn`
+  accepts `memory_chunks` and reports `suppressed_chunk_ids` in its response —
+  so a host learns which chunks the store's dedup check dropped. (WI-007a, F-B5)
+
+### Security
+
+- **Escaped pidgin wire delimiters** (`ncp/encoder.py`): chunk/whisper content is
+  neutralized before assembly so stored text cannot forge `[NCP:...]` section
+  headers or counterfeit `src:`/`trust:`/`from:` provenance in another agent's
+  assembled context. (WI-014, F-S1)
+
+### Changed
+
+- **Honest benchmark claims** (`README.md`, `benchmarks/mace/README.md`): replace
+  the stale headline MACE score with the reproduced composite (0.8915), lead the
+  coding-pipeline table with the sliding-window comparison, and annotate each
+  benchmark row with a one-line honest caveat instead of deleting it. (WI-001,
+  F-A3)
+- **Reconcile trust/identity/drift/cost language with reality** (`README.md`,
+  `docs/NCP_PROTOCOL_SPEC.md`): document opt-in Ed25519 authorship signing
+  (`[identity].require_signatures`, default false) and the `verified` wire marker,
+  mark `base_trust`/`drift_score` as self-reported advisory inputs (computed drift
+  is future work WI-016), state that reputation is computed/displayed but does not
+  yet weight retrieval (CAP-T4/WI-015), and clarify cost telemetry is measured for
+  provider adapters and estimated for local/mock; remaining gaps point at the
+  north-star roadmap. (WI-002)
+
+### Docs
+
+- **Document the WI-003 counter-reset side effect** (`ncp/cli.py` `trust-drift`
+  help, `README.md` operator commands): note that because `ncp calibrate
+  --feedback` consumes and resets the per-chunk retrieval/dissent watermarks,
+  `ncp trust-drift`'s "most retrieved" view reflects activity since the last
+  calibration, not lifetime totals. (HK-002)
+
+### CI
+
+- **pgvector + redis integration job** (`.github/workflows/ci.yml`): add a
+  `pgvector-redis` job that runs the durable/coordination tier against
+  `pgvector/pgvector:pg16` and `redis:7-alpine` service containers (image tags
+  matching `compose.yaml`) with `NCP_RUN_PGVECTOR_INTEGRATION=1`, so the
+  previously `importorskip`-ed pgvector store, migration, retrieval-feedback, and
+  async coordination tests execute on every PR instead of silently skipping.
+  (WI-011, F-C4)
+
 ## [1.2.1] - 2026-06-30
 
 ### Added
@@ -366,7 +583,7 @@ MACE benchmark plus async pgvector observability parity. No breaking changes.
 - **Docs**: README benchmark section now points to MACE as the end-to-end
   benchmark entry point.
 - **Canonical benchmark run**: `python benchmarks/mace/run.py --turns 40`
-  currently yields composite `0.9608` with D1 `0.8695`, D2 `1.0000`,
+  currently yields composite `0.8915` with D1 `0.6384`, D2 `1.0000`,
   D3 `1.0000`, D4 `1.0000`.
 - **`AsyncPgvectorStore` observability parity** (`ncp/stores/pgvector_async.py`):
   added native async `async_status_detail()`, `async_cost_summary()`, and

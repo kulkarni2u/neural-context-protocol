@@ -54,6 +54,7 @@ DEFAULT_CONFIG = {
         "default_ttl_seconds": 1800,
         "max_per_drain": 3,
         "min_confidence": 0.60,
+        "min_author_reputation": 0.0,
     },
     "observability": {
         "log_level": "info",
@@ -69,6 +70,9 @@ DEFAULT_CONFIG = {
         "edge_expansion_decay": 0.7,
         "trust_propagation_factor": 0.5,
         "dissent_weight": 0.2,
+        "diversity_lambda": 1.0,
+        "usage_prior_weight": 1.0,
+        "reputation_weight": 0.0,
     },
     "reputation": {
         "gain": 4.0,
@@ -78,7 +82,11 @@ DEFAULT_CONFIG = {
     "embedding": {
         "enabled": False,
         "provider": "local",
-        "model": "sentence-transformers/all-MiniLM-L6-v2",
+        "model": "BAAI/bge-small-en-v1.5",
+    },
+    "distillation": {
+        "enabled": False,
+        "min_chunk_tokens": 120,
     },
     "consolidation": {
         "enabled": True,
@@ -92,6 +100,21 @@ DEFAULT_CONFIG = {
     },
     "server": {
         "auth_token": "",
+    },
+    "memoization": {
+        "enabled": False,
+        "max_age_hours": 24,
+        "min_outcome": 0.0,
+        "allow_unverified": False,
+        "similarity_threshold": 0.95,
+    },
+    "identity": {
+        # OPT-IN authorship enforcement. When false (default) unsigned writes and
+        # whispers keep working exactly as before and any supplied signature is
+        # verified and recorded but never required. When true, a write/emit whose
+        # authorship cannot be verified (missing/bad signature or revoked identity)
+        # is rejected.
+        "require_signatures": False,
     },
     "providers": {
         "pricing": {
@@ -202,6 +225,18 @@ class NCPConfig:
         return float(self.values.get("retrieval", {}).get("dissent_weight", 0.2))
 
     @property
+    def diversity_lambda(self) -> float:
+        return float(self.values.get("retrieval", {}).get("diversity_lambda", 1.0))
+
+    @property
+    def usage_prior_weight(self) -> float:
+        return float(self.values.get("retrieval", {}).get("usage_prior_weight", 1.0))
+
+    @property
+    def reputation_weight(self) -> float:
+        return float(self.values.get("retrieval", {}).get("reputation_weight", 0.0))
+
+    @property
     def reputation_gain(self) -> float:
         return float(self.values.get("reputation", {}).get("gain", 4.0))
 
@@ -250,6 +285,10 @@ class NCPConfig:
         return int(self.values.get("whispers", {}).get("default_ttl_seconds", 1800))
 
     @property
+    def whisper_min_author_reputation(self) -> float:
+        return float(self.values.get("whispers", {}).get("min_author_reputation", 0.0))
+
+    @property
     def embedding_enabled(self) -> bool:
         return bool(self.values.get("embedding", {}).get("enabled", False))
 
@@ -259,7 +298,15 @@ class NCPConfig:
 
     @property
     def embedding_model(self) -> str:
-        return str(self.values.get("embedding", {}).get("model", "sentence-transformers/all-MiniLM-L6-v2"))
+        return str(self.values.get("embedding", {}).get("model", "BAAI/bge-small-en-v1.5"))
+
+    @property
+    def distillation_enabled(self) -> bool:
+        return bool(self.values.get("distillation", {}).get("enabled", False))
+
+    @property
+    def distillation_min_chunk_tokens(self) -> int:
+        return int(self.values.get("distillation", {}).get("min_chunk_tokens", 120))
 
     @property
     def server_auth_token(self) -> str | None:
@@ -269,6 +316,30 @@ class NCPConfig:
     @property
     def retention_max_working_chunks_per_pipeline(self) -> int:
         return int(self.values.get("retention", {}).get("max_working_chunks_per_pipeline", 0))
+
+    @property
+    def memoization_enabled(self) -> bool:
+        return bool(self.values.get("memoization", {}).get("enabled", False))
+
+    @property
+    def memoization_max_age_hours(self) -> int:
+        return int(self.values.get("memoization", {}).get("max_age_hours", 24))
+
+    @property
+    def memoization_min_outcome(self) -> float:
+        return float(self.values.get("memoization", {}).get("min_outcome", 0.0))
+
+    @property
+    def memoization_allow_unverified(self) -> bool:
+        return bool(self.values.get("memoization", {}).get("allow_unverified", False))
+
+    @property
+    def memoization_similarity_threshold(self) -> float:
+        return float(self.values.get("memoization", {}).get("similarity_threshold", 0.95))
+
+    @property
+    def require_signatures(self) -> bool:
+        return bool(self.values.get("identity", {}).get("require_signatures", False))
 
 def load_config(
     path: str | Path | None = None,
@@ -345,6 +416,11 @@ def _apply_env_overrides(values: dict[str, Any], env: dict[str, str]) -> None:
         values["embedding"]["provider"] = env["NCP_EMBEDDING_PROVIDER"]
     if "NCP_EMBEDDING_MODEL" in env:
         values["embedding"]["model"] = env["NCP_EMBEDDING_MODEL"]
+    if "NCP_DISTILLATION_ENABLED" in env:
+        val = env["NCP_DISTILLATION_ENABLED"].lower()
+        values["distillation"]["enabled"] = val in {"true", "1", "yes"}
+    if "NCP_DISTILLATION_MIN_CHUNK_TOKENS" in env:
+        values["distillation"]["min_chunk_tokens"] = int(env["NCP_DISTILLATION_MIN_CHUNK_TOKENS"])
     if "NCP_GENERATION_PENALTY_BASE" in env:
         values["retrieval"]["generation_penalty_base"] = float(env["NCP_GENERATION_PENALTY_BASE"])
     if "NCP_EDGE_EXPANSION" in env:
@@ -354,6 +430,8 @@ def _apply_env_overrides(values: dict[str, Any], env: dict[str, str]) -> None:
         values["retrieval"]["trust_propagation_factor"] = float(env["NCP_TRUST_PROPAGATION_FACTOR"])
     if "NCP_DISSENT_WEIGHT" in env:
         values["retrieval"]["dissent_weight"] = float(env["NCP_DISSENT_WEIGHT"])
+    if "NCP_DIVERSITY_LAMBDA" in env:
+        values["retrieval"]["diversity_lambda"] = float(env["NCP_DIVERSITY_LAMBDA"])
     if "NCP_REPUTATION_GAIN" in env:
         values["reputation"]["gain"] = float(env["NCP_REPUTATION_GAIN"])
     if "NCP_REPUTATION_FORGET" in env:

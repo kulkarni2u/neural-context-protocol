@@ -1,76 +1,68 @@
-"""Sliding-window control efficacy benchmark — NCP vs fixed window.
+#!/usr/bin/env python3
+"""Provider efficacy benchmark at matched context budget.
 
-The scenario plants an oauth constraint + dead-end facts into a fresh SQLite
-store, then asks both the NCP condition and the sliding-window condition to
-produce an integration plan. Scoring is deterministic: the response must name
-the exact approved path and must NOT propose any previously rejected dead-end
-paths.
+This harness compares three context-construction conditions over the existing
+task-success task set:
+
+- ``ncp``: NCP assembly from a SQLite store.
+- ``sliding_window``: most recent raw turns that fit the same budget.
+- ``rolling_summary``: a deterministic extractive rolling summary plus recent
+  turns, fit to the same budget.
+
+``--provider mock`` is deterministic and keyless; it measures context adequacy,
+not model reasoning. ``--provider anthropic`` is live and skips clearly when
+``ANTHROPIC_API_KEY`` is unset.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
+import os
+import random
 import statistics
-import subprocess
 import tempfile
-import time
 from pathlib import Path
 from typing import Any
 
+from benchmarks.task_success.tasks import Task, get_tasks, score_response
 from ncp.api import agent as make_conscious
 from ncp.assembler import Assembler
-from ncp.benchmarks import estimate_tokens, token_unit
-from ncp.dogfood import get_live_provider_readiness, load_dogfood_adapter
+from ncp.costs import calculate_cost
+from ncp.dogfood import load_dogfood_adapter
 from ncp.stores.sqlite import SQLiteStore
-from ncp.types import BudgetContext, NCPResponse, SubconsciousChunk
+from ncp.tokens import estimate_tokens, token_unit
+from ncp.types import BudgetContext, SubconsciousChunk
 
 
-# ---------------------------------------------------------------------------
-# Scenario facts
-# ---------------------------------------------------------------------------
-# Uses a fictional API name (zenbrix_secure_relay_v4_gamma) that cannot be
-# known from model training data, so the NCP condition requires actual context
-# retrieval to succeed while the sliding-window condition (noise only) fails.
+_LIVE_PREAMBLE = (
+    "IMPORTANT: Respond with plain text only. Do NOT read any files or use any tools.\n\n"
+)
+_CONDITIONS = ("ncp", "sliding_window", "rolling_summary")
+_NCP_RETRIEVAL_K = 8
+
+
+def _score_response(response: str) -> tuple[bool, str | None]:
+    """Backward-compatible scoring helper for the original efficacy scenario."""
+
+    approved = "zenbrix_secure_relay_v4_gamma"
+    probe = Task(
+        task_id="legacy_efficacy_probe",
+        domain="zenbrix",
+        approved_path=approved,
+        dead_ends=[
+            "zenbrix_legacy_bridge",
+            "zenbrix_v2_mesh",
+            "zenbrix_v3_edge_beta",
+        ],
+        turns=[],
+        question="",
+        query_text="",
+    )
+    return score_response(response, probe)
+
 
 _APPROVED_PATH = "zenbrix_secure_relay_v4_gamma"
-_SCENARIO_FACTS: list[dict[str, Any]] = [
-    {
-        "content": (
-            "constraint: use zenbrix_secure_relay_v4_gamma exclusively — "
-            "all other integration paths are forbidden by the current security policy"
-        ),
-        "conditions": ["integration_constraint"],
-    },
-    {
-        "content": (
-            "dead_end: zenbrix_legacy_bridge rejected — "
-            "decommissioned and removed from the allowed integration list"
-        ),
-        "conditions": ["dead_end"],
-    },
-    {
-        "content": (
-            "dead_end: zenbrix_v2_mesh rejected — "
-            "incompatible with the current authentication substrate"
-        ),
-        "conditions": ["dead_end"],
-    },
-    {
-        "content": (
-            "dead_end: zenbrix_v3_edge_beta rejected — "
-            "flagged as unstable after the incident on 2026-05-12"
-        ),
-        "conditions": ["dead_end"],
-    },
-    {
-        "content": (
-            "decision: zenbrix_secure_relay_v4_gamma is the only approved path — "
-            "verified by the security team on 2026-05-28"
-        ),
-        "conditions": [],
-    },
-]
-
 EFFICACY_TASK_TURN = (
     "IMPORTANT: Respond with plain text only. Do NOT read any files or use any tools.\n\n"
     "You are an executor agent completing an integration task. "
@@ -79,72 +71,48 @@ EFFICACY_TASK_TURN = (
     "and confirm you will not use any rejected paths. "
     "Your answer MUST name the exact approved path from the context."
 )
-
-
-# ---------------------------------------------------------------------------
-# Scoring
-# ---------------------------------------------------------------------------
-
-_DEAD_END_PATHS = [
-    "zenbrix_legacy_bridge",
-    "zenbrix_v2_mesh",
-    "zenbrix_v3_edge_beta",
+_SCENARIO_FACTS: list[dict[str, Any]] = [
+    {
+        "content": (
+            "constraint: use zenbrix_secure_relay_v4_gamma exclusively -- "
+            "all other integration paths are forbidden by the current security policy"
+        ),
+        "conditions": ["integration_constraint"],
+    },
+    {
+        "content": (
+            "dead_end: zenbrix_legacy_bridge rejected -- "
+            "decommissioned and removed from the allowed integration list"
+        ),
+        "conditions": ["dead_end"],
+    },
+    {
+        "content": (
+            "dead_end: zenbrix_v2_mesh rejected -- "
+            "incompatible with the current authentication substrate"
+        ),
+        "conditions": ["dead_end"],
+    },
+    {
+        "content": (
+            "dead_end: zenbrix_v3_edge_beta rejected -- "
+            "flagged as unstable after the incident on 2026-05-12"
+        ),
+        "conditions": ["dead_end"],
+    },
+    {
+        "content": (
+            "decision: zenbrix_secure_relay_v4_gamma is the only approved path -- "
+            "verified by the security team on 2026-05-28"
+        ),
+        "conditions": [],
+    },
 ]
 
-_NEGATION_MARKERS = (
-    "will not use",
-    "do not use",
-    "don't use",
-    "won't use",
-    "not use",
-    "avoid",
-    "rejected",
-    "forbidden",
-    "decommissioned",
-    "removed from the allowed integration list",
-)
-
-
-def _mentions_dead_end_as_retry(response_lower: str, path: str) -> bool:
-    """Return True when a dead-end path is proposed, not merely negated."""
-
-    start = 0
-    while True:
-        idx = response_lower.find(path, start)
-        if idx == -1:
-            return False
-        window_start = max(0, idx - 80)
-        window_end = min(len(response_lower), idx + len(path) + 80)
-        context_window = response_lower[window_start:window_end]
-        if not any(marker in context_window for marker in _NEGATION_MARKERS):
-            return True
-        start = idx + len(path)
-
-
-def _score_response(response: str) -> tuple[bool, str | None]:
-    """Score whether the response correctly names the approved integration path.
-
-    Success: response mentions the approved path (_APPROVED_PATH) AND does not
-    propose any of the rejected dead-end paths.
-
-    The approved path is a fictional identifier only available in the NCP context,
-    so the sliding-window condition (which only sees noise) cannot pass this check.
-    """
-    lower = response.lower()
-    if _APPROVED_PATH not in lower:
-        return False, "missing_approved_path"
-    for path in _DEAD_END_PATHS:
-        if _mentions_dead_end_as_retry(lower, path):
-            return False, f"retried_dead_end:{path}"
-    return True, None
-
-
-# ---------------------------------------------------------------------------
-# Store seeding + pipeline noise helpers
-# ---------------------------------------------------------------------------
 
 def _seed_store(store: SQLiteStore, pipeline_id: str) -> list[str]:
-    """Write the scenario facts into the store. Returns their contents."""
+    """Seed the legacy single-scenario facts used by cross-host benchmarks."""
+
     contents: list[str] = []
     for fact in _SCENARIO_FACTS:
         chunk = SubconsciousChunk(
@@ -152,13 +120,13 @@ def _seed_store(store: SQLiteStore, pipeline_id: str) -> list[str]:
             src="user_verified",
             base_trust=0.98,
             relevance=0.95,
-            content=fact["content"],
-            conditions=fact["conditions"],
+            content=str(fact["content"]),
+            conditions=list(fact["conditions"]),
             pipeline_id=pipeline_id,
             written_by="bench_seed",
         )
         store.write(chunk)
-        contents.append(fact["content"])
+        contents.append(str(fact["content"]))
     return contents
 
 
@@ -167,46 +135,33 @@ def _add_pipeline_noise(
     pipeline_id: str,
     n_turns: int = 20,
 ) -> list[str]:
-    """Write filler chunks AFTER the constraint facts to simulate pipeline depth.
+    """Write filler chunks after legacy facts so recency windows lose constraints."""
 
-    This pushes the constraint facts into the past so a recency-based sliding
-    window only sees noise, while NCP's query-based retrieval still finds the
-    high-relevance constraint chunks.
-
-    Returns the filler content strings in write order.
-    """
     noise: list[str] = []
-    for i in range(1, n_turns + 1):
-        # Each entry is ~50 words; 20 entries ≈ 1000 words — well above a 600-token
-        # budget so the sliding window can only hold noise, never constraint facts.
+    for index in range(1, n_turns + 1):
         content = (
-            f"turn {i:02d}: routine implementation progress — "
+            f"turn {index:02d}: routine implementation progress -- "
             "the executor is validating endpoint configuration, verifying TLS certificate "
             "bindings, checking exponential-backoff retry logic, and confirming the "
             "service layer dispatch chain; the planner has not issued new constraints "
             "this turn; all checks nominal; proceeding to the next pipeline stage"
         )
-        chunk = SubconsciousChunk(
-            layer="episodic",
-            src="agent_inferred",
-            base_trust=0.4,
-            relevance=0.05,
-            content=content,
-            pipeline_id=pipeline_id,
-            written_by="bench_noise",
+        store.write(
+            SubconsciousChunk(
+                layer="episodic",
+                src="agent_inferred",
+                base_trust=0.4,
+                relevance=0.05,
+                content=content,
+                pipeline_id=pipeline_id,
+                written_by="bench_noise",
+            )
         )
-        store.write(chunk)
         noise.append(content)
     return noise
 
 
 def _build_window_context(transcript: list[str], budget: int) -> str:
-    """Build a sliding-window context from the MOST RECENT transcript entries.
-
-    Fills from the end of the transcript backwards until the budget (in tokens)
-    is reached. With constraints first and noise last in the transcript, a tight
-    budget returns only noise — no constraint information.
-    """
     selected: list[str] = []
     used = 0
     for entry in reversed(transcript):
@@ -218,302 +173,341 @@ def _build_window_context(transcript: list[str], budget: int) -> str:
     return "\n".join(reversed(selected)) if selected else ""
 
 
-# ---------------------------------------------------------------------------
-# NCP condition
-# ---------------------------------------------------------------------------
-
-def _run_ncp_attempt(
-    adapter: Any,
-    store_path: Path,
-    pipeline_id: str,
-    budget: int,
-) -> dict[str, object]:
-    """Run one NCP-condition attempt.
-
-    Seeds constraint facts THEN adds pipeline noise so NCP must retrieve
-    constraint chunks through the noise via query-based relevance scoring.
-    """
+def _ncp_context(task: Task, budget: int, pipeline_id: str, store_path: Path) -> tuple[str, int]:
     store = SQLiteStore(store_path)
-    _seed_store(store, pipeline_id)
-    _add_pipeline_noise(store, pipeline_id)   # push constraints into past
+    for index, turn in enumerate(task.turns, start=1):
+        store.write(
+            SubconsciousChunk(
+                layer=turn.layer,  # type: ignore[arg-type]
+                src=turn.src,  # type: ignore[arg-type]
+                base_trust=turn.base_trust,
+                relevance=turn.relevance,
+                content=turn.content,
+                conditions=list(turn.conditions),
+                pipeline_id=pipeline_id,
+                written_by=f"agent_turn_{index:02d}",
+            )
+        )
 
     assembler = Assembler(store=store)
     conscious = make_conscious(
         id="bench_executor",
         role="pravaha",
-        owns=["integration"],
+        owns=[task.domain],
         must_not=["rejected_paths"],
-        task="oauth_integration_plan",
+        task=f"{task.task_id}_question",
         slot="build",
-        intent="oauth_pkce_integration",
+        intent="select_approved_path",
         pipeline_id=pipeline_id,
-    )
-    budget_ctx = BudgetContext(
-        ctx_used=0.7,    # late-pipeline pressure so assembler works hard to retrieve
-        pressure="medium",
     )
     assembly = assembler.assemble(
         conscious=conscious,
-        budget=budget_ctx,
-        query_text="oauth constraint forbidden paths integration plan",
-        k=4,
+        budget=BudgetContext(ctx_used=0.7, pressure="medium"),
+        query_text=task.query_text,
+        k=_NCP_RETRIEVAL_K,
+        max_tokens=budget,
     )
+    return assembly.context, estimate_tokens(assembly.context)
 
-    # Combine context + task into user_turn so all adapters (including ClaudeCLI,
-    # which ignores ncp_context in its fetch-inject design) receive the full prompt.
-    full_turn = f"[NCP assembled context]\n{assembly.context}\n\n[Task]\n{EFFICACY_TASK_TURN}"
-    prompt_tokens = estimate_tokens(full_turn)
 
+def _sliding_window_context(task: Task, budget: int) -> tuple[str, int]:
+    selected: list[str] = []
+    used = 0
+    for turn in reversed(task.turns):
+        tokens = estimate_tokens(turn.content)
+        if used + tokens > budget:
+            break
+        selected.append(turn.content)
+        used += tokens
+    context = "\n".join(reversed(selected)) if selected else ""
+    return context, estimate_tokens(context)
+
+
+def _compress_turn(turn_text: str, max_words: int = 22) -> str:
+    words = turn_text.split()
+    if len(words) <= max_words:
+        return turn_text
+    return " ".join(words[:max_words])
+
+
+def _rolling_summary_context(task: Task, budget: int) -> tuple[str, int]:
+    recent_turns = task.turns[-4:]
+    older_turns = task.turns[:-4]
+    summary_lines = [
+        f"summary turn {index + 1}: {_compress_turn(turn.content)}"
+        for index, turn in enumerate(older_turns)
+    ]
+    recent_lines = [turn.content for turn in recent_turns]
+    candidates = [*summary_lines, *recent_lines]
+
+    selected: list[str] = []
+    used = 0
+    for entry in candidates:
+        tokens = estimate_tokens(entry)
+        if used + tokens > budget:
+            continue
+        selected.append(entry)
+        used += tokens
+    context = "\n".join(selected)
+    return context, estimate_tokens(context)
+
+
+def _mock_response(context: str, task: Task) -> str:
+    if task.approved_path in context.lower():
+        return f"I will use {task.approved_path} and will not use any rejected paths"
+    return "no approved path found in context"
+
+
+def _live_response(adapter: Any, context: str, task: Task) -> str:
+    full_turn = f"{_LIVE_PREAMBLE}[Context]\n{context}\n\n[Task]\n{task.question}"
+    return adapter.call(ncp_context="", user_turn=full_turn)
+
+
+def _price_response(
+    *,
+    provider: str,
+    prompt_tokens: int,
+    output_tokens: int,
+) -> tuple[str, float, str]:
+    if provider == "mock":
+        return "mock", 0.0, "not_applicable"
+    model = "claude-sonnet-4-20250514"
     try:
-        response_text = adapter.call(
-            ncp_context="",
-            user_turn=full_turn,
-        )
-    except subprocess.TimeoutExpired:
-        return {
-            "success": False,
-            "prompt_tokens": prompt_tokens,
-            "failure_type": "timeout",
-            "response": "",
-        }
-    except RuntimeError as exc:
-        return {
-            "success": False,
-            "prompt_tokens": prompt_tokens,
-            "failure_type": f"adapter_error:{str(exc)[:80]}",
-            "response": "",
-        }
-
-    # post_turn (contract compliance)
-    ncp_response = NCPResponse(
-        content=response_text,
-        input_tokens=prompt_tokens,
-        output_tokens=estimate_tokens(response_text),
-        cost_usd=0.0,
-        model="bench_ncp",
-        pipeline_id=pipeline_id,
-        turn_id=f"ncp_{int(time.time() * 1000)}",
-        latency_ms=1,
-    )
-    assembler.post_turn(
-        conscious=conscious,
-        response=ncp_response,
-        result_summary=response_text.splitlines()[0] if response_text else "",
-        result_full=response_text,
-    )
-
-    success, failure_type = _score_response(response_text)
-    return {
-        "success": success,
-        "prompt_tokens": prompt_tokens,
-        "failure_type": failure_type,
-        "response": response_text,
-    }
+        cost = calculate_cost(
+            model=model,
+            input_tokens=prompt_tokens,
+            output_tokens=output_tokens,
+        ).total_cost_usd
+    except KeyError:
+        cost = 0.0
+    return model, cost, "estimated_from_token_estimator"
 
 
-# ---------------------------------------------------------------------------
-# Sliding-window condition
-# ---------------------------------------------------------------------------
+def _condition_context(task: Task, condition: str, budget: int, pipeline_id: str, store_dir: Path) -> tuple[str, int]:
+    if condition == "ncp":
+        return _ncp_context(task, budget, pipeline_id, store_dir / f"{pipeline_id}.db")
+    if condition == "sliding_window":
+        return _sliding_window_context(task, budget)
+    if condition == "rolling_summary":
+        return _rolling_summary_context(task, budget)
+    raise ValueError(f"unknown condition {condition!r}")
 
-def _run_sliding_window_attempt(
-    adapter: Any,
-    store_path: Path,
-    pipeline_id: str,
+
+def _run_one(
+    *,
+    task: Task,
+    condition: str,
+    seed: int,
     budget: int,
+    provider: str,
+    adapter: Any | None,
+    store_dir: Path,
+    pipeline_id: str,
 ) -> dict[str, object]:
-    """Run one sliding-window condition attempt.
-
-    Seeds the same constraint facts then adds the same pipeline noise, but
-    builds context from the MOST RECENT transcript entries (the noise), not
-    from the full fact list. At budget=600 the window fills with noise turns;
-    constraint facts planted earlier fall outside the window.
-    """
-    store = SQLiteStore(store_path)
-    fact_contents = _seed_store(store, pipeline_id)
-    noise_contents = _add_pipeline_noise(store, pipeline_id)
-    transcript = fact_contents + noise_contents   # constraints first, noise last
-
-    sliding_window_context = _build_window_context(transcript, budget)
-
-    full_turn = f"[Sliding-window context]\n{sliding_window_context}\n\n[Task]\n{EFFICACY_TASK_TURN}"
-    prompt_tokens = estimate_tokens(full_turn)
-
-    try:
-        response_text = adapter.call(
-            ncp_context="",
-            user_turn=full_turn,
-        )
-    except subprocess.TimeoutExpired:
-        return {
-            "success": False,
-            "prompt_tokens": prompt_tokens,
-            "failure_type": "timeout",
-            "response": "",
-        }
-    except RuntimeError as exc:
-        return {
-            "success": False,
-            "prompt_tokens": prompt_tokens,
-            "failure_type": f"adapter_error:{str(exc)[:80]}",
-            "response": "",
-        }
-
-    success, failure_type = _score_response(response_text)
+    context, context_tokens = _condition_context(
+        task,
+        condition,
+        budget,
+        f"{pipeline_id}_seed_{seed}_{task.task_id}_{condition}",
+        store_dir,
+    )
+    prompt = f"[Context]\n{context}\n\n[Task]\n{task.question}"
+    prompt_tokens = estimate_tokens(prompt)
+    if provider == "mock":
+        response = _mock_response(context, task)
+    else:
+        assert adapter is not None
+        response = _live_response(adapter, context, task)
+    success, failure_type = score_response(response, task)
+    model, cost_usd, cost_source = _price_response(
+        provider=provider,
+        prompt_tokens=prompt_tokens,
+        output_tokens=estimate_tokens(response),
+    )
     return {
+        "seed": seed,
+        "task_id": task.task_id,
+        "condition": condition,
         "success": success,
-        "prompt_tokens": prompt_tokens,
         "failure_type": failure_type,
-        "response": response_text,
+        "context_tokens": context_tokens,
+        "prompt_tokens": prompt_tokens,
+        "cost_usd": cost_usd,
+        "cost_source": cost_source,
+        "model": model,
+        "response_excerpt": response[:200],
     }
 
 
-# ---------------------------------------------------------------------------
-# Summary helper
-# ---------------------------------------------------------------------------
+def _summarize(rows: list[dict[str, object]]) -> dict[str, dict[str, object]]:
+    by_condition: dict[str, dict[str, object]] = {}
+    for condition in _CONDITIONS:
+        subset = [row for row in rows if row["condition"] == condition]
+        if not subset:
+            by_condition[condition] = {
+                "success_rate": 0.0,
+                "mean_tokens": 0.0,
+                "mean_cost_usd_per_task": 0.0,
+                "n": 0,
+            }
+            continue
+        by_condition[condition] = {
+            "success_rate": sum(1 for row in subset if row["success"]) / len(subset),
+            "mean_tokens": statistics.mean(int(row["prompt_tokens"]) for row in subset),
+            "mean_cost_usd_per_task": statistics.mean(float(row["cost_usd"]) for row in subset),
+            "n": len(subset),
+        }
+    return by_condition
 
-def _summarize(attempts: list[dict[str, object]]) -> dict[str, object]:
-    if not attempts:
-        return {"success_rate": 0.0, "median_prompt_tokens": 0.0, "timeout_rate": 0.0}
-    successes = sum(1 for a in attempts if a["success"])
-    timeouts = sum(1 for a in attempts if a.get("failure_type") == "timeout")
-    tokens = [int(a["prompt_tokens"]) for a in attempts]
-    return {
-        "success_rate": successes / len(attempts),
-        "median_prompt_tokens": float(statistics.median(tokens)) if tokens else 0.0,
-        "timeout_rate": timeouts / len(attempts),
-    }
 
+def _anthropic_skip(provider: str) -> str | None:
+    if provider == "anthropic" and not os.environ.get("ANTHROPIC_API_KEY"):
+        return "ANTHROPIC_API_KEY is unset; live Anthropic efficacy run skipped"
+    return None
 
-# ---------------------------------------------------------------------------
-# Main entry point
-# ---------------------------------------------------------------------------
 
 def run_efficacy(
     *,
-    continuation_adapter: str,
-    budget: int = 600,
-    attempts: int = 1,
+    provider: str = "mock",
+    budget: int = 400,
+    seeds: int = 5,
+    n_tasks: int | None = None,
     adapter_timeout_seconds: float | None = None,
     pipeline_id: str = "bench_efficacy",
-    cwd: str | Path | None = None,
+    artifact_path: str | Path | None = None,
+    store_dir: str | Path | None = None,
 ) -> dict[str, object]:
-    """Run the sliding-window control efficacy benchmark for one adapter.
+    if budget < 1:
+        raise ValueError("budget must be >= 1")
+    if seeds < 1:
+        raise ValueError("seeds must be >= 1")
+    provider = provider.lower()
+    if provider not in {"mock", "anthropic"}:
+        raise ValueError("provider must be 'mock' or 'anthropic'")
 
-    Returns a structured artifact with NCP and sliding-window conditions,
-    per-attempt detail, and summary statistics.
-    """
-    if attempts < 1:
-        raise ValueError("attempts must be >= 1")
+    skip_reason = _anthropic_skip(provider)
+    if skip_reason is not None:
+        artifact: dict[str, object] = {
+            "benchmark": "provider_real_efficacy",
+            "provider": provider,
+            "skipped": True,
+            "skip_reason": skip_reason,
+            "rows": [],
+            "summary": {"by_condition": _summarize([])},
+        }
+        _write_artifact(artifact, artifact_path)
+        return artifact
 
-    ncp_attempts: list[dict[str, object]] = []
-    sw_attempts: list[dict[str, object]] = []
+    adapter = None
+    if provider == "anthropic":
+        adapter = load_dogfood_adapter(provider, timeout_seconds=adapter_timeout_seconds)
 
-    for attempt_index in range(1, attempts + 1):
-        attempt_pipeline_id = f"{pipeline_id}_attempt_{attempt_index}"
+    tasks = get_tasks(n_tasks)
+    rows: list[dict[str, object]] = []
 
-        # Check readiness (advisory only — we still attempt).
-        get_live_provider_readiness(continuation_adapter)
+    def collect(target_dir: Path) -> None:
+        for seed in range(1, seeds + 1):
+            ordered = list(tasks)
+            random.Random(seed).shuffle(ordered)
+            for task in ordered:
+                for condition in _CONDITIONS:
+                    rows.append(
+                        _run_one(
+                            task=task,
+                            condition=condition,
+                            seed=seed,
+                            budget=budget,
+                            provider=provider,
+                            adapter=adapter,
+                            store_dir=target_dir,
+                            pipeline_id=pipeline_id,
+                        )
+                    )
 
-        # Load adapter.
-        adapter = load_dogfood_adapter(
-            continuation_adapter,
-            timeout_seconds=adapter_timeout_seconds,
+    if store_dir is None:
+        with tempfile.TemporaryDirectory() as tmp:
+            collect(Path(tmp))
+    else:
+        target = Path(store_dir)
+        target.mkdir(parents=True, exist_ok=True)
+        collect(target)
+
+    artifact = {
+        "benchmark": "provider_real_efficacy",
+        "claim": (
+            "Mock mode measures context adequacy at matched budget; live provider mode "
+            "measures model task success and cost at the same budget."
+        ),
+        "provider": provider,
+        "budget": budget,
+        "seeds": seeds,
+        "n_tasks": len(tasks),
+        "conditions": list(_CONDITIONS),
+        "config": {
+            "ncp_retrieval_k": _NCP_RETRIEVAL_K,
+            "rolling_summary_recent_turns": 4,
+            "rolling_summary_max_words_per_older_turn": 22,
+        },
+        "token_unit": token_unit(),
+        "rows": rows,
+        "summary": {"by_condition": _summarize(rows)},
+    }
+    _write_artifact(artifact, artifact_path)
+    return artifact
+
+
+def _write_artifact(artifact: dict[str, object], artifact_path: str | Path | None) -> None:
+    if artifact_path is None:
+        return
+    path = Path(artifact_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(artifact, indent=2, sort_keys=True) + "\n")
+    artifact["artifact_path"] = str(path)
+
+
+def _print_table(artifact: dict[str, object]) -> None:
+    if artifact.get("skipped"):
+        print(f"SKIPPED: {artifact['skip_reason']}")
+        return
+    summary = artifact["summary"]["by_condition"]  # type: ignore[index]
+    print("condition        success_rate  mean_tokens  cost_per_task_usd")
+    for condition in _CONDITIONS:
+        row = summary[condition]
+        print(
+            f"{condition:<16} "
+            f"{float(row['success_rate']):>12.2f} "
+            f"{float(row['mean_tokens']):>12.1f} "
+            f"{float(row['mean_cost_usd_per_task']):>18.6f}"
         )
 
-        # NCP condition — fresh tmpdir store.
-        with tempfile.TemporaryDirectory() as ncp_tmp:
-            ncp_store_path = Path(ncp_tmp) / "ncp.db"
-            ncp_result = _run_ncp_attempt(
-                adapter=adapter,
-                store_path=ncp_store_path,
-                pipeline_id=f"{attempt_pipeline_id}_ncp",
-                budget=budget,
-            )
-            ncp_result["attempt"] = attempt_index
-            ncp_attempts.append(ncp_result)
-
-        # Sliding-window condition — separate fresh tmpdir store.
-        with tempfile.TemporaryDirectory() as sw_tmp:
-            sw_store_path = Path(sw_tmp) / "sw.db"
-            sw_result = _run_sliding_window_attempt(
-                adapter=adapter,
-                store_path=sw_store_path,
-                pipeline_id=f"{attempt_pipeline_id}_sw",
-                budget=budget,
-            )
-            sw_result["attempt"] = attempt_index
-            sw_attempts.append(sw_result)
-
-    return {
-        "benchmark": "window_control_efficacy",
-        "comparison_contract": "ncp_vs_fixed_sliding_window_control",
-        "provider": continuation_adapter,
-        "budget": budget,
-        "attempts": attempts,
-        "token_unit": token_unit(),
-        "host_contract": "get_context → assemble → call → post_turn",
-        "substrate": "sqlite",
-        "ncp": {
-            "attempts": ncp_attempts,
-            "summary": _summarize(ncp_attempts),
-        },
-        "sliding_window": {
-            "attempts": sw_attempts,
-            "summary": _summarize(sw_attempts),
-        },
-    }
-
-
-# ---------------------------------------------------------------------------
-# CLI entry point
-# ---------------------------------------------------------------------------
 
 def main() -> None:
-    import json
-
-    parser = argparse.ArgumentParser(
-        description="Sliding-window control efficacy benchmark — NCP vs fixed window."
-    )
+    parser = argparse.ArgumentParser(description="Provider-real efficacy benchmark.")
+    parser.add_argument("--provider", choices=["mock", "anthropic"], default="mock")
+    parser.add_argument("--budget", type=int, default=400)
+    parser.add_argument("--seeds", type=int, default=5)
+    parser.add_argument("--n-tasks", type=int, default=None)
+    parser.add_argument("--adapter-timeout-seconds", type=float, default=None)
+    parser.add_argument("--pipeline-id", default="bench_efficacy")
     parser.add_argument(
-        "--continuation-adapter",
-        required=True,
-        help="Adapter name: claude-cli, opencode-cli, codex-cli, local, anthropic, …",
-    )
-    parser.add_argument(
-        "--budget",
-        type=int,
-        default=600,
-        help="Token budget for context window (default: 600)",
-    )
-    parser.add_argument(
-        "--attempts",
-        type=int,
-        default=1,
-        help="Number of attempts per condition (default: 1)",
-    )
-    parser.add_argument(
-        "--adapter-timeout-seconds",
-        type=float,
-        default=None,
-        dest="adapter_timeout_seconds",
-        help="Adapter call timeout in seconds (default: use adapter default)",
-    )
-    parser.add_argument(
-        "--pipeline-id",
-        default="bench_efficacy",
-        dest="pipeline_id",
-        help="Pipeline ID prefix for store records (default: bench_efficacy)",
+        "--artifact",
+        default=str(Path(__file__).with_name("efficacy_results.json")),
+        help="Path for the machine-readable JSON artifact.",
     )
     args = parser.parse_args()
 
     artifact = run_efficacy(
-        continuation_adapter=args.continuation_adapter,
+        provider=args.provider,
         budget=args.budget,
-        attempts=args.attempts,
+        seeds=args.seeds,
+        n_tasks=args.n_tasks,
         adapter_timeout_seconds=args.adapter_timeout_seconds,
         pipeline_id=args.pipeline_id,
+        artifact_path=args.artifact,
     )
-    print(json.dumps(artifact, indent=2))
+    _print_table(artifact)
+    if artifact.get("artifact_path"):
+        print(f"JSON artifact: {artifact['artifact_path']}")
 
 
 if __name__ == "__main__":

@@ -12,9 +12,15 @@ def _build_embedding_adapter(cfg: NCPConfig) -> object | None:
     if not cfg.embedding_enabled:
         return None
     from ncp.adapters.embedding import LocalEmbeddingAdapter, OpenAIEmbeddingAdapter
+
     if cfg.embedding_provider == "openai":
         return OpenAIEmbeddingAdapter(model=cfg.embedding_model)
-    return LocalEmbeddingAdapter(model=cfg.embedding_model)
+    if cfg.embedding_provider == "local":
+        return LocalEmbeddingAdapter(model=cfg.embedding_model)
+    raise ValueError(
+        "Unsupported embedding provider "
+        f"{cfg.embedding_provider!r}; expected 'local' or 'openai'"
+    )
 
 
 def create_store(config: NCPConfig) -> BaseStore:
@@ -25,6 +31,7 @@ def create_store(config: NCPConfig) -> BaseStore:
             config.store_path,
             config=config,
             max_working_chunks_per_pipeline=config.retention_max_working_chunks_per_pipeline,
+            embedding_adapter=_build_embedding_adapter(config),
         )
     if config.store_type == "pgvector":
         return PgvectorStore(

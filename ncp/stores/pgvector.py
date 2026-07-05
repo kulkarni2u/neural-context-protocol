@@ -26,12 +26,14 @@ from ncp.stores.retrieval import (
     DEFAULT_RETRIEVAL_POLICY,
     RetrievalPolicy,
     apply_diversity_limit,
+    blend_trust,
     build_lexical_candidates,
     normalize_result_limit,
     score_trust_recency_candidate,
     score_vector_distance,
 )
-from ncp.types import CalibrationReport, ConsolidationReport, ConsciousBlock, NCPResponse, SubconsciousChunk, TurnRecord, Whisper
+from ncp.tokens import estimate_tokens
+from ncp.types import CalibrationReport, ConsolidationReport, ConsciousBlock, NCPResponse, OutcomeRecord, SubconsciousChunk, TurnRecord, Whisper
 
 
 PGVECTOR_SCHEMA_TEMPLATE = """
@@ -69,7 +71,8 @@ CREATE TABLE IF NOT EXISTS {schema}.{prefix}chunks (
     retrieval_count INTEGER DEFAULT 0,
     last_retrieved_at DOUBLE PRECISION,
     written_at_drift DOUBLE PRECISION DEFAULT 0.0,
-    dissent_count INTEGER DEFAULT 0
+    dissent_count INTEGER DEFAULT 0,
+    verified BOOLEAN DEFAULT FALSE
 );
 
 CREATE TABLE IF NOT EXISTS {schema}.{prefix}tombstones (
@@ -88,6 +91,8 @@ CREATE TABLE IF NOT EXISTS {schema}.{prefix}whispers (
     payload TEXT NOT NULL,
     confidence DOUBLE PRECISION NOT NULL,
     ref TEXT,
+    dissent_target TEXT,
+    verified BOOLEAN DEFAULT FALSE,
     created_at DOUBLE PRECISION NOT NULL,
     expires_at DOUBLE PRECISION NOT NULL
 );
@@ -176,6 +181,38 @@ CREATE TABLE IF NOT EXISTS {schema}.{prefix}reputation (
 
 CREATE INDEX IF NOT EXISTS {prefix}idx_reputation_updated
     ON {schema}.{prefix}reputation(last_updated);
+
+CREATE TABLE IF NOT EXISTS {schema}.{prefix}outcomes (
+    outcome_id TEXT PRIMARY KEY,
+    turn_id TEXT,
+    chunk_ids TEXT NOT NULL DEFAULT '[]',
+    success INTEGER NOT NULL,
+    weight REAL NOT NULL DEFAULT 1.0,
+    note TEXT,
+    created_at REAL NOT NULL,
+    consumed INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS {schema}.{prefix}memo_entries (
+    signature TEXT PRIMARY KEY,
+    task TEXT NOT NULL,
+    result_summary TEXT,
+    chunk_ids TEXT NOT NULL DEFAULT '[]',
+    outcome DOUBLE PRECISION DEFAULT 0.0,
+    verified INTEGER DEFAULT 0,
+    created_at DOUBLE PRECISION NOT NULL,
+    last_hit_at DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    hit_count INTEGER NOT NULL DEFAULT 0,
+    output_tokens_est INTEGER NOT NULL DEFAULT 0
+);
+
+ALTER TABLE {schema}.{prefix}memo_entries
+    ADD COLUMN IF NOT EXISTS output_tokens_est INTEGER NOT NULL DEFAULT 0;
+
+CREATE TABLE IF NOT EXISTS {schema}.{prefix}memo_stats (
+    stat_key TEXT PRIMARY KEY,
+    stat_value BIGINT NOT NULL DEFAULT 0
+);
 """
 
 
@@ -255,6 +292,7 @@ class PgvectorStore(BaseStore):
         from ncp.config import load_config
         try:
             cfg = config or load_config()
+            self.config = cfg
             self.reranker = Reranker(cfg)
             self.retrieval_policy = retrieval_policy or RetrievalPolicy(
                 generation_penalty_base=cfg.retrieval_generation_penalty_base
@@ -263,6 +301,7 @@ class PgvectorStore(BaseStore):
             self.reputation_forget = cfg.reputation_forget
             self.reputation_confidence_k = cfg.reputation_confidence_k
         except Exception:
+            self.config = None
             self.retrieval_policy = retrieval_policy or DEFAULT_RETRIEVAL_POLICY
             self.reputation_gain = 4.0
             self.reputation_forget = 0.99
@@ -351,6 +390,8 @@ class PgvectorStore(BaseStore):
             chunk = chunk.model_copy(
                 update={"embedding": self._embedding_adapter.embed(chunk.content)}
             )
+        if chunk.embedding is not None and len(chunk.embedding) != 1536:
+            raise ValueError(f"embedding must have 1536 dimensions, got {len(chunk.embedding)}")
         with self._connect() as connection:
             self._soft_gc(connection)
             self._assert_src_immutable(connection, chunk)
@@ -371,10 +412,10 @@ class PgvectorStore(BaseStore):
                             written_by, caused_by, conscious_hash, evidence_id, version, supersedes,
                             source_refs, schema_version, created_at, base_trust, generation,
                             result_confidence, result_attempts, conditions, valid_while, expiry, owner, meta,
-                            embedding, written_at_drift
+                            embedding, written_at_drift, verified
                         ) VALUES (
                             %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                         )
                         ON CONFLICT (chunk_id) DO UPDATE SET
                             pipeline_id = EXCLUDED.pipeline_id,
@@ -403,7 +444,8 @@ class PgvectorStore(BaseStore):
                             owner = EXCLUDED.owner,
                             meta = EXCLUDED.meta,
                             embedding = EXCLUDED.embedding,
-                            written_at_drift = EXCLUDED.written_at_drift
+                            written_at_drift = EXCLUDED.written_at_drift,
+                            verified = EXCLUDED.verified
                         """
                     ),
                     (
@@ -435,6 +477,7 @@ class PgvectorStore(BaseStore):
                         json.dumps({}),
                         embedding_val,
                         chunk.written_at_drift,
+                        bool(chunk.verified),
                     ),
                 )
             finally:
@@ -491,13 +534,34 @@ class PgvectorStore(BaseStore):
         now = time.time()
         candidates: list[SubconsciousChunk] = []
 
+        # CAP-T4: reputation-weighted retrieval blending
+        blended_trust: dict[str, float] | None = None
+        if self.config is not None and self.config.reputation_weight > 0.0:
+            authors = {str(r["written_by"]) for r in rows}
+            with self._connect() as connection:
+                rep_data = self._load_reputation(connection, authors)
+            rw = self.config.reputation_weight
+            blended_trust = {
+                str(row["chunk_id"]): blend_trust(
+                    float(row["base_trust"]),
+                    rep_data.get(str(row["written_by"])),
+                    rw,
+                )
+                for row in rows
+            }
+
+        def _bt(row: dict) -> float:
+            if blended_trust is not None:
+                return blended_trust.get(str(row["chunk_id"]), float(row["base_trust"]))
+            return float(row["base_trust"])
+
         if retrieval_mode == "trust_recency":
             for row in rows:
                 score = score_trust_recency_candidate(
                     policy,
                     created_at=float(row["created_at"]),
                     now=now,
-                    base_trust=float(row["base_trust"]),
+                    base_trust=_bt(row),
                     generation=int(row["generation"]),
                     written_at_drift=float(row["written_at_drift"]) if row.get("written_at_drift") is not None else 0.0,
                 )
@@ -525,7 +589,7 @@ class PgvectorStore(BaseStore):
                     bm25_normalized=lexical_candidate.lexical_signal,
                     vector_normalized=vector_score,
                     age_seconds=age_seconds,
-                    base_trust=float(row["base_trust"]),
+                    base_trust=_bt(row),
                     generation=int(row["generation"]),
                     written_at_drift=float(row["written_at_drift"]) if row.get("written_at_drift") is not None else 0.0,
                 )
@@ -583,6 +647,7 @@ class PgvectorStore(BaseStore):
         scope: str | None,
         zone: str,
         diversity_limit: int = 2,
+        blended_trust: dict[str, float] | None = None,
     ) -> list[SubconsciousChunk]:
         if embedding is None:
             if self._embedding_adapter is not None:
@@ -607,6 +672,9 @@ class PgvectorStore(BaseStore):
         if scope is not None:
             where_clauses.append("scope = %s")
             where_params.append(scope)
+        # WI-006: exclude expired chunks from vector retrieval.
+        where_clauses.append("(expiry IS NULL OR expiry > %s)")
+        where_params.append(time.time())
 
         # Always fetch k*4 to give the diversity loop enough candidates.
         result_limit = normalize_result_limit(k)
@@ -698,6 +766,184 @@ class PgvectorStore(BaseStore):
             finally:
                 self._close_cursor(cursor)
 
+    def record_outcome(self, outcome: OutcomeRecord) -> bool:
+        chunk_ids = outcome.chunk_ids
+        with self._connect() as connection:
+            cursor = connection.cursor()
+            try:
+                # Resolve turn_id to chunk_ids if needed
+                if outcome.turn_id and not chunk_ids:
+                    cursor.execute(
+                        self._sql(
+                            "SELECT chunk_id FROM {schema}.{prefix}chunks"
+                            " WHERE caused_by = %s OR conscious_hash = %s"
+                        ),
+                        (outcome.turn_id, outcome.turn_id),
+                    )
+                    rows = cursor.fetchall()
+                    chunk_ids = [str(r[0]) for r in rows]
+                cursor.execute(
+                    self._sql(
+                        "INSERT INTO {schema}.{prefix}outcomes"
+                        " (outcome_id, turn_id, chunk_ids, success, weight, note, created_at, consumed)"
+                        " VALUES (%s, %s, %s, %s, %s, %s, %s, 0)"
+                    ),
+                    (
+                        outcome.outcome_id,
+                        outcome.turn_id,
+                        json.dumps(chunk_ids),
+                        1 if outcome.success else 0,
+                        outcome.weight,
+                        outcome.note,
+                        outcome.created_at,
+                    ),
+                )
+                connection.commit()
+                return cursor.rowcount > 0
+            finally:
+                self._close_cursor(cursor)
+
+    def record_memo(
+        self,
+        signature: str,
+        task: str,
+        chunk_ids: list[str],
+        result_summary: str | None = None,
+        output_tokens_est: int | None = None,
+    ) -> bool:
+        if output_tokens_est is None:
+            # No real token count available: estimate over the stored result.
+            output_tokens_est = estimate_tokens(result_summary) if result_summary else 0
+        with self._connect() as connection:
+            cursor = connection.cursor()
+            try:
+                cursor.execute(
+                    self._sql(
+                        """
+                        INSERT INTO {schema}.{prefix}memo_entries
+                            (signature, task, result_summary, chunk_ids, outcome, verified,
+                             created_at, last_hit_at, hit_count, output_tokens_est)
+                        VALUES (%s, %s, %s, %s, 0.0, 0, %s, 0.0, 0, %s)
+                        ON CONFLICT (signature) DO UPDATE SET
+                            task = EXCLUDED.task,
+                            result_summary = EXCLUDED.result_summary,
+                            chunk_ids = EXCLUDED.chunk_ids,
+                            created_at = EXCLUDED.created_at,
+                            output_tokens_est = EXCLUDED.output_tokens_est
+                        """
+                    ),
+                    (
+                        signature, task, result_summary, json.dumps(chunk_ids),
+                        time.time(), max(0, int(output_tokens_est)),
+                    ),
+                )
+                connection.commit()
+                return cursor.rowcount > 0
+            finally:
+                self._close_cursor(cursor)
+
+    def lookup_memo(self, signature: str) -> dict | None:
+        with self._connect() as connection:
+            cursor = connection.cursor()
+            try:
+                cursor.execute(
+                    self._sql(
+                        "SELECT * FROM {schema}.{prefix}memo_entries WHERE signature = %s"
+                    ),
+                    (signature,),
+                )
+                row = self._fetchone(cursor)
+            finally:
+                self._close_cursor(cursor)
+        if row is None:
+            self._bump_memo_miss()
+            return None
+        max_age = self.config.memoization_max_age_hours if self.config is not None else 24
+        age_seconds = time.time() - float(row["created_at"])
+        if age_seconds > max_age * 3600:
+            self._bump_memo_miss()
+            return None
+        with self._connect() as connection:
+            cursor = connection.cursor()
+            try:
+                cursor.execute(
+                    self._sql(
+                        "UPDATE {schema}.{prefix}memo_entries"
+                        " SET hit_count = hit_count + 1, last_hit_at = %s"
+                        " WHERE signature = %s"
+                    ),
+                    (time.time(), signature),
+                )
+                connection.commit()
+            finally:
+                self._close_cursor(cursor)
+        return dict(row)
+
+    def update_memo_outcome(self, signature: str, outcome: float, verified: bool = False) -> bool:
+        with self._connect() as connection:
+            cursor = connection.cursor()
+            try:
+                cursor.execute(
+                    self._sql(
+                        "UPDATE {schema}.{prefix}memo_entries"
+                        " SET outcome = %s, verified = %s WHERE signature = %s"
+                    ),
+                    (outcome, 1 if verified else 0, signature),
+                )
+                connection.commit()
+                return cursor.rowcount > 0
+            finally:
+                self._close_cursor(cursor)
+
+    def _bump_memo_miss(self) -> None:
+        """Increment the S4.1 memoization miss counter."""
+        with self._connect() as connection:
+            cursor = connection.cursor()
+            try:
+                cursor.execute(
+                    self._sql(
+                        "INSERT INTO {schema}.{prefix}memo_stats AS ms (stat_key, stat_value)"
+                        " VALUES ('misses', 1)"
+                        " ON CONFLICT (stat_key) DO UPDATE SET stat_value = ms.stat_value + 1"
+                    )
+                )
+                connection.commit()
+            finally:
+                self._close_cursor(cursor)
+
+    def memo_stats(self) -> dict[str, int]:
+        """Aggregate memoization telemetry: hits, misses, entries, tokens saved.
+
+        ``estimated_tokens_saved`` is an estimate: SUM(hit_count * output_tokens_est).
+        """
+        with self._connect() as connection:
+            cursor = connection.cursor()
+            try:
+                cursor.execute(
+                    self._sql(
+                        "SELECT COUNT(*) AS entry_count,"
+                        " COALESCE(SUM(hit_count), 0) AS hits,"
+                        " COALESCE(SUM(hit_count * output_tokens_est), 0) AS tokens_saved"
+                        " FROM {schema}.{prefix}memo_entries"
+                    )
+                )
+                row = self._fetchone(cursor)
+                cursor.execute(
+                    self._sql(
+                        "SELECT stat_value FROM {schema}.{prefix}memo_stats"
+                        " WHERE stat_key = 'misses'"
+                    )
+                )
+                miss_row = self._fetchone(cursor)
+            finally:
+                self._close_cursor(cursor)
+        return {
+            "hits": int(row["hits"]) if row is not None else 0,
+            "misses": int(miss_row["stat_value"]) if miss_row is not None else 0,
+            "entry_count": int(row["entry_count"]) if row is not None else 0,
+            "estimated_tokens_saved": int(row["tokens_saved"]) if row is not None else 0,
+        }
+
     def drain_whispers(
         self,
         *,
@@ -710,12 +956,30 @@ class PgvectorStore(BaseStore):
             raise NCPStoreUnavailableError(
                 "pgvector whisper coordination requires Redis. Set NCP_REDIS_URL and ensure Redis is reachable."
             )
-        return self.coordination.drain_whispers(
+        drained = self.coordination.drain_whispers(
             agent_id=agent_id,
             pipeline_id=pipeline_id,
             max_items=max_items,
             min_confidence=min_confidence,
         )
+        # CAP-T4: whisper gating by author reputation
+        if drained and self.config is not None and self.config.whisper_min_author_reputation > 0.0:
+            threshold = self.config.whisper_min_author_reputation
+            authors = {w.from_agent for w in drained}
+            with self._connect() as connection:
+                rep_data = self._load_reputation(connection, authors)
+            filtered: list[Whisper] = []
+            for w in drained:
+                result = rep_data.get(w.from_agent)
+                if result is not None:
+                    alpha, beta = result
+                    if alpha / (alpha + beta) >= threshold:
+                        filtered.append(w)
+                else:
+                    if 0.5 >= threshold:
+                        filtered.append(w)
+            drained = filtered
+        return drained
 
     def peek_whispers(
         self,
@@ -901,9 +1165,48 @@ class PgvectorStore(BaseStore):
             finally:
                 self._close_cursor(cursor)
 
-    def resolve_identity(self, agent_id: str, *, pipeline_id: str | None = None) -> str:
-        del pipeline_id
+    def resolve_identity(
+        self,
+        agent_id: str,
+        *,
+        pipeline_id: str | None = None,
+        signature: str | None = None,
+        content: str | None = None,
+    ) -> str:
+        if signature is not None and content is not None:
+            from ncp.identity import canonical_authorship_payload
+
+            payload = canonical_authorship_payload(agent_id, content, pipeline_id)
+            if self.verify_authorship(agent_id, payload, signature):
+                return agent_id
         return agent_id
+
+    def verify_authorship(
+        self, identity_id: str, payload: bytes | str, signature: str
+    ) -> bool:
+        """Verify a signature for ``identity_id``; False if unknown or revoked."""
+
+        from ncp.identity import verify_signature
+
+        with self._connect() as connection:
+            cursor = connection.cursor()
+            try:
+                cursor.execute(
+                    self._sql(
+                        "SELECT public_key, revoked_at FROM {schema}.{prefix}identities"
+                        " WHERE identity_id = %s"
+                    ),
+                    (identity_id,),
+                )
+                rows = self._fetchall(cursor)
+            finally:
+                self._close_cursor(cursor)
+        if not rows:
+            return False
+        row = rows[0]
+        if row.get("revoked_at") is not None:
+            return False
+        return verify_signature(str(row["public_key"]), payload, signature)
 
     def register_identity(
         self,
@@ -1313,6 +1616,7 @@ class PgvectorStore(BaseStore):
                 updates: list[tuple[float, str]] = []
                 feedback_rows: list[FeedbackRow] = []
                 chunk_author: dict[str, str] = {}
+                consumed_feedback_ids: list[str] = []
                 for row in rows:
                     cid = str(row["chunk_id"])
                     src = str(row["src"])
@@ -1349,17 +1653,29 @@ class PgvectorStore(BaseStore):
                             )
                         )
 
+                # CAP-T3: initialize outcome tracking
+                consumed_outcome_ids: list[str] = []
                 if feedback_mode and feedback_rows:
+                    outcomes = self._load_unconsumed_outcomes(connection)
+                    outcome_evidence = None
+                    if outcomes:
+                        from ncp.stores.calibration import compute_outcome_evidence
+                        outcome_evidence = compute_outcome_evidence(outcomes)
+                        consumed_outcome_ids = [o.outcome_id for o in outcomes]
+
                     fb = compute_feedback_updates(
                         feedback_rows,
                         feedback_weight=feedback_weight,
                         propagation_factor=propagation_factor,
                         dissent_weight=dissent_weight,
+                        usage_prior_weight=self.config.usage_prior_weight if self.config is not None else 1.0,
+                        outcome_evidence=outcome_evidence,
                     )
                     updates.extend(fb.updates)
                     report.change_log.extend(fb.change_log)
                     report.feedback_adjusted += fb.adjusted
                     report.skipped += fb.skipped
+                    consumed_feedback_ids = fb.consumed_chunk_ids
 
                     prior = self._load_reputation(
                         connection,
@@ -1372,6 +1688,7 @@ class PgvectorStore(BaseStore):
                         gain=self.reputation_gain,
                         forget=self.reputation_forget,
                         K_CONF=self.reputation_confidence_k,
+                        outcome_evidence=outcome_evidence,
                     )
                     report.change_log.extend(
                         {
@@ -1400,6 +1717,22 @@ class PgvectorStore(BaseStore):
                         self._close_cursor(update_cursor)
                 if feedback_mode and not dry_run:
                     self._upsert_reputation_updates(connection, rep_updates, now=now)
+                    if consumed_feedback_ids:
+                        reset_cursor = connection.cursor()
+                        try:
+                            placeholders = ",".join(["%s"] * len(consumed_feedback_ids))
+                            reset_cursor.execute(
+                                self._sql(
+                                    "UPDATE {schema}.{prefix}chunks"
+                                    " SET retrieval_count = 0, dissent_count = 0"
+                                    f" WHERE chunk_id IN ({placeholders})"
+                                ),
+                                tuple(consumed_feedback_ids),
+                            )
+                        finally:
+                            self._close_cursor(reset_cursor)
+                    if consumed_outcome_ids:
+                        self._mark_outcomes_consumed(connection, consumed_outcome_ids)
 
         report.duration_seconds = time.monotonic() - started
         return report
@@ -1693,6 +2026,49 @@ class PgvectorStore(BaseStore):
             for row in rows
         }
 
+    def _load_unconsumed_outcomes(self, connection: Any) -> list[OutcomeRecord]:
+        cursor = connection.cursor()
+        try:
+            cursor.execute(
+                self._sql(
+                    "SELECT * FROM {schema}.{prefix}outcomes WHERE consumed = 0 ORDER BY created_at ASC"
+                )
+            )
+            rows = self._fetchall(cursor)
+        finally:
+            self._close_cursor(cursor)
+        results: list[OutcomeRecord] = []
+        for row in rows:
+            results.append(OutcomeRecord(
+                outcome_id=str(row["outcome_id"]),
+                turn_id=row["turn_id"],
+                chunk_ids=json.loads(str(row["chunk_ids"])),
+                success=bool(row["success"]),
+                weight=float(row["weight"]),
+                note=row["note"],
+                created_at=float(row["created_at"]),
+                consumed=bool(row["consumed"]),
+            ))
+        return results
+
+    def _mark_outcomes_consumed(
+        self, connection: Any, outcome_ids: list[str]
+    ) -> None:
+        if not outcome_ids:
+            return
+        placeholders = ",".join(["%s"] * len(outcome_ids))
+        cursor = connection.cursor()
+        try:
+            cursor.execute(
+                self._sql(
+                    f"UPDATE {{schema}}.{{prefix}}outcomes SET consumed = 1"
+                    f" WHERE outcome_id IN ({placeholders})"
+                ),
+                tuple(outcome_ids),
+            )
+        finally:
+            self._close_cursor(cursor)
+
     def _upsert_reputation_updates(
         self,
         connection: Any,
@@ -1776,6 +2152,9 @@ class PgvectorStore(BaseStore):
         if scope is not None:
             clauses.append("scope = %s")
             params.append(scope)
+        # WI-006: never surface chunks whose expiry has passed.
+        clauses.append("(expiry IS NULL OR expiry > %s)")
+        params.append(time.time())
         cursor = connection.cursor()
         try:
             cursor.execute(
@@ -2020,6 +2399,7 @@ class PgvectorStore(BaseStore):
             source_refs=self._decode_json_list(row["source_refs"]),
             age_seconds=max(0.0, time.time() - created_at),
             dissent_count=int(row["dissent_count"]) if row.get("dissent_count") is not None else 0,
+            verified=bool(row.get("verified")) if row.get("verified") is not None else False,
         )
 
     def _decode_json_list(self, value: Any) -> list[str]:
@@ -2127,8 +2507,26 @@ class PgvectorStore(BaseStore):
                 )
             finally:
                 self._close_cursor(cursor)
+        # WI-006: reclaim chunks whose expiry has passed.
+        chunk_cursor = connection.cursor()
+        try:
+            chunk_cursor.execute(
+                self._sql("DELETE FROM {schema}.{prefix}chunks WHERE expiry IS NOT NULL AND expiry <= %s"),
+                (now,),
+            )
+        finally:
+            self._close_cursor(chunk_cursor)
 
     def _hard_gc(self, connection: Any, *, pipeline_id: str | None) -> None:
+        # WI-006: drop expired chunks before evaluating overflow capacity.
+        expiry_cursor = connection.cursor()
+        try:
+            expiry_cursor.execute(
+                self._sql("DELETE FROM {schema}.{prefix}chunks WHERE expiry IS NOT NULL AND expiry <= %s"),
+                (time.time(),),
+            )
+        finally:
+            self._close_cursor(expiry_cursor)
         clauses = ["zone = 'working'"]
         params: list[object] = []
         if pipeline_id is not None:
