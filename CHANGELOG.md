@@ -2,7 +2,7 @@
 
 All notable changes to Neural Context Protocol will be documented in this file.
 
-## [Unreleased]
+## [1.3.0] - 2026-07-06
 
 Audit remediation from `docs/NCP_AUDIT_AND_REMEDIATION_PLAN.md`. One work item
 (`WI-###`) per commit; each addresses a finding (`F-*`) from the audit.
