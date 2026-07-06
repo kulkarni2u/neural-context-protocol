@@ -23,6 +23,27 @@ context_token_budget = 840
 warn_at_ratio = 0.70
 critical_at_ratio = 0.85
 recent_slot_budget = 2
+# CAP-E2: per-pipeline $ spend ceiling over real (CAP-E1) recorded cost. None
+# (default) disables the governor entirely -- ncp_get_context/ncp_post_turn
+# never surface a "budget" block when this is unset.
+# pipeline_budget_usd = 5.00
+# Fraction of pipeline_budget_usd at which status flips from "ok" to
+# "warning" (default 0.8).
+# budget_warn_fraction = 0.8
+# "off" (no governance), "warn" (surface status, never refuse), or "block"
+# (ncp_get_context returns {"budget_exceeded": true, ...} once exceeded).
+# budget_enforcement = "warn"
+# CAP-C6: adaptive per-turn context token budget. Default false (opt-in) --
+# disabled reproduces legacy behavior exactly (static context_token_budget,
+# no "budget_tokens" response field). When enabled, ncp_get_context scales
+# the effective token budget between the floor/ceiling below based on turn
+# difficulty (query length, drift, pressure, slot cadence) and CAP-E2 $
+# budget pressure -- see ncp/adaptive_budget.py for the formula. An explicit
+# caller max_tokens is always honored as-is; adaptation only fills in when
+# max_tokens is omitted.
+# adaptive_budget_enabled = false
+# adaptive_budget_floor_tokens = 300
+# adaptive_budget_ceiling_tokens = 2000
 
 [chunking]
 max_chunk_tokens = 200
@@ -107,3 +128,24 @@ confidence_k = 20
 # and recorded but never required. Set to true to REJECT any write/emit whose
 # authorship cannot be verified (missing/bad signature or revoked identity).
 # require_signatures = false
+
+# [tiering]
+# CAP-E3: advisory model-tiering signal (tier_hint/complexity_signal/factors)
+# on ncp_get_context responses. NCP never routes models itself. Default true;
+# set false to omit the fields entirely.
+# tier_hints_enabled = true
+
+# [drift]
+# CAP-T5: compute drift_score from observable turn history instead of trusting
+# the client's self-reported value (see ncp/drift.py for the exact formula).
+# Default false (opt-in); disabled preserves exact legacy self-reported
+# behavior with no response change. When enabled, ncp_get_context overrides
+# ConsciousBlock.drift_score with the computed value before tiering/adaptive
+# budget consume it, and the response gains a "drift" block showing both the
+# computed score and the original self-reported value.
+# drift_computed_enabled = false
+# drift_window_turns = 5
+# Optional local-embedding cosine-distance blend on top of the always-on
+# lexical baseline. Requires the fastembed-backed [local-embeddings] extra;
+# silently falls back to lexical-only when it is not installed.
+# drift_use_embeddings = false

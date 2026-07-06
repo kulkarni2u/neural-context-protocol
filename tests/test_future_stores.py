@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from ncp.budget import evaluate_budget
 from ncp.config import NCPConfig
 from ncp.stores.factory import create_store
 from ncp.stores.pgvector import PgvectorStore, infra_hint as pgvector_hint
@@ -789,6 +790,53 @@ def test_pgvector_store_status_detail_and_cost_summary_with_coordination() -> No
     assert costs["by_agent"][0]["agent_id"] == "planner"
     assert costs["by_model"][0]["model"] == "claude-sonnet"
     assert costs["recent_entries"][0]["turn_id"] == "turn_cost_alpha"
+
+
+def test_pgvector_cost_governor_accumulates_spend_per_pipeline() -> None:
+    """CAP-E2 against the pgvector mock: no live Postgres, same fake connection
+    pattern as the other pgvector tests in this module."""
+
+    db = _MemoryPgDB()
+    store = PgvectorStore(
+        "postgresql://postgres:postgres@127.0.0.1:5432/ncp",
+        connect_factory=_pg_connect_factory(db),
+    )
+
+    for index, cost_usd in enumerate((3.0, 3.0)):
+        store.log_cost(
+            agent_id="planner",
+            response=NCPResponse(
+                content="done",
+                input_tokens=80,
+                output_tokens=10,
+                cost_usd=cost_usd,
+                model="claude-sonnet",
+                pipeline_id="pipe_budget",
+                turn_id=f"turn_budget_{index}",
+                latency_ms=150,
+            ),
+        )
+    # A different pipeline's spend must not bleed into pipe_budget's total.
+    store.log_cost(
+        agent_id="planner",
+        response=NCPResponse(
+            content="done",
+            input_tokens=80,
+            output_tokens=10,
+            cost_usd=50.0,
+            model="claude-sonnet",
+            pipeline_id="pipe_other",
+            turn_id="turn_other",
+            latency_ms=150,
+        ),
+    )
+
+    spent_usd = float(store.cost_summary(pipeline_id="pipe_budget")["summary"]["cost_usd_total"])
+    snapshot = evaluate_budget(spent_usd=spent_usd, budget_usd=10.0, warn_fraction=0.5)
+
+    assert spent_usd == pytest.approx(6.0)
+    assert snapshot.status == "warning"
+    assert snapshot.fraction_used == pytest.approx(0.6)
 
 
 def test_pgvector_hybrid_query_uses_vector_signal_to_break_lexical_tie() -> None:

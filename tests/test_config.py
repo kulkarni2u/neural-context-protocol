@@ -170,3 +170,166 @@ def test_distillation_config_defaults_and_overrides(tmp_path) -> None:
     )
     assert config.distillation_enabled is False
     assert config.distillation_min_chunk_tokens == 64
+
+
+def test_budget_governor_config_defaults(tmp_path: Path) -> None:
+    project = tmp_path / "repo"
+    (project / ".git").mkdir(parents=True)
+
+    config = load_config(cwd=project)
+
+    assert config.pipeline_budget_usd is None
+    assert config.budget_warn_fraction == pytest.approx(0.8)
+    assert config.budget_enforcement == "warn"
+
+
+def test_budget_governor_config_file_and_env_overrides(tmp_path: Path) -> None:
+    project = tmp_path / "repo"
+    (project / ".git").mkdir(parents=True)
+    (project / ".ncp").mkdir()
+    (project / ".ncp" / "config.toml").write_text(
+        "[budget]\npipeline_budget_usd = 5.0\nbudget_warn_fraction = 0.5\n"
+        "budget_enforcement = \"block\"\n"
+    )
+
+    config = load_config(cwd=project)
+    assert config.pipeline_budget_usd == pytest.approx(5.0)
+    assert config.budget_warn_fraction == pytest.approx(0.5)
+    assert config.budget_enforcement == "block"
+
+    config = load_config(
+        cwd=project,
+        env={
+            "NCP_PIPELINE_BUDGET_USD": "12.5",
+            "NCP_BUDGET_WARN_FRACTION": "0.9",
+            "NCP_BUDGET_ENFORCEMENT": "off",
+        },
+    )
+    assert config.pipeline_budget_usd == pytest.approx(12.5)
+    assert config.budget_warn_fraction == pytest.approx(0.9)
+    assert config.budget_enforcement == "off"
+
+
+def test_budget_governor_env_override_can_clear_pipeline_budget(tmp_path: Path) -> None:
+    project = tmp_path / "repo"
+    (project / ".git").mkdir(parents=True)
+    (project / ".ncp").mkdir()
+    (project / ".ncp" / "config.toml").write_text("[budget]\npipeline_budget_usd = 5.0\n")
+
+    config = load_config(cwd=project, env={"NCP_PIPELINE_BUDGET_USD": ""})
+    assert config.pipeline_budget_usd is None
+
+
+def test_budget_enforcement_falls_back_to_warn_for_unknown_value(tmp_path: Path) -> None:
+    project = tmp_path / "repo"
+    (project / ".git").mkdir(parents=True)
+    (project / ".ncp").mkdir()
+    (project / ".ncp" / "config.toml").write_text(
+        "[budget]\nbudget_enforcement = \"nonsense\"\n"
+    )
+
+    config = load_config(cwd=project)
+    assert config.budget_enforcement == "warn"
+
+
+def test_adaptive_budget_config_defaults(tmp_path: Path) -> None:
+    project = tmp_path / "repo"
+    (project / ".git").mkdir(parents=True)
+
+    config = load_config(cwd=project)
+
+    assert config.adaptive_budget_enabled is False
+    assert config.adaptive_budget_floor_tokens == 300
+    assert config.adaptive_budget_ceiling_tokens == 2000
+
+
+def test_adaptive_budget_config_file_and_env_overrides(tmp_path: Path) -> None:
+    project = tmp_path / "repo"
+    (project / ".git").mkdir(parents=True)
+    (project / ".ncp").mkdir()
+    (project / ".ncp" / "config.toml").write_text(
+        "[budget]\nadaptive_budget_enabled = true\n"
+        "adaptive_budget_floor_tokens = 250\n"
+        "adaptive_budget_ceiling_tokens = 1500\n"
+    )
+
+    config = load_config(cwd=project)
+    assert config.adaptive_budget_enabled is True
+    assert config.adaptive_budget_floor_tokens == 250
+    assert config.adaptive_budget_ceiling_tokens == 1500
+
+    config = load_config(
+        cwd=project,
+        env={
+            "NCP_ADAPTIVE_BUDGET_ENABLED": "false",
+            "NCP_ADAPTIVE_BUDGET_FLOOR_TOKENS": "400",
+            "NCP_ADAPTIVE_BUDGET_CEILING_TOKENS": "1800",
+        },
+    )
+    assert config.adaptive_budget_enabled is False
+    assert config.adaptive_budget_floor_tokens == 400
+    assert config.adaptive_budget_ceiling_tokens == 1800
+
+
+def test_tier_hints_enabled_config_default_and_overrides(tmp_path: Path) -> None:
+    project = tmp_path / "repo"
+    (project / ".git").mkdir(parents=True)
+
+    assert load_config(cwd=project).tier_hints_enabled is True
+
+    (project / ".ncp").mkdir()
+    (project / ".ncp" / "config.toml").write_text("[tiering]\ntier_hints_enabled = false\n")
+    config = load_config(cwd=project)
+    assert config.tier_hints_enabled is False
+
+    config = load_config(cwd=project, env={"NCP_TIER_HINTS_ENABLED": "true"})
+    assert config.tier_hints_enabled is True
+
+
+def test_drift_config_defaults(tmp_path: Path) -> None:
+    project = tmp_path / "repo"
+    (project / ".git").mkdir(parents=True)
+
+    config = load_config(cwd=project)
+
+    assert config.drift_computed_enabled is False
+    assert config.drift_window_turns == 5
+    assert config.drift_use_embeddings is False
+
+
+def test_drift_config_file_and_env_overrides(tmp_path: Path) -> None:
+    project = tmp_path / "repo"
+    (project / ".git").mkdir(parents=True)
+    (project / ".ncp").mkdir()
+    (project / ".ncp" / "config.toml").write_text(
+        "[drift]\ndrift_computed_enabled = true\n"
+        "drift_window_turns = 8\n"
+        "drift_use_embeddings = true\n"
+    )
+
+    config = load_config(cwd=project)
+    assert config.drift_computed_enabled is True
+    assert config.drift_window_turns == 8
+    assert config.drift_use_embeddings is True
+
+    config = load_config(
+        cwd=project,
+        env={
+            "NCP_DRIFT_COMPUTED_ENABLED": "false",
+            "NCP_DRIFT_WINDOW_TURNS": "3",
+            "NCP_DRIFT_USE_EMBEDDINGS": "false",
+        },
+    )
+    assert config.drift_computed_enabled is False
+    assert config.drift_window_turns == 3
+    assert config.drift_use_embeddings is False
+
+
+def test_drift_window_turns_is_clamped_to_at_least_one(tmp_path: Path) -> None:
+    project = tmp_path / "repo"
+    (project / ".git").mkdir(parents=True)
+    (project / ".ncp").mkdir()
+    (project / ".ncp" / "config.toml").write_text("[drift]\ndrift_window_turns = 0\n")
+
+    config = load_config(cwd=project)
+    assert config.drift_window_turns == 1

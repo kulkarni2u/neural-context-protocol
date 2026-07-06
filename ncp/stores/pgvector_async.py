@@ -21,8 +21,10 @@ from difflib import SequenceMatcher
 from typing import Any, AsyncIterator
 
 import anyio
+import structlog
 
 from ncp.stores.base import BaseStore, NCPStoreUnavailableError
+from ncp.stores.bitemporal import collect_successor_ids, filter_bitemporal
 from ncp.stores.pgvector import (
     DEFAULT_RETRIEVAL_POLICY,
     PGVECTOR_SCHEMA_TEMPLATE,
@@ -55,6 +57,8 @@ from ncp.types import (
     TurnRecord,
     Whisper,
 )
+
+_logger = structlog.get_logger(__name__)
 
 
 class AsyncPgvectorStore(BaseStore):
@@ -304,10 +308,10 @@ class AsyncPgvectorStore(BaseStore):
                             written_by, caused_by, conscious_hash, evidence_id, version, supersedes,
                             source_refs, schema_version, created_at, base_trust, generation,
                             result_confidence, result_attempts, conditions, valid_while, expiry,
-                            owner, meta, embedding
+                            owner, meta, embedding, valid_from, valid_to, superseded_by
                         ) VALUES (
                             %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                         )
                         ON CONFLICT (chunk_id) DO UPDATE SET
                             pipeline_id = EXCLUDED.pipeline_id,
@@ -335,7 +339,8 @@ class AsyncPgvectorStore(BaseStore):
                             expiry = EXCLUDED.expiry,
                             owner = EXCLUDED.owner,
                             meta = EXCLUDED.meta,
-                            embedding = EXCLUDED.embedding
+                            embedding = EXCLUDED.embedding,
+                            valid_from = EXCLUDED.valid_from
                         """
                     ),
                     (
@@ -366,6 +371,9 @@ class AsyncPgvectorStore(BaseStore):
                         chunk.owner,
                         json.dumps({}),
                         embedding_val,
+                        chunk.valid_from,
+                        chunk.valid_to,
+                        chunk.superseded_by,
                     ),
                 )
             await self._async_hard_gc(conn, pipeline_id=chunk.pipeline_id)
@@ -555,6 +563,36 @@ class AsyncPgvectorStore(BaseStore):
             )
         self.retention_evictions += len(evict_ids)
 
+    async def _async_apply_bitemporal_filter(
+        self,
+        conn: Any,
+        rows: list[dict[str, Any]],
+        *,
+        as_of: float | None,
+    ) -> list[dict[str, Any]]:
+        """CAP-C5: apply bi-temporal visibility as a Python post-filter.
+
+        See ``PgvectorStore._apply_bitemporal_filter`` for why this stays out
+        of the SQL WHERE clause. Native async I/O for the one follow-up
+        successor-timestamp lookup, reusing the caller's open connection.
+        """
+        now = time.time()
+        if as_of is None:
+            return filter_bitemporal(rows, as_of=None, now=now)
+        successor_ids = collect_successor_ids(rows)
+        successor_created_at: dict[str, float] = {}
+        if successor_ids:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    self._sql(
+                        "SELECT chunk_id, created_at FROM {schema}.{prefix}chunks WHERE chunk_id = ANY(%s)"
+                    ),
+                    (list(successor_ids),),
+                )
+                succ_rows = await self._afetchall(cur)
+            successor_created_at = {str(r["chunk_id"]): float(r["created_at"]) for r in succ_rows}
+        return filter_bitemporal(rows, as_of=as_of, now=now, successor_created_at=successor_created_at)
+
     async def _async_query_vector(
         self,
         *,
@@ -567,6 +605,7 @@ class AsyncPgvectorStore(BaseStore):
         scope: str | None,
         zone: str,
         diversity_limit: int = 2,
+        as_of: float | None = None,
     ) -> list[SubconsciousChunk]:
         if embedding is None:
             if self._embedding_adapter is not None:
@@ -617,7 +656,8 @@ class AsyncPgvectorStore(BaseStore):
                 raw_rows = await cur.fetchall()
                 description = cur.description
 
-        rows = [self._normalize_row(r, description) for r in raw_rows]
+            rows = [self._normalize_row(r, description) for r in raw_rows]
+            rows = await self._async_apply_bitemporal_filter(conn, rows, as_of=as_of)
         results: list[SubconsciousChunk] = []
         for row in rows:
             score = score_vector_distance(
@@ -668,6 +708,7 @@ class AsyncPgvectorStore(BaseStore):
         retrieval_mode: str = "hybrid",
         embedding: list[float] | None = None,
         diversity_limit: int = 2,
+        as_of: float | None = None,
     ) -> list[SubconsciousChunk]:
         """Query chunks using native async DB I/O; score computation stays synchronous."""
         _VALID_RETRIEVAL_MODES = ("hybrid", "trust_recency", "vector")
@@ -686,6 +727,7 @@ class AsyncPgvectorStore(BaseStore):
                 scope=scope,
                 zone=zone,
                 diversity_limit=diversity_limit,
+                as_of=as_of,
             )
         if embedding is None and self._embedding_adapter is not None:
             _adapter = self._embedding_adapter
@@ -725,7 +767,8 @@ class AsyncPgvectorStore(BaseStore):
                 raw_rows = await cur.fetchall()
                 description = cur.description
 
-        rows = [self._normalize_row(r, description) for r in raw_rows]
+            rows = [self._normalize_row(r, description) for r in raw_rows]
+            rows = await self._async_apply_bitemporal_filter(conn, rows, as_of=as_of)
         if not rows:
             return []
 
@@ -872,6 +915,39 @@ class AsyncPgvectorStore(BaseStore):
             return None
         row = self._normalize_row(raw, description)
         return TurnRecord(**row)
+
+    async def async_recent_turns(self, *, pipeline_id: str | None, limit: int = 20) -> list[TurnRecord]:
+        """CAP-T5/Sprint 5d parity: most recent turn records, oldest-first.
+
+        Native async DB I/O (no thread pool) -- mirrors ``SQLiteStore.recent_turns``
+        and ``PgvectorStore.recent_turns`` exactly so computed drift
+        (``ncp/drift.py``) works identically across all three backends.
+        """
+        capped_limit = max(0, int(limit))
+        if capped_limit == 0:
+            return []
+        async with self._aconnect() as conn:
+            async with conn.cursor() as cur:
+                if pipeline_id is None:
+                    await cur.execute(
+                        self._sql(
+                            "SELECT * FROM {schema}.{prefix}turn_records"
+                            " WHERE pipeline_id IS NULL ORDER BY created_at DESC LIMIT %s"
+                        ),
+                        (capped_limit,),
+                    )
+                else:
+                    await cur.execute(
+                        self._sql(
+                            "SELECT * FROM {schema}.{prefix}turn_records"
+                            " WHERE pipeline_id = %s ORDER BY created_at DESC LIMIT %s"
+                        ),
+                        (pipeline_id, capped_limit),
+                    )
+                rows = await self._afetchall(cur)
+        records = [TurnRecord(**row) for row in rows]
+        records.reverse()
+        return records
 
     async def async_log_conscious(self, conscious: ConsciousBlock, *, snapshot_hash: str) -> None:
         """Persist a conscious-block snapshot using native async DB I/O."""
@@ -1093,6 +1169,31 @@ class AsyncPgvectorStore(BaseStore):
             )
         await self._acoordination.emit_whisper(whisper)
 
+    async def async_supersede(
+        self,
+        old_chunk_id: str,
+        new_chunk_id: str,
+        *,
+        valid_to: float | None = None,
+    ) -> bool:
+        """CAP-C5: mark ``old_chunk_id`` as honestly replaced, via native async I/O.
+
+        The old row is never deleted -- only ``superseded_by`` and
+        ``valid_to`` are updated in place, so a later ``as_of`` query can
+        still recover it.
+        """
+        resolved_valid_to = time.time() if valid_to is None else valid_to
+        async with self._aconnect() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    self._sql(
+                        "UPDATE {schema}.{prefix}chunks"
+                        " SET superseded_by = %s, valid_to = %s WHERE chunk_id = %s"
+                    ),
+                    (new_chunk_id, resolved_valid_to, old_chunk_id),
+                )
+                return cur.rowcount > 0
+
     async def async_record_dissent(self, chunk_id: str) -> bool:
         """Increment a chunk's dissent counter via native async DB I/O."""
         normalized = chunk_id.removeprefix("ctx://sub/")
@@ -1165,7 +1266,6 @@ class AsyncPgvectorStore(BaseStore):
                             task = EXCLUDED.task,
                             result_summary = EXCLUDED.result_summary,
                             chunk_ids = EXCLUDED.chunk_ids,
-                            created_at = EXCLUDED.created_at,
                             output_tokens_est = EXCLUDED.output_tokens_est
                         """
                     ),
@@ -1188,30 +1288,48 @@ class AsyncPgvectorStore(BaseStore):
                     )
                 )
 
+    async def async_record_memo_miss(self) -> None:
+        """Public entry point for bumping the miss counter (S4.1)."""
+        await self._abump_memo_miss()
+
     async def async_memo_stats(self) -> dict[str, int]:
         """Aggregate memoization telemetry: hits, misses, entries, tokens saved.
 
         ``estimated_tokens_saved`` is an estimate: SUM(hit_count * output_tokens_est).
+
+        If the query fails (e.g. the memo tables are missing because
+        migrations haven't run, or the connection drops), this logs a
+        warning and re-raises rather than masking the failure as an
+        all-zero result — a genuine error must not look identical to "no
+        memo activity yet".
         """
-        async with self._aconnect() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute(
-                    self._sql(
-                        "SELECT COUNT(*) AS entry_count,"
-                        " COALESCE(SUM(hit_count), 0) AS hits,"
-                        " COALESCE(SUM(hit_count * output_tokens_est), 0) AS tokens_saved"
-                        " FROM {schema}.{prefix}memo_entries"
+        try:
+            async with self._aconnect() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        self._sql(
+                            "SELECT COUNT(*) AS entry_count,"
+                            " COALESCE(SUM(hit_count), 0) AS hits,"
+                            " COALESCE(SUM(hit_count * output_tokens_est), 0) AS tokens_saved"
+                            " FROM {schema}.{prefix}memo_entries"
+                        )
                     )
-                )
-                row = await self._afetchone(cur)
-            async with conn.cursor() as cur:
-                await cur.execute(
-                    self._sql(
-                        "SELECT stat_value FROM {schema}.{prefix}memo_stats"
-                        " WHERE stat_key = 'misses'"
+                    row = await self._afetchone(cur)
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        self._sql(
+                            "SELECT stat_value FROM {schema}.{prefix}memo_stats"
+                            " WHERE stat_key = 'misses'"
+                        )
                     )
-                )
-                miss_row = await self._afetchone(cur)
+                    miss_row = await self._afetchone(cur)
+        except Exception:
+            _logger.warning(
+                "ncp.memo_stats.query_failed",
+                exc_info=True,
+                hint="memo_entries/memo_stats tables may be missing or unreachable",
+            )
+            raise
         return {
             "hits": int(row["hits"]) if row is not None else 0,
             "misses": int(miss_row["stat_value"]) if miss_row is not None else 0,
@@ -1220,6 +1338,20 @@ class AsyncPgvectorStore(BaseStore):
         }
 
     async def async_lookup_memo(self, signature: str) -> dict | None:
+        """Look up a memo, unconditionally counting a hit if found and fresh.
+
+        See ``BaseStore.lookup_memo`` for why callers that apply further
+        usability gating should prefer ``async_peek_memo`` + ``async_record_memo_hit``/
+        ``async_record_memo_miss`` instead.
+        """
+        memo = await self.async_peek_memo(signature)
+        if memo is None:
+            await self._abump_memo_miss()
+            return None
+        await self.async_record_memo_hit(signature)
+        return memo
+
+    async def async_peek_memo(self, signature: str) -> dict | None:
         async with self._aconnect() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
@@ -1231,14 +1363,15 @@ class AsyncPgvectorStore(BaseStore):
                 raw = await cur.fetchone()
                 description = cur.description
         if raw is None:
-            await self._abump_memo_miss()
             return None
         row = self._normalize_row(raw, description)
         max_age = self.config.memoization_max_age_hours if self.config is not None else 24
         age_seconds = time.time() - float(row["created_at"])
         if age_seconds > max_age * 3600:
-            await self._abump_memo_miss()
             return None
+        return dict(row)
+
+    async def async_record_memo_hit(self, signature: str) -> None:
         async with self._aconnect() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
@@ -1249,7 +1382,6 @@ class AsyncPgvectorStore(BaseStore):
                     ),
                     (time.time(), signature),
                 )
-        return dict(row)
 
     async def async_update_memo_outcome(self, signature: str, outcome: float, verified: bool = False) -> bool:
         async with self._aconnect() as conn:
@@ -1395,6 +1527,9 @@ class AsyncPgvectorStore(BaseStore):
             age_seconds=max(0.0, time.time() - created_at),
             dissent_count=int(row.get("dissent_count") or 0),
             verified=bool(row.get("verified")) if row.get("verified") is not None else False,
+            valid_from=float(row["valid_from"]) if row.get("valid_from") is not None else None,
+            valid_to=float(row["valid_to"]) if row.get("valid_to") is not None else None,
+            superseded_by=row.get("superseded_by"),
         )
 
     def _decode_embedding(self, value: Any) -> list[float] | None:

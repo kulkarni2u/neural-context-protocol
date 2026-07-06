@@ -87,9 +87,12 @@ Tracking fields (defaults shown):
   slot_age        int   = 0       calls since slot last confirmed
   slot_confidence float = 1.0     0-1, decays if unconfirmed
   goal_version    int   = 1       increments on goal change, broadcast on change
-  drift_score     float = 0.0     0-1, self-reported advisory signal (client-asserted,
-                                  NOT runtime-computed; a computed drift signal is
-                                  future work, WI-016 — see north-star roadmap)
+  drift_score     float = 0.0     0-1, self-reported by default (client-asserted).
+                                  When [drift].drift_computed_enabled is true
+                                  (CAP-T5, WI-016), ncp_get_context instead
+                                  overrides this with a value computed from
+                                  observable turn history and exposes both
+                                  values in a "drift" response block — see §4e.
   intent_anchor   str?  = None    sha256 of original intent at turn 0
 
 History:
@@ -142,6 +145,15 @@ Validity:
   valid_while     str?      = None  staleness condition
   expiry          datetime? = None  required for proven/global zones
   owner           str?      = None  team or agent identifier
+
+Bi-temporal fields (CAP-C5 -- see §4f):
+  valid_from      float?    = None  epoch seconds; when this fact became
+                                    true in the world (valid time)
+  valid_to        float?    = None  epoch seconds; when this fact stopped
+                                    being true in the world
+  superseded_by   str?      = None  chunk_id of the chunk that honestly
+                                    replaced this one; set by supersede(),
+                                    never by a plain write
 
 Chunk type (for chunker dispatch):
   chunk_type      str = "prose"    prose|json|code|table|auto
@@ -424,6 +436,317 @@ Semantics:
 
 ---
 
+## 4c. Cost Governance and Model-Tiering Signals (CAP-E2, CAP-E3, normative)
+
+### CAP-E2 — budget block on ncp_get_context / ncp_post_turn
+
+```
+Config gate ([budget] table):
+  pipeline_budget_usd:   float?  — $ ceiling per pipeline_id. None (default)
+                                   disables the governor: no "budget" field
+                                   is ever present in responses.
+  budget_warn_fraction:  float   — fraction of the ceiling at which status
+                                   flips from "ok" to "warning" (default 0.8).
+  budget_enforcement:    str     — "off" | "warn" (default) | "block".
+                                   "off" fully disables the governor even if
+                                   pipeline_budget_usd is set.
+
+Spend source (honesty constraint):
+  spent_usd is read back from store.cost_summary(pipeline_id=...) --
+  the same cost_log rows CAP-E1 populates from real provider usage
+  (cost_source == "measured") or the unpriced (0.0) local/mock estimate
+  path (cost_source == "estimated"). The governor never presents an
+  estimated figure as billed spend.
+
+"budget" block shape (present on ncp_get_context and ncp_post_turn only
+when pipeline_budget_usd is configured and budget_enforcement != "off"):
+  {
+    "spent_usd":      float,  # cumulative recorded cost_usd for this pipeline_id
+    "budget_usd":     float,  # the configured ceiling
+    "fraction_used":  float,  # spent_usd / budget_usd
+    "status":         "ok" | "warning" | "exceeded"
+  }
+  status = "exceeded" once spent_usd >= budget_usd; "warning" once
+  fraction_used >= budget_warn_fraction; "ok" otherwise.
+
+Block-mode refusal (ncp_get_context only):
+  When budget_enforcement == "block" and status == "exceeded", assembly is
+  skipped entirely and ncp_get_context returns a structured refusal instead
+  of an exception:
+    {
+      "budget_exceeded": true,
+      "context": "",
+      "session_id": str,
+      "budget": { ...budget block above, status == "exceeded"... }
+    }
+  ncp_post_turn never blocks (the turn's cost is already spent by the time
+  post_turn runs); it only surfaces the post-turn "budget" block, including
+  when status is "exceeded", so a warn/off-mode host can react on its own.
+```
+
+### CAP-E3 — tier_hint / complexity_signal on ncp_get_context
+
+```
+Config gate ([tiering] table):
+  tier_hints_enabled: bool (default true) -- set false to omit these fields.
+
+NCP does not route models. This signal only tells an external orchestrator
+whether a turn looks safe to downshift to a cheaper model; NCP makes no
+routing decision itself.
+
+Response fields (top-level, alongside "context"/"telemetry"):
+  "tier_hint":         "light" | "standard" | "deep"
+  "complexity_signal": float in [0.0, 1.0]
+  "factors": {
+    "query_length_chars": int,
+    "query_length_norm":  float,  # min(1.0, query_length_chars / 240)
+    "chunk_count":        int,    # chunks in the assembled context
+    "distinct_authors":   int,    # distinct written_by among those chunks
+    "diversity_ratio":    float,  # distinct_authors / chunk_count (0.0 if empty)
+    "drift_score":        float,  # ConsciousBlock.drift_score, already 0-1
+    "pressure":           "low" | "medium" | "high" | "critical",
+    "pressure_norm":      float,  # {low:0.0, medium:0.33, high:0.66, critical:1.0}
+    "cold_start":         bool    # true iff retrieval was empty and the
+                                  # assembler substituted its synthetic
+                                  # cold_* pipeline_summary chunk
+  }
+
+Formula (deterministic; see ncp/tiering.py for the reference implementation):
+  complexity_signal = 0.25 * query_length_norm
+                     + 0.25 * drift_score
+                     + 0.25 * pressure_norm
+                     + 0.15 * diversity_ratio
+                     + 0.10 * (1.0 if cold_start else 0.0)
+
+  tier_hint = "light"    if complexity_signal <  0.35
+            = "deep"     if complexity_signal >= 0.65
+            = "standard" otherwise
+
+Every factor above is one of the raw inputs to the formula -- the signal is
+fully reconstructable from the "factors" block, not a black box.
+```
+
+## 4d. Adaptive Context Token Budget (CAP-C6, normative)
+
+```
+Config gate ([budget] table):
+  adaptive_budget_enabled:        bool (default false, OPT-IN) -- disabled
+                                   reproduces legacy behavior exactly: the
+                                   effective max_tokens is always whatever
+                                   the caller passed (or None, letting the
+                                   assembler fall back to its own configured
+                                   default), and no "budget_tokens" field is
+                                   ever present in the response.
+  adaptive_budget_floor_tokens:    int (default 300)  -- hard lower bound.
+  adaptive_budget_ceiling_tokens:  int (default 2000) -- hard upper bound.
+
+Precedence (never violated): an explicit caller max_tokens argument always
+wins. When present, no adaptive computation is applied to the value actually
+used for assembly -- it is passed through unchanged. This holds whether or
+not adaptive_budget_enabled is true.
+
+"budget_tokens" block shape (present on ncp_get_context, streaming and
+non-streaming, only when adaptive_budget_enabled is true):
+  {
+    "requested": int,   # what would have been used: the caller's explicit
+                         # max_tokens if given, else [budget].context_token_budget
+    "adjusted":  int,    # what was actually passed to assembly.
+                         # == "requested" whenever the caller passed an
+                         # explicit max_tokens (never overridden); otherwise
+                         # the computed value, always in
+                         # [adaptive_budget_floor_tokens, adaptive_budget_ceiling_tokens]
+    "reason_factors": {
+      # when the caller supplied an explicit max_tokens:
+      "explicit_override": true
+      # otherwise, every raw input to the formula below:
+      "query_length_chars": int,
+      "query_length_norm":  float,  # min(1.0, query_length_chars / 240)
+      "drift_score":        float,  # ConsciousBlock.drift_score, already 0-1
+      "pressure":           "low" | "medium" | "high" | "critical",
+      "pressure_norm":      float,  # {low:0.0, medium:0.33, high:0.66, critical:1.0}
+      "slot_age":           int,    # ConsciousBlock.slot_age (turns on this slot)
+      "cadence_norm":       float,  # min(1.0, slot_age / 10)
+      "task_signal":        float,  # weighted blend, in [0.0, 1.0]
+      "scale":               float, # 0.5 + task_signal, in [0.5, 1.5]
+      "dollar_budget_fraction_used": float | null,  # CAP-E2 fraction_used, or
+                                                     # null when the $ governor
+                                                     # is not configured
+      "conserved_scale":    float,  # scale after the $ pressure cut
+      "floor_tokens":       int,
+      "ceiling_tokens":     int,
+    }
+  }
+
+Formula (deterministic; see ncp/adaptive_budget.py for the reference
+implementation). All computed from values already available before
+assembly runs -- no extra retrieval, no ML:
+  query_length_norm = min(1.0, len(query_text) / 240)      # same reference as CAP-E3
+  drift              = clamp(drift_score, 0.0, 1.0)
+  pressure_norm      = {"low":0.0,"medium":0.33,"high":0.66,"critical":1.0}[pressure]
+  cadence_norm       = min(1.0, slot_age / 10)              # 10 turns on one slot == "sustained"
+
+  task_signal = 0.30 * query_length_norm
+              + 0.30 * drift
+              + 0.25 * pressure_norm
+              + 0.15 * cadence_norm
+
+  scale = 0.5 + task_signal                                  # in [0.5, 1.5]
+
+  dollar_pressure  = 0.0 if no CAP-E2 $ ceiling is configured
+                     else clamp(BudgetSnapshot.fraction_used, 0.0, 1.0)
+  conserved_scale  = scale * (1.0 - 0.5 * dollar_pressure)
+
+  adjusted_tokens = round(requested_tokens * conserved_scale)
+  adjusted_tokens = clamp(adjusted_tokens, floor_tokens, ceiling_tokens)
+
+Intent: simple/cheap turns (short query, low drift, low pressure, fresh slot)
+spend fewer tokens; complex/contested turns (long query, high drift, high
+pressure, a long-running slot) are allowed to spend more -- but a pipeline
+that is close to exhausting its CAP-E2 $ ceiling gets pulled back down, and
+the result never leaves [floor_tokens, ceiling_tokens] regardless of inputs.
+NCP never widens the ceiling itself; it only chooses where inside the fixed
+[floor, ceiling] range to spend for this turn.
+```
+
+## 4e. Computed Drift (CAP-T5, normative)
+
+```
+Config gate ([drift] table):
+  drift_computed_enabled: bool (default false, OPT-IN) -- disabled reproduces
+                           legacy behavior exactly: ConsciousBlock.drift_score
+                           stays whatever the caller self-reported (or
+                           inherited from the last persisted conscious
+                           snapshot, or 0.0), and no "drift" field is ever
+                           present in the response.
+  drift_window_turns:      int (default 5) -- sliding-window size, in prior
+                           turns, considered when scoring. Clamped to >= 1.
+  drift_use_embeddings:    bool (default false) -- optionally blend local-
+                           embedding cosine distance into the always-on
+                           lexical score (see formula below). Requires the
+                           fastembed-backed [local-embeddings] extra; when
+                           unavailable this silently degrades to the lexical
+                           score with no error.
+
+Why: drift_score was previously a pure honor-system float -- an agent (or a
+world_check whisper) could assert any value and nothing checked it. This
+section replaces that with a value NCP computes from observable turn
+history (ncp/drift.py), while still exposing the self-reported value so the
+two can be compared -- the divergence is the trust signal.
+
+Turn history source: BaseStore.recent_turns(pipeline_id, limit) returns up to
+drift_window_turns TurnRecords for the pipeline, oldest-first. Implemented
+identically by SQLiteStore, PgvectorStore, and AsyncPgvectorStore (the async
+variant is native async, no thread-pool shim); a backend that has not
+implemented it defaults to returning [], which degrades to a computed score
+of 0.0 -- never a crash.
+
+Formula (deterministic lexical baseline; see ncp/drift.py for the reference
+implementation):
+  task_tokens   = normalize_query_terms(task + " " + slot)   # lower().split()
+  window_turns  = last drift_window_turns entries of recent_turns
+  window_tokens = union of normalize_query_terms(f"{task} {slot} {result}")
+                  over window_turns
+  jaccard       = |task_tokens & window_tokens| / |task_tokens | window_tokens|
+  lexical_score = clamp(1 - jaccard, 0.0, 1.0)
+
+  Edge cases score 0.0 (no observable evidence of divergence, not a crash):
+  zero prior turns, or an empty/blank task+slot text.
+
+Optional embedding blend (drift_use_embeddings=true and an adapter is
+available):
+  embedding_distance = 1 - cosine_similarity(embed(task+slot),
+                                              centroid(embed(window turns)))
+  score = 0.5 * embedding_distance + 0.5 * lexical_score
+
+Wiring in ncp_get_context (when drift_computed_enabled is true):
+  1. Hydrate ConsciousBlock as usual (self-reported/inherited drift_score).
+  2. Compute the reading above from the pipeline's recent turns.
+  3. Override ConsciousBlock.drift_score with the computed score BEFORE
+     CAP-E3 tiering, CAP-C6 adaptive budget, and assembly consume it -- so
+     every downstream consumer of drift_score sees the computed value, not
+     the claimed one.
+
+"drift" block shape (present on ncp_get_context, streaming and
+non-streaming, only when drift_computed_enabled is true):
+  {
+    "score":         float,          # the computed value in [0.0, 1.0];
+                                      # this is also what overrides
+                                      # ConsciousBlock.drift_score
+    "method":        "lexical" | "blended",
+    "self_reported": float | null,   # the pre-override drift_score: the
+                                      # caller's explicit drift_score arg, or
+                                      # the value inherited from the last
+                                      # persisted conscious snapshot for this
+                                      # agent/pipeline. null when neither
+                                      # existed (nothing was ever
+                                      # self-reported -- an untouched
+                                      # hardcoded default is not a claim).
+    "window_turns":  int             # the configured drift_window_turns
+  }
+```
+
+---
+
+## 4f. Bi-temporal Memory (CAP-C5, normative)
+
+```
+Why: facts go stale, and destructive overwrite discards history. Best-in-
+class memory carries two independent time dimensions per chunk:
+  - transaction time (created_at): when NCP recorded the row. Fixed at
+    first write, never rewritten by later upserts of the same chunk_id.
+  - valid time (valid_from / valid_to): when the fact was/is true in the
+    world. Both nullable; unset means "no bound in that direction."
+Supersession (superseded_by) records that a newer chunk honestly replaced
+this one. The old chunk is NEVER deleted -- only marked -- so "what did we
+believe as of turn N" stays answerable via as_of.
+
+ncp_write_memory — new optional params:
+  valid_from   str?  ISO-8601 timestamp or epoch seconds. When this chunk's
+                     fact became true in the world.
+  valid_to     str?  ISO-8601 timestamp or epoch seconds. When this chunk's
+                     own fact stops being true in the world. Independent of
+                     supersedes (which sets the PREVIOUS chunk's valid_to).
+  supersedes   str?  chunk_id of an existing chunk this write honestly
+                     replaces. After the new chunk is written:
+                       old.superseded_by = new.chunk_id
+                       old.valid_to      = new.valid_from  (or "now" if
+                                           valid_from was omitted)
+                     The old chunk is not deleted. Response includes
+                     "superseded": bool (whether the old chunk_id was found
+                     and updated).
+
+ncp_get_context — new optional param:
+  as_of        str?  ISO-8601 timestamp or epoch seconds. See view semantics
+                     below. Echoed back in the response as "as_of" (epoch
+                     seconds) when given.
+
+View semantics (query(), get_working_zone(), get_chunks_by_ids() on every
+backend — SQLiteStore, PgvectorStore, AsyncPgvectorStore):
+  as_of omitted (default, currently-valid view):
+    EXCLUDE a chunk if superseded_by is set (regardless of when), OR if
+    valid_to is set and has already passed "now".
+  as_of given (point-in-time view):
+    INCLUDE a chunk only if:
+      1. created_at <= as_of                      (recorded by then)
+      2. not superseded by a chunk itself recorded by as_of -- the
+         transaction time a supersession took effect is the superseding
+         chunk's own created_at, since supersede() always runs
+         transactionally alongside that chunk's write
+      3. valid_from is unset or <= as_of, AND valid_to is unset or > as_of
+         (valid at that instant)
+    A chunk whose successor cannot be resolved (should not normally happen)
+    is treated as not-yet-confirmed-superseded and stays visible --
+    correctness over aggressiveness.
+
+Backward compatibility: rows written before this feature (or by writers
+that never pass the new params) have valid_from/valid_to/superseded_by all
+NULL, which is a no-op under both views above -- default reads are
+unaffected except that they now correctly exclude chunks that literally
+cannot exist in pre-CAP-C5 data (nothing to filter).
+```
+
+---
+
 ## 5. Trust Boundaries (normative, first-class)
 
 These rules are enforced by the assembler and store. Not optional.
@@ -615,7 +938,10 @@ CREATE TABLE chunks (
     valid_while     TEXT,
     expiry          REAL,
     owner           TEXT,
-    meta            TEXT DEFAULT '{}'
+    meta            TEXT DEFAULT '{}',
+    valid_from      REAL,             -- CAP-C5: bi-temporal valid-time lower bound
+    valid_to        REAL,             -- CAP-C5: bi-temporal valid-time upper bound
+    superseded_by   TEXT              -- CAP-C5: chunk_id of the honest replacement
 );
 
 -- Reference integrity
@@ -770,6 +1096,20 @@ cold_start_retry = 2
 max_tokens_per_call = 4000
 warn_at_ratio = 0.70
 critical_at_ratio = 0.85
+# pipeline_budget_usd = 5.00   # CAP-E2; unset (default) disables the governor
+budget_warn_fraction = 0.8     # CAP-E2
+budget_enforcement = "warn"    # CAP-E2: off | warn | block
+adaptive_budget_enabled = false        # CAP-C6: opt-in
+adaptive_budget_floor_tokens = 300     # CAP-C6
+adaptive_budget_ceiling_tokens = 2000  # CAP-C6
+
+[tiering]
+tier_hints_enabled = true      # CAP-E3
+
+[drift]
+drift_computed_enabled = false  # CAP-T5: opt-in; see §4e
+drift_window_turns = 5          # CAP-T5
+drift_use_embeddings = false    # CAP-T5: optional local-embedding blend
 
 [chunking]
 max_chunk_tokens = 200

@@ -14,6 +14,7 @@ import time
 
 from ncp.config import NCPConfig
 from ncp.stores.base import BaseStore, NCPStoreUnavailableError
+from ncp.stores.bitemporal import collect_successor_ids, filter_bitemporal
 from ncp.stores.calibration import (
     FeedbackRow,
     ReputationUpdate,
@@ -72,7 +73,10 @@ CREATE TABLE IF NOT EXISTS {schema}.{prefix}chunks (
     last_retrieved_at DOUBLE PRECISION,
     written_at_drift DOUBLE PRECISION DEFAULT 0.0,
     dissent_count INTEGER DEFAULT 0,
-    verified BOOLEAN DEFAULT FALSE
+    verified BOOLEAN DEFAULT FALSE,
+    valid_from DOUBLE PRECISION,
+    valid_to DOUBLE PRECISION,
+    superseded_by TEXT
 );
 
 CREATE TABLE IF NOT EXISTS {schema}.{prefix}tombstones (
@@ -412,10 +416,10 @@ class PgvectorStore(BaseStore):
                             written_by, caused_by, conscious_hash, evidence_id, version, supersedes,
                             source_refs, schema_version, created_at, base_trust, generation,
                             result_confidence, result_attempts, conditions, valid_while, expiry, owner, meta,
-                            embedding, written_at_drift, verified
+                            embedding, written_at_drift, verified, valid_from, valid_to, superseded_by
                         ) VALUES (
                             %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                         )
                         ON CONFLICT (chunk_id) DO UPDATE SET
                             pipeline_id = EXCLUDED.pipeline_id,
@@ -445,7 +449,8 @@ class PgvectorStore(BaseStore):
                             meta = EXCLUDED.meta,
                             embedding = EXCLUDED.embedding,
                             written_at_drift = EXCLUDED.written_at_drift,
-                            verified = EXCLUDED.verified
+                            verified = EXCLUDED.verified,
+                            valid_from = EXCLUDED.valid_from
                         """
                     ),
                     (
@@ -478,6 +483,9 @@ class PgvectorStore(BaseStore):
                         embedding_val,
                         chunk.written_at_drift,
                         bool(chunk.verified),
+                        chunk.valid_from,
+                        chunk.valid_to,
+                        chunk.superseded_by,
                     ),
                 )
             finally:
@@ -501,6 +509,7 @@ class PgvectorStore(BaseStore):
         embedding: list[float] | None = None,
         diversity_limit: int = 2,
         fallback_to_trust_recency: bool = False,
+        as_of: float | None = None,
     ) -> list[SubconsciousChunk]:
         _VALID_RETRIEVAL_MODES = ("hybrid", "trust_recency", "vector")
         if retrieval_mode not in _VALID_RETRIEVAL_MODES:
@@ -512,7 +521,7 @@ class PgvectorStore(BaseStore):
             return self._query_vector(
                 text=text, embedding=embedding, k=k, min_score=min_score,
                 layer=layer, pipeline_id=pipeline_id, scope=scope, zone=zone,
-                diversity_limit=diversity_limit,
+                diversity_limit=diversity_limit, as_of=as_of,
             )
         if embedding is None and self._embedding_adapter is not None:
             embedding = self._embedding_adapter.embed(text)
@@ -526,6 +535,7 @@ class PgvectorStore(BaseStore):
                 pipeline_id=pipeline_id,
                 scope=scope,
                 zone=zone,
+                as_of=as_of,
             )
         if not rows:
             return []
@@ -648,6 +658,7 @@ class PgvectorStore(BaseStore):
         zone: str,
         diversity_limit: int = 2,
         blended_trust: dict[str, float] | None = None,
+        as_of: float | None = None,
     ) -> list[SubconsciousChunk]:
         if embedding is None:
             if self._embedding_adapter is not None:
@@ -698,6 +709,7 @@ class PgvectorStore(BaseStore):
                 rows = self._fetchall(cursor)
             finally:
                 self._close_cursor(cursor)
+            rows = self._apply_bitemporal_filter(connection, rows, as_of=as_of)
 
         results: list[SubconsciousChunk] = []
         for row in rows:
@@ -748,6 +760,35 @@ class PgvectorStore(BaseStore):
                 "pgvector whisper coordination requires Redis. Set NCP_REDIS_URL and ensure Redis is reachable."
             )
         self.coordination.emit_whisper(whisper)
+
+    def supersede(
+        self,
+        old_chunk_id: str,
+        new_chunk_id: str,
+        *,
+        valid_to: float | None = None,
+    ) -> bool:
+        """CAP-C5: mark ``old_chunk_id`` as honestly replaced by ``new_chunk_id``.
+
+        The old row is never deleted -- only ``superseded_by`` and
+        ``valid_to`` are updated in place, so a later ``as_of`` query can
+        still recover it.
+        """
+        resolved_valid_to = time.time() if valid_to is None else valid_to
+        with self._connect() as connection:
+            cursor = connection.cursor()
+            try:
+                cursor.execute(
+                    self._sql(
+                        "UPDATE {schema}.{prefix}chunks"
+                        " SET superseded_by = %s, valid_to = %s WHERE chunk_id = %s"
+                    ),
+                    (new_chunk_id, resolved_valid_to, old_chunk_id),
+                )
+                connection.commit()
+                return cursor.rowcount > 0
+            finally:
+                self._close_cursor(cursor)
 
     def record_dissent(self, chunk_id: str) -> bool:
         normalized = chunk_id.removeprefix("ctx://sub/")
@@ -828,7 +869,6 @@ class PgvectorStore(BaseStore):
                             task = EXCLUDED.task,
                             result_summary = EXCLUDED.result_summary,
                             chunk_ids = EXCLUDED.chunk_ids,
-                            created_at = EXCLUDED.created_at,
                             output_tokens_est = EXCLUDED.output_tokens_est
                         """
                     ),
@@ -843,6 +883,20 @@ class PgvectorStore(BaseStore):
                 self._close_cursor(cursor)
 
     def lookup_memo(self, signature: str) -> dict | None:
+        """Look up a memo, unconditionally counting a hit if found and fresh.
+
+        See ``BaseStore.lookup_memo`` for why callers that apply further
+        usability gating should prefer ``peek_memo`` + ``record_memo_hit``/
+        ``record_memo_miss`` instead.
+        """
+        memo = self.peek_memo(signature)
+        if memo is None:
+            self._bump_memo_miss()
+            return None
+        self.record_memo_hit(signature)
+        return memo
+
+    def peek_memo(self, signature: str) -> dict | None:
         with self._connect() as connection:
             cursor = connection.cursor()
             try:
@@ -856,13 +910,14 @@ class PgvectorStore(BaseStore):
             finally:
                 self._close_cursor(cursor)
         if row is None:
-            self._bump_memo_miss()
             return None
         max_age = self.config.memoization_max_age_hours if self.config is not None else 24
         age_seconds = time.time() - float(row["created_at"])
         if age_seconds > max_age * 3600:
-            self._bump_memo_miss()
             return None
+        return dict(row)
+
+    def record_memo_hit(self, signature: str) -> None:
         with self._connect() as connection:
             cursor = connection.cursor()
             try:
@@ -877,7 +932,9 @@ class PgvectorStore(BaseStore):
                 connection.commit()
             finally:
                 self._close_cursor(cursor)
-        return dict(row)
+
+    def record_memo_miss(self) -> None:
+        self._bump_memo_miss()
 
     def update_memo_outcome(self, signature: str, outcome: float, verified: bool = False) -> bool:
         with self._connect() as connection:
@@ -1024,6 +1081,7 @@ class PgvectorStore(BaseStore):
         *,
         pipeline_id: str | None = None,
         layer: str | None = None,
+        as_of: float | None = None,
     ) -> Sequence[SubconsciousChunk]:
         with self._connect() as connection:
             rows = self._load_query_rows(
@@ -1032,6 +1090,7 @@ class PgvectorStore(BaseStore):
                 pipeline_id=pipeline_id,
                 scope=None,
                 zone="working",
+                as_of=as_of,
             )
         return [self._row_to_chunk(row) for row in rows]
 
@@ -1086,6 +1145,42 @@ class PgvectorStore(BaseStore):
             finally:
                 self._close_cursor(cursor)
         return None if row is None else TurnRecord(**row)
+
+    def recent_turns(self, *, pipeline_id: str | None, limit: int = 20) -> list[TurnRecord]:
+        """CAP-T5/Sprint 5d parity: most recent turn records, oldest-first.
+
+        Mirrors ``SQLiteStore.recent_turns`` exactly: most-recent ``limit``
+        rows for the pipeline (or pipeline_id IS NULL), returned oldest-first
+        so callers can feed them straight into computed drift.
+        """
+        capped_limit = max(0, int(limit))
+        if capped_limit == 0:
+            return []
+        with self._connect() as connection:
+            cursor = connection.cursor()
+            try:
+                if pipeline_id is None:
+                    cursor.execute(
+                        self._sql(
+                            "SELECT * FROM {schema}.{prefix}turn_records"
+                            " WHERE pipeline_id IS NULL ORDER BY created_at DESC LIMIT %s"
+                        ),
+                        (capped_limit,),
+                    )
+                else:
+                    cursor.execute(
+                        self._sql(
+                            "SELECT * FROM {schema}.{prefix}turn_records"
+                            " WHERE pipeline_id = %s ORDER BY created_at DESC LIMIT %s"
+                        ),
+                        (pipeline_id, capped_limit),
+                    )
+                rows = self._fetchall(cursor)
+            finally:
+                self._close_cursor(cursor)
+        records = [TurnRecord(**row) for row in rows]
+        records.reverse()
+        return records
 
     def log_cost(self, *, agent_id: str, response: NCPResponse) -> None:
         self.log_cost_raw(
@@ -2138,6 +2233,7 @@ class PgvectorStore(BaseStore):
         pipeline_id: str | None,
         scope: str | None,
         zone: str,
+        as_of: float | None = None,
     ) -> list[dict[str, Any]]:
         clauses = ["zone = %s"]
         params: list[object] = [zone]
@@ -2163,9 +2259,53 @@ class PgvectorStore(BaseStore):
                 ),
                 tuple(params),
             )
-            return self._fetchall(cursor)
+            rows = self._fetchall(cursor)
         finally:
             self._close_cursor(cursor)
+        return self._apply_bitemporal_filter(connection, rows, as_of=as_of)
+
+    def _apply_bitemporal_filter(
+        self,
+        connection: Any,
+        rows: list[dict[str, Any]],
+        *,
+        as_of: float | None,
+    ) -> list[dict[str, Any]]:
+        """CAP-C5: apply bi-temporal visibility as a Python post-filter.
+
+        Kept out of the SQL WHERE clause deliberately: it keeps the query
+        text backward compatible (important for callers/tests that pattern-
+        match on it) and sidesteps schema/prefix-substitution gymnastics for
+        the self-referential "was the successor itself recorded by as_of"
+        check, which only needs one small follow-up lookup when ``as_of`` is
+        given and at least one row is superseded.
+        """
+        now = time.time()
+        if as_of is None:
+            return filter_bitemporal(rows, as_of=None, now=now)
+        successor_ids = collect_successor_ids(rows)
+        successor_created_at = (
+            self._load_successor_created_at(connection, successor_ids) if successor_ids else {}
+        )
+        return filter_bitemporal(rows, as_of=as_of, now=now, successor_created_at=successor_created_at)
+
+    def _load_successor_created_at(
+        self, connection: Any, chunk_ids: set[str]
+    ) -> dict[str, float]:
+        if not chunk_ids:
+            return {}
+        cursor = connection.cursor()
+        try:
+            cursor.execute(
+                self._sql(
+                    "SELECT chunk_id, created_at FROM {schema}.{prefix}chunks WHERE chunk_id = ANY(%s)"
+                ),
+                (list(chunk_ids),),
+            )
+            rows = self._fetchall(cursor)
+        finally:
+            self._close_cursor(cursor)
+        return {str(row["chunk_id"]): float(row["created_at"]) for row in rows}
 
     def _count_rows(self, connection: Any, table: str, *, pipeline_id: str | None = None) -> int:
         cursor = connection.cursor()
@@ -2400,6 +2540,9 @@ class PgvectorStore(BaseStore):
             age_seconds=max(0.0, time.time() - created_at),
             dissent_count=int(row["dissent_count"]) if row.get("dissent_count") is not None else 0,
             verified=bool(row.get("verified")) if row.get("verified") is not None else False,
+            valid_from=float(row["valid_from"]) if row.get("valid_from") is not None else None,
+            valid_to=float(row["valid_to"]) if row.get("valid_to") is not None else None,
+            superseded_by=row.get("superseded_by"),
         )
 
     def _decode_json_list(self, value: Any) -> list[str]:

@@ -169,8 +169,10 @@ async def test_async_write_embedding_stored_after_auto_embed() -> None:
              if len(c[0]) > 0 and "INSERT INTO" in str(c[0][0])]
     assert calls, "No INSERT call found"
     insert_sql, insert_params = calls[0]
-    # Last param is embedding_val — should be non-None (adapter returned floats)
-    assert insert_params[-1] is not None, (
+    # embedding_val is the 4th-from-last param (CAP-C5 appended valid_from,
+    # valid_to, superseded_by after it) — should be non-None (adapter returned
+    # floats).
+    assert insert_params[-4] is not None, (
         "INSERT embedding param must be set when adapter auto-embedded"
     )
 

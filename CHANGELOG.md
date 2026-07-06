@@ -2,7 +2,7 @@
 
 All notable changes to Neural Context Protocol will be documented in this file.
 
-## [Unreleased]
+## [1.3.0] - 2026-07-06
 
 Audit remediation from `docs/NCP_AUDIT_AND_REMEDIATION_PLAN.md`. One work item
 (`WI-###`) per commit; each addresses a finding (`F-*`) from the audit.
@@ -32,6 +32,92 @@ Audit remediation from `docs/NCP_AUDIT_AND_REMEDIATION_PLAN.md`. One work item
 
 ### Added
 
+- **Bi-temporal memory** (`ncp/types.py`, `ncp/stores/base.py`,
+  `ncp/stores/bitemporal.py`, `ncp/stores/sqlite.py`, `ncp/stores/pgvector.py`,
+  `ncp/stores/pgvector_async.py`, `ncp/assembler.py`, `ncp/mcp/server.py`,
+  `ncp/migrations/011_add_bitemporal_columns.sql`): chunks gain nullable
+  `valid_from`/`valid_to` (valid time -- when a fact was/is true in the
+  world, independent of `created_at`'s transaction time) and `superseded_by`
+  (honest supersedence: the replaced chunk is never deleted, only marked).
+  `ncp_write_memory` accepts optional `valid_from`/`valid_to` (ISO-8601 or
+  epoch seconds) and `supersedes` (an existing `chunk_id`); superseding sets
+  `old.superseded_by = new.chunk_id` and `old.valid_to = new.valid_from`
+  (or "now"). `ncp_get_context` gains an optional `as_of` param: omitted, it
+  returns the currently-valid view (excludes superseded chunks and chunks
+  whose `valid_to` has passed); given, it returns the point-in-time view as
+  of that transaction time (recorded by then, not superseded by a chunk
+  itself recorded by then, valid at that instant) -- "what did we believe as
+  of turn N." Implemented identically across `SQLiteStore`, `PgvectorStore`,
+  and `AsyncPgvectorStore`. Backward compatible: writes without the new
+  params, and all pre-existing rows (`NULL` in the new columns), behave
+  exactly as before. See `docs/NCP_PROTOCOL_SPEC.md` §4f. (CAP-C5)
+- **`recent_turns` parity for pgvector** (`ncp/stores/pgvector.py`,
+  `ncp/stores/pgvector_async.py`): `PgvectorStore.recent_turns` and
+  `AsyncPgvectorStore.async_recent_turns` (native async, no thread-pool
+  shim) now query `turn_records` for real, mirroring
+  `SQLiteStore.recent_turns` exactly (most-recent `limit` rows for the
+  pipeline, returned oldest-first). Computed drift (CAP-T5,
+  `ncp/drift.py`) previously silently degraded to `0.0` on pgvector
+  deployments via `BaseStore`'s empty-list default; it now sees real turn
+  history there too.
+- **Computed drift signal** (`ncp/drift.py`, `ncp/mcp/server.py`,
+  `ncp/config.py`, `ncp/stores/base.py`, `ncp/stores/sqlite.py`):
+  `ConsciousBlock.drift_score` was previously pure honor system — an agent
+  (or a `world_check` whisper) could assert any value and nothing verified
+  it. `ncp_get_context` can now compute drift itself from observable turn
+  history: a deterministic Jaccard/BM25-token-overlap score between the
+  current task/slot text and a sliding window (`drift_window_turns`,
+  **default `5`**) of the pipeline's recent turn summaries (`0.0` = on-topic,
+  `1.0` = fully drifted), optionally blended with local-embedding cosine
+  distance (`drift_use_embeddings`, **default `false`**; falls back silently
+  to the lexical score when `fastembed` is not installed — never a hard
+  dependency). Gated by `[drift].drift_computed_enabled` (**default
+  `false`**); when enabled, the computed value overrides `drift_score`
+  *before* CAP-E3 tiering and CAP-C6 adaptive budget consume it, and the
+  response gains a `drift` block (`score`/`method`/`self_reported`/
+  `window_turns`) so the divergence between the claimed and computed values
+  is visible. Disabled (default) reproduces legacy self-reported behavior
+  byte-for-byte. Zero prior turns, empty task text, and very long histories
+  all degrade to a safe, deterministic `0.0`/clamped result rather than
+  erroring. See the formula in `ncp/drift.py` and
+  `docs/NCP_PROTOCOL_SPEC.md` §4e. (CAP-T5, WI-016)
+- **Adaptive per-turn context token budget** (`ncp/adaptive_budget.py`,
+  `ncp/mcp/server.py`, `ncp/config.py`): `ncp_get_context` can scale its
+  effective token budget to turn difficulty instead of always spending
+  `[budget].context_token_budget`. When `[budget].adaptive_budget_enabled`
+  is true (**default `false`**) and the caller omits `max_tokens`, the
+  budget is computed from query length, drift score, budget pressure, and
+  slot cadence (all already observable before assembly runs), scaled
+  `0.5x`-`1.5x` of the requested budget, further pulled down under CAP-E2 $
+  budget pressure, and always clamped to
+  `[adaptive_budget_floor_tokens, adaptive_budget_ceiling_tokens]`
+  (**defaults `300`/`2000`**). The response gains a `budget_tokens`
+  (`requested`/`adjusted`/`reason_factors`) block, present only when the
+  feature is enabled. An explicit caller `max_tokens` is always honored
+  as-is regardless of this setting. Disabled (default) reproduces legacy
+  behavior byte-for-byte. See the formula in `ncp/adaptive_budget.py` and
+  `docs/NCP_PROTOCOL_SPEC.md` §4d. (CAP-C6)
+- **Model-tiering advisory signal** (`ncp/tiering.py`, `ncp/mcp/server.py`,
+  `ncp/config.py`): `ncp_get_context` responses gain a top-level `tier_hint`
+  (`"light"`/`"standard"`/`"deep"`), `complexity_signal` (0.0-1.0), and a
+  `factors` block exposing every raw input (query length, retrieved chunk
+  count/author diversity, drift score, budget pressure, cold-start flag) that
+  fed the deterministic formula documented in `ncp/tiering.py` and
+  `docs/NCP_PROTOCOL_SPEC.md` §4c. NCP does not route models itself — this
+  only hands an orchestrator a defensible, auditable signal for downshifting
+  cheap turns to a smaller model. Gated by `[tiering].tier_hints_enabled`
+  (**default `true`**). (CAP-E3)
+- **Per-pipeline cost governor** (`ncp/budget.py`, `ncp/mcp/server.py`,
+  `ncp/config.py`): opt-in `[budget].pipeline_budget_usd` ceiling, classified
+  against cumulative recorded spend from the existing CAP-E1 `cost_log` (never
+  an estimate) via `budget_warn_fraction` (**default `0.8`**) and
+  `budget_enforcement` (**default `"warn"`**: `"off"` | `"warn"` | `"block"`).
+  `ncp_get_context` and `ncp_post_turn` surface a `budget` block
+  (`spent_usd`/`budget_usd`/`fraction_used`/`status`) whenever a budget is
+  configured; in `"block"` mode an already-exceeded pipeline gets a structured
+  `{"budget_exceeded": true, ...}` refusal from `ncp_get_context` instead of an
+  exception, before any assembly work runs. Unset `pipeline_budget_usd`
+  (default) keeps the governor fully off. (CAP-E2)
 - **Outcome-calibrated reputation** (`ncp/types.py`, `ncp/stores/base.py`,
   `ncp/stores/calibration.py`, `ncp/stores/sqlite.py`, `ncp/stores/pgvector.py`,
   `ncp/stores/pgvector_async.py`, `ncp/mcp/server.py`,

@@ -45,6 +45,17 @@ DEFAULT_CONFIG = {
         "whisper_cap_default": 3,
         "whisper_cap_high": 2,
         "whisper_cap_critical": 1,
+        # CAP-E2: per-pipeline $ budget governance over real (CAP-E1) cost
+        # accounting. None (default) disables the governor entirely.
+        "pipeline_budget_usd": None,
+        "budget_warn_fraction": 0.8,
+        "budget_enforcement": "warn",
+        # CAP-C6: adaptive per-turn context token budget. Default false
+        # (opt-in) -- disabled preserves exact legacy behavior. Floor/ceiling
+        # are only consulted when enabled.
+        "adaptive_budget_enabled": False,
+        "adaptive_budget_floor_tokens": 300,
+        "adaptive_budget_ceiling_tokens": 2000,
     },
     "chunking": {
         "max_chunk_tokens": 200,
@@ -115,6 +126,24 @@ DEFAULT_CONFIG = {
         # authorship cannot be verified (missing/bad signature or revoked identity)
         # is rejected.
         "require_signatures": False,
+    },
+    "tiering": {
+        # CAP-E3: advisory model-tiering signal on ncp_get_context responses.
+        # NCP never routes models itself; this only emits a signal an
+        # orchestrator can use. Default true; set false to omit the fields.
+        "tier_hints_enabled": True,
+    },
+    "drift": {
+        # CAP-T5: replace the self-reported ConsciousBlock.drift_score with a
+        # value NCP computes from observable turn history. Default false
+        # (opt-in) -- disabled preserves exact legacy (self-reported) behavior.
+        "drift_computed_enabled": False,
+        "drift_window_turns": 5,
+        # Blend in local-embedding cosine distance alongside the always-on
+        # lexical baseline (see ncp/drift.py). Requires drift_computed_enabled
+        # and the fastembed-backed [local-embeddings] extra; silently falls
+        # back to lexical-only when the adapter is unavailable.
+        "drift_use_embeddings": False,
     },
     "providers": {
         "pricing": {
@@ -281,6 +310,55 @@ class NCPConfig:
         return int(self.values.get("budget", {}).get("whisper_cap_critical", 1))
 
     @property
+    def pipeline_budget_usd(self) -> float | None:
+        """CAP-E2: per-pipeline $ spend ceiling. None (default) disables the governor."""
+        val = self.values.get("budget", {}).get("pipeline_budget_usd")
+        return None if val is None else float(val)
+
+    @property
+    def budget_warn_fraction(self) -> float:
+        return float(self.values.get("budget", {}).get("budget_warn_fraction", 0.8))
+
+    @property
+    def budget_enforcement(self) -> str:
+        """CAP-E2 enforcement mode: 'off' | 'warn' | 'block'. Falls back to 'warn' for unknown values."""
+        val = str(self.values.get("budget", {}).get("budget_enforcement", "warn"))
+        return val if val in {"off", "warn", "block"} else "warn"
+
+    @property
+    def adaptive_budget_enabled(self) -> bool:
+        """CAP-C6: whether ncp_get_context adapts the token budget to turn difficulty."""
+        return bool(self.values.get("budget", {}).get("adaptive_budget_enabled", False))
+
+    @property
+    def adaptive_budget_floor_tokens(self) -> int:
+        return int(self.values.get("budget", {}).get("adaptive_budget_floor_tokens", 300))
+
+    @property
+    def adaptive_budget_ceiling_tokens(self) -> int:
+        return int(self.values.get("budget", {}).get("adaptive_budget_ceiling_tokens", 2000))
+
+    @property
+    def tier_hints_enabled(self) -> bool:
+        """CAP-E3: whether ncp_get_context emits the advisory tier_hint/complexity_signal fields."""
+        return bool(self.values.get("tiering", {}).get("tier_hints_enabled", True))
+
+    @property
+    def drift_computed_enabled(self) -> bool:
+        """CAP-T5: whether ncp_get_context overrides drift_score with a computed value."""
+        return bool(self.values.get("drift", {}).get("drift_computed_enabled", False))
+
+    @property
+    def drift_window_turns(self) -> int:
+        """CAP-T5: sliding-window size (in turns) computed drift considers."""
+        return max(1, int(self.values.get("drift", {}).get("drift_window_turns", 5)))
+
+    @property
+    def drift_use_embeddings(self) -> bool:
+        """CAP-T5: whether computed drift blends in local-embedding cosine distance."""
+        return bool(self.values.get("drift", {}).get("drift_use_embeddings", False))
+
+    @property
     def whisper_ttl_default(self) -> int:
         return int(self.values.get("whispers", {}).get("default_ttl_seconds", 1800))
 
@@ -440,6 +518,31 @@ def _apply_env_overrides(values: dict[str, Any], env: dict[str, str]) -> None:
         values["reputation"]["confidence_k"] = int(env["NCP_REPUTATION_CONFIDENCE_K"])
     if "NCP_AUTH_TOKEN" in env:
         values["server"]["auth_token"] = env["NCP_AUTH_TOKEN"]
+    if "NCP_PIPELINE_BUDGET_USD" in env:
+        raw_budget = env["NCP_PIPELINE_BUDGET_USD"]
+        values["budget"]["pipeline_budget_usd"] = None if raw_budget == "" else float(raw_budget)
+    if "NCP_BUDGET_WARN_FRACTION" in env:
+        values["budget"]["budget_warn_fraction"] = float(env["NCP_BUDGET_WARN_FRACTION"])
+    if "NCP_BUDGET_ENFORCEMENT" in env:
+        values["budget"]["budget_enforcement"] = env["NCP_BUDGET_ENFORCEMENT"]
+    if "NCP_TIER_HINTS_ENABLED" in env:
+        val = env["NCP_TIER_HINTS_ENABLED"].lower()
+        values["tiering"]["tier_hints_enabled"] = val in {"true", "1", "yes"}
+    if "NCP_ADAPTIVE_BUDGET_ENABLED" in env:
+        val = env["NCP_ADAPTIVE_BUDGET_ENABLED"].lower()
+        values["budget"]["adaptive_budget_enabled"] = val in {"true", "1", "yes"}
+    if "NCP_ADAPTIVE_BUDGET_FLOOR_TOKENS" in env:
+        values["budget"]["adaptive_budget_floor_tokens"] = int(env["NCP_ADAPTIVE_BUDGET_FLOOR_TOKENS"])
+    if "NCP_ADAPTIVE_BUDGET_CEILING_TOKENS" in env:
+        values["budget"]["adaptive_budget_ceiling_tokens"] = int(env["NCP_ADAPTIVE_BUDGET_CEILING_TOKENS"])
+    if "NCP_DRIFT_COMPUTED_ENABLED" in env:
+        val = env["NCP_DRIFT_COMPUTED_ENABLED"].lower()
+        values["drift"]["drift_computed_enabled"] = val in {"true", "1", "yes"}
+    if "NCP_DRIFT_WINDOW_TURNS" in env:
+        values["drift"]["drift_window_turns"] = int(env["NCP_DRIFT_WINDOW_TURNS"])
+    if "NCP_DRIFT_USE_EMBEDDINGS" in env:
+        val = env["NCP_DRIFT_USE_EMBEDDINGS"].lower()
+        values["drift"]["drift_use_embeddings"] = val in {"true", "1", "yes"}
 
 
 def _deep_merge(target: dict[str, Any], updates: dict[str, Any]) -> None:

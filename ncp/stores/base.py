@@ -57,6 +57,7 @@ class BaseStore(ABC):
         embedding: list[float] | None = None,
         diversity_limit: int = 2,
         fallback_to_trust_recency: bool = False,
+        as_of: float | None = None,
     ) -> list[SubconsciousChunk]:
         """Query stored chunks by text relevance.
 
@@ -71,6 +72,13 @@ class BaseStore(ABC):
 
         ``diversity_limit`` caps the number of results per author
         (``written_by``).  Default 2 preserves existing behavior.
+
+        ``as_of`` (CAP-C5, epoch seconds): when ``None`` (default), returns
+        the currently-valid view -- excludes chunks that are superseded or
+        whose ``valid_to`` has passed. When given, returns the bi-temporal
+        view as of that transaction time: only chunks recorded (written) by
+        then, not superseded by a chunk recorded by then, and valid
+        (``valid_from``/``valid_to``) at that instant.
         """
 
     @abstractmethod
@@ -79,17 +87,55 @@ class BaseStore(ABC):
         *,
         pipeline_id: str | None = None,
         layer: str | None = None,
+        as_of: float | None = None,
     ) -> Sequence[SubconsciousChunk]:
-        """Return working-zone chunks, optionally filtered."""
+        """Return working-zone chunks, optionally filtered.
 
-    def get_chunks_by_ids(self, ids: Sequence[str]) -> list[SubconsciousChunk]:
+        See ``query`` for ``as_of`` (CAP-C5 bi-temporal view) semantics.
+        """
+
+    def get_chunks_by_ids(
+        self, ids: Sequence[str], *, as_of: float | None = None
+    ) -> list[SubconsciousChunk]:
         """Fetch live (non-tombstoned) chunks by exact ids, any order.
 
         Used for 1-hop edge expansion over chunk relationships
         (``caused_by``, etc.). Backends that do not implement this return
         an empty list, which disables edge expansion gracefully.
+
+        See ``query`` for ``as_of`` (CAP-C5 bi-temporal view) semantics.
         """
         return []
+
+    def supersede(
+        self,
+        old_chunk_id: str,
+        new_chunk_id: str,
+        *,
+        valid_to: float | None = None,
+    ) -> bool:
+        """CAP-C5: mark ``old_chunk_id`` as honestly replaced by ``new_chunk_id``.
+
+        Sets ``old.superseded_by = new_chunk_id`` and ``old.valid_to =
+        valid_to`` (the caller resolves ``valid_to`` to the new chunk's
+        ``valid_from`` or "now"). The old chunk is never deleted -- this is
+        the bi-temporal honesty story: supersession is recorded, not
+        overwritten. Returns True if a row was found and updated. Backends
+        that do not implement this return False.
+        """
+        return False
+
+    async def async_supersede(
+        self,
+        old_chunk_id: str,
+        new_chunk_id: str,
+        *,
+        valid_to: float | None = None,
+    ) -> bool:
+        """Asynchronously mark a chunk as superseded."""
+        return await anyio.to_thread.run_sync(
+            partial(self.supersede, old_chunk_id, new_chunk_id, valid_to=valid_to)
+        )
 
     def record_dissent(self, chunk_id: str) -> bool:
         """Record that ``chunk_id`` was disputed (e.g. by a dissent whisper).
@@ -130,6 +176,13 @@ class BaseStore(ABC):
         ``output_tokens_est`` records how many output tokens a memo hit is
         estimated to save; when None, backends estimate it from the stored
         result via ``ncp.tokens.estimate_tokens``. Returns True on success.
+
+        Re-recording an existing ``signature`` is an upsert of the task/
+        content fields only: ``created_at``, ``hit_count``, ``last_hit_at``,
+        ``outcome``, and ``verified`` are preserved rather than reset, so a
+        memo doesn't lose its accumulated telemetry or review state just
+        because the same work was recorded again.
+
         Backends that do not implement this return False.
         """
         return False
@@ -137,7 +190,40 @@ class BaseStore(ABC):
     def lookup_memo(self, signature: str) -> dict | None:
         """Return a memo entry if found and not stale, or None.
 
+        This unconditionally counts a hit whenever a fresh row is found — it
+        has no notion of any downstream usability gating (e.g. outcome/verified
+        thresholds applied by a caller). Callers that apply further validation
+        before deciding whether a memo is actually *usable* should instead use
+        ``peek_memo`` (no telemetry side effects) followed by an explicit
+        ``record_memo_hit``/``record_memo_miss`` once that decision is made, so
+        hit/miss telemetry only reflects memos actually returned to the caller.
+
         Backends that do not implement this return None.
+        """
+        return None
+
+    def peek_memo(self, signature: str) -> dict | None:
+        """Fetch a memo entry (applying staleness filtering) without touching telemetry.
+
+        Returns None if the signature is unknown or the entry is stale. Does
+        not increment hit_count/last_hit_at nor the miss counter — pair this
+        with ``record_memo_hit``/``record_memo_miss`` so telemetry is only
+        recorded once the caller has decided whether the memo is usable.
+        Backends that do not implement this return None.
+        """
+        return None
+
+    def record_memo_hit(self, signature: str) -> None:
+        """Increment hit_count/last_hit_at for a memo actually returned as usable.
+
+        Backends that do not implement memoization are no-ops.
+        """
+        return None
+
+    def record_memo_miss(self) -> None:
+        """Increment the S4.1 miss counter for a lookup that yielded no usable memo.
+
+        Backends that do not implement memoization are no-ops.
         """
         return None
 
@@ -179,6 +265,18 @@ class BaseStore(ABC):
     async def async_lookup_memo(self, signature: str) -> dict | None:
         """Asynchronously look up a memo by signature."""
         return await anyio.to_thread.run_sync(self.lookup_memo, signature)
+
+    async def async_peek_memo(self, signature: str) -> dict | None:
+        """Asynchronously fetch a memo without touching hit/miss telemetry."""
+        return await anyio.to_thread.run_sync(self.peek_memo, signature)
+
+    async def async_record_memo_hit(self, signature: str) -> None:
+        """Asynchronously mark a memo as a counted hit."""
+        await anyio.to_thread.run_sync(self.record_memo_hit, signature)
+
+    async def async_record_memo_miss(self) -> None:
+        """Asynchronously increment the miss counter."""
+        await anyio.to_thread.run_sync(self.record_memo_miss)
 
     async def async_update_memo_outcome(self, signature: str, outcome: float, verified: bool = False) -> bool:
         """Asynchronously update memo outcome."""
@@ -231,6 +329,15 @@ class BaseStore(ABC):
     @abstractmethod
     def resolve_recent_ref(self, ref: str) -> TurnRecord | None:
         """Resolve a recent ref like ``r:sub/<turn_id>``."""
+
+    def recent_turns(self, *, pipeline_id: str | None, limit: int = 20) -> list[TurnRecord]:
+        """CAP-T5: return up to ``limit`` recent turn records, oldest-first.
+
+        Backs computed drift (``ncp/drift.py``). Default no-op implementation
+        for stores that have not opted in -- computed drift then correctly
+        degrades to ``0.0`` (no observable history) rather than erroring.
+        """
+        return []
 
     @abstractmethod
     def log_conscious(self, conscious: ConsciousBlock, *, snapshot_hash: str) -> None:
@@ -375,6 +482,7 @@ class BaseStore(ABC):
         zone: str = "working",
         retrieval_mode: str = "hybrid",
         embedding: list[float] | None = None,
+        as_of: float | None = None,
     ) -> list[SubconsciousChunk]:
         """Asynchronously query stored chunks by text relevance using thread pool."""
         fn = partial(
@@ -388,6 +496,7 @@ class BaseStore(ABC):
             zone=zone,
             retrieval_mode=retrieval_mode,
             embedding=embedding,
+            as_of=as_of,
         )
         return await anyio.to_thread.run_sync(fn)
 
@@ -434,6 +543,11 @@ class BaseStore(ABC):
     async def async_resolve_recent_ref(self, ref: str) -> TurnRecord | None:
         """Asynchronously resolve a recent ref using thread pool."""
         return await anyio.to_thread.run_sync(self.resolve_recent_ref, ref)
+
+    async def async_recent_turns(self, *, pipeline_id: str | None, limit: int = 20) -> list[TurnRecord]:
+        """Asynchronously fetch recent turn records using thread pool."""
+        fn = partial(self.recent_turns, pipeline_id=pipeline_id, limit=limit)
+        return await anyio.to_thread.run_sync(fn)
 
     async def async_log_drift_history(self, *, session_id: str, turn: int, drift_score: float) -> None:
         """Asynchronously persist a drift sensor reading using thread pool."""

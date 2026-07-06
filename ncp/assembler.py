@@ -92,6 +92,7 @@ class Assembler:
         k: int | None = None,
         diversity_limit: int | None = None,
         max_tokens: int | None = None,
+        as_of: float | None = None,
     ) -> tuple[
         ConsciousBlock,
         BudgetContext,
@@ -114,10 +115,11 @@ class Assembler:
             k=chunk_cap,
             diversity_limit=diversity_limit,
             diversity_lambda=self._diversity_lambda,
+            as_of=as_of,
         )
         subconscious = self._cold_start_bootstrap(hydrated, subconscious)
         if self._edge_expansion:
-            expanded = self._expand_edges([*recent_chunks, *subconscious], limit=chunk_cap)
+            expanded = self._expand_edges([*recent_chunks, *subconscious], limit=chunk_cap, as_of=as_of)
             subconscious = [*subconscious, *expanded]
             recent_chunks, subconscious = self._suppress_superseded(recent_chunks, subconscious)
         deduped_chunks = self._dedupe_chunks([*recent_chunks, *subconscious])
@@ -194,6 +196,7 @@ class Assembler:
         k: int | None = None,
         diversity_limit: int | None = None,
         max_tokens: int | None = None,
+        as_of: float | None = None,
     ) -> AssemblyResult:
         hydrated, budget, combined_chunks, combined_whispers, evicted_high_relevance, evicted_whispers = self._prepare_assembly(
             conscious=conscious,
@@ -203,6 +206,7 @@ class Assembler:
             k=k,
             diversity_limit=diversity_limit,
             max_tokens=max_tokens,
+            as_of=as_of,
         )
         context = self.encoder.assemble(
             conscious=hydrated,
@@ -235,6 +239,7 @@ class Assembler:
         max_tokens: int | None = None,
         k: int | None = None,
         diversity_limit: int | None = None,
+        as_of: float | None = None,
     ) -> Iterator[tuple[str, str]]:
         """Yield (label, section_text) in priority order, enforcing max_tokens.
 
@@ -255,6 +260,7 @@ class Assembler:
             k=k,
             diversity_limit=diversity_limit,
             max_tokens=max_tokens,
+            as_of=as_of,
         )
 
         conscious_text = self.encoder._encode_conscious(hydrated)
@@ -441,6 +447,7 @@ class Assembler:
         k: int | None = None,
         diversity_limit: int | None = None,
         diversity_lambda: float | None = None,
+        as_of: float | None = None,
     ) -> list[SubconsciousChunk]:
         if k is None:
             k = 2 if (budget is not None and budget.pressure == "critical") else 4
@@ -449,6 +456,8 @@ class Assembler:
         extra: dict = {}
         if diversity_limit is not None:
             extra["diversity_limit"] = diversity_limit
+        if as_of is not None:
+            extra["as_of"] = as_of
         return self.store.query(
             search_text,
             k=store_k,
@@ -501,6 +510,7 @@ class Assembler:
         chunks: list[SubconsciousChunk],
         *,
         limit: int,
+        as_of: float | None = None,
     ) -> list[SubconsciousChunk]:
         """Pull in 1-hop ``caused_by`` neighbors of the retrieved set.
 
@@ -525,7 +535,7 @@ class Assembler:
             return []
         # Bound the fetch so a fan-out of edges can't blow up the query.
         neighbor_ids = sorted(wanted, key=lambda cid: -wanted[cid])[: max(1, limit)]
-        fetched = self.store.get_chunks_by_ids(neighbor_ids)
+        fetched = self.store.get_chunks_by_ids(neighbor_ids, as_of=as_of)
         expanded: list[SubconsciousChunk] = []
         for neighbor in fetched:
             if neighbor.chunk_id in present_ids:

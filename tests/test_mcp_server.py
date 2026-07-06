@@ -8,6 +8,7 @@ import threading
 from pathlib import Path
 
 import httpx
+import pytest
 
 from ncp.version import __version__
 from ncp.config import load_config
@@ -1516,3 +1517,560 @@ class TestStreamingGetContext:
         )
         assert assembled_from_sections == non_stream_context
         assert stream_result.handler_result["context"] == non_stream_context
+
+
+class TestCostGovernor:
+    """CAP-E2: per-pipeline budget governance."""
+
+    def _post_turn(self, handlers: dict, *, pipeline_id: str, cost_usd: float, turn_id: str) -> object:
+        return _content(_handle_request(
+            _call("ncp_post_turn", {
+                "agent_id": "builder",
+                "role": "build",
+                "task": "test",
+                "slot": "test",
+                "intent": "test",
+                "pipeline_id": pipeline_id,
+                "turn_id": turn_id,
+                "result_summary": "summary",
+                "result_full": "full result",
+                "model": "gpt-4o-mini",
+                "cost_usd": cost_usd,
+            }),
+            handlers,
+        ))
+
+    def _get_context(self, handlers: dict, *, pipeline_id: str) -> object:
+        return _content(_handle_request(
+            _call("ncp_get_context", {
+                "agent_id": "builder",
+                "role": "build",
+                "owns": [],
+                "must_not": [],
+                "task": "test",
+                "slot": "test",
+                "intent": "test",
+                "pipeline_id": pipeline_id,
+            }),
+            handlers,
+        ))
+
+    def test_no_budget_configured_is_a_no_op(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "gov.db")
+        handlers = make_handlers(store, config=load_config(cwd=tmp_path))
+
+        posted = self._post_turn(handlers, pipeline_id="pipe_gov", cost_usd=100.0, turn_id="t1")
+        context = self._get_context(handlers, pipeline_id="pipe_gov")
+
+        assert "budget" not in posted
+        assert "budget" not in context
+
+    def test_off_enforcement_is_a_no_op_even_with_budget_set(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "gov_off.db")
+        config = load_config(cwd=tmp_path)
+        config.values["budget"]["pipeline_budget_usd"] = 1.0
+        config.values["budget"]["budget_enforcement"] = "off"
+        handlers = make_handlers(store, config=config)
+
+        posted = self._post_turn(handlers, pipeline_id="pipe_gov", cost_usd=100.0, turn_id="t1")
+        context = self._get_context(handlers, pipeline_id="pipe_gov")
+
+        assert "budget" not in posted
+        assert "budget" not in context
+
+    def test_spend_accumulates_across_turns(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "gov_accum.db")
+        config = load_config(cwd=tmp_path)
+        config.values["budget"]["pipeline_budget_usd"] = 10.0
+        config.values["budget"]["budget_warn_fraction"] = 0.8
+        handlers = make_handlers(store, config=config)
+
+        first = self._post_turn(handlers, pipeline_id="pipe_accum", cost_usd=3.0, turn_id="t1")
+        assert first["budget"] == {
+            "spent_usd": 3.0,
+            "budget_usd": 10.0,
+            "fraction_used": 0.3,
+            "status": "ok",
+        }
+
+        second = self._post_turn(handlers, pipeline_id="pipe_accum", cost_usd=3.0, turn_id="t2")
+        assert second["budget"]["spent_usd"] == pytest.approx(6.0)
+        assert second["budget"]["fraction_used"] == pytest.approx(0.6)
+        assert second["budget"]["status"] == "ok"
+
+        context = self._get_context(handlers, pipeline_id="pipe_accum")
+        assert context["budget"]["spent_usd"] == pytest.approx(6.0)
+
+        # A separate pipeline's spend must not bleed into this one's total.
+        self._post_turn(handlers, pipeline_id="pipe_other", cost_usd=50.0, turn_id="other1")
+        unaffected = self._get_context(handlers, pipeline_id="pipe_accum")
+        assert unaffected["budget"]["spent_usd"] == pytest.approx(6.0)
+
+    def test_warn_threshold_crossing(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "gov_warn.db")
+        config = load_config(cwd=tmp_path)
+        config.values["budget"]["pipeline_budget_usd"] = 10.0
+        config.values["budget"]["budget_warn_fraction"] = 0.5
+        handlers = make_handlers(store, config=config)
+
+        below = self._post_turn(handlers, pipeline_id="pipe_warn", cost_usd=4.0, turn_id="t1")
+        assert below["budget"]["status"] == "ok"
+
+        crossing = self._post_turn(handlers, pipeline_id="pipe_warn", cost_usd=2.0, turn_id="t2")
+        assert crossing["budget"]["fraction_used"] == pytest.approx(0.6)
+        assert crossing["budget"]["status"] == "warning"
+
+    def test_block_mode_refuses_get_context_once_exceeded(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "gov_block.db")
+        config = load_config(cwd=tmp_path)
+        config.values["budget"]["pipeline_budget_usd"] = 1.0
+        config.values["budget"]["budget_enforcement"] = "block"
+        handlers = make_handlers(store, config=config)
+
+        posted = self._post_turn(handlers, pipeline_id="pipe_block", cost_usd=1.5, turn_id="t1")
+        assert posted["budget"]["status"] == "exceeded"
+
+        refusal = self._get_context(handlers, pipeline_id="pipe_block")
+
+        assert refusal["budget_exceeded"] is True
+        assert refusal["context"] == ""
+        assert refusal["budget"]["status"] == "exceeded"
+        assert refusal["session_id"] == "pipe_block:builder"
+        assert "telemetry" not in refusal
+        assert "tier_hint" not in refusal
+
+    def test_warn_mode_never_blocks_get_context(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "gov_warn_noblock.db")
+        config = load_config(cwd=tmp_path)
+        config.values["budget"]["pipeline_budget_usd"] = 1.0
+        config.values["budget"]["budget_enforcement"] = "warn"
+        handlers = make_handlers(store, config=config)
+
+        self._post_turn(handlers, pipeline_id="pipe_wnb", cost_usd=5.0, turn_id="t1")
+        context = self._get_context(handlers, pipeline_id="pipe_wnb")
+
+        assert "budget_exceeded" not in context
+        assert context["budget"]["status"] == "exceeded"
+        assert "context" in context and isinstance(context["context"], str) and context["context"] != ""
+
+
+class TestTierHintSignal:
+    """CAP-E3: advisory model-tiering signal on ncp_get_context."""
+
+    def test_tier_hint_present_by_default_with_factors(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "tier.db")
+        handlers = make_handlers(store)
+
+        result = _content(_handle_request(
+            _call("ncp_get_context", {
+                "agent_id": "builder",
+                "role": "build",
+                "owns": [],
+                "must_not": [],
+                "task": "test",
+                "slot": "test",
+                "intent": "test",
+                "pipeline_id": "pipe_tier",
+            }),
+            handlers,
+        ))
+
+        assert result["tier_hint"] in {"light", "standard", "deep"}
+        assert 0.0 <= result["complexity_signal"] <= 1.0
+        factors = result["factors"]
+        for key in (
+            "query_length_chars", "query_length_norm", "chunk_count",
+            "distinct_authors", "diversity_ratio", "drift_score",
+            "pressure", "pressure_norm", "cold_start",
+        ):
+            assert key in factors
+
+    def test_tier_hints_disabled_omits_fields(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "tier_off.db")
+        config = load_config(cwd=tmp_path)
+        config.values["tiering"]["tier_hints_enabled"] = False
+        handlers = make_handlers(store, config=config)
+
+        result = _content(_handle_request(
+            _call("ncp_get_context", {
+                "agent_id": "builder",
+                "role": "build",
+                "owns": [],
+                "must_not": [],
+                "task": "test",
+                "slot": "test",
+                "intent": "test",
+                "pipeline_id": "pipe_tier_off",
+            }),
+            handlers,
+        ))
+
+        assert "tier_hint" not in result
+        assert "complexity_signal" not in result
+        assert "factors" not in result
+
+    def test_tier_hint_is_deterministic_for_identical_state(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "tier_det.db")
+        handlers = make_handlers(store)
+        args = {
+            "agent_id": "builder",
+            "role": "build",
+            "owns": [],
+            "must_not": [],
+            "task": "test",
+            "slot": "test",
+            "intent": "test",
+            "pipeline_id": "pipe_tier_det",
+        }
+
+        first = _content(_handle_request(_call("ncp_get_context", args), handlers))
+        second = _content(_handle_request(_call("ncp_get_context", args), handlers))
+
+        assert first["tier_hint"] == second["tier_hint"]
+        assert first["complexity_signal"] == pytest.approx(second["complexity_signal"])
+        assert first["factors"] == second["factors"]
+
+    def test_cold_start_turn_raises_complexity_signal(self, tmp_path: Path) -> None:
+        # Empty store -> the assembler's cold-start bootstrap fires, which
+        # the tier signal should surface via factors["cold_start"].
+        store = SQLiteStore(tmp_path / "tier_cold.db")
+        handlers = make_handlers(store)
+
+        result = _content(_handle_request(
+            _call("ncp_get_context", {
+                "agent_id": "builder",
+                "role": "build",
+                "owns": [],
+                "must_not": [],
+                "task": "test",
+                "slot": "test",
+                "intent": "test",
+                "pipeline_id": "pipe_tier_cold",
+            }),
+            handlers,
+        ))
+
+        assert result["factors"]["cold_start"] is True
+        assert result["factors"]["chunk_count"] == 1
+
+
+class TestAdaptiveBudget:
+    """CAP-C6: adaptive per-turn context token budget."""
+
+    def _args(self, **overrides: object) -> dict:
+        base = {
+            "agent_id": "builder",
+            "role": "build",
+            "owns": [],
+            "must_not": [],
+            "task": "test",
+            "slot": "test",
+            "intent": "test",
+            "pipeline_id": "pipe_adaptive",
+        }
+        base.update(overrides)
+        return base
+
+    def test_disabled_by_default_omits_budget_tokens_block(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "adaptive_off.db")
+        handlers = make_handlers(store)
+
+        result = _content(_handle_request(_call("ncp_get_context", self._args()), handlers))
+
+        assert "budget_tokens" not in result
+
+    def test_disabled_flag_is_byte_identical_to_no_config(self, tmp_path: Path) -> None:
+        store_a = SQLiteStore(tmp_path / "adaptive_legacy_a.db")
+        store_b = SQLiteStore(tmp_path / "adaptive_legacy_b.db")
+        handlers_no_config = make_handlers(store_a)
+
+        config = load_config(cwd=tmp_path)
+        config.values["budget"]["adaptive_budget_enabled"] = False
+        handlers_explicit_off = make_handlers(store_b, config=config)
+
+        args = self._args(pipeline_id="pipe_legacy")
+        result_no_config = _content(_handle_request(_call("ncp_get_context", args), handlers_no_config))
+        result_explicit_off = _content(_handle_request(_call("ncp_get_context", args), handlers_explicit_off))
+
+        assert result_no_config["context"] == result_explicit_off["context"]
+        assert "budget_tokens" not in result_no_config
+        assert "budget_tokens" not in result_explicit_off
+
+    def test_enabled_without_caller_max_tokens_exposes_budget_tokens_block(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "adaptive_on.db")
+        config = load_config(cwd=tmp_path)
+        config.values["budget"]["adaptive_budget_enabled"] = True
+        handlers = make_handlers(store, config=config)
+
+        result = _content(_handle_request(_call("ncp_get_context", self._args()), handlers))
+
+        assert "budget_tokens" in result
+        block = result["budget_tokens"]
+        assert set(block) == {"requested", "adjusted", "reason_factors"}
+        assert block["requested"] == config.context_token_budget
+        assert config.adaptive_budget_floor_tokens <= block["adjusted"] <= config.adaptive_budget_ceiling_tokens
+        assert estimate_tokens(result["context"]) <= block["adjusted"]
+
+    def test_explicit_caller_max_tokens_is_never_overridden(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "adaptive_explicit.db")
+        for index in range(4):
+            store.write(SubconsciousChunk(
+                chunk_id=f"adaptive_large_{index}",
+                content=" ".join(["adaptive explicit context"] + [f"tokenish_{index}_{j}" for j in range(120)]),
+                layer="semantic",
+                src="tool_result",
+                pipeline_id="pipe_adaptive_explicit",
+            ))
+        config = load_config(cwd=tmp_path)
+        config.values["budget"]["adaptive_budget_enabled"] = True
+        config.values["budget"]["adaptive_budget_floor_tokens"] = 50
+        config.values["budget"]["adaptive_budget_ceiling_tokens"] = 100
+        handlers = make_handlers(store, config=config)
+
+        result = _content(_handle_request(
+            _call("ncp_get_context", self._args(
+                pipeline_id="pipe_adaptive_explicit",
+                max_tokens=200,
+                drift_score=1.0,
+                ctx_used=0.95,
+            )),
+            handlers,
+        ))
+
+        assert result["budget_tokens"] == {
+            "requested": 200,
+            "adjusted": 200,
+            "reason_factors": {"explicit_override": True},
+        }
+        assert estimate_tokens(result["context"]) <= 200
+
+    def test_adjusted_always_within_configured_floor_and_ceiling(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "adaptive_bounds.db")
+        config = load_config(cwd=tmp_path)
+        config.values["budget"]["adaptive_budget_enabled"] = True
+        config.values["budget"]["adaptive_budget_floor_tokens"] = 120
+        config.values["budget"]["adaptive_budget_ceiling_tokens"] = 180
+        handlers = make_handlers(store, config=config)
+
+        easy = _content(_handle_request(
+            _call("ncp_get_context", self._args(pipeline_id="pipe_bounds_easy", task="t", slot="s")),
+            handlers,
+        ))
+        hard = _content(_handle_request(
+            _call("ncp_get_context", self._args(
+                pipeline_id="pipe_bounds_hard",
+                task="x" * 200,
+                slot="y" * 100,
+                drift_score=1.0,
+                ctx_used=0.95,
+            )),
+            handlers,
+        ))
+
+        assert 120 <= easy["budget_tokens"]["adjusted"] <= 180
+        assert 120 <= hard["budget_tokens"]["adjusted"] <= 180
+        assert hard["budget_tokens"]["adjusted"] >= easy["budget_tokens"]["adjusted"]
+
+    def test_budget_tokens_is_deterministic_for_identical_state(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "adaptive_det.db")
+        config = load_config(cwd=tmp_path)
+        config.values["budget"]["adaptive_budget_enabled"] = True
+        handlers = make_handlers(store, config=config)
+        args = self._args(pipeline_id="pipe_adaptive_det", drift_score=0.4, ctx_used=0.6)
+
+        first = _content(_handle_request(_call("ncp_get_context", args), handlers))
+        second = _content(_handle_request(_call("ncp_get_context", args), handlers))
+
+        assert first["budget_tokens"] == second["budget_tokens"]
+
+
+class TestComputedDrift:
+    """CAP-T5: computed drift overrides the self-reported drift_score."""
+
+    def _args(self, **overrides: object) -> dict:
+        base = {
+            "agent_id": "builder",
+            "role": "build",
+            "owns": [],
+            "must_not": [],
+            "task": "test",
+            "slot": "test",
+            "intent": "test",
+            "pipeline_id": "pipe_drift",
+        }
+        base.update(overrides)
+        return base
+
+    def _post_turn(self, handlers, *, pipeline_id: str, turn_id: str, task: str, slot: str, result_summary: str) -> None:
+        posted = _content(_handle_request(
+            _call("ncp_post_turn", {
+                "agent_id": "builder",
+                "role": "build",
+                "task": task,
+                "slot": slot,
+                "intent": "test",
+                "pipeline_id": pipeline_id,
+                "turn_id": turn_id,
+                "result_summary": result_summary,
+                "result_full": result_summary,
+            }),
+            handlers,
+        ))
+        assert posted["posted"] is True
+
+    def test_disabled_by_default_omits_drift_block(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "drift_off.db")
+        handlers = make_handlers(store)
+
+        result = _content(_handle_request(_call("ncp_get_context", self._args()), handlers))
+
+        assert "drift" not in result
+
+    def test_disabled_flag_is_byte_identical_to_no_config(self, tmp_path: Path) -> None:
+        store_a = SQLiteStore(tmp_path / "drift_legacy_a.db")
+        store_b = SQLiteStore(tmp_path / "drift_legacy_b.db")
+        handlers_no_config = make_handlers(store_a)
+
+        config = load_config(cwd=tmp_path)
+        config.values["drift"]["drift_computed_enabled"] = False
+        handlers_explicit_off = make_handlers(store_b, config=config)
+
+        args = self._args(pipeline_id="pipe_drift_legacy", drift_score=0.9)
+        result_no_config = _content(_handle_request(_call("ncp_get_context", args), handlers_no_config))
+        result_explicit_off = _content(_handle_request(_call("ncp_get_context", args), handlers_explicit_off))
+
+        assert result_no_config["context"] == result_explicit_off["context"]
+        assert "drift" not in result_no_config
+        assert "drift" not in result_explicit_off
+
+    def test_zero_prior_turns_computes_zero_drift_without_crashing(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "drift_zero.db")
+        config = load_config(cwd=tmp_path)
+        config.values["drift"]["drift_computed_enabled"] = True
+        handlers = make_handlers(store, config=config)
+
+        result = _content(_handle_request(
+            _call("ncp_get_context", self._args(pipeline_id="pipe_drift_new")),
+            handlers,
+        ))
+
+        assert result["drift"]["score"] == 0.0
+        assert result["drift"]["method"] == "lexical"
+        assert result["drift"]["window_turns"] == 5
+        assert result["drift"]["self_reported"] is None
+
+    def test_self_reported_is_null_when_never_supplied(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "drift_null.db")
+        config = load_config(cwd=tmp_path)
+        config.values["drift"]["drift_computed_enabled"] = True
+        handlers = make_handlers(store, config=config)
+
+        result = _content(_handle_request(
+            _call("ncp_get_context", self._args(pipeline_id="pipe_drift_no_claim")),
+            handlers,
+        ))
+
+        assert result["drift"]["self_reported"] is None
+
+    def test_self_reported_is_exposed_alongside_computed_score(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "drift_self_reported.db")
+        config = load_config(cwd=tmp_path)
+        config.values["drift"]["drift_computed_enabled"] = True
+        handlers = make_handlers(store, config=config)
+
+        result = _content(_handle_request(
+            _call("ncp_get_context", self._args(pipeline_id="pipe_drift_claim", drift_score=0.95)),
+            handlers,
+        ))
+
+        # The client claimed near-total drift; the computed score for a
+        # fresh pipeline with no history is 0.0 -- the divergence is visible.
+        assert result["drift"]["self_reported"] == 0.95
+        assert result["drift"]["score"] == 0.0
+
+    def test_computed_drift_overrides_tiering_and_adaptive_budget_inputs(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "drift_override.db")
+        config = load_config(cwd=tmp_path)
+        config.values["drift"]["drift_computed_enabled"] = True
+        config.values["budget"]["adaptive_budget_enabled"] = True
+        handlers = make_handlers(store, config=config)
+
+        self._post_turn(
+            handlers,
+            pipeline_id="pipe_drift_wired",
+            turn_id="turn_1",
+            task="billing",
+            slot="invoice",
+            result_summary="billing invoice reconciliation",
+        )
+
+        # Client asserts zero drift, but the task has totally changed topic
+        # from the turn history -- computed drift should override it upward
+        # and that higher value should be what tiering/adaptive-budget see.
+        result = _content(_handle_request(
+            _call("ncp_get_context", self._args(
+                pipeline_id="pipe_drift_wired",
+                task="astronomy",
+                slot="telescope",
+                drift_score=0.0,
+            )),
+            handlers,
+        ))
+
+        assert result["drift"]["self_reported"] == 0.0
+        assert result["drift"]["score"] == pytest.approx(1.0)
+        assert result["drift"]["method"] == "lexical"
+        # CAP-E3 tiering read the overridden (high) drift, not the claimed 0.0.
+        assert result["factors"]["drift_score"] == pytest.approx(1.0)
+
+    def test_window_turns_config_is_respected_and_reported(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "drift_window.db")
+        config = load_config(cwd=tmp_path)
+        config.values["drift"]["drift_computed_enabled"] = True
+        config.values["drift"]["drift_window_turns"] = 2
+        handlers = make_handlers(store, config=config)
+
+        for index in range(4):
+            self._post_turn(
+                handlers,
+                pipeline_id="pipe_drift_window",
+                turn_id=f"turn_{index}",
+                task=f"topic_{index}",
+                slot=f"topic_{index}",
+                result_summary=f"topic_{index}",
+            )
+
+        result = _content(_handle_request(
+            _call("ncp_get_context", self._args(pipeline_id="pipe_drift_window", task="topic_0", slot="topic_0")),
+            handlers,
+        ))
+
+        # window_turns=2 means only turn_2/turn_3 (topic_2/topic_3) are in
+        # scope; topic_0 no longer overlaps with the window, so drift is high.
+        assert result["drift"]["window_turns"] == 2
+        assert result["drift"]["score"] == pytest.approx(1.0)
+
+    def test_computed_drift_is_deterministic(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "drift_det.db")
+        config = load_config(cwd=tmp_path)
+        config.values["drift"]["drift_computed_enabled"] = True
+        handlers = make_handlers(store, config=config)
+        args = self._args(pipeline_id="pipe_drift_det")
+
+        first = _content(_handle_request(_call("ncp_get_context", args), handlers))
+        second = _content(_handle_request(_call("ncp_get_context", args), handlers))
+
+        assert first["drift"] == second["drift"]
+
+    def test_drift_use_embeddings_falls_back_to_lexical_without_fastembed(self, tmp_path: Path) -> None:
+        # fastembed is not installed in this environment; enabling the blend
+        # must never raise -- it silently degrades to the lexical method.
+        store = SQLiteStore(tmp_path / "drift_embed_fallback.db")
+        config = load_config(cwd=tmp_path)
+        config.values["drift"]["drift_computed_enabled"] = True
+        config.values["drift"]["drift_use_embeddings"] = True
+        handlers = make_handlers(store, config=config)
+
+        result = _content(_handle_request(_call("ncp_get_context", self._args()), handlers))
+
+        assert result["drift"]["method"] == "lexical"

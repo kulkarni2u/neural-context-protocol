@@ -384,6 +384,47 @@ def test_sqlite_store_turn_logging_and_recent_ref_resolution(tmp_path: Path) -> 
     assert resolved.result_full == "longer result body"
 
 
+def test_sqlite_store_recent_turns_returns_oldest_first_within_pipeline(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "store.db")
+    for index, created_at in enumerate((100.0, 200.0, 300.0, 400.0)):
+        store.log_turn_record(
+            TurnRecord(
+                turn_id=f"turn_{index}",
+                agent_id="planner",
+                pipeline_id="pipe_recent",
+                task="task",
+                slot="slot",
+                result=f"result_{index}",
+                result_full="full",
+                created_at=created_at,
+                expires_at=created_at + 1000,
+            )
+        )
+    # A turn from a different pipeline must not leak into recent_turns.
+    store.log_turn_record(
+        TurnRecord(
+            turn_id="turn_other_pipeline",
+            agent_id="planner",
+            pipeline_id="pipe_other",
+            task="task",
+            slot="slot",
+            result="result_other",
+            result_full="full",
+            created_at=350.0,
+            expires_at=1350.0,
+        )
+    )
+
+    all_turns = store.recent_turns(pipeline_id="pipe_recent", limit=20)
+    assert [t.turn_id for t in all_turns] == ["turn_0", "turn_1", "turn_2", "turn_3"]
+
+    limited = store.recent_turns(pipeline_id="pipe_recent", limit=2)
+    assert [t.turn_id for t in limited] == ["turn_2", "turn_3"]
+
+    assert store.recent_turns(pipeline_id="pipe_nonexistent", limit=20) == []
+    assert store.recent_turns(pipeline_id="pipe_recent", limit=0) == []
+
+
 def test_sqlite_store_tombstone_chain_and_status(tmp_path: Path) -> None:
     store = SQLiteStore(tmp_path / "store.db")
     store.write(

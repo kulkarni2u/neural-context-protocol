@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -14,11 +15,15 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import BinaryIO
 
+from ncp.adaptive_budget import AdaptiveBudgetResult, compute_adaptive_budget
 from ncp.assembler import Assembler
+from ncp.budget import BudgetSnapshot, evaluate_budget
 from ncp.chunker import filter_content
 from ncp.config import NCPConfig, load_config
+from ncp.drift import EmbeddingAdapter, compute_drift
 from ncp.stores.base import BaseStore
 from ncp.stores.factory import create_store
+from ncp.tiering import compute_tier_signal
 from ncp.types import BudgetContext, ConsciousBlock, NCPResponse, OutcomeRecord, SubconsciousChunk, Whisper
 from ncp.version import __version__
 
@@ -61,17 +66,27 @@ MCP_TOOLS: list[dict[str, object]] = [
                 "stream": {"type": "boolean", "description": "If true, returns sections progressively as NDJSON (HTTP) or JSON-RPC notifications (stdio). Default false."},
                 "k": {"type": "integer", "description": "Number of subconscious chunks to retrieve. Overrides the default budget-pressure-based value (2 for critical, 4 otherwise)."},
                 "diversity_limit": {"type": "integer", "description": "Max chunks per author in retrieved results. Default 2. Set higher to allow more results from one author."},
-                "max_tokens": {"type": "integer", "description": "Optional estimated token ceiling for the assembled context block."},
+                "max_tokens": {"type": "integer", "description": "Optional estimated token ceiling for the assembled context block. Always honored as-is; when omitted and [budget].adaptive_budget_enabled is true, the ceiling is instead computed per-turn (see the response's budget_tokens block)."},
                 "recent": {"type": "array", "items": {"type": "string"}, "description": "Optional recent refs overriding hydrated conscious state."},
                 "tried": {"type": "array", "items": {"type": "string"}, "description": "Optional attempted actions overriding hydrated conscious state."},
                 "failed": {"type": "array", "items": {"type": "string"}, "description": "Optional failed actions overriding hydrated conscious state."},
                 "slot_age": {"type": "integer", "description": "Optional slot age overriding hydrated conscious state."},
                 "slot_confidence": {"type": "number", "description": "Optional slot confidence overriding hydrated conscious state."},
                 "goal_version": {"type": "integer", "description": "Optional goal version overriding hydrated conscious state."},
-                "drift_score": {"type": "number", "description": "Optional drift score overriding hydrated conscious state."},
+                "drift_score": {"type": "number", "description": "Optional drift score overriding hydrated conscious state. Ignored -- and reported back as self_reported -- when [drift].drift_computed_enabled is true; see the response's drift block."},
                 "ctx_used": {"type": "number", "description": "Context window usage ratio 0.0-1.0."},
                 "steps_completed": {"type": "integer", "description": "Completed plan steps for budget pressure."},
                 "steps_total": {"type": "integer", "description": "Total plan steps for budget pressure."},
+                "as_of": {
+                    "type": "string",
+                    "description": (
+                        "CAP-C5: optional ISO-8601 timestamp (or epoch seconds). When given, "
+                        "assembles the bi-temporal view as of that transaction time -- only "
+                        "chunks recorded by then, not superseded by a chunk recorded by then, "
+                        "and valid (valid_from/valid_to) at that instant. Omit for the default "
+                        "currently-valid view."
+                    ),
+                },
             },
             "required": ["agent_id", "role", "task", "slot", "intent"],
         },
@@ -102,6 +117,33 @@ MCP_TOOLS: list[dict[str, object]] = [
                         "payload (written_by | sha256(content) | pipeline_id). When present it "
                         "is verified and recorded. Required only if [identity].require_signatures "
                         "is enabled, in which case an unverifiable write is rejected."
+                    ),
+                },
+                "valid_from": {
+                    "type": "string",
+                    "description": (
+                        "CAP-C5: optional ISO-8601 timestamp (or epoch seconds) for when this "
+                        "fact became true in the world (valid time). Defaults to unset (no bound)."
+                    ),
+                },
+                "valid_to": {
+                    "type": "string",
+                    "description": (
+                        "CAP-C5: optional ISO-8601 timestamp (or epoch seconds) for when this "
+                        "chunk's own fact stops being true in the world. Defaults to unset (no "
+                        "bound). Independent of 'supersedes', which sets the *previous* chunk's "
+                        "valid_to, not this one's."
+                    ),
+                },
+                "supersedes": {
+                    "type": "string",
+                    "description": (
+                        "CAP-C5: chunk_id of an existing chunk this write honestly replaces. "
+                        "The old chunk is NOT deleted: its superseded_by is set to this new "
+                        "chunk's id and its own valid_to is set to this chunk's valid_from (or "
+                        "now if valid_from is omitted). Default (non-as_of) reads then return "
+                        "only this new chunk; an as_of query before the supersession still "
+                        "returns the old one."
                     ),
                 },
             },
@@ -351,6 +393,17 @@ MCP_TOOLS: list[dict[str, object]] = [
                         "estimated from result_summary when omitted"
                     ),
                 },
+                "kind": {
+                    "type": "string",
+                    "enum": ["function", "class", "module"],
+                    "description": (
+                        "Optional declared shape of result_summary when it holds code. "
+                        "If set, result_summary must parse as Python and (for 'function'/"
+                        "'class') contain a matching top-level def/class, or the memo is "
+                        "rejected. This is a structural presence check only — it does not "
+                        "verify correctness or safety of the code."
+                    ),
+                },
             },
             "required": ["task", "chunk_ids"],
         },
@@ -436,12 +489,68 @@ def _session_id_from_args(args: dict[str, object]) -> str:
     return DEFAULT_FETCH_SESSION_ID
 
 
+def _build_drift_embedding_adapter(config: NCPConfig) -> EmbeddingAdapter | None:
+    """CAP-T5: best-effort local embedding adapter for the drift blend.
+
+    Built once at handler setup (not per-request) since loading the
+    fastembed model is comparatively expensive. ``None`` -- e.g. fastembed
+    is not installed -- means computed drift silently stays lexical-only.
+    """
+    try:
+        from ncp.adapters.embedding import LocalEmbeddingAdapter
+
+        return LocalEmbeddingAdapter(model=config.embedding_model)
+    except Exception:
+        return None
+
+
 def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[str, ToolHandler]:
     sessions: dict[str, FetchSession] = {}
     sessions_lock = threading.Lock()
     coordination = getattr(store, "coordination", None)
     default_whisper_ttl = config.whisper_ttl_default if config is not None else 1800
     require_signatures = config.require_signatures if config is not None else False
+    # CAP-E2: per-pipeline budget governance settings.
+    pipeline_budget_usd = config.pipeline_budget_usd if config is not None else None
+    budget_warn_fraction = config.budget_warn_fraction if config is not None else 0.8
+    budget_enforcement = config.budget_enforcement if config is not None else "warn"
+    # CAP-E3: model-tiering advisory signal, on by default.
+    tier_hints_enabled = config.tier_hints_enabled if config is not None else True
+    # CAP-C6: adaptive per-turn context token budget, opt-in (off by default).
+    adaptive_budget_enabled = config.adaptive_budget_enabled if config is not None else False
+    adaptive_budget_floor_tokens = config.adaptive_budget_floor_tokens if config is not None else 300
+    adaptive_budget_ceiling_tokens = config.adaptive_budget_ceiling_tokens if config is not None else 2000
+    default_context_token_budget = config.context_token_budget if config is not None else 840
+    # CAP-T5: computed drift, opt-in (off by default -- legacy self-reported
+    # drift_score is unchanged when disabled).
+    drift_computed_enabled = config.drift_computed_enabled if config is not None else False
+    drift_window_turns = config.drift_window_turns if config is not None else 5
+    drift_use_embeddings = config.drift_use_embeddings if config is not None else False
+    drift_embedding_adapter: EmbeddingAdapter | None = None
+    if drift_computed_enabled and drift_use_embeddings:
+        drift_embedding_adapter = _build_drift_embedding_adapter(config)
+
+    def _budget_snapshot(*, pipeline_id: str | None) -> BudgetSnapshot | None:
+        """CAP-E2: read real recorded spend and classify it against the ceiling.
+
+        Returns ``None`` when no budget is configured, the governor is off,
+        or the store cannot report cost (never fabricates a number).
+        """
+        if pipeline_budget_usd is None or budget_enforcement == "off":
+            return None
+        cost_summary_fn = getattr(store, "cost_summary", None)
+        if not callable(cost_summary_fn):
+            return None
+        try:
+            summary = cost_summary_fn(pipeline_id=pipeline_id, limit=1)
+            spent_usd = float(summary.get("summary", {}).get("cost_usd_total", 0.0))
+        except Exception:
+            return None
+        return evaluate_budget(
+            spent_usd=spent_usd,
+            budget_usd=pipeline_budget_usd,
+            warn_fraction=budget_warn_fraction,
+        )
 
     def _prune_sessions() -> None:
         # Caller must hold sessions_lock. Drop expired entries, then LRU-evict
@@ -490,6 +599,116 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             "fetch_hint": "ncp_fetch" if evicted_high_relevance and fetch_budget_remaining > 0 else None,
         }
 
+    def _tier_signal(result: object, *, budget: BudgetContext, search_text: str):
+        """CAP-E3: derive the tier-hint signal from one assembly result.
+
+        ``cold_start`` mirrors ``Assembler._cold_start_bootstrap``: it fires
+        when retrieval came back empty and the assembler substituted its
+        single synthetic ``cold_*`` pipeline_summary chunk.
+        """
+        chunks = list(getattr(result, "chunks", []))
+        chunk_count = len(chunks)
+        distinct_authors = len({chunk.written_by for chunk in chunks})
+        cold_start = chunk_count == 1 and chunks[0].chunk_id.startswith("cold_")
+        conscious = getattr(result, "conscious", None)
+        drift_score = float(getattr(conscious, "drift_score", 0.0))
+        return compute_tier_signal(
+            query_text=search_text,
+            chunk_count=chunk_count,
+            distinct_authors=distinct_authors,
+            drift_score=drift_score,
+            pressure=budget.pressure,
+            cold_start=cold_start,
+        )
+
+    def _adaptive_budget_tokens(
+        *,
+        caller_max_tokens: int | None,
+        conscious: ConsciousBlock,
+        budget: BudgetContext,
+        search_text: str,
+        budget_snapshot: BudgetSnapshot | None,
+    ) -> tuple[int | None, dict[str, object] | None]:
+        """CAP-C6: resolve the effective ``max_tokens`` for this call.
+
+        Returns ``(effective_max_tokens, budget_tokens_block)``. The block is
+        ``None`` whenever the feature is disabled; ``effective_max_tokens`` is
+        always exactly ``caller_max_tokens`` (including ``None``, i.e. "let
+        the assembler use its configured default") when disabled, so a
+        disabled flag reproduces legacy behavior byte-for-byte.
+
+        An explicit caller ``max_tokens`` always wins: when present, no
+        adaptive computation runs and the block (when the feature is on)
+        simply echoes it back with ``reason_factors: {"explicit_override": True}``.
+        """
+
+        if not adaptive_budget_enabled:
+            return caller_max_tokens, None
+
+        if caller_max_tokens is not None:
+            return caller_max_tokens, {
+                "requested": caller_max_tokens,
+                "adjusted": caller_max_tokens,
+                "reason_factors": {"explicit_override": True},
+            }
+
+        result: AdaptiveBudgetResult = compute_adaptive_budget(
+            requested_tokens=default_context_token_budget,
+            floor_tokens=adaptive_budget_floor_tokens,
+            ceiling_tokens=adaptive_budget_ceiling_tokens,
+            query_text=search_text,
+            drift_score=conscious.drift_score,
+            pressure=budget.pressure,
+            slot_age=conscious.slot_age,
+            dollar_budget_fraction_used=(
+                None if budget_snapshot is None else budget_snapshot.fraction_used
+            ),
+        )
+        return result.adjusted_tokens, result.to_dict()
+
+    def _apply_computed_drift(
+        conscious: ConsciousBlock,
+        args: dict[str, object],
+    ) -> tuple[ConsciousBlock, dict[str, object] | None]:
+        """CAP-T5: override ``drift_score`` with a computed reading.
+
+        Returns ``(conscious, drift_block)``. When disabled, ``conscious`` is
+        returned unchanged and ``drift_block`` is ``None`` -- exact legacy
+        behavior, no response change. When enabled, ``conscious.drift_score``
+        is overridden with the computed value *before* the caller runs
+        tiering/adaptive-budget/assembly, and ``drift_block`` exposes both the
+        computed score and the original self-reported value (``None`` when
+        nothing was ever self-reported for this agent/pipeline -- an
+        untouched hardcoded default is not a claim) so the two can be
+        compared.
+        """
+        if not drift_computed_enabled:
+            return conscious, None
+
+        had_prior_conscious = (
+            store.load_latest_conscious(pipeline_id=conscious.pipeline_id, agent_id=conscious.agent_id)
+            is not None
+        )
+        self_reported = (
+            conscious.drift_score if ("drift_score" in args or had_prior_conscious) else None
+        )
+        turns_fn = getattr(store, "recent_turns", None)
+        recent_records = (
+            turns_fn(pipeline_id=conscious.pipeline_id, limit=drift_window_turns) if callable(turns_fn) else []
+        )
+        recent_turn_texts = [f"{record.task} {record.slot} {record.result}" for record in recent_records]
+        reading = compute_drift(
+            recent_turn_texts,
+            conscious.task + " " + conscious.slot,
+            window_turns=drift_window_turns,
+            use_embeddings=drift_use_embeddings,
+            embedding_adapter=drift_embedding_adapter,
+        )
+        updated_conscious = conscious.model_copy(update={"drift_score": reading.score})
+        drift_block = reading.to_dict()
+        drift_block["self_reported"] = self_reported
+        return updated_conscious, drift_block
+
     def _handle_get_context(args: dict[str, object]) -> object:
         session_id = _session_id_from_args(args)
         pipeline_id = args.get("pipeline_id")
@@ -505,9 +724,26 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
                     sessions[DEFAULT_FETCH_SESSION_ID] = FetchSession(fetch_count=0, pipeline_id=normalized_pipeline_id)
                 _prune_sessions()
         conscious = _build_conscious_from_args(store, args)
+        # CAP-T5: compute drift from observable turn history and override the
+        # self-reported drift_score *before* budget/tiering/assembly consume
+        # it. No-op (drift_block stays None) when the feature is disabled.
+        conscious, drift_block = _apply_computed_drift(conscious, args)
         budget = _budget_from_args(args, conscious=conscious)
+
+        # CAP-E2: pre-flight budget check. In "block" mode an already-exceeded
+        # pipeline gets a structured refusal instead of paying for assembly.
+        budget_snapshot = _budget_snapshot(pipeline_id=normalized_pipeline_id)
+        if budget_snapshot is not None and budget_enforcement == "block" and budget_snapshot.status == "exceeded":
+            return {
+                "budget_exceeded": True,
+                "context": "",
+                "session_id": session_id,
+                "budget": budget_snapshot.to_dict(),
+            }
+
         assembler = Assembler(store=store, config=config)
         stream = bool(args.get("stream", False))
+        search_text = conscious.task + " " + conscious.slot
         try:
             caller_k: int | None = max(1, int(args["k"])) if "k" in args else None  # type: ignore[arg-type]
         except (ValueError, TypeError):
@@ -520,39 +756,75 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             caller_max_tokens: int | None = max(1, int(args["max_tokens"])) if "max_tokens" in args else None  # type: ignore[arg-type]
         except (ValueError, TypeError):
             caller_max_tokens = None
+        # CAP-C5: optional bi-temporal point-in-time view.
+        as_of_raw = args.get("as_of")
+        as_of: float | None = None if as_of_raw is None else _parse_iso_timestamp(as_of_raw, field="as_of")
+        # CAP-C6: adaptive budget only ever substitutes for an *omitted*
+        # max_tokens; an explicit caller value is never overridden.
+        effective_max_tokens, budget_tokens_block = _adaptive_budget_tokens(
+            caller_max_tokens=caller_max_tokens,
+            conscious=conscious,
+            budget=budget,
+            search_text=search_text,
+            budget_snapshot=budget_snapshot,
+        )
         if stream:
             stream_result = assembler.assemble(
                 conscious=conscious,
                 budget=budget,
-                query_text=conscious.task + " " + conscious.slot,
+                query_text=search_text,
                 k=caller_k,
                 diversity_limit=caller_diversity_limit,
-                max_tokens=caller_max_tokens,
+                max_tokens=effective_max_tokens,
+                as_of=as_of,
             )
             sections = assembler.sections_from_result(result=stream_result, budget=budget)
+            handler_result: dict[str, object] = {
+                "context": stream_result.context,
+                "session_id": session_id,
+                "pending_whisper_ids": stream_result.pending_whisper_ids,
+                "telemetry": _context_telemetry(stream_result, session_id=session_id),
+            }
+            if budget_snapshot is not None:
+                handler_result["budget"] = budget_snapshot.to_dict()
+            if tier_hints_enabled:
+                handler_result.update(_tier_signal(stream_result, budget=budget, search_text=search_text).to_dict())
+            if budget_tokens_block is not None:
+                handler_result["budget_tokens"] = budget_tokens_block
+            if drift_block is not None:
+                handler_result["drift"] = drift_block
+            if as_of is not None:
+                handler_result["as_of"] = as_of
             return StreamResponse(
                 sections=sections,
-                handler_result={
-                    "context": stream_result.context,
-                    "session_id": session_id,
-                    "pending_whisper_ids": stream_result.pending_whisper_ids,
-                    "telemetry": _context_telemetry(stream_result, session_id=session_id),
-                },
+                handler_result=handler_result,
             )
         result = assembler.assemble(
             conscious=conscious,
             budget=budget,
-            query_text=conscious.task + " " + conscious.slot,
+            query_text=search_text,
             k=caller_k,
             diversity_limit=caller_diversity_limit,
-            max_tokens=caller_max_tokens,
+            max_tokens=effective_max_tokens,
+            as_of=as_of,
         )
-        return {
+        response: dict[str, object] = {
             "context": result.context,
             "session_id": session_id,
             "pending_whisper_ids": result.pending_whisper_ids,
             "telemetry": _context_telemetry(result, session_id=session_id),
         }
+        if budget_snapshot is not None:
+            response["budget"] = budget_snapshot.to_dict()
+        if tier_hints_enabled:
+            response.update(_tier_signal(result, budget=budget, search_text=search_text).to_dict())
+        if budget_tokens_block is not None:
+            response["budget_tokens"] = budget_tokens_block
+        if drift_block is not None:
+            response["drift"] = drift_block
+        if as_of is not None:
+            response["as_of"] = as_of
+        return response
 
     def _handle_write_memory(args: dict[str, object]) -> object:
         written_by = str(args.get("written_by", "agent"))
@@ -582,6 +854,15 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
                 "could not be verified (missing/invalid signature or revoked identity)."
             )
 
+        # CAP-C5: optional bi-temporal validity window and honest supersedence.
+        valid_from_raw = args.get("valid_from")
+        valid_from = (
+            None if valid_from_raw is None else _parse_iso_timestamp(valid_from_raw, field="valid_from")
+        )
+        valid_to_raw = args.get("valid_to")
+        valid_to = None if valid_to_raw is None else _parse_iso_timestamp(valid_to_raw, field="valid_to")
+        supersedes = args.get("supersedes")
+
         kwargs: dict = {
             "content": content,
             "layer": str(args["layer"]),
@@ -591,6 +872,8 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             "base_trust": _trust_from_args(args),
             "written_at_drift": 0.0 if latest is None else latest.drift_score,
             "verified": verified,
+            "valid_from": valid_from,
+            "valid_to": valid_to,
         }
         if (chunk_id := args.get("chunk_id")):
             kwargs["chunk_id"] = str(chunk_id)
@@ -621,6 +904,13 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             result["reduction_ratio"] = round(fr.reduction_ratio, 3)
             if raw_ref is not None:
                 result["raw_ref"] = raw_ref
+        if supersedes is not None:
+            # Honest supersedence: the old chunk is never deleted, only marked.
+            # Its valid_to becomes this chunk's valid_from (or "now" if unset).
+            resolved_old_valid_to = time.time() if valid_from is None else valid_from
+            result["superseded"] = store.supersede(
+                str(supersedes), chunk.chunk_id, valid_to=resolved_old_valid_to
+            )
         return result
 
     def _handle_emit_whisper(args: dict[str, object]) -> object:
@@ -707,6 +997,10 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         # WI-007(a): surface dedup-suppressed memory writes to the host.
         if record.suppressed_chunk_ids:
             result["suppressed_chunk_ids"] = record.suppressed_chunk_ids
+        # CAP-E2: reflect spend *after* this turn's cost was just logged above.
+        budget_snapshot = _budget_snapshot(pipeline_id=conscious.pipeline_id)
+        if budget_snapshot is not None:
+            result["budget"] = budget_snapshot.to_dict()
         return result
 
     def _handle_fetch(args: dict[str, object]) -> object:
@@ -854,9 +1148,16 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             task = str(args.get("task", ""))
             context = str(args.get("context", ""))
             sig = compute_memo_signature(task, context)
-        memo = store.lookup_memo(str(sig))
+        sig = str(sig)
+        # Use the telemetry-neutral peek here, not `store.lookup_memo` — the
+        # latter unconditionally counts a hit as soon as a fresh row exists,
+        # before the outcome/verified gating below runs. We only want to
+        # count a hit once we know the memo will actually be returned as
+        # usable; anything else (not found, stale, or gated) is a miss.
+        memo = store.peek_memo(sig)
         result: dict[str, object] = {"found": False, "memo": None}
         cfg = config
+        usable = False
         if memo is not None and (cfg is None or cfg.memoization_enabled):
             # Apply outcome and verified gating at the handler level
             gated = False
@@ -866,22 +1167,39 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
                 elif not cfg.memoization_allow_unverified and not bool(memo.get("verified", 0)):
                     gated = True
             if not gated:
+                usable = True
                 result = {"found": True, "memo": dict(memo)}
+        if usable:
+            store.record_memo_hit(sig)
+        else:
+            store.record_memo_miss()
         counters = _memo_counters()
         if counters is not None:
             result["stats"] = counters
         return result
 
     def _handle_record_memo(args: dict[str, object]) -> object:
-        from ncp.stores.memo import compute_memo_signature
+        from ncp.stores.memo import compute_memo_signature, validate_code_memo_ast
         task = str(args.get("task", ""))
         sig = args.get("signature")
         if sig is None:
             sig = compute_memo_signature(task)
+        sig = str(sig)
         chunk_ids = [str(c) for c in list(args.get("chunk_ids", []) or [])]
         result_summary = args.get("result_summary")
         if result_summary is not None:
             result_summary = str(result_summary)
+        kind = args.get("kind")
+        if kind is not None:
+            kind = str(kind)
+            if not validate_code_memo_ast(result_summary or "", kind):
+                return {
+                    "recorded": False,
+                    "signature": sig,
+                    "error": (
+                        f"result_summary does not parse as Python matching declared kind {kind!r}"
+                    ),
+                }
         output_tokens_est: int | None = None
         raw_tokens = args.get("output_tokens_est")
         if raw_tokens is not None:
@@ -890,9 +1208,9 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             except (TypeError, ValueError):
                 output_tokens_est = None
         recorded = store.record_memo(
-            str(sig), task, chunk_ids, result_summary, output_tokens_est
+            sig, task, chunk_ids, result_summary, output_tokens_est
         )
-        return {"recorded": recorded, "signature": str(sig)}
+        return {"recorded": recorded, "signature": sig}
 
     # Expose the in-memory fetch-session table for observability/testing of the
     # LRU+TTL pruning without widening the returned handler mapping.
@@ -985,6 +1303,25 @@ def _build_conscious_from_args(store: BaseStore, args: dict[str, object]) -> Con
         steps_completed=_int_arg(args, "steps_completed", 0 if latest is None else latest.steps_completed),
         steps_total=(None if latest is None else latest.steps_total),
     )
+
+
+def _parse_iso_timestamp(value: object, *, field: str) -> float:
+    """CAP-C5: parse an ISO-8601 timestamp arg into epoch seconds.
+
+    Accepts a bare epoch number too (int/float or numeric string) so callers
+    that already track epoch time don't need to round-trip through ISO.
+    """
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except ValueError as exc:
+        raise ValueError(f"{field} must be an ISO-8601 timestamp or epoch seconds: {value!r}") from exc
 
 
 def _trust_from_args(args: dict[str, object]) -> float:
