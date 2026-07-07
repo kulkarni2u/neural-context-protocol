@@ -63,6 +63,24 @@ JSON-encoded text item:
  "params": {"name": "<tool>", "arguments": { ... }}}
 ```
 
+**Unwrapping the result.** The tool payload is *not* on `result` directly — it
+is a JSON-*encoded string* nested at `result.content[0].text`. You must parse
+that inner string to get the object the sections below describe. Reading
+`result` directly is the most common first-integration mistake: writes look
+like they succeeded (the return value is simply ignored) while reads come back
+empty with no error.
+
+```javascript
+const rpc = await resp.json();
+const payload = JSON.parse(rpc.result.content[0].text);  // <- the actual result
+// payload.context, payload.session_id, payload.written, ...
+```
+
+```bash
+# jq equivalent
+curl -s ... | jq -r '.result.content[0].text | fromjson'
+```
+
 ### ncp_get_context — assemble the bounded turn context
 
 ```bash
