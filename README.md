@@ -510,6 +510,7 @@ NCP is the memory bus. In our workflows, Sarathi is one orchestrator that runs o
 ## Documentation
 
 - [Setup guide](./docs/NCP_SETUP.md)
+- [Orchestrator integration guide](./docs/NCP_ORCHESTRATOR_INTEGRATION_GUIDE.md)
 - [Protocol spec](./docs/NCP_PROTOCOL_SPEC.md)
 - [HTTP API contract](./docs/NCP_HTTP_API.md)
 - [Benchmark: task success at matched budget](./docs/NCP_BENCHMARK_TASK_SUCCESS.md)
