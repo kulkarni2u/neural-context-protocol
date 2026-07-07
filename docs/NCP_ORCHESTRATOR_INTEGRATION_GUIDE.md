@@ -125,7 +125,7 @@ first; everything else follows.
 |---|---|---|
 | `agent_id` | One node / worker / role instance | Stable across turns. No spaces (use `snake_case`). |
 | `role` | The node's function (`planner`, `reviewer`) | Used in the context header and whisper addressing. |
-| `pipeline_id` | One workflow run / job / thread | Chunks, whispers, turn records, and budgets are scoped to it. Reuse it across runs when you *want* memory to carry over; mint a fresh one when you don't. |
+| `pipeline_id` | One workflow run / job / thread | Chunks, whispers, turn records, and budgets are scoped to it. Reuse it across runs when you *want* memory to carry over; mint a fresh one when you don't. **Pass it on reads too, not just writes** — omitting it on `get_context`/`fetch` silently widens the candidate pool (you retrieve against unscoped/global chunks instead of this run's), degrading ranking with no error or warning. |
 | `session_id` | One turn's fetch budget | Returned by `ncp_get_context`; pass it to `ncp_fetch`. If omitted, NCP derives `pipeline_id:agent_id`. |
 | `task` / `slot` / `intent` | Current objective / what's being resolved / why | Required on every `get_context` and `post_turn`. Single tokens, no spaces — they're both identity and the retrieval query (`task + slot` is the search text). |
 
