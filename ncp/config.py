@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 
 try:
     import tomllib
@@ -79,6 +79,11 @@ DEFAULT_CONFIG = {
         "generation_penalty_base": 0.9,
         "edge_expansion": True,
         "edge_expansion_decay": 0.7,
+        # Graph engineering (WI-G2/G3): bounded multi-hop traversal. Defaults
+        # reproduce the legacy 1-hop caused_by-only behavior exactly.
+        "edge_max_hops": 1,
+        "edge_expansion_types": ["caused_by"],
+        "propagation_max_hops": 1,
         "trust_propagation_factor": 0.5,
         "dissent_weight": 0.2,
         "diversity_lambda": 1.0,
@@ -244,6 +249,31 @@ class NCPConfig:
     @property
     def edge_expansion_decay(self) -> float:
         return float(self.values.get("retrieval", {}).get("edge_expansion_decay", 0.7))
+
+    @property
+    def edge_max_hops(self) -> int:
+        """WI-G2: bound on BFS hops for edge expansion. 1 reproduces legacy behavior."""
+        return max(0, int(self.values.get("retrieval", {}).get("edge_max_hops", 1)))
+
+    @property
+    def edge_expansion_types(self) -> list[str]:
+        """WI-G2: edge types traversed during expansion, validated against the closed set."""
+        from ncp.types import ChunkEdgeType
+
+        valid_types = set(get_args(ChunkEdgeType))
+        raw = self.values.get("retrieval", {}).get("edge_expansion_types", ["caused_by"])
+        types = [str(item) for item in raw]
+        invalid = [t for t in types if t not in valid_types]
+        if invalid:
+            raise ValueError(
+                f"Invalid edge_expansion_types {invalid}; expected a subset of {sorted(valid_types)}"
+            )
+        return types
+
+    @property
+    def propagation_max_hops(self) -> int:
+        """WI-G3: bound on caused_by trust-propagation hops. 1 reproduces legacy behavior."""
+        return max(0, int(self.values.get("retrieval", {}).get("propagation_max_hops", 1)))
 
     @property
     def trust_propagation_factor(self) -> float:
@@ -504,6 +534,14 @@ def _apply_env_overrides(values: dict[str, Any], env: dict[str, str]) -> None:
     if "NCP_EDGE_EXPANSION" in env:
         val = env["NCP_EDGE_EXPANSION"].lower()
         values["retrieval"]["edge_expansion"] = val in {"true", "1", "yes"}
+    if "NCP_EDGE_MAX_HOPS" in env:
+        values["retrieval"]["edge_max_hops"] = int(env["NCP_EDGE_MAX_HOPS"])
+    if "NCP_EDGE_EXPANSION_TYPES" in env:
+        values["retrieval"]["edge_expansion_types"] = [
+            item.strip() for item in env["NCP_EDGE_EXPANSION_TYPES"].split(",") if item.strip()
+        ]
+    if "NCP_PROPAGATION_MAX_HOPS" in env:
+        values["retrieval"]["propagation_max_hops"] = int(env["NCP_PROPAGATION_MAX_HOPS"])
     if "NCP_TRUST_PROPAGATION_FACTOR" in env:
         values["retrieval"]["trust_propagation_factor"] = float(env["NCP_TRUST_PROPAGATION_FACTOR"])
     if "NCP_DISSENT_WEIGHT" in env:

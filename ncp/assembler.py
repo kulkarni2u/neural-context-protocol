@@ -74,6 +74,8 @@ class Assembler:
         self._whisper_cap_critical = config.whisper_cap_critical if config else 1
         self._edge_expansion = config.edge_expansion_enabled if config else True
         self._edge_expansion_decay = config.edge_expansion_decay if config else 0.7
+        self._edge_max_hops = config.edge_max_hops if config else 1
+        self._edge_expansion_types = config.edge_expansion_types if config else ["caused_by"]
         self._diversity_lambda = config.diversity_lambda if config else 1.0
         self._distillation_enabled = config.distillation_enabled if config else False
         self._distillation_min_chunk_tokens = config.distillation_min_chunk_tokens if config else 120
@@ -502,7 +504,7 @@ class Assembler:
     # ------------------------------------------------------------------
 
     # ------------------------------------------------------------------
-    # 1-hop edge expansion + supersession suppression
+    # Multi-hop edge expansion + supersession suppression
     # ------------------------------------------------------------------
 
     def _expand_edges(
@@ -512,36 +514,95 @@ class Assembler:
         limit: int,
         as_of: float | None = None,
     ) -> list[SubconsciousChunk]:
-        """Pull in 1-hop ``caused_by`` neighbors of the retrieved set.
+        """Pull in up to ``edge_max_hops`` hops of typed-edge neighbors.
 
         The cause of a relevant chunk is often more useful than the next
         marginal lexical hit, and fetching it here saves the model an
-        ``ncp_fetch`` round trip. Neighbors inherit a decayed relevance from
-        the chunk that referenced them so they stay subordinate to primary
-        results, and they still compete inside the existing ``chunk_cap`` —
-        expansion never widens the bounded budget.
+        ``ncp_fetch`` round trip. Neighbors inherit relevance decayed by
+        ``edge_expansion_decay`` per hop from the chunk that referenced them
+        (hop *h* gets ``decay ** h`` of the original), so they stay
+        subordinate to primary results and still compete inside the existing
+        ``chunk_cap`` -- expansion never widens the bounded budget. A visited
+        set makes traversal cycle-safe. At the defaults (``edge_max_hops=1``,
+        ``edge_expansion_types=["caused_by"]``) this reproduces the legacy
+        1-hop behavior exactly.
+
+        Typed edges come from ``store.get_chunk_edges``; when ``caused_by``
+        is among the configured types, the legacy per-chunk ``caused_by``
+        scalar is also consulted as a fallback neighbor source for chunks
+        that predate the edge table. If a chunk's current scalar disagrees
+        with an older ``caused_by`` edge row (the row is stale -- rewritten
+        by a later write that the additive-only edge table never retracted),
+        the scalar wins and the stale row is skipped for that chunk.
         """
-        present_ids = {chunk.chunk_id for chunk in chunks}
-        # Map neighbor id -> best (decayed) relevance inherited from a referrer.
-        wanted: dict[str, float] = {}
-        for chunk in chunks:
-            cause = chunk.caused_by
-            if not cause or cause in present_ids:
-                continue
-            inherited = float(chunk.relevance) * self._edge_expansion_decay
-            if inherited > wanted.get(cause, -1.0):
-                wanted[cause] = inherited
-        if not wanted:
+        types = self._edge_expansion_types
+        if not types or self._edge_max_hops < 1:
             return []
-        # Bound the fetch so a fan-out of edges can't blow up the query.
-        neighbor_ids = sorted(wanted, key=lambda cid: -wanted[cid])[: max(1, limit)]
-        fetched = self.store.get_chunks_by_ids(neighbor_ids, as_of=as_of)
-        expanded: list[SubconsciousChunk] = []
-        for neighbor in fetched:
-            if neighbor.chunk_id in present_ids:
-                continue
-            expanded.append(neighbor.model_copy(update={"relevance": wanted.get(neighbor.chunk_id, 0.0)}))
-        return expanded
+        caused_by_active = "caused_by" in types
+        visited_ids = {chunk.chunk_id for chunk in chunks}
+        expanded: dict[str, SubconsciousChunk] = {}
+        frontier = chunks
+        for _hop in range(self._edge_max_hops):
+            frontier_ids = [chunk.chunk_id for chunk in frontier]
+            if not frontier_ids:
+                break
+            frontier_relevance = {chunk.chunk_id: float(chunk.relevance) for chunk in frontier}
+            scalar_targets: dict[str, str] = {}
+            if caused_by_active:
+                for chunk in frontier:
+                    if chunk.caused_by and chunk.caused_by != chunk.chunk_id:
+                        scalar_targets[chunk.chunk_id] = chunk.caused_by
+
+            edge_rows = self.store.get_chunk_edges(frontier_ids, edge_types=types, direction="out")
+            hop_candidates: dict[str, float] = {}
+            covered_scalar_pairs: set[tuple[str, str]] = set()
+            for edge in edge_rows:
+                src, dst = edge.src_chunk_id, edge.dst_chunk_id
+                if edge.edge_type == "caused_by":
+                    scalar = scalar_targets.get(src)
+                    if scalar is not None:
+                        if scalar != dst:
+                            continue  # stale edge row: current scalar disagrees, skip it
+                        covered_scalar_pairs.add((src, dst))
+                if dst in visited_ids:
+                    continue
+                referrer_relevance = frontier_relevance.get(src)
+                if referrer_relevance is None:
+                    continue
+                weight = max(0.0, min(1.0, float(edge.weight)))
+                inherited = referrer_relevance * self._edge_expansion_decay * weight
+                if inherited > hop_candidates.get(dst, -1.0):
+                    hop_candidates[dst] = inherited
+
+            if caused_by_active:
+                # Legacy fallback: chunks whose caused_by predates the edge
+                # table (no matching edge row) still expand via the scalar.
+                for src, dst in scalar_targets.items():
+                    if (src, dst) in covered_scalar_pairs or dst in visited_ids:
+                        continue
+                    referrer_relevance = frontier_relevance.get(src)
+                    if referrer_relevance is None:
+                        continue
+                    inherited = referrer_relevance * self._edge_expansion_decay
+                    if inherited > hop_candidates.get(dst, -1.0):
+                        hop_candidates[dst] = inherited
+
+            if not hop_candidates:
+                break
+            # Bound the fetch so a fan-out of edges can't blow up the query.
+            neighbor_ids = sorted(hop_candidates, key=lambda cid: -hop_candidates[cid])[: max(1, limit)]
+            fetched = self.store.get_chunks_by_ids(neighbor_ids, as_of=as_of)
+            next_frontier: list[SubconsciousChunk] = []
+            for neighbor in fetched:
+                if neighbor.chunk_id in visited_ids:
+                    continue
+                visited_ids.add(neighbor.chunk_id)
+                updated = neighbor.model_copy(update={"relevance": hop_candidates[neighbor.chunk_id]})
+                expanded[neighbor.chunk_id] = updated
+                next_frontier.append(updated)
+            frontier = next_frontier
+
+        return list(expanded.values())
 
     @staticmethod
     def _superseded_ids(chunks: list[SubconsciousChunk]) -> set[str]:

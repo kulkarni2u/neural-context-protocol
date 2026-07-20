@@ -1432,6 +1432,7 @@ def consolidate_command(
 @click.option("--feedback", is_flag=True, default=False, help="Run the self-improvement pass: boost retrieved chunks, penalize disputed ones, and propagate net trust along caused_by edges.")
 @click.option("--feedback-weight", default=None, type=float, help="Max retrieval boost (default from config, 0.15).")
 @click.option("--propagation-factor", default=None, type=float, help="Fraction of a chunk's net delta propagated to its caused_by parent (default from config, 0.5).")
+@click.option("--propagation-max-hops", default=None, type=int, help="How many caused_by hops trust propagation walks (default from config, 1).")
 @click.option("--dissent-weight", default=None, type=float, help="Max dissent penalty (default from config, 0.2).")
 @click.option("--dry-run", is_flag=True, default=False, help="Preview changes without writing.")
 def calibrate_command(
@@ -1443,6 +1444,7 @@ def calibrate_command(
     feedback: bool,
     feedback_weight: float | None,
     propagation_factor: float | None,
+    propagation_max_hops: int | None,
     dissent_weight: float | None,
     dry_run: bool,
 ) -> None:
@@ -1474,6 +1476,9 @@ def calibrate_command(
             calibrate_kwargs["feedback_weight"] = feedback_weight
         calibrate_kwargs["propagation_factor"] = (
             propagation_factor if propagation_factor is not None else config.trust_propagation_factor
+        )
+        calibrate_kwargs["propagation_max_hops"] = (
+            propagation_max_hops if propagation_max_hops is not None else config.propagation_max_hops
         )
         calibrate_kwargs["dissent_weight"] = (
             dissent_weight if dissent_weight is not None else config.dissent_weight

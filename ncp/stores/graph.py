@@ -30,6 +30,31 @@ def parse_supersedes_ids(raw: str | None) -> list[str]:
     return [str(parsed)]
 
 
+def resolve_caused_by_fallback(edges: list[ChunkEdge]) -> dict[str, str]:
+    """Resolve a fallback ``caused_by`` parent per src chunk from edge rows.
+
+    Used by multi-hop calibration propagation (WI-G3) and graph traversal
+    (WI-G2) for chunks whose ``caused_by`` scalar is empty (e.g. edges added
+    via the MCP ``edges`` arg without ever setting the legacy column) but
+    that do have a ``caused_by`` edge row. Callers only consult this when the
+    scalar is absent -- the scalar always wins when both exist, since the
+    additive-only edge table can carry stale rows from an earlier rewrite
+    (see ``backfill_edges_for_chunk``).
+
+    A src with multiple candidate ``caused_by`` edges (fan-out, or several
+    rewrites) resolves deterministically to the highest-weight edge, ties
+    broken by the most recently created one.
+    """
+    best: dict[str, ChunkEdge] = {}
+    for edge in edges:
+        if edge.edge_type != "caused_by":
+            continue
+        current = best.get(edge.src_chunk_id)
+        if current is None or (edge.weight, edge.created_at) > (current.weight, current.created_at):
+            best[edge.src_chunk_id] = edge
+    return {src: edge.dst_chunk_id for src, edge in best.items()}
+
+
 def backfill_edges_for_chunk(chunk: SubconsciousChunk) -> list[ChunkEdge]:
     """Derive ``chunk_edges`` rows implied by a chunk's legacy scalar fields.
 

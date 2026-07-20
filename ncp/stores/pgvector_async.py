@@ -18,6 +18,7 @@ import math
 import time
 from collections.abc import Sequence
 from contextlib import asynccontextmanager
+from dataclasses import replace as dataclass_replace
 from difflib import SequenceMatcher
 from typing import Any, AsyncIterator
 
@@ -26,7 +27,7 @@ import structlog
 
 from ncp.stores.base import BaseStore, NCPStoreUnavailableError
 from ncp.stores.bitemporal import collect_successor_ids, filter_bitemporal
-from ncp.stores.graph import backfill_edges_for_chunk, parse_supersedes_ids
+from ncp.stores.graph import backfill_edges_for_chunk, parse_supersedes_ids, resolve_caused_by_fallback
 from ncp.stores.pgvector import (
     DEFAULT_RETRIEVAL_POLICY,
     PGVECTOR_SCHEMA_TEMPLATE,
@@ -2212,6 +2213,7 @@ class AsyncPgvectorStore(BaseStore):
         feedback_weight: float = 0.15,
         propagation_factor: float = 0.5,
         dissent_weight: float = 0.2,
+        propagation_max_hops: int = 1,
     ) -> CalibrationReport:
         """Re-score base_trust on live chunks using async DB I/O. Full parity with calibrate()."""
         started = time.monotonic()
@@ -2336,6 +2338,23 @@ class AsyncPgvectorStore(BaseStore):
         # CAP-T3: initialize outcome tracking
         consumed_outcome_ids: list[str] = []
         if feedback_mode and feedback_rows:
+            # WI-G3: chunks without a caused_by scalar (e.g. edges added via
+            # the MCP edges arg only) still get an ancestor via a caused_by
+            # edge row, so multi-hop propagation can walk them.
+            missing_parent_ids = [row.chunk_id for row in feedback_rows if not row.caused_by]
+            if missing_parent_ids and propagation_factor > 0.0 and propagation_max_hops > 0:
+                fallback_edges = await self.async_get_chunk_edges(
+                    missing_parent_ids, edge_types=["caused_by"], direction="out"
+                )
+                fallback_parent = resolve_caused_by_fallback(fallback_edges)
+                if fallback_parent:
+                    feedback_rows = [
+                        dataclass_replace(row, caused_by=fallback_parent[row.chunk_id])
+                        if row.chunk_id in fallback_parent
+                        else row
+                        for row in feedback_rows
+                    ]
+
             outcome_evidence = None
             async with self._aconnect() as conn:
                 outcomes = await self._aload_unconsumed_outcomes(conn)
@@ -2351,6 +2370,7 @@ class AsyncPgvectorStore(BaseStore):
                 dissent_weight=dissent_weight,
                 usage_prior_weight=self.config.usage_prior_weight if self.config is not None else 1.0,
                 outcome_evidence=outcome_evidence,
+                propagation_max_hops=propagation_max_hops,
             )
             updates.extend(fb.updates)
             report.change_log.extend(fb.change_log)

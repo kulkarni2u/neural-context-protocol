@@ -485,6 +485,7 @@ class BaseStore(ABC):
         feedback_weight: float = 0.15,
         propagation_factor: float = 0.5,
         dissent_weight: float = 0.2,
+        propagation_max_hops: int = 1,
     ) -> CalibrationReport:
         """Re-score base_trust on existing chunks.
 
@@ -494,8 +495,9 @@ class BaseStore(ABC):
           recency_half_life_seconds, base_trust > 0.5, generation == 0). Chunks with
           src == "user_verified" are always protected.
         - Feedback: apply a net trust delta per chunk (retrieval boost minus dissent
-          penalty) and propagate a fraction (``propagation_factor``) of it one hop
-          along ``caused_by`` edges.
+          penalty) and propagate a fraction (``propagation_factor``) of it up to
+          ``propagation_max_hops`` hops along ``caused_by`` ancestry (default 1
+          hop, matching legacy behavior).
         """
 
     def query_precedents(

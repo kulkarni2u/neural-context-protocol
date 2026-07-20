@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from contextlib import contextmanager
+from dataclasses import replace as dataclass_replace
 from difflib import SequenceMatcher
 import json
 from pathlib import Path
@@ -19,7 +20,7 @@ from ncp.stores.calibration import (
     rollup_reputation,
 )
 from ncp.stores.consolidation import cluster_by_tags, find_merge_candidates
-from ncp.stores.graph import backfill_edges_for_chunk, parse_supersedes_ids
+from ncp.stores.graph import backfill_edges_for_chunk, parse_supersedes_ids, resolve_caused_by_fallback
 from ncp.stores.retrieval import (
     DEFAULT_RETRIEVAL_POLICY,
     RetrievalPolicy,
@@ -1544,6 +1545,7 @@ class SQLiteStore(BaseStore):
         feedback_weight: float = 0.15,
         propagation_factor: float = 0.5,
         dissent_weight: float = 0.2,
+        propagation_max_hops: int = 1,
     ) -> CalibrationReport:
         """Re-score base_trust on live chunks.
 
@@ -1551,7 +1553,8 @@ class SQLiteStore(BaseStore):
         Batch mode: pipeline_id applies decay to eligible chunks.
         Feedback mode: applies a net trust delta per chunk (retrieval boost minus
         dissent penalty) and propagates a fraction (``propagation_factor``) of it
-        one hop along ``caused_by`` edges.
+        up to ``propagation_max_hops`` hops along ``caused_by`` ancestry (default
+        1 hop, matching legacy behavior).
         """
         started = time.monotonic()
         report = CalibrationReport(dry_run=dry_run, pipeline_id=pipeline_id)
@@ -1650,6 +1653,23 @@ class SQLiteStore(BaseStore):
                 # CAP-T3: initialize outcome tracking
                 consumed_outcome_ids: list[str] = []
                 if feedback_mode and feedback_rows:
+                    # WI-G3: chunks without a caused_by scalar (e.g. edges added
+                    # via the MCP edges arg only) still get an ancestor via a
+                    # caused_by edge row, so multi-hop propagation can walk them.
+                    missing_parent_ids = [row.chunk_id for row in feedback_rows if not row.caused_by]
+                    if missing_parent_ids and propagation_factor > 0.0 and propagation_max_hops > 0:
+                        fallback_edges = self.get_chunk_edges(
+                            missing_parent_ids, edge_types=["caused_by"], direction="out"
+                        )
+                        fallback_parent = resolve_caused_by_fallback(fallback_edges)
+                        if fallback_parent:
+                            feedback_rows = [
+                                dataclass_replace(row, caused_by=fallback_parent[row.chunk_id])
+                                if row.chunk_id in fallback_parent
+                                else row
+                                for row in feedback_rows
+                            ]
+
                     outcomes = self._load_unconsumed_outcomes(connection)
                     outcome_evidence = None
                     if outcomes:
@@ -1664,6 +1684,7 @@ class SQLiteStore(BaseStore):
                         dissent_weight=dissent_weight,
                         usage_prior_weight=self.config.usage_prior_weight if self.config is not None else 1.0,
                         outcome_evidence=outcome_evidence,
+                        propagation_max_hops=propagation_max_hops,
                     )
                     updates.extend(fb.updates)
                     report.change_log.extend(fb.change_log)

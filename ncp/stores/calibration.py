@@ -58,6 +58,7 @@ def compute_feedback_updates(
     dissent_weight: float = 0.2,
     usage_prior_weight: float = 1.0,
     outcome_evidence: dict[str, float] | None = None,
+    propagation_max_hops: int = 1,
 ) -> FeedbackResult:
     """Compute net trust deltas from retrieval feedback, dissent, and outcomes.
 
@@ -74,11 +75,19 @@ def compute_feedback_updates(
     before (retrieval counts drive the update at their full weight).
 
     Propagation: a fraction (``propagation_factor``) of each chunk's net delta
-    flows one hop to its ``caused_by`` parent — crediting a cause for useful
-    effects and debiting it for disputed ones. The hop is single to keep credit
-    assignment bounded and acyclic; the parent must be among ``rows`` (live and
-    not protected) to be affected. A chunk that is both retrieved and a parent
-    accumulates both contributions.
+    flows up to ``propagation_max_hops`` hops along ``caused_by`` ancestry —
+    crediting a cause for useful effects and debiting it for disputed ones.
+    Hop *h* receives ``propagation_factor ** h`` of the originating delta.
+    ``propagation_max_hops=1`` (the default) reproduces the original single-hop
+    behavior exactly. Each ``FeedbackRow.caused_by`` is taken as the already-
+    resolved parent id (callers pick the current ``caused_by`` scalar, falling
+    back to a ``caused_by`` edge row only when the scalar is absent); walking
+    further ancestry is just following that chain across ``rows``. A visited
+    set per originating chunk makes the walk cycle-safe, and an ancestor must
+    be among ``rows`` (live and not protected) to receive credit. A chunk that
+    is both retrieved and an ancestor of another accumulates both/all
+    contributions, and multiple descendants sharing an ancestor accumulate
+    into that ancestor together.
 
     Caller is responsible for excluding protected (``user_verified``) chunks
     from ``rows`` before calling.
@@ -112,14 +121,20 @@ def compute_feedback_updates(
             direct[cid] = delta
 
     total: dict[str, float] = dict(direct)
-    if propagation_factor > 0.0:
+    if propagation_factor > 0.0 and propagation_max_hops > 0:
+        parent_of = {row.chunk_id: row.caused_by for row in rows if row.caused_by}
         for row in rows:
             delta = direct.get(row.chunk_id, 0.0)
             if delta == 0.0:
                 continue
-            parent = row.caused_by
-            if parent and parent in base_trust:
-                total[parent] = total.get(parent, 0.0) + delta * propagation_factor
+            visited = {row.chunk_id}
+            ancestor = parent_of.get(row.chunk_id)
+            hop = 1
+            while ancestor and ancestor in base_trust and ancestor not in visited and hop <= propagation_max_hops:
+                total[ancestor] = total.get(ancestor, 0.0) + delta * (propagation_factor**hop)
+                visited.add(ancestor)
+                hop += 1
+                ancestor = parent_of.get(ancestor)
 
     result = FeedbackResult()
     result.consumed_chunk_ids = [
