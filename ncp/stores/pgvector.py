@@ -2049,6 +2049,7 @@ class PgvectorStore(BaseStore):
                     updates.extend(fb.updates)
                     report.change_log.extend(fb.change_log)
                     report.feedback_adjusted += fb.adjusted
+                    report.outcome_propagated += fb.outcome_propagated
                     report.skipped += fb.skipped
                     consumed_feedback_ids = fb.consumed_chunk_ids
 

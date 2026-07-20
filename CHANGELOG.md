@@ -64,6 +64,21 @@ All notable changes to Neural Context Protocol will be documented in this file.
   edges that already exist. `ncp_write_memory` response gains an
   `edges_inferred` count when the flag is enabled (field absent when
   disabled, preserving exact legacy behavior by default).
+- **Multi-hop outcome credit attribution** (CAP-T3 extension) (`ncp/stores/calibration.py`,
+  `ncp/types.py`, all three backends, `ncp/cli.py`): confirmed and made
+  visible that outcome-driven trust deltas (from `ncp_record_outcome` /
+  `calibrate --feedback`) already take the identical multi-hop `caused_by`
+  propagation path as retrieval/dissent deltas (`propagation_max_hops`,
+  `propagation_factor ** hop`, cycle-safe, `user_verified` protected) —
+  `compute_feedback_updates` folds outcome evidence into each chunk's net
+  delta before the shared propagation loop runs, so no separate code path
+  was needed. Added attribution surfacing: change-log entries for
+  propagated credit are now tagged `reason="outcome_propagation"` when the
+  originating delta included outcome evidence, distinct from
+  `"trust_propagation"` for retrieval/dissent-only propagation. New
+  `FeedbackResult.outcome_propagated` / `CalibrationReport.outcome_propagated`
+  counts, and a new "via outcome propagation" row in `ncp calibrate --feedback`
+  table output.
 
 ## [1.3.0] - 2026-07-06
 

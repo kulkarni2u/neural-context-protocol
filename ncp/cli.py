@@ -1621,6 +1621,7 @@ def calibrate_command(
     table.add_row("Adjusted", str(report.adjusted))
     if feedback:
         table.add_row("Feedback adjusted", str(report.feedback_adjusted))
+        table.add_row("  via outcome propagation", str(report.outcome_propagated))
         identities_updated = sum(
             1 for entry in report.change_log if entry.get("reason") == "reputation_rollup"
         )

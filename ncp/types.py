@@ -622,6 +622,10 @@ class CalibrationReport:
     dry_run: bool = False
     pipeline_id: str | None = None
     change_log: list[dict] = field(default_factory=list)
+    # Chunks adjusted via outcome-driven multi-hop propagation (WI-P3,
+    # CAP-T3 extension) — a subset of feedback_adjusted, distinct from
+    # chunks adjusted directly by outcome/retrieval/dissent signal.
+    outcome_propagated: int = 0
 
 
 class OutcomeRecord(NCPModel):
