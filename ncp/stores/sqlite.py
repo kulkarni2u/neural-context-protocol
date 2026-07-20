@@ -20,7 +20,12 @@ from ncp.stores.calibration import (
     rollup_reputation,
 )
 from ncp.stores.consolidation import cluster_by_tags, find_merge_candidates
-from ncp.stores.graph import backfill_edges_for_chunk, parse_supersedes_ids, resolve_caused_by_fallback
+from ncp.stores.graph import (
+    backfill_edges_for_chunk,
+    infer_edges_for_chunk,
+    parse_supersedes_ids,
+    resolve_caused_by_fallback,
+)
 from ncp.stores.retrieval import (
     DEFAULT_RETRIEVAL_POLICY,
     RetrievalPolicy,
@@ -272,6 +277,12 @@ class SQLiteStore(BaseStore):
         self.gc_threshold = gc_threshold
         self.max_working_chunks_per_pipeline = max_working_chunks_per_pipeline
         self.retention_evictions = 0
+        # CAP-C7/WI-P2: count of `refines` edges inferred+persisted by the most
+        # recent write() call (0 when disabled or none matched). Reset at the
+        # top of every write() -- read immediately after by the MCP layer for
+        # the `edges_inferred` response field; not meaningful across concurrent
+        # writers on the same store instance.
+        self.last_write_inferred_edge_count = 0
         self._embedding_adapter = embedding_adapter
 
         from ncp.stores.rerank import Reranker
@@ -361,6 +372,7 @@ class SQLiteStore(BaseStore):
                     pass  # column already exists
 
     def write(self, chunk: SubconsciousChunk) -> bool:
+        self.last_write_inferred_edge_count = 0
         chunk = self._validate_chunk_for_write(chunk)
         if self._embedding_adapter is not None and chunk.embedding is None:
             chunk = chunk.model_copy(
@@ -449,10 +461,51 @@ class SQLiteStore(BaseStore):
             backfilled_edges = backfill_edges_for_chunk(chunk)
             if backfilled_edges:
                 self._upsert_chunk_edges(connection, backfilled_edges)
+            if self.config is not None and self.config.infer_edges:
+                inferred_edges = infer_edges_for_chunk(
+                    chunk,
+                    self._edge_inference_candidates(
+                        connection, chunk, limit=self.config.infer_scan_limit
+                    ),
+                    threshold=self.config.infer_similarity_threshold,
+                    max_edges=self.config.infer_max_edges,
+                    existing_dst_ids=self._existing_refines_dst_ids(connection, chunk.chunk_id),
+                )
+                if inferred_edges:
+                    self._upsert_chunk_edges(connection, inferred_edges)
+                self.last_write_inferred_edge_count = len(inferred_edges)
             self._hard_gc(connection, pipeline_id=chunk.pipeline_id)
             if self.max_working_chunks_per_pipeline > 0 and chunk.zone == "working":
                 self._enforce_retention(connection, pipeline_id=chunk.pipeline_id)
             return True
+
+    def _edge_inference_candidates(
+        self, connection: sqlite3.Connection, chunk: SubconsciousChunk, *, limit: int
+    ) -> list[SubconsciousChunk]:
+        """Bounded, most-recent-first scan of same-pipeline chunks (CAP-C7/WI-P2).
+
+        Exclusion (self, raw backups, empty content, existing edges) is owned
+        by ``infer_edges_for_chunk`` -- this only bounds the scan so inference
+        never issues an unbounded table read.
+        """
+        rows = connection.execute(
+            """
+            SELECT * FROM chunks
+            WHERE IFNULL(pipeline_id, '') = IFNULL(?, '')
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (chunk.pipeline_id, max(0, int(limit))),
+        ).fetchall()
+        return [self._row_to_chunk(row) for row in rows]
+
+    @staticmethod
+    def _existing_refines_dst_ids(connection: sqlite3.Connection, src_chunk_id: str) -> set[str]:
+        rows = connection.execute(
+            "SELECT dst_chunk_id FROM chunk_edges WHERE src_chunk_id = ? AND edge_type = 'refines'",
+            (src_chunk_id,),
+        ).fetchall()
+        return {str(row["dst_chunk_id"]) for row in rows}
 
     @staticmethod
     def _cosine_similarity(a: list[float], b: list[float]) -> float:

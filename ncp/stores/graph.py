@@ -7,6 +7,8 @@ derive identical ``ChunkEdge`` rows from the same legacy ``caused_by``/
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Sequence
+from difflib import SequenceMatcher
 import json
 
 from ncp.types import ChunkEdge, SubconsciousChunk
@@ -86,3 +88,52 @@ def backfill_edges_for_chunk(chunk: SubconsciousChunk) -> list[ChunkEdge]:
                 )
             )
     return edges
+
+
+def infer_edges_for_chunk(
+    chunk: SubconsciousChunk,
+    candidates: Sequence[SubconsciousChunk],
+    *,
+    threshold: float,
+    max_edges: int,
+    existing_dst_ids: Iterable[str] | None = None,
+) -> list[ChunkEdge]:
+    """Deterministically infer ``refines`` edges from recent chunk content (CAP-C7/WI-P2).
+
+    No model calls: a plain ``difflib.SequenceMatcher`` ratio over ``content``
+    decides candidacy. ``candidates`` is typically a bounded, most-recent-first
+    scan of chunks from the same pipeline (``[graph].infer_scan_limit``) -- this
+    function owns every exclusion rule so callers only need to hand through the
+    raw candidate list plus what already has a ``refines`` edge from ``chunk``:
+    self-references, low-trust ``raw_*`` backup chunks (see ``ncp_write_memory``'s
+    reversible ``raw_ref`` filtering), empty content, and (src, dst, "refines")
+    pairs that already exist. Ties in ratio break on ``dst_chunk_id`` so the
+    result is reproducible across runs given the same inputs.
+    """
+    if max_edges <= 0 or not chunk.content:
+        return []
+    already = set(existing_dst_ids or ())
+    scored: list[tuple[float, SubconsciousChunk]] = []
+    for candidate in candidates:
+        if candidate.chunk_id == chunk.chunk_id:
+            continue
+        if candidate.chunk_id.startswith("raw_"):
+            continue
+        if not candidate.content:
+            continue
+        if candidate.chunk_id in already:
+            continue
+        ratio = SequenceMatcher(None, chunk.content, candidate.content).ratio()
+        if ratio >= threshold:
+            scored.append((ratio, candidate))
+    scored.sort(key=lambda pair: (-pair[0], pair[1].chunk_id))
+    return [
+        ChunkEdge(
+            src_chunk_id=chunk.chunk_id,
+            dst_chunk_id=candidate.chunk_id,
+            edge_type="refines",
+            weight=ratio,
+            created_by="ncp:inferred",
+        )
+        for ratio, candidate in scored[:max_edges]
+    ]

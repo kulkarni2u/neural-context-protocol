@@ -111,7 +111,9 @@ MCP_TOOLS: list[dict[str, object]] = [
             "filtered at ingestion (ANSI codes, duplicate lines, boilerplate stripped). "
             "If filtering reduced the content, the response includes filtered=true, "
             "reduction_ratio, and a raw_ref chunk ID you can retrieve via ncp_fetch "
-            "to recover the original."
+            "to recover the original. When [graph].infer_edges is enabled, the response "
+            "also includes edges_inferred: the count of 'refines' edges automatically "
+            "linked to similar recent chunks in the same pipeline (0 is valid)."
         ),
         "inputSchema": {
             "type": "object",
@@ -557,6 +559,9 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
     drift_computed_enabled = config.drift_computed_enabled if config is not None else False
     drift_window_turns = config.drift_window_turns if config is not None else 5
     drift_use_embeddings = config.drift_use_embeddings if config is not None else False
+    # CAP-C7/WI-P2: write-time edge inference, opt-in (off by default -- the
+    # `edges_inferred` response field is only surfaced when enabled).
+    infer_edges_enabled = config.infer_edges if config is not None else False
     drift_embedding_adapter: EmbeddingAdapter | None = None
     if drift_computed_enabled and drift_use_embeddings:
         drift_embedding_adapter = _build_drift_embedding_adapter(config)
@@ -943,6 +948,10 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         chunk = SubconsciousChunk(**kwargs)
         ok = store.write(chunk)
         result: dict[str, object] = {"written": ok, "chunk_id": chunk.chunk_id}
+        if infer_edges_enabled:
+            # CAP-C7/WI-P2: write() ran deterministic similarity inference;
+            # 0 is a valid, meaningful count (no similar recent chunk found).
+            result["edges_inferred"] = getattr(store, "last_write_inferred_edge_count", 0)
         if raw_edges:
             edges = [
                 ChunkEdge(

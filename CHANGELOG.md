@@ -48,6 +48,22 @@ All notable changes to Neural Context Protocol will be documented in this file.
 - **pgvector migration `012_add_chunk_edges.sql`** (`ncp/migrations/`): versioned
   schema upgrade for pgvector deployments, adding `chunk_edges` table and indexes.
   Managed via `ncp migrate apply/rollback`.
+- **Automatic edge inference at write time** (CAP-C7) (`ncp/config.py`,
+  `ncp/stores/graph.py`, `ncp/stores/sqlite.py`, `ncp/stores/pgvector.py`,
+  `ncp/stores/pgvector_async.py`, `ncp/mcp/server.py`): new `[graph]` config
+  block (`infer_edges` bool, **default false**; `infer_similarity_threshold`
+  default 0.6; `infer_scan_limit` default 50; `infer_max_edges` default 3;
+  env overrides `NCP_INFER_EDGES`, `NCP_INFER_SIMILARITY_THRESHOLD`,
+  `NCP_INFER_SCAN_LIMIT`, `NCP_INFER_MAX_EDGES`). When enabled, `write()`/
+  `async_write()` scan up to `infer_scan_limit` most-recent same-pipeline
+  chunks after backfill and score them against the new chunk's content with a
+  deterministic `difflib.SequenceMatcher` ratio (no model calls); matches
+  `>= infer_similarity_threshold` become `refines` edges (weight = ratio,
+  `created_by = "ncp:inferred"`), capped at `infer_max_edges` by highest
+  ratio, excluding self, low-trust `raw_*` backup chunks, empty content, and
+  edges that already exist. `ncp_write_memory` response gains an
+  `edges_inferred` count when the flag is enabled (field absent when
+  disabled, preserving exact legacy behavior by default).
 
 ## [1.3.0] - 2026-07-06
 

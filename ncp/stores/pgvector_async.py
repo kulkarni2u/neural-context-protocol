@@ -27,7 +27,12 @@ import structlog
 
 from ncp.stores.base import BaseStore, NCPStoreUnavailableError
 from ncp.stores.bitemporal import collect_successor_ids, filter_bitemporal
-from ncp.stores.graph import backfill_edges_for_chunk, parse_supersedes_ids, resolve_caused_by_fallback
+from ncp.stores.graph import (
+    backfill_edges_for_chunk,
+    infer_edges_for_chunk,
+    parse_supersedes_ids,
+    resolve_caused_by_fallback,
+)
 from ncp.stores.pgvector import (
     DEFAULT_RETRIEVAL_POLICY,
     PGVECTOR_SCHEMA_TEMPLATE,
@@ -98,6 +103,8 @@ class AsyncPgvectorStore(BaseStore):
         self.gc_threshold = gc_threshold
         self.max_working_chunks_per_pipeline = max_working_chunks_per_pipeline
         self.retention_evictions = 0
+        # CAP-C7/WI-P2: see SQLiteStore.last_write_inferred_edge_count.
+        self.last_write_inferred_edge_count = 0
         self.reputation_gain = 4.0
         self.reputation_forget = 0.99
         self.reputation_confidence_k = 20
@@ -283,6 +290,7 @@ class AsyncPgvectorStore(BaseStore):
         Matches sync write() behavior: soft_gc → src_immutability → dedup →
         INSERT/upsert → hard_gc.
         """
+        self.last_write_inferred_edge_count = 0
         chunk = self._validate_chunk_for_write(chunk)
         if self._embedding_adapter is not None and chunk.embedding is None:
             _adapter = self._embedding_adapter
@@ -383,10 +391,65 @@ class AsyncPgvectorStore(BaseStore):
             backfilled_edges = backfill_edges_for_chunk(chunk)
             if backfilled_edges:
                 await self._async_upsert_chunk_edges_rows(conn, backfilled_edges)
+            if self.config is not None and self.config.infer_edges:
+                inferred_edges = infer_edges_for_chunk(
+                    chunk,
+                    await self._async_edge_inference_candidates(
+                        conn, chunk, limit=self.config.infer_scan_limit
+                    ),
+                    threshold=self.config.infer_similarity_threshold,
+                    max_edges=self.config.infer_max_edges,
+                    existing_dst_ids=await self._async_existing_refines_dst_ids(
+                        conn, chunk.chunk_id
+                    ),
+                )
+                if inferred_edges:
+                    await self._async_upsert_chunk_edges_rows(conn, inferred_edges)
+                self.last_write_inferred_edge_count = len(inferred_edges)
             await self._async_hard_gc(conn, pipeline_id=chunk.pipeline_id)
             if self.max_working_chunks_per_pipeline > 0 and chunk.zone == "working":
                 await self._async_enforce_retention(conn, pipeline_id=chunk.pipeline_id)
         return True
+
+    async def _async_edge_inference_candidates(
+        self, conn: Any, chunk: SubconsciousChunk, *, limit: int
+    ) -> list[SubconsciousChunk]:
+        """Bounded, most-recent-first scan of same-pipeline chunks (CAP-C7/WI-P2).
+
+        Exclusion (self, raw backups, empty content, existing edges) is owned
+        by ``infer_edges_for_chunk`` -- this only bounds the scan so inference
+        never issues an unbounded table read.
+        """
+        async with conn.cursor() as cur:
+            await cur.execute(
+                self._sql(
+                    """
+                    SELECT * FROM {schema}.{prefix}chunks
+                    WHERE COALESCE(pipeline_id, '') = COALESCE(%s, '')
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                    """
+                ),
+                (chunk.pipeline_id, max(0, int(limit))),
+            )
+            raw_rows = await cur.fetchall()
+            description = cur.description
+        rows = [self._normalize_row(r, description) for r in raw_rows]
+        return [self._row_to_chunk(row) for row in rows]
+
+    async def _async_existing_refines_dst_ids(self, conn: Any, src_chunk_id: str) -> set[str]:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                self._sql(
+                    "SELECT dst_chunk_id FROM {schema}.{prefix}chunk_edges"
+                    " WHERE src_chunk_id = %s AND edge_type = 'refines'"
+                ),
+                (src_chunk_id,),
+            )
+            raw_rows = await cur.fetchall()
+            description = cur.description
+        rows = [self._normalize_row(r, description) for r in raw_rows]
+        return {str(row["dst_chunk_id"]) for row in rows}
 
     # ------------------------------------------------------------------
     # Async dedup/GC helpers — native async equivalents of PgvectorStore

@@ -23,7 +23,12 @@ from ncp.stores.calibration import (
     rollup_reputation,
 )
 from ncp.stores.consolidation import cluster_by_tags, find_merge_candidates
-from ncp.stores.graph import backfill_edges_for_chunk, parse_supersedes_ids, resolve_caused_by_fallback
+from ncp.stores.graph import (
+    backfill_edges_for_chunk,
+    infer_edges_for_chunk,
+    parse_supersedes_ids,
+    resolve_caused_by_fallback,
+)
 from ncp.stores.redis_coordination import RedisCoordination
 from ncp.stores.retrieval import (
     DEFAULT_RETRIEVAL_POLICY,
@@ -308,6 +313,8 @@ class PgvectorStore(BaseStore):
         self.gc_threshold = gc_threshold
         self.max_working_chunks_per_pipeline = max_working_chunks_per_pipeline
         self.retention_evictions = 0
+        # CAP-C7/WI-P2: see SQLiteStore.last_write_inferred_edge_count.
+        self.last_write_inferred_edge_count = 0
         self._ivfflat_probes = ivfflat_probes
 
         from ncp.stores.rerank import Reranker
@@ -407,6 +414,7 @@ class PgvectorStore(BaseStore):
                 self._close_cursor(cursor)
 
     def write(self, chunk: SubconsciousChunk) -> bool:
+        self.last_write_inferred_edge_count = 0
         chunk = self._validate_chunk_for_write(chunk)
         if self._embedding_adapter is not None and chunk.embedding is None:
             chunk = chunk.model_copy(
@@ -511,10 +519,65 @@ class PgvectorStore(BaseStore):
             backfilled_edges = backfill_edges_for_chunk(chunk)
             if backfilled_edges:
                 self._upsert_chunk_edges_rows(connection, backfilled_edges)
+            if self.config is not None and self.config.infer_edges:
+                inferred_edges = infer_edges_for_chunk(
+                    chunk,
+                    self._edge_inference_candidates(
+                        connection, chunk, limit=self.config.infer_scan_limit
+                    ),
+                    threshold=self.config.infer_similarity_threshold,
+                    max_edges=self.config.infer_max_edges,
+                    existing_dst_ids=self._existing_refines_dst_ids(connection, chunk.chunk_id),
+                )
+                if inferred_edges:
+                    self._upsert_chunk_edges_rows(connection, inferred_edges)
+                self.last_write_inferred_edge_count = len(inferred_edges)
             self._hard_gc(connection, pipeline_id=chunk.pipeline_id)
             if self.max_working_chunks_per_pipeline > 0 and chunk.zone == "working":
                 self._enforce_retention(connection, pipeline_id=chunk.pipeline_id)
             return True
+
+    def _edge_inference_candidates(
+        self, connection: Any, chunk: SubconsciousChunk, *, limit: int
+    ) -> list[SubconsciousChunk]:
+        """Bounded, most-recent-first scan of same-pipeline chunks (CAP-C7/WI-P2).
+
+        Exclusion (self, raw backups, empty content, existing edges) is owned
+        by ``infer_edges_for_chunk`` -- this only bounds the scan so inference
+        never issues an unbounded table read.
+        """
+        cursor = connection.cursor()
+        try:
+            cursor.execute(
+                self._sql(
+                    """
+                    SELECT * FROM {schema}.{prefix}chunks
+                    WHERE COALESCE(pipeline_id, '') = COALESCE(%s, '')
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                    """
+                ),
+                (chunk.pipeline_id, max(0, int(limit))),
+            )
+            rows = self._fetchall(cursor)
+        finally:
+            self._close_cursor(cursor)
+        return [self._row_to_chunk(row) for row in rows]
+
+    def _existing_refines_dst_ids(self, connection: Any, src_chunk_id: str) -> set[str]:
+        cursor = connection.cursor()
+        try:
+            cursor.execute(
+                self._sql(
+                    "SELECT dst_chunk_id FROM {schema}.{prefix}chunk_edges"
+                    " WHERE src_chunk_id = %s AND edge_type = 'refines'"
+                ),
+                (src_chunk_id,),
+            )
+            rows = self._fetchall(cursor)
+        finally:
+            self._close_cursor(cursor)
+        return {str(row["dst_chunk_id"]) for row in rows}
 
     def query(
         self,

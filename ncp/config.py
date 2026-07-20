@@ -150,6 +150,16 @@ DEFAULT_CONFIG = {
         # back to lexical-only when the adapter is unavailable.
         "drift_use_embeddings": False,
     },
+    "graph": {
+        # CAP-C7 (WI-P2): deterministic write-time edge inference. Default
+        # false (opt-in) -- disabled preserves exact legacy write() behavior,
+        # no similarity scan, no extra edges. No model calls; a SequenceMatcher
+        # ratio over recent same-pipeline chunk content decides `refines` edges.
+        "infer_edges": False,
+        "infer_similarity_threshold": 0.6,
+        "infer_scan_limit": 50,
+        "infer_max_edges": 3,
+    },
     "providers": {
         "pricing": {
             "claude-sonnet-4-20250514": {"input": 3.00, "output": 15.00, "cache_read": 0.30},
@@ -449,6 +459,24 @@ class NCPConfig:
     def require_signatures(self) -> bool:
         return bool(self.values.get("identity", {}).get("require_signatures", False))
 
+    @property
+    def infer_edges(self) -> bool:
+        """CAP-C7/WI-P2: whether write() infers `refines` edges from recent content. Off by default."""
+        return bool(self.values.get("graph", {}).get("infer_edges", False))
+
+    @property
+    def infer_similarity_threshold(self) -> float:
+        return float(self.values.get("graph", {}).get("infer_similarity_threshold", 0.6))
+
+    @property
+    def infer_scan_limit(self) -> int:
+        return max(0, int(self.values.get("graph", {}).get("infer_scan_limit", 50)))
+
+    @property
+    def infer_max_edges(self) -> int:
+        return max(0, int(self.values.get("graph", {}).get("infer_max_edges", 3)))
+
+
 def load_config(
     path: str | Path | None = None,
     *,
@@ -581,6 +609,15 @@ def _apply_env_overrides(values: dict[str, Any], env: dict[str, str]) -> None:
     if "NCP_DRIFT_USE_EMBEDDINGS" in env:
         val = env["NCP_DRIFT_USE_EMBEDDINGS"].lower()
         values["drift"]["drift_use_embeddings"] = val in {"true", "1", "yes"}
+    if "NCP_INFER_EDGES" in env:
+        val = env["NCP_INFER_EDGES"].lower()
+        values["graph"]["infer_edges"] = val in {"true", "1", "yes"}
+    if "NCP_INFER_SIMILARITY_THRESHOLD" in env:
+        values["graph"]["infer_similarity_threshold"] = float(env["NCP_INFER_SIMILARITY_THRESHOLD"])
+    if "NCP_INFER_SCAN_LIMIT" in env:
+        values["graph"]["infer_scan_limit"] = int(env["NCP_INFER_SCAN_LIMIT"])
+    if "NCP_INFER_MAX_EDGES" in env:
+        values["graph"]["infer_max_edges"] = int(env["NCP_INFER_MAX_EDGES"])
 
 
 def _deep_merge(target: dict[str, Any], updates: dict[str, Any]) -> None:
