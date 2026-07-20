@@ -2,6 +2,53 @@
 
 All notable changes to Neural Context Protocol will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- **Typed chunk relationship graph** (`ncp/types.py`, `ncp/stores/graph.py`,
+  `ncp/stores/base.py`, `ncp/stores/sqlite.py`, `ncp/stores/pgvector.py`,
+  `ncp/stores/pgvector_async.py`): new `ChunkEdge` pydantic type and closed-set
+  `ChunkEdgeType` enum (caused_by, supersedes, supports, contradicts, refines,
+  derived_from). Normalized `chunk_edges` table stores directed edges between
+  chunks with weight and authorship. Write-time backfill auto-upserts edges
+  matching legacy `caused_by`/`supersedes` scalar columns (authoritative-compatible;
+  stale additive-only edge rows are skipped when they disagree with current
+  scalar). Store API adds `add_chunk_edges()`/`get_chunk_edges()`/`graph_data()`
+  (sync + async variants) with safe no-op defaults on optional stores.
+- **`edges` parameter on `ncp_write_memory`** (`ncp/mcp/server.py`): optional
+  array of `{dst: chunk_id, type: edge_type, weight?: float}` validated against
+  closed edge-type set; unknown types rejected as -32603 error before store write.
+  Written via `add_chunk_edges` after chunk write; response includes `edges_written` count.
+- **Multi-hop edge expansion in retrieval** (`ncp/assembler.py`, `ncp/config.py`):
+  bounded BFS from initially-retrieved chunks up to `[retrieval].edge_max_hops`
+  (**default 1**) along types in `[retrieval].edge_expansion_types` (**default
+  ["caused_by"]**), with per-hop relevance decay via `edge_expansion_decay`.
+  Visited set prevents cycles; budget never widens (expansion redistributes within
+  existing token/chunk cap). When `caused_by` is configured, stale edge rows
+  (those disagreeing with current chunk scalar) are skipped; legacy-column
+  fallback resolves missing-scalar cases. Env overrides: `NCP_EDGE_MAX_HOPS`,
+  `NCP_EDGE_EXPANSION_TYPES` (CSV).
+- **Multi-hop trust propagation in calibration** (`ncp/stores/calibration.py`,
+  all three backends): feedback-driven trust deltas propagate up to
+  `[retrieval].propagation_max_hops` (**default 1**) along `caused_by` edges,
+  scaled by `propagation_factor ** hop` (default factor 0.5). Cycle-safe via
+  per-originator visited set. `user_verified` chunks remain protected.
+  New `--propagation-max-hops` kwarg on `ncp calibrate` CLI. Env override:
+  `NCP_PROPAGATION_MAX_HOPS`.
+- **`ncp graph` CLI command** (`ncp/cli.py`): export typed chunk relationships
+  as JSON or Graphviz DOT. Options: `--format json|dot` (default json),
+  `--output PATH` (stdout if omitted), `--pipeline-id` scope, `--limit` max nodes.
+  JSON includes node list, edge list, and stats (node/edge counts, per-type
+  breakdown). DOT renders nodes with trust-band fillcolors (green ≥0.8, amber
+  0.5–0.8, red <0.5) and layer labels; edge styles by type (solid for
+  caused_by, dashed for supersedes, dotted for others). Stale `caused_by` edges
+  filtered before output for "current view" semantics. Summary stats printed to
+  stderr as table; stdout is pure JSON/DOT.
+- **pgvector migration `012_add_chunk_edges.sql`** (`ncp/migrations/`): versioned
+  schema upgrade for pgvector deployments, adding `chunk_edges` table and indexes.
+  Managed via `ncp migrate apply/rollback`.
+
 ## [1.3.0] - 2026-07-06
 
 Audit remediation from `docs/NCP_AUDIT_AND_REMEDIATION_PLAN.md`. One work item

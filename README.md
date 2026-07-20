@@ -260,6 +260,31 @@ The self-improving loop closes through `ncp calibrate --feedback` (`ncp/stores/c
 
 -----
 
+## Graph engineering
+
+Relationships between memories are first-class graph structure. Chunks are linked via typed directional edges (`caused_by`, `supersedes`, `supports`, `contradicts`, `refines`, `derived_from`), so retrieval and trust propagation can traverse relationships instead of treating memory as a flat scored pool.
+
+At write time, the `edges` parameter on `ncp_write_memory` lets you specify chunk relationships (e.g., `{"dst": "parent_chunk_id", "type": "caused_by"}`). Retrieval can expand up to `[retrieval].edge_max_hops` (default `1`) along `[retrieval].edge_expansion_types` (default `["caused_by"]`), inheriting relevance with per-hop decay. Trust propagation walks edges up to `[retrieval].propagation_max_hops` (default `1`), crediting or debiting causes for effects that proved useful or drew dissent. All defaults preserve legacy behavior exactly.
+
+Export the relationship graph with `ncp graph`:
+
+```bash
+ncp graph --format dot
+```
+
+```
+digraph ncp_graph {
+  "chunk_abc123..." [label="chunk_abc\nepisodic", style=filled, fillcolor="#2e7d32"];
+  "chunk_def456..." [label="chunk_def\nreasoning_trace", style=filled, fillcolor="#f9a825"];
+  "chunk_abc123..." -> "chunk_def456..." [label="caused_by", style=solid];
+  "chunk_ghi789..." -> "chunk_abc123..." [label="supports", style=dotted];
+}
+```
+
+Node fillcolor indicates trust (green ≥0.8, amber 0.5–0.8, red <0.5); edge styles differ by type. JSON export includes stats and per-type edge counts. See [the graph engineering plan](./docs/NCP_GRAPH_ENGINEERING_PLAN.md) for the full model, multi-hop semantics, and compatibility details.
+
+-----
+
 ## Signal filtering at write time
 
 The bus is not a compression tool — but a memory bus should carry useful signal, not tool-output boilerplate.
@@ -407,6 +432,7 @@ ncp status      # store and activity metrics
 ncp cost        # token and USD rollups
 ncp explain     # human-readable runtime summary
 ncp viz         # pipeline visualization
+ncp graph       # export typed chunk relationships as JSON or Graphviz DOT
 ncp trust-drift # trust-drift observability: rising, falling, and feedback summary
 ncp precedents  # query past decisions: 'show me decisions like this one'
 ncp consolidate # merge and compact memory
@@ -513,6 +539,7 @@ NCP is the memory bus. In our workflows, Sarathi is one orchestrator that runs o
 - [Orchestrator integration guide](./docs/NCP_ORCHESTRATOR_INTEGRATION_GUIDE.md)
 - [Protocol spec](./docs/NCP_PROTOCOL_SPEC.md)
 - [HTTP API contract](./docs/NCP_HTTP_API.md)
+- [Graph engineering plan](./docs/NCP_GRAPH_ENGINEERING_PLAN.md)
 - [Benchmark: task success at matched budget](./docs/NCP_BENCHMARK_TASK_SUCCESS.md)
 - [Benchmark: provider-real efficacy](./docs/NCP_BENCHMARK_EFFICACY_LIVE.md)
 - [Benchmark: coding pipeline](./docs/NCP_BENCHMARK_CODING_PIPELINE.md)
