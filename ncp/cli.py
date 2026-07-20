@@ -1370,6 +1370,129 @@ def viz_command(cwd: Path, pipeline_id: str | None) -> None:
     console.print(Panel("\n".join(wq_lines), title="Whisper Queue", expand=False))
 
 
+_GRAPH_EDGE_STYLE = {"caused_by": "solid", "supersedes": "dashed"}
+
+
+def _dot_escape(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _graph_trust_color(base_trust: float) -> str:
+    if base_trust >= 0.8:
+        return "#2e7d32"  # green: high trust
+    if base_trust >= 0.5:
+        return "#f9a825"  # amber: medium trust
+    return "#c62828"  # red: low trust
+
+
+def _render_graph_dot(nodes: list[dict[str, object]], edges: list[dict[str, object]]) -> str:
+    lines = ["digraph ncp_graph {"]
+    for node in nodes:
+        chunk_id = str(node["chunk_id"])
+        layer = str(node.get("layer", ""))
+        base_trust = float(node.get("base_trust", 0.0))
+        short_id = chunk_id[:12]
+        label = f"{_dot_escape(short_id)}\\n{_dot_escape(layer)}"
+        color = _graph_trust_color(base_trust)
+        lines.append(
+            f'  "{_dot_escape(chunk_id)}" [label="{label}", style=filled, fillcolor="{color}"];'
+        )
+    for edge in edges:
+        src = _dot_escape(str(edge["src"]))
+        dst = _dot_escape(str(edge["dst"]))
+        edge_type = str(edge["type"])
+        style = _GRAPH_EDGE_STYLE.get(edge_type, "dotted")
+        lines.append(
+            f'  "{src}" -> "{dst}" [label="{_dot_escape(edge_type)}", style={style}];'
+        )
+    lines.append("}")
+    return "\n".join(lines)
+
+
+@main.command("graph")
+@click.option("--cwd", type=click.Path(path_type=Path), default=Path.cwd)
+@click.option("--pipeline-id", default=None, help="Optional pipeline scope filter.")
+@click.option(
+    "--format",
+    "output_format",
+    type=click.Choice(["json", "dot"]),
+    default="json",
+    show_default=True,
+    help="Export format.",
+)
+@click.option("--output", type=click.Path(path_type=Path), default=None, help="Write export to file instead of stdout.")
+@click.option("--limit", default=500, type=int, show_default=True, help="Max nodes to include.")
+def graph_command(
+    cwd: Path,
+    pipeline_id: str | None,
+    output_format: str,
+    output: Path | None,
+    limit: int,
+) -> None:
+    """Export the typed chunk relationship graph (nodes + chunk_edges) as JSON or Graphviz DOT."""
+
+    try:
+        config = ncp.configure(cwd=cwd)
+        store = _resolve_reporting_store(config, "graph", "graph_data")
+        data = store.graph_data(pipeline_id=pipeline_id, limit=limit)
+    except NCPStoreUnavailableError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    nodes = list(data.get("nodes", []))  # type: ignore[union-attr]
+    edges = list(data.get("edges", []))  # type: ignore[union-attr]
+
+    # Stale caused_by pass: graph_data's legacy-column fallback only dedupes
+    # against real chunk_edges rows, but the edge table is additive-only
+    # (WI-G1 backfill) -- rewriting a chunk to point at a new caused_by
+    # parent leaves the old edge row in place. Resolve each node's *current*
+    # caused_by scalar via get_chunks_by_ids and drop caused_by edges from
+    # that node that disagree with it, so the export reflects the live view.
+    node_ids = [str(n["chunk_id"]) for n in nodes]
+    current_chunks = store.get_chunks_by_ids(node_ids) if node_ids else []
+    current_caused_by = {c.chunk_id: c.caused_by for c in current_chunks if c.caused_by}
+    edges = [
+        e
+        for e in edges
+        if not (
+            str(e.get("type")) == "caused_by"
+            and str(e["src"]) in current_caused_by
+            and current_caused_by[str(e["src"])] != e["dst"]
+        )
+    ]
+
+    edges_by_type: dict[str, int] = {}
+    for e in edges:
+        edge_type = str(e["type"])
+        edges_by_type[edge_type] = edges_by_type.get(edge_type, 0) + 1
+    stats = {"node_count": len(nodes), "edge_count": len(edges), "edges_by_type": edges_by_type}
+
+    if output_format == "json":
+        text = json.dumps({"nodes": nodes, "edges": edges, "stats": stats}, indent=2)
+    else:
+        text = _render_graph_dot(nodes, edges)
+
+    if output:
+        output.write_text(text + "\n")
+    else:
+        sys.stdout.write(text + "\n")
+
+    err_console = Console(stderr=True)
+    err_console.print(
+        f"[bold]NCP Graph[/bold]  store={_store_display(config)}"
+        + (f"  pipeline={pipeline_id}" if pipeline_id else "")
+    )
+    summary_table = Table(title="Graph Summary", box=box.SIMPLE_HEAVY)
+    summary_table.add_column("Metric")
+    summary_table.add_column("Value", justify="right")
+    summary_table.add_row("Nodes", str(stats["node_count"]))
+    summary_table.add_row("Edges", str(stats["edge_count"]))
+    for edge_type, count in sorted(edges_by_type.items()):
+        summary_table.add_row(f"  {edge_type}", str(count))
+    if not edges_by_type:
+        summary_table.add_row("[dim]-[/dim]", "[dim]0[/dim]")
+    err_console.print(summary_table)
+
+
 @main.command("consolidate")
 @click.option("--cwd", default=None, type=click.Path(exists=True, file_okay=False, path_type=Path))
 @click.option("--pipeline-id", default=None, help="Scope consolidation to one pipeline.")
