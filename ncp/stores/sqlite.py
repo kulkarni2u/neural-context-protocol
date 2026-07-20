@@ -19,6 +19,7 @@ from ncp.stores.calibration import (
     rollup_reputation,
 )
 from ncp.stores.consolidation import cluster_by_tags, find_merge_candidates
+from ncp.stores.graph import backfill_edges_for_chunk, parse_supersedes_ids
 from ncp.stores.retrieval import (
     DEFAULT_RETRIEVAL_POLICY,
     RetrievalPolicy,
@@ -32,6 +33,7 @@ from ncp.stores.retrieval import (
 from ncp.tokens import estimate_tokens
 from ncp.types import (
     CalibrationReport,
+    ChunkEdge,
     ConsolidationReport,
     ConsciousBlock,
     NCPResponse,
@@ -232,6 +234,20 @@ CREATE TABLE IF NOT EXISTS memo_stats (
     stat_key TEXT PRIMARY KEY,
     stat_value INTEGER NOT NULL DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS chunk_edges (
+    edge_id TEXT PRIMARY KEY,
+    src_chunk_id TEXT NOT NULL,
+    dst_chunk_id TEXT NOT NULL,
+    edge_type TEXT NOT NULL,
+    weight REAL NOT NULL DEFAULT 1.0,
+    created_at REAL NOT NULL,
+    created_by TEXT,
+    UNIQUE(src_chunk_id, dst_chunk_id, edge_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_chunk_edges_src ON chunk_edges(src_chunk_id);
+CREATE INDEX IF NOT EXISTS idx_chunk_edges_dst ON chunk_edges(dst_chunk_id);
 """
 
 
@@ -429,6 +445,9 @@ class SQLiteStore(BaseStore):
                     chunk.superseded_by,
                 ),
             )
+            backfilled_edges = backfill_edges_for_chunk(chunk)
+            if backfilled_edges:
+                self._upsert_chunk_edges(connection, backfilled_edges)
             self._hard_gc(connection, pipeline_id=chunk.pipeline_id)
             if self.max_working_chunks_per_pipeline > 0 and chunk.zone == "working":
                 self._enforce_retention(connection, pipeline_id=chunk.pipeline_id)
@@ -991,6 +1010,156 @@ class SQLiteStore(BaseStore):
                 [*unique_ids, time.time(), *bitemporal_params],
             ).fetchall()
         return [self._row_to_chunk(row) for row in rows]
+
+    @staticmethod
+    def _upsert_chunk_edges(connection: sqlite3.Connection, edges: Sequence[ChunkEdge]) -> int:
+        for edge in edges:
+            connection.execute(
+                """
+                INSERT INTO chunk_edges (
+                    edge_id, src_chunk_id, dst_chunk_id, edge_type, weight, created_at, created_by
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(src_chunk_id, dst_chunk_id, edge_type) DO UPDATE SET
+                    weight = excluded.weight,
+                    created_at = excluded.created_at,
+                    created_by = excluded.created_by
+                """,
+                (
+                    edge.edge_id,
+                    edge.src_chunk_id,
+                    edge.dst_chunk_id,
+                    edge.edge_type,
+                    edge.weight,
+                    edge.created_at,
+                    edge.created_by,
+                ),
+            )
+        return len(edges)
+
+    def add_chunk_edges(self, edges: Sequence[ChunkEdge]) -> int:
+        if not edges:
+            return 0
+        with self._connect() as connection:
+            return self._upsert_chunk_edges(connection, edges)
+
+    def get_chunk_edges(
+        self,
+        chunk_ids: Sequence[str],
+        *,
+        edge_types: Sequence[str] | None = None,
+        direction: str = "out",
+        limit: int = 200,
+    ) -> list[ChunkEdge]:
+        if direction not in ("out", "in", "both"):
+            raise ValueError(f"Unknown direction {direction!r}; expected 'out', 'in', or 'both'")
+        unique_ids = [cid for cid in dict.fromkeys(chunk_ids) if cid]
+        if not unique_ids:
+            return []
+        placeholders = ",".join("?" * len(unique_ids))
+        params: list[object] = []
+        if direction == "out":
+            where = f"src_chunk_id IN ({placeholders})"
+            params.extend(unique_ids)
+        elif direction == "in":
+            where = f"dst_chunk_id IN ({placeholders})"
+            params.extend(unique_ids)
+        else:
+            where = f"(src_chunk_id IN ({placeholders}) OR dst_chunk_id IN ({placeholders}))"
+            params.extend(unique_ids)
+            params.extend(unique_ids)
+        if edge_types:
+            type_placeholders = ",".join("?" * len(edge_types))
+            where += f" AND edge_type IN ({type_placeholders})"
+            params.extend(edge_types)
+        capped_limit = max(0, int(limit))
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM chunk_edges WHERE {where} ORDER BY created_at DESC LIMIT ?",
+                [*params, capped_limit],
+            ).fetchall()
+        return [self._row_to_chunk_edge(row) for row in rows]
+
+    @staticmethod
+    def _row_to_chunk_edge(row: sqlite3.Row) -> ChunkEdge:
+        return ChunkEdge(
+            edge_id=str(row["edge_id"]),
+            src_chunk_id=str(row["src_chunk_id"]),
+            dst_chunk_id=str(row["dst_chunk_id"]),
+            edge_type=str(row["edge_type"]),
+            weight=float(row["weight"]),
+            created_at=float(row["created_at"]),
+            created_by=row["created_by"],
+        )
+
+    def graph_data(
+        self,
+        *,
+        pipeline_id: str | None = None,
+        limit: int = 500,
+    ) -> dict[str, object]:
+        capped_limit = max(0, int(limit))
+        with self._connect() as connection:
+            if pipeline_id is not None:
+                chunk_rows = connection.execute(
+                    "SELECT chunk_id, layer, base_trust, src, written_by, content, caused_by, supersedes"
+                    " FROM chunks WHERE pipeline_id = ? AND chunk_id NOT IN (SELECT chunk_id FROM tombstones)"
+                    " ORDER BY created_at DESC LIMIT ?",
+                    (pipeline_id, capped_limit),
+                ).fetchall()
+            else:
+                chunk_rows = connection.execute(
+                    "SELECT chunk_id, layer, base_trust, src, written_by, content, caused_by, supersedes"
+                    " FROM chunks WHERE chunk_id NOT IN (SELECT chunk_id FROM tombstones)"
+                    " ORDER BY created_at DESC LIMIT ?",
+                    (capped_limit,),
+                ).fetchall()
+
+            node_ids = [str(r["chunk_id"]) for r in chunk_rows]
+            edge_rows: list[sqlite3.Row] = []
+            if node_ids:
+                placeholders = ",".join("?" * len(node_ids))
+                edge_rows = connection.execute(
+                    "SELECT src_chunk_id, dst_chunk_id, edge_type, weight FROM chunk_edges"
+                    f" WHERE src_chunk_id IN ({placeholders}) OR dst_chunk_id IN ({placeholders})",
+                    [*node_ids, *node_ids],
+                ).fetchall()
+
+        nodes = [
+            {
+                "chunk_id": str(r["chunk_id"]),
+                "layer": str(r["layer"]),
+                "base_trust": float(r["base_trust"]),
+                "src": str(r["src"]),
+                "written_by": str(r["written_by"]),
+                "summary": str(r["content"])[:80],
+            }
+            for r in chunk_rows
+        ]
+
+        edges: list[dict[str, object]] = []
+        seen: set[tuple[str, str, str]] = set()
+        for row in edge_rows:
+            key = (str(row["src_chunk_id"]), str(row["dst_chunk_id"]), str(row["edge_type"]))
+            seen.add(key)
+            edges.append({"src": key[0], "dst": key[1], "type": key[2], "weight": float(row["weight"])})
+
+        # Legacy-column fallback: chunks whose caused_by/supersedes predate the
+        # edge table get a synthesized edge, unless a real row already covers it.
+        for r in chunk_rows:
+            cid = str(r["chunk_id"])
+            cause = r["caused_by"]
+            if cause:
+                key = (cid, str(cause), "caused_by")
+                if key not in seen:
+                    seen.add(key)
+                    edges.append({"src": key[0], "dst": key[1], "type": key[2], "weight": 1.0})
+            for target in parse_supersedes_ids(r["supersedes"]):
+                key = (cid, target, "supersedes")
+                if key not in seen:
+                    seen.add(key)
+                    edges.append({"src": key[0], "dst": key[1], "type": key[2], "weight": 1.0})
+
+        return {"nodes": nodes, "edges": edges}
 
     def emit_whisper(self, whisper: Whisper) -> None:
         whisper = Whisper.model_validate(whisper.model_dump())

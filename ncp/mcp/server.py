@@ -13,7 +13,7 @@ import time
 import traceback
 from collections.abc import Callable
 from pathlib import Path
-from typing import BinaryIO
+from typing import BinaryIO, get_args
 
 from ncp.adaptive_budget import AdaptiveBudgetResult, compute_adaptive_budget
 from ncp.assembler import Assembler
@@ -24,7 +24,20 @@ from ncp.drift import EmbeddingAdapter, compute_drift
 from ncp.stores.base import BaseStore
 from ncp.stores.factory import create_store
 from ncp.tiering import compute_tier_signal
-from ncp.types import BudgetContext, ConsciousBlock, NCPResponse, OutcomeRecord, SubconsciousChunk, Whisper
+from ncp.types import (
+    BudgetContext,
+    ChunkEdge,
+    ChunkEdgeType,
+    ConsciousBlock,
+    NCPResponse,
+    OutcomeRecord,
+    SubconsciousChunk,
+    Whisper,
+)
+
+# Graph engineering: closed edge-type set, derived from ncp.types.ChunkEdgeType
+# so the MCP schema/validation can't drift from the pydantic model's Literal.
+_CHUNK_EDGE_TYPES = get_args(ChunkEdgeType)
 from ncp.version import __version__
 
 
@@ -145,6 +158,24 @@ MCP_TOOLS: list[dict[str, object]] = [
                         "only this new chunk; an as_of query before the supersession still "
                         "returns the old one."
                     ),
+                },
+                "edges": {
+                    "type": "array",
+                    "description": (
+                        "Graph engineering: optional typed edges from this new chunk to other "
+                        "existing chunks. Each item is {dst, type, weight?}; 'type' must be one "
+                        "of caused_by, supersedes, supports, contradicts, refines, derived_from. "
+                        "Written via the typed chunk_edges graph with src = this new chunk's id."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "dst": {"type": "string", "description": "Target chunk_id"},
+                            "type": {"type": "string", "enum": list(_CHUNK_EDGE_TYPES)},
+                            "weight": {"type": "number", "description": "Optional edge weight, default 1.0"},
+                        },
+                        "required": ["dst", "type"],
+                    },
                 },
             },
             "required": ["content", "layer", "src"],
@@ -837,6 +868,21 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         fr = filter_content(raw_content)
         content = fr.filtered
 
+        # Graph engineering: validate requested edges before any writes happen,
+        # so an unknown edge type rejects the whole call rather than persisting
+        # a chunk with edges silently dropped.
+        raw_edges = args.get("edges") or []
+        if not isinstance(raw_edges, list):
+            raise ValueError("ncp_write_memory: 'edges' must be an array")
+        for item in raw_edges:
+            if not isinstance(item, dict) or "dst" not in item or "type" not in item:
+                raise ValueError("ncp_write_memory: each edges item must be an object with 'dst' and 'type'")
+            if item["type"] not in _CHUNK_EDGE_TYPES:
+                raise ValueError(
+                    f"ncp_write_memory: unknown edge type {item['type']!r}; "
+                    f"expected one of {sorted(_CHUNK_EDGE_TYPES)}"
+                )
+
         # CAP-T1/WI-013: opt-in authorship verification. The client signs over the
         # canonical (written_by | sha256(raw_content) | pipeline_id) payload, so we
         # verify against the raw content it sent (not the post-filter content).
@@ -897,6 +943,18 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         chunk = SubconsciousChunk(**kwargs)
         ok = store.write(chunk)
         result: dict[str, object] = {"written": ok, "chunk_id": chunk.chunk_id}
+        if raw_edges:
+            edges = [
+                ChunkEdge(
+                    src_chunk_id=chunk.chunk_id,
+                    dst_chunk_id=str(item["dst"]),
+                    edge_type=item["type"],
+                    weight=float(item.get("weight", 1.0)),
+                    created_by=written_by,
+                )
+                for item in raw_edges
+            ]
+            result["edges_written"] = store.add_chunk_edges(edges)
         if signature is not None:
             result["verified"] = verified
         if fr.was_filtered:

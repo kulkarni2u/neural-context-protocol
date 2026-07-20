@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import math
 import time
+from collections.abc import Sequence
 from contextlib import asynccontextmanager
 from difflib import SequenceMatcher
 from typing import Any, AsyncIterator
@@ -25,6 +26,7 @@ import structlog
 
 from ncp.stores.base import BaseStore, NCPStoreUnavailableError
 from ncp.stores.bitemporal import collect_successor_ids, filter_bitemporal
+from ncp.stores.graph import backfill_edges_for_chunk, parse_supersedes_ids
 from ncp.stores.pgvector import (
     DEFAULT_RETRIEVAL_POLICY,
     PGVECTOR_SCHEMA_TEMPLATE,
@@ -49,6 +51,7 @@ from ncp.stores.consolidation import cluster_by_tags, find_merge_candidates
 from ncp.tokens import estimate_tokens
 from ncp.types import (
     CalibrationReport,
+    ChunkEdge,
     ConsciousBlock,
     ConsolidationReport,
     NCPResponse,
@@ -376,6 +379,9 @@ class AsyncPgvectorStore(BaseStore):
                         chunk.superseded_by,
                     ),
                 )
+            backfilled_edges = backfill_edges_for_chunk(chunk)
+            if backfilled_edges:
+                await self._async_upsert_chunk_edges_rows(conn, backfilled_edges)
             await self._async_hard_gc(conn, pipeline_id=chunk.pipeline_id)
             if self.max_working_chunks_per_pipeline > 0 and chunk.zone == "working":
                 await self._async_enforce_retention(conn, pipeline_id=chunk.pipeline_id)
@@ -1193,6 +1199,171 @@ class AsyncPgvectorStore(BaseStore):
                     (new_chunk_id, resolved_valid_to, old_chunk_id),
                 )
                 return cur.rowcount > 0
+
+    async def _async_upsert_chunk_edges_rows(self, connection: Any, edges: Sequence[ChunkEdge]) -> int:
+        async with connection.cursor() as cur:
+            for edge in edges:
+                await cur.execute(
+                    self._sql(
+                        """
+                        INSERT INTO {schema}.{prefix}chunk_edges (
+                            edge_id, src_chunk_id, dst_chunk_id, edge_type, weight, created_at, created_by
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (src_chunk_id, dst_chunk_id, edge_type) DO UPDATE SET
+                            weight = EXCLUDED.weight,
+                            created_at = EXCLUDED.created_at,
+                            created_by = EXCLUDED.created_by
+                        """
+                    ),
+                    (
+                        edge.edge_id,
+                        edge.src_chunk_id,
+                        edge.dst_chunk_id,
+                        edge.edge_type,
+                        edge.weight,
+                        edge.created_at,
+                        edge.created_by,
+                    ),
+                )
+        return len(edges)
+
+    async def async_add_chunk_edges(self, edges: Sequence[ChunkEdge]) -> int:  # type: ignore[override]
+        """Upsert typed chunk edges using native async DB I/O."""
+        if not edges:
+            return 0
+        async with self._aconnect() as conn:
+            return await self._async_upsert_chunk_edges_rows(conn, edges)
+
+    async def async_get_chunk_edges(  # type: ignore[override]
+        self,
+        chunk_ids: Sequence[str],
+        *,
+        edge_types: Sequence[str] | None = None,
+        direction: str = "out",
+        limit: int = 200,
+    ) -> list[ChunkEdge]:
+        """Fetch typed chunk edges using native async DB I/O."""
+        if direction not in ("out", "in", "both"):
+            raise ValueError(f"Unknown direction {direction!r}; expected 'out', 'in', or 'both'")
+        unique_ids = [cid for cid in dict.fromkeys(chunk_ids) if cid]
+        if not unique_ids:
+            return []
+        placeholders = ", ".join(["%s"] * len(unique_ids))
+        params: list[object] = []
+        if direction == "out":
+            where = f"src_chunk_id IN ({placeholders})"
+            params.extend(unique_ids)
+        elif direction == "in":
+            where = f"dst_chunk_id IN ({placeholders})"
+            params.extend(unique_ids)
+        else:
+            where = f"(src_chunk_id IN ({placeholders}) OR dst_chunk_id IN ({placeholders}))"
+            params.extend(unique_ids)
+            params.extend(unique_ids)
+        if edge_types:
+            type_placeholders = ", ".join(["%s"] * len(edge_types))
+            where += f" AND edge_type IN ({type_placeholders})"
+            params.extend(edge_types)
+        capped_limit = max(0, int(limit))
+        async with self._aconnect() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    self._sql(
+                        f"SELECT * FROM {{schema}}.{{prefix}}chunk_edges WHERE {where}"
+                        " ORDER BY created_at DESC LIMIT %s"
+                    ),
+                    (*params, capped_limit),
+                )
+                rows = await self._afetchall(cur)
+        return [self._row_to_chunk_edge(row) for row in rows]
+
+    @staticmethod
+    def _row_to_chunk_edge(row: dict[str, Any]) -> ChunkEdge:
+        return ChunkEdge(
+            edge_id=str(row["edge_id"]),
+            src_chunk_id=str(row["src_chunk_id"]),
+            dst_chunk_id=str(row["dst_chunk_id"]),
+            edge_type=str(row["edge_type"]),
+            weight=float(row["weight"]),
+            created_at=float(row["created_at"]),
+            created_by=row["created_by"],
+        )
+
+    async def async_graph_data(  # type: ignore[override]
+        self,
+        *,
+        pipeline_id: str | None = None,
+        limit: int = 500,
+    ) -> dict[str, object]:
+        """Build graph export data (nodes + edges) using native async DB I/O."""
+        capped_limit = max(0, int(limit))
+        live_filter = f"chunk_id NOT IN (SELECT chunk_id FROM {self._table_name('tombstones')})"
+        async with self._aconnect() as conn:
+            select_cols = "chunk_id, layer, base_trust, src, written_by, content, caused_by, supersedes"
+            async with conn.cursor() as cur:
+                if pipeline_id is not None:
+                    await cur.execute(
+                        f"SELECT {select_cols} FROM {self._table_name('chunks')}"
+                        f" WHERE {live_filter} AND pipeline_id = %s"
+                        " ORDER BY created_at DESC LIMIT %s",
+                        (pipeline_id, capped_limit),
+                    )
+                else:
+                    await cur.execute(
+                        f"SELECT {select_cols} FROM {self._table_name('chunks')}"
+                        f" WHERE {live_filter}"
+                        " ORDER BY created_at DESC LIMIT %s",
+                        (capped_limit,),
+                    )
+                chunk_rows = await self._afetchall(cur)
+
+            node_ids = [str(r["chunk_id"]) for r in chunk_rows]
+            edge_rows: list[dict[str, Any]] = []
+            if node_ids:
+                placeholders = ", ".join(["%s"] * len(node_ids))
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        f"SELECT src_chunk_id, dst_chunk_id, edge_type, weight"
+                        f" FROM {self._table_name('chunk_edges')}"
+                        f" WHERE src_chunk_id IN ({placeholders}) OR dst_chunk_id IN ({placeholders})",
+                        (*node_ids, *node_ids),
+                    )
+                    edge_rows = await self._afetchall(cur)
+
+        nodes = [
+            {
+                "chunk_id": str(r["chunk_id"]),
+                "layer": str(r["layer"]),
+                "base_trust": float(r["base_trust"]),
+                "src": str(r["src"]),
+                "written_by": str(r["written_by"]),
+                "summary": str(r["content"])[:80],
+            }
+            for r in chunk_rows
+        ]
+
+        edges: list[dict[str, object]] = []
+        seen: set[tuple[str, str, str]] = set()
+        for row in edge_rows:
+            key = (str(row["src_chunk_id"]), str(row["dst_chunk_id"]), str(row["edge_type"]))
+            seen.add(key)
+            edges.append({"src": key[0], "dst": key[1], "type": key[2], "weight": float(row["weight"])})
+
+        for r in chunk_rows:
+            cid = str(r["chunk_id"])
+            cause = r["caused_by"]
+            if cause:
+                key = (cid, str(cause), "caused_by")
+                if key not in seen:
+                    seen.add(key)
+                    edges.append({"src": key[0], "dst": key[1], "type": key[2], "weight": 1.0})
+            for target in parse_supersedes_ids(r["supersedes"]):
+                key = (cid, target, "supersedes")
+                if key not in seen:
+                    seen.add(key)
+                    edges.append({"src": key[0], "dst": key[1], "type": key[2], "weight": 1.0})
+
+        return {"nodes": nodes, "edges": edges}
 
     async def async_record_dissent(self, chunk_id: str) -> bool:
         """Increment a chunk's dissent counter via native async DB I/O."""
