@@ -747,6 +747,81 @@ cannot exist in pre-CAP-C5 data (nothing to filter).
 
 ---
 
+## 4g. Chunk Relationship Graph (normative)
+
+```
+Why: memory is associative. Single-edge causality (caused_by scalar) works for
+sequential chains but fails for rich relationships: a chunk may be supported
+by multiple parents, refined by others, contradicted by still others, or
+derived from external sources. Typed, multi-hop edges allow retrieval,
+calibration, and consolidation to exploit this structure. Write-time backfill
+keeps legacy scalar columns authoritative and backward-compatible.
+
+ChunkEdge fields:
+  edge_id         str  auto-generated if omitted
+  src_chunk_id    str  PK1 of the source chunk
+  dst_chunk_id    str  PK2 of the destination chunk
+  edge_type       str  from closed set below; validated at write time
+  weight          float default 1.0, [0.0, ∞); clamped to [0, 1] in BFS
+  created_at      float unix timestamp; auto-generated if omitted
+  created_by      str  optional agent/tool id; can be "ncp:inferred" or similar
+  UNIQUE(src_chunk_id, dst_chunk_id, edge_type) constraint
+
+Direction convention (immutable at protocol level):
+  edge src -> dst reads "src <type> dst"
+  Example: src=child, type=caused_by, dst=parent reads "child caused_by parent"
+           (the *parent* is the cause of the *child*, so the edge points upward)
+
+Closed edge-type set (required to match ncp/types.py ChunkEdgeType):
+  caused_by      — dst is the originating cause or parent context of src
+  supersedes     — src is a new/corrected version that replaces dst
+  supports       — src is evidence or rationale for dst
+  contradicts    — src disputes the truthfulness or applicability of dst
+  refines        — src is a specialized elaboration or improvement of dst
+  derived_from   — src was computed or inferred from dst as input
+
+Write-time backfill (legacy compatibility):
+  When a chunk is written with caused_by and/or supersedes set:
+    auto-upsert matching rows in chunk_edges table (src = new chunk):
+      - if chunk.caused_by is set and non-self, add edge (src, "caused_by", dst=caused_by, weight=1.0)
+      - if chunk.supersedes is set and non-self, add edge (src, "supersedes", dst=supersedes, weight=1.0)
+    When chunk.supersedes is set, also mark the old chunk:
+      old.superseded_by = new.chunk_id
+      old.valid_to = new.valid_from (or time.time() if valid_from is None)
+  Legacy scalar columns remain writable and authoritative; edge rows are a
+  mirror, not the source of truth.
+
+Additive-only and stale-edge semantics (immutable history):
+  Edges are never deleted, only added. If a chunk is rewritten with a
+  different caused_by target, the old (src, "caused_by", old_dst) row
+  persists in chunk_edges, but the current chunk.caused_by scalar no longer
+  matches it. BFS and calibration skip such stale rows via scalar agreement
+  check: only traverse (src, edge_type, dst) if edge.dst matches the current
+  chunk.caused_by scalar (for caused_by edges only; other types always traverse).
+  Legacy scalar fallback (when no matching edge row covers a pair) keeps old
+  chunks without edge rows functional.
+
+ncp_write_memory — edges argument (optional):
+  "edges": array of {dst: str, type: str, weight?: float}
+    dst      — target chunk_id (required)
+    type     — edge_type from closed set above (required)
+    weight   — optional multiplier, default 1.0 (0.0 is valid)
+  Validation happens before any write:
+    - unknown type -> ValueError -> JSON-RPC -32603 tool error, nothing persisted
+    - no chunk_edges rows written if validation fails
+  After the chunk is written, edges are written via store.add_chunk_edges():
+    new edges have src_chunk_id = the new chunk's id, created_by = written_by
+  Response includes:
+    "edges_written": int — count of edges persisted; present only when the
+    edges argument was provided
+
+Upsert and conflict (UNIQUE constraint):
+  INSERT ... ON CONFLICT(src_chunk_id, dst_chunk_id, edge_type) DO UPDATE
+  duplicates on the same (src, dst, type) triple update weight and created_at
+```
+
+---
+
 ## 5. Trust Boundaries (normative, first-class)
 
 These rules are enforced by the assembler and store. Not optional.
@@ -864,10 +939,21 @@ Step 3: Hybrid subconscious retrieval
   apply diversity cap (max 2 per written_by)
   select top 4 by effective_score
 
-Step 3b: 1-hop edge expansion (optional, retrieval.edge_expansion, default on)
-  pull caused_by neighbors of retrieved chunks (decayed inherited relevance)
+Step 3b: Bounded multi-hop edge expansion (normative, config-gated)
+  BFS from retrieved chunk set up to edge_max_hops hops via typed edges
+  per-hop edge_expansion_types filter (default ["caused_by"]; validated subset)
+  inherited relevance *= edge_expansion_decay per hop; decay per-hop (hop h gets decay**h)
+  edge weight clamped [0.0, 1.0] and multiplied into hop inheritance
+  cycle-safe via visited_ids seeded with original retrieved set
+  at edge_max_hops=1 (default) with edge_expansion_types=["caused_by"] (default)
+    the expansion is behaviorally equivalent to the legacy 1-hop caused_by pass
+  when caused_by is configured, stale edge rows (current scalar disagrees)
+    are skipped; legacy scalar fallback fires when no edge row covers (src, dst)
+  expansion never widens budget: neighbors compete inside the same chunk_cap
   suppress chunks whose superseding chunk is already present
-  neighbors compete inside the same chunk_cap — never widens the budget
+  [retrieval] config: edge_max_hops (default 1), edge_expansion_types (default
+    ["caused_by"]), edge_expansion_decay (default 0.7); env overrides
+    NCP_EDGE_MAX_HOPS, NCP_EDGE_EXPANSION_TYPES (CSV), NCP_EDGE_EXPANSION
 
 Step 4: Peek whisper queue
   filter: not expired, confidence >= 0.60 (except alert + world_check)
@@ -951,6 +1037,21 @@ CREATE TABLE tombstones (
     tombstoned_at   REAL NOT NULL,
     expires_at      REAL NOT NULL
 );
+
+-- Graph engineering: typed, directed relationships between chunks (§4g)
+CREATE TABLE chunk_edges (
+    edge_id         TEXT PRIMARY KEY,
+    src_chunk_id    TEXT NOT NULL,
+    dst_chunk_id    TEXT NOT NULL,
+    edge_type       TEXT NOT NULL,
+    weight          REAL NOT NULL DEFAULT 1.0,
+    created_at      REAL NOT NULL,
+    created_by      TEXT,
+    UNIQUE(src_chunk_id, dst_chunk_id, edge_type)
+);
+
+CREATE INDEX idx_chunk_edges_src ON chunk_edges(src_chunk_id);
+CREATE INDEX idx_chunk_edges_dst ON chunk_edges(dst_chunk_id);
 
 -- Agent-to-agent signals
 CREATE TABLE whispers (
