@@ -281,7 +281,9 @@ digraph ncp_graph {
 }
 ```
 
-Node fillcolor indicates trust (green ≥0.8, amber 0.5–0.8, red <0.5); edge styles differ by type. JSON export includes stats and per-type edge counts. See [the graph engineering plan](./docs/NCP_GRAPH_ENGINEERING_PLAN.md) for the full model, multi-hop semantics, and compatibility details.
+Node fillcolor indicates trust (green ≥0.8, amber 0.5–0.8, red <0.5); edge styles differ by type. JSON export includes stats and per-type edge counts. Add `--as-of <epoch|ISO-8601>` for a point-in-time view of the graph over the bi-temporal columns.
+
+Two further graph capabilities are opt-in: `[graph].infer_edges` (default off) infers `refines` edges between similar chunks at write time with a deterministic similarity ratio — no model calls — marking them `created_by="ncp:inferred"`; and outcome credit recorded via `ncp_record_outcome` propagates along the `caused_by` chain during `ncp calibrate --feedback`, reported as a "via outcome propagation" count. See [the graph engineering plan](./docs/NCP_GRAPH_ENGINEERING_PLAN.md) for the full model, multi-hop semantics, and compatibility details.
 
 -----
 

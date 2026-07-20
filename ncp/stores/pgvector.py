@@ -972,13 +972,25 @@ class PgvectorStore(BaseStore):
         *,
         pipeline_id: str | None = None,
         limit: int = 500,
+        as_of: float | None = None,
     ) -> dict[str, object]:
+        """See ``BaseStore.graph_data`` for the node/edge shape.
+
+        ``as_of`` (CAP-C5, epoch seconds): ``None`` (default) is exactly the
+        pre-WI-P4 behavior -- no bi-temporal filtering. When given, nodes are
+        filtered with the same point-in-time visibility rule as
+        ``_apply_bitemporal_filter`` (Python post-filter, mirroring the other
+        as_of query paths on this backend), and edges recorded after ``as_of``
+        are excluded.
+        """
         capped_limit = max(0, int(limit))
         live_filter = f"chunk_id NOT IN (SELECT chunk_id FROM {self._table_name('tombstones')})"
         with self._connect() as connection:
             cursor = connection.cursor()
             try:
                 select_cols = "chunk_id, layer, base_trust, src, written_by, content, caused_by, supersedes"
+                if as_of is not None:
+                    select_cols += ", created_at, valid_from, valid_to, superseded_by"
                 if pipeline_id is not None:
                     cursor.execute(
                         f"SELECT {select_cols} FROM {self._table_name('chunks')}"
@@ -997,17 +1009,34 @@ class PgvectorStore(BaseStore):
             finally:
                 self._close_cursor(cursor)
 
+            if as_of is not None:
+                successor_ids = collect_successor_ids(chunk_rows)
+                successor_created_at = (
+                    self._load_successor_created_at(connection, successor_ids)
+                    if successor_ids
+                    else {}
+                )
+                chunk_rows = filter_bitemporal(
+                    chunk_rows, as_of=as_of, now=time.time(), successor_created_at=successor_created_at
+                )
+
             node_ids = [str(r["chunk_id"]) for r in chunk_rows]
             edge_rows: list[dict[str, Any]] = []
             if node_ids:
                 placeholders = ", ".join(["%s"] * len(node_ids))
+                select_edge_cols = "src_chunk_id, dst_chunk_id, edge_type, weight"
+                edge_where = f"src_chunk_id IN ({placeholders}) OR dst_chunk_id IN ({placeholders})"
+                edge_params: list[object] = [*node_ids, *node_ids]
+                if as_of is not None:
+                    edge_where = f"({edge_where}) AND created_at <= %s"
+                    edge_params.append(as_of)
                 cursor = connection.cursor()
                 try:
                     cursor.execute(
-                        f"SELECT src_chunk_id, dst_chunk_id, edge_type, weight"
+                        f"SELECT {select_edge_cols}"
                         f" FROM {self._table_name('chunk_edges')}"
-                        f" WHERE src_chunk_id IN ({placeholders}) OR dst_chunk_id IN ({placeholders})",
-                        (*node_ids, *node_ids),
+                        f" WHERE {edge_where}",
+                        tuple(edge_params),
                     )
                     edge_rows = self._fetchall(cursor)
                 finally:

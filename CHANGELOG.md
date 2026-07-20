@@ -79,6 +79,15 @@ All notable changes to Neural Context Protocol will be documented in this file.
   `FeedbackResult.outcome_propagated` / `CalibrationReport.outcome_propagated`
   counts, and a new "via outcome propagation" row in `ncp calibrate --feedback`
   table output.
+- **Temporal graph export** (`ncp/stores/base.py`, `ncp/stores/sqlite.py`,
+  `ncp/stores/pgvector.py`, `ncp/stores/pgvector_async.py`, `ncp/cli.py`):
+  `graph_data()` gains a keyword-only `as_of` (epoch seconds, **default
+  `None`** = current view) filtering nodes with the same CAP-C5 point-in-time
+  visibility rule as the other `as_of` query paths and excluding edge rows
+  created after `as_of`. New `ncp graph --as-of <epoch|ISO-8601>` (naive
+  datetimes treated as UTC); the CLI's stale-`caused_by` filter resolves node
+  scalars from the same as-of view, so the export answers "what did the memory
+  graph look like at time T."
 
 ## [1.3.0] - 2026-07-06
 

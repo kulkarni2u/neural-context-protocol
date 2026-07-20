@@ -199,6 +199,7 @@ class BaseStore(ABC):
         *,
         pipeline_id: str | None = None,
         limit: int = 500,
+        as_of: float | None = None,
     ) -> dict[str, object]:
         """Return structured node/edge data for graph export (``ncp graph``).
 
@@ -207,6 +208,12 @@ class BaseStore(ABC):
         ``caused_by``/``supersedes`` column links for chunks that predate the
         edge table, deduplicated against real edge rows). Backends that do
         not implement this return empty nodes/edges.
+
+        ``as_of`` (CAP-C5, epoch seconds): ``None`` (default) is the current
+        behavior -- no bi-temporal filtering. When given, nodes are filtered
+        to the same point-in-time visibility as the other ``as_of`` query
+        paths (see ``query``), and edges recorded after ``as_of`` are
+        excluded. Edges stay restricted to endpoints present in the node set.
         """
         return {"nodes": [], "edges": []}
 
@@ -237,9 +244,10 @@ class BaseStore(ABC):
         *,
         pipeline_id: str | None = None,
         limit: int = 500,
+        as_of: float | None = None,
     ) -> dict[str, object]:
         """Asynchronously build graph export data using thread pool."""
-        fn = partial(self.graph_data, pipeline_id=pipeline_id, limit=limit)
+        fn = partial(self.graph_data, pipeline_id=pipeline_id, limit=limit, as_of=as_of)
         return await anyio.to_thread.run_sync(fn)
 
     # ------------------------------------------------------------------

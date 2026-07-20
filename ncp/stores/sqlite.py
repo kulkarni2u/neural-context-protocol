@@ -1150,32 +1150,49 @@ class SQLiteStore(BaseStore):
         *,
         pipeline_id: str | None = None,
         limit: int = 500,
+        as_of: float | None = None,
     ) -> dict[str, object]:
+        """See ``BaseStore.graph_data`` for the node/edge shape.
+
+        ``as_of`` (CAP-C5, epoch seconds): ``None`` (default) is exactly the
+        pre-WI-P4 behavior -- no bi-temporal filtering, matching the other
+        ``as_of=None`` query paths' "no history awareness" baseline that
+        ``graph_data`` has always had. When given, nodes are filtered with
+        the same point-in-time visibility rule as ``get_chunks_by_ids``/
+        ``query`` (see ``_bitemporal_clause``), and edges recorded after
+        ``as_of`` are excluded.
+        """
         capped_limit = max(0, int(limit))
         with self._connect() as connection:
+            clauses = ["chunk_id NOT IN (SELECT chunk_id FROM tombstones)"]
+            params: list[object] = []
             if pipeline_id is not None:
-                chunk_rows = connection.execute(
-                    "SELECT chunk_id, layer, base_trust, src, written_by, content, caused_by, supersedes"
-                    " FROM chunks WHERE pipeline_id = ? AND chunk_id NOT IN (SELECT chunk_id FROM tombstones)"
-                    " ORDER BY created_at DESC LIMIT ?",
-                    (pipeline_id, capped_limit),
-                ).fetchall()
-            else:
-                chunk_rows = connection.execute(
-                    "SELECT chunk_id, layer, base_trust, src, written_by, content, caused_by, supersedes"
-                    " FROM chunks WHERE chunk_id NOT IN (SELECT chunk_id FROM tombstones)"
-                    " ORDER BY created_at DESC LIMIT ?",
-                    (capped_limit,),
-                ).fetchall()
+                clauses.append("pipeline_id = ?")
+                params.append(pipeline_id)
+            if as_of is not None:
+                bitemporal_sql, bitemporal_params = self._bitemporal_clause(as_of)
+                clauses.append(f"({bitemporal_sql})")
+                params.extend(bitemporal_params)
+            chunk_rows = connection.execute(
+                "SELECT chunk_id, layer, base_trust, src, written_by, content, caused_by, supersedes"
+                f" FROM chunks WHERE {' AND '.join(clauses)}"
+                " ORDER BY created_at DESC LIMIT ?",
+                [*params, capped_limit],
+            ).fetchall()
 
             node_ids = [str(r["chunk_id"]) for r in chunk_rows]
             edge_rows: list[sqlite3.Row] = []
             if node_ids:
                 placeholders = ",".join("?" * len(node_ids))
+                edge_where = f"(src_chunk_id IN ({placeholders}) OR dst_chunk_id IN ({placeholders}))"
+                edge_params: list[object] = [*node_ids, *node_ids]
+                if as_of is not None:
+                    edge_where += " AND created_at <= ?"
+                    edge_params.append(as_of)
                 edge_rows = connection.execute(
                     "SELECT src_chunk_id, dst_chunk_id, edge_type, weight FROM chunk_edges"
-                    f" WHERE src_chunk_id IN ({placeholders}) OR dst_chunk_id IN ({placeholders})",
-                    [*node_ids, *node_ids],
+                    f" WHERE {edge_where}",
+                    edge_params,
                 ).fetchall()
 
         nodes = [

@@ -145,15 +145,22 @@ Summary statistics (node count, edge count, per-type breakdown) are printed to s
 - **Stale edges are survivable.** When a chunk is rewritten with a different `caused_by` target, the old edge row stays in the table (additive-only). Traversal and calibration skip stale rows by checking the current scalar. Export filters them for "current view" semantics.
 - **No breaking changes.** Existing code that does not use edges or the new config knobs works unchanged.
 
-## Future phases (envisioned, not shipped)
+## Phase 2 (shipped)
 
 ### CAP-C7 · Automatic edge inference at write time
 
-Detect causal and support relationships automatically when a chunk is written (e.g., via embeddings or a small model), creating edges without manual specification. Trades ingest latency for unsupervised graph enrichment.
+Shipped, off by default. When `[graph].infer_edges` is enabled, writes compare the new chunk against up to `infer_scan_limit` recent same-pipeline chunks with a deterministic `difflib` similarity ratio (no model calls); matches at or above `infer_similarity_threshold` (default 0.6) produce `refines` edges with `weight = ratio`, capped at `infer_max_edges`, marked `created_by = "ncp:inferred"` so inferred edges stay distinguishable from author-asserted ones. `ncp_write_memory` reports `edges_inferred` when enabled.
 
 ### CAP-T3 extension · Outcome credit assignment
 
-Walk the graph multi-hop to attribute outcome success/failure to the evidence and decisions that informed it, not just the immediate parent. Foundation for "this evidence led to a bad decision, deprioritize similar evidence" reasoning.
+Outcome-driven trust deltas already rode the multi-hop `caused_by` propagation (they are folded into each chunk's net delta before the propagation loop); phase 2 made this provable and observable. Propagated credit originating from an outcome-evidenced descendant is tagged `reason = "outcome_propagation"` in the calibration change log, counted in `CalibrationReport.outcome_propagated`, and shown as a "via outcome propagation" row in `ncp calibrate --feedback`.
+
+### Temporal graph queries
+
+`graph_data()` accepts `as_of` (epoch seconds) and `ncp graph --as-of <epoch|ISO-8601>` answers "what did the memory graph look like at time T": nodes are filtered with the CAP-C5 point-in-time visibility rule (transaction time, supersession-at-T, validity window), edge rows created after T are excluded, and the CLI's stale-edge filter resolves scalars from the same as-of view. The default (no `as_of`) export is unchanged: the full graph minus tombstones, superseded nodes included so history can be rendered.
+
+## Future phases (envisioned, not shipped)
+
 
 ### Temporal graph queries
 

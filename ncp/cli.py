@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from importlib import resources
 from pathlib import Path
 import sys
@@ -1409,6 +1409,25 @@ def _render_graph_dot(nodes: list[dict[str, object]], edges: list[dict[str, obje
     return "\n".join(lines)
 
 
+def _parse_as_of(raw: str | None) -> float | None:
+    """Parse --as-of: epoch seconds or ISO-8601 (naive datetimes are UTC)."""
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        pass
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError as exc:
+        raise click.ClickException(
+            f"invalid --as-of value {raw!r}: expected epoch seconds or ISO-8601 datetime"
+        ) from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
 @main.command("graph")
 @click.option("--cwd", type=click.Path(path_type=Path), default=Path.cwd)
 @click.option("--pipeline-id", default=None, help="Optional pipeline scope filter.")
@@ -1422,19 +1441,27 @@ def _render_graph_dot(nodes: list[dict[str, object]], edges: list[dict[str, obje
 )
 @click.option("--output", type=click.Path(path_type=Path), default=None, help="Write export to file instead of stdout.")
 @click.option("--limit", default=500, type=int, show_default=True, help="Max nodes to include.")
+@click.option(
+    "--as-of",
+    "as_of_raw",
+    default=None,
+    help="Point-in-time view (CAP-C5): epoch seconds or ISO-8601 datetime (naive values are UTC).",
+)
 def graph_command(
     cwd: Path,
     pipeline_id: str | None,
     output_format: str,
     output: Path | None,
     limit: int,
+    as_of_raw: str | None,
 ) -> None:
     """Export the typed chunk relationship graph (nodes + chunk_edges) as JSON or Graphviz DOT."""
 
+    as_of = _parse_as_of(as_of_raw)
     try:
         config = ncp.configure(cwd=cwd)
         store = _resolve_reporting_store(config, "graph", "graph_data")
-        data = store.graph_data(pipeline_id=pipeline_id, limit=limit)
+        data = store.graph_data(pipeline_id=pipeline_id, limit=limit, as_of=as_of)
     except NCPStoreUnavailableError as exc:
         raise click.ClickException(str(exc)) from exc
 
@@ -1448,7 +1475,7 @@ def graph_command(
     # caused_by scalar via get_chunks_by_ids and drop caused_by edges from
     # that node that disagree with it, so the export reflects the live view.
     node_ids = [str(n["chunk_id"]) for n in nodes]
-    current_chunks = store.get_chunks_by_ids(node_ids) if node_ids else []
+    current_chunks = store.get_chunks_by_ids(node_ids, as_of=as_of) if node_ids else []
     current_caused_by = {c.chunk_id: c.caused_by for c in current_chunks if c.caused_by}
     edges = [
         e
@@ -1480,6 +1507,7 @@ def graph_command(
     err_console.print(
         f"[bold]NCP Graph[/bold]  store={_store_display(config)}"
         + (f"  pipeline={pipeline_id}" if pipeline_id else "")
+        + (f"  as_of={as_of}" if as_of is not None else "")
     )
     summary_table = Table(title="Graph Summary", box=box.SIMPLE_HEAVY)
     summary_table.add_column("Metric")
