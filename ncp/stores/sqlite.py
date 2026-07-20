@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from contextlib import contextmanager
+from dataclasses import replace as dataclass_replace
 from difflib import SequenceMatcher
 import json
 from pathlib import Path
@@ -19,6 +20,12 @@ from ncp.stores.calibration import (
     rollup_reputation,
 )
 from ncp.stores.consolidation import cluster_by_tags, find_merge_candidates
+from ncp.stores.graph import (
+    backfill_edges_for_chunk,
+    infer_edges_for_chunk,
+    parse_supersedes_ids,
+    resolve_caused_by_fallback,
+)
 from ncp.stores.retrieval import (
     DEFAULT_RETRIEVAL_POLICY,
     RetrievalPolicy,
@@ -32,6 +39,7 @@ from ncp.stores.retrieval import (
 from ncp.tokens import estimate_tokens
 from ncp.types import (
     CalibrationReport,
+    ChunkEdge,
     ConsolidationReport,
     ConsciousBlock,
     NCPResponse,
@@ -232,6 +240,20 @@ CREATE TABLE IF NOT EXISTS memo_stats (
     stat_key TEXT PRIMARY KEY,
     stat_value INTEGER NOT NULL DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS chunk_edges (
+    edge_id TEXT PRIMARY KEY,
+    src_chunk_id TEXT NOT NULL,
+    dst_chunk_id TEXT NOT NULL,
+    edge_type TEXT NOT NULL,
+    weight REAL NOT NULL DEFAULT 1.0,
+    created_at REAL NOT NULL,
+    created_by TEXT,
+    UNIQUE(src_chunk_id, dst_chunk_id, edge_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_chunk_edges_src ON chunk_edges(src_chunk_id);
+CREATE INDEX IF NOT EXISTS idx_chunk_edges_dst ON chunk_edges(dst_chunk_id);
 """
 
 
@@ -255,6 +277,12 @@ class SQLiteStore(BaseStore):
         self.gc_threshold = gc_threshold
         self.max_working_chunks_per_pipeline = max_working_chunks_per_pipeline
         self.retention_evictions = 0
+        # CAP-C7/WI-P2: count of `refines` edges inferred+persisted by the most
+        # recent write() call (0 when disabled or none matched). Reset at the
+        # top of every write() -- read immediately after by the MCP layer for
+        # the `edges_inferred` response field; not meaningful across concurrent
+        # writers on the same store instance.
+        self.last_write_inferred_edge_count = 0
         self._embedding_adapter = embedding_adapter
 
         from ncp.stores.rerank import Reranker
@@ -344,6 +372,7 @@ class SQLiteStore(BaseStore):
                     pass  # column already exists
 
     def write(self, chunk: SubconsciousChunk) -> bool:
+        self.last_write_inferred_edge_count = 0
         chunk = self._validate_chunk_for_write(chunk)
         if self._embedding_adapter is not None and chunk.embedding is None:
             chunk = chunk.model_copy(
@@ -429,10 +458,54 @@ class SQLiteStore(BaseStore):
                     chunk.superseded_by,
                 ),
             )
+            backfilled_edges = backfill_edges_for_chunk(chunk)
+            if backfilled_edges:
+                self._upsert_chunk_edges(connection, backfilled_edges)
+            if self.config is not None and self.config.infer_edges:
+                inferred_edges = infer_edges_for_chunk(
+                    chunk,
+                    self._edge_inference_candidates(
+                        connection, chunk, limit=self.config.infer_scan_limit
+                    ),
+                    threshold=self.config.infer_similarity_threshold,
+                    max_edges=self.config.infer_max_edges,
+                    existing_dst_ids=self._existing_refines_dst_ids(connection, chunk.chunk_id),
+                )
+                if inferred_edges:
+                    self._upsert_chunk_edges(connection, inferred_edges)
+                self.last_write_inferred_edge_count = len(inferred_edges)
             self._hard_gc(connection, pipeline_id=chunk.pipeline_id)
             if self.max_working_chunks_per_pipeline > 0 and chunk.zone == "working":
                 self._enforce_retention(connection, pipeline_id=chunk.pipeline_id)
             return True
+
+    def _edge_inference_candidates(
+        self, connection: sqlite3.Connection, chunk: SubconsciousChunk, *, limit: int
+    ) -> list[SubconsciousChunk]:
+        """Bounded, most-recent-first scan of same-pipeline chunks (CAP-C7/WI-P2).
+
+        Exclusion (self, raw backups, empty content, existing edges) is owned
+        by ``infer_edges_for_chunk`` -- this only bounds the scan so inference
+        never issues an unbounded table read.
+        """
+        rows = connection.execute(
+            """
+            SELECT * FROM chunks
+            WHERE IFNULL(pipeline_id, '') = IFNULL(?, '')
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (chunk.pipeline_id, max(0, int(limit))),
+        ).fetchall()
+        return [self._row_to_chunk(row) for row in rows]
+
+    @staticmethod
+    def _existing_refines_dst_ids(connection: sqlite3.Connection, src_chunk_id: str) -> set[str]:
+        rows = connection.execute(
+            "SELECT dst_chunk_id FROM chunk_edges WHERE src_chunk_id = ? AND edge_type = 'refines'",
+            (src_chunk_id,),
+        ).fetchall()
+        return {str(row["dst_chunk_id"]) for row in rows}
 
     @staticmethod
     def _cosine_similarity(a: list[float], b: list[float]) -> float:
@@ -992,6 +1065,173 @@ class SQLiteStore(BaseStore):
             ).fetchall()
         return [self._row_to_chunk(row) for row in rows]
 
+    @staticmethod
+    def _upsert_chunk_edges(connection: sqlite3.Connection, edges: Sequence[ChunkEdge]) -> int:
+        for edge in edges:
+            connection.execute(
+                """
+                INSERT INTO chunk_edges (
+                    edge_id, src_chunk_id, dst_chunk_id, edge_type, weight, created_at, created_by
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(src_chunk_id, dst_chunk_id, edge_type) DO UPDATE SET
+                    weight = excluded.weight,
+                    created_at = excluded.created_at,
+                    created_by = excluded.created_by
+                """,
+                (
+                    edge.edge_id,
+                    edge.src_chunk_id,
+                    edge.dst_chunk_id,
+                    edge.edge_type,
+                    edge.weight,
+                    edge.created_at,
+                    edge.created_by,
+                ),
+            )
+        return len(edges)
+
+    def add_chunk_edges(self, edges: Sequence[ChunkEdge]) -> int:
+        if not edges:
+            return 0
+        with self._connect() as connection:
+            return self._upsert_chunk_edges(connection, edges)
+
+    def get_chunk_edges(
+        self,
+        chunk_ids: Sequence[str],
+        *,
+        edge_types: Sequence[str] | None = None,
+        direction: str = "out",
+        limit: int = 200,
+    ) -> list[ChunkEdge]:
+        if direction not in ("out", "in", "both"):
+            raise ValueError(f"Unknown direction {direction!r}; expected 'out', 'in', or 'both'")
+        unique_ids = [cid for cid in dict.fromkeys(chunk_ids) if cid]
+        if not unique_ids:
+            return []
+        placeholders = ",".join("?" * len(unique_ids))
+        params: list[object] = []
+        if direction == "out":
+            where = f"src_chunk_id IN ({placeholders})"
+            params.extend(unique_ids)
+        elif direction == "in":
+            where = f"dst_chunk_id IN ({placeholders})"
+            params.extend(unique_ids)
+        else:
+            where = f"(src_chunk_id IN ({placeholders}) OR dst_chunk_id IN ({placeholders}))"
+            params.extend(unique_ids)
+            params.extend(unique_ids)
+        if edge_types:
+            type_placeholders = ",".join("?" * len(edge_types))
+            where += f" AND edge_type IN ({type_placeholders})"
+            params.extend(edge_types)
+        capped_limit = max(0, int(limit))
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM chunk_edges WHERE {where} ORDER BY created_at DESC LIMIT ?",
+                [*params, capped_limit],
+            ).fetchall()
+        return [self._row_to_chunk_edge(row) for row in rows]
+
+    @staticmethod
+    def _row_to_chunk_edge(row: sqlite3.Row) -> ChunkEdge:
+        return ChunkEdge(
+            edge_id=str(row["edge_id"]),
+            src_chunk_id=str(row["src_chunk_id"]),
+            dst_chunk_id=str(row["dst_chunk_id"]),
+            edge_type=str(row["edge_type"]),
+            weight=float(row["weight"]),
+            created_at=float(row["created_at"]),
+            created_by=row["created_by"],
+        )
+
+    def graph_data(
+        self,
+        *,
+        pipeline_id: str | None = None,
+        limit: int = 500,
+        as_of: float | None = None,
+    ) -> dict[str, object]:
+        """See ``BaseStore.graph_data`` for the node/edge shape.
+
+        ``as_of`` (CAP-C5, epoch seconds): ``None`` (default) is exactly the
+        pre-WI-P4 behavior -- no bi-temporal filtering, matching the other
+        ``as_of=None`` query paths' "no history awareness" baseline that
+        ``graph_data`` has always had. When given, nodes are filtered with
+        the same point-in-time visibility rule as ``get_chunks_by_ids``/
+        ``query`` (see ``_bitemporal_clause``), and edges recorded after
+        ``as_of`` are excluded.
+        """
+        capped_limit = max(0, int(limit))
+        with self._connect() as connection:
+            clauses = ["chunk_id NOT IN (SELECT chunk_id FROM tombstones)"]
+            params: list[object] = []
+            if pipeline_id is not None:
+                clauses.append("pipeline_id = ?")
+                params.append(pipeline_id)
+            if as_of is not None:
+                bitemporal_sql, bitemporal_params = self._bitemporal_clause(as_of)
+                clauses.append(f"({bitemporal_sql})")
+                params.extend(bitemporal_params)
+            chunk_rows = connection.execute(
+                "SELECT chunk_id, layer, base_trust, src, written_by, content, caused_by, supersedes"
+                f" FROM chunks WHERE {' AND '.join(clauses)}"
+                " ORDER BY created_at DESC LIMIT ?",
+                [*params, capped_limit],
+            ).fetchall()
+
+            node_ids = [str(r["chunk_id"]) for r in chunk_rows]
+            edge_rows: list[sqlite3.Row] = []
+            if node_ids:
+                placeholders = ",".join("?" * len(node_ids))
+                edge_where = f"(src_chunk_id IN ({placeholders}) OR dst_chunk_id IN ({placeholders}))"
+                edge_params: list[object] = [*node_ids, *node_ids]
+                if as_of is not None:
+                    edge_where += " AND created_at <= ?"
+                    edge_params.append(as_of)
+                edge_rows = connection.execute(
+                    "SELECT src_chunk_id, dst_chunk_id, edge_type, weight FROM chunk_edges"
+                    f" WHERE {edge_where}",
+                    edge_params,
+                ).fetchall()
+
+        nodes = [
+            {
+                "chunk_id": str(r["chunk_id"]),
+                "layer": str(r["layer"]),
+                "base_trust": float(r["base_trust"]),
+                "src": str(r["src"]),
+                "written_by": str(r["written_by"]),
+                "summary": str(r["content"])[:80],
+            }
+            for r in chunk_rows
+        ]
+
+        edges: list[dict[str, object]] = []
+        seen: set[tuple[str, str, str]] = set()
+        for row in edge_rows:
+            key = (str(row["src_chunk_id"]), str(row["dst_chunk_id"]), str(row["edge_type"]))
+            seen.add(key)
+            edges.append({"src": key[0], "dst": key[1], "type": key[2], "weight": float(row["weight"])})
+
+        # Legacy-column fallback: chunks whose caused_by/supersedes predate the
+        # edge table get a synthesized edge, unless a real row already covers it.
+        for r in chunk_rows:
+            cid = str(r["chunk_id"])
+            cause = r["caused_by"]
+            if cause:
+                key = (cid, str(cause), "caused_by")
+                if key not in seen:
+                    seen.add(key)
+                    edges.append({"src": key[0], "dst": key[1], "type": key[2], "weight": 1.0})
+            for target in parse_supersedes_ids(r["supersedes"]):
+                key = (cid, target, "supersedes")
+                if key not in seen:
+                    seen.add(key)
+                    edges.append({"src": key[0], "dst": key[1], "type": key[2], "weight": 1.0})
+
+        return {"nodes": nodes, "edges": edges}
+
     def emit_whisper(self, whisper: Whisper) -> None:
         whisper = Whisper.model_validate(whisper.model_dump())
         with self._connect() as connection:
@@ -1375,6 +1615,7 @@ class SQLiteStore(BaseStore):
         feedback_weight: float = 0.15,
         propagation_factor: float = 0.5,
         dissent_weight: float = 0.2,
+        propagation_max_hops: int = 1,
     ) -> CalibrationReport:
         """Re-score base_trust on live chunks.
 
@@ -1382,7 +1623,8 @@ class SQLiteStore(BaseStore):
         Batch mode: pipeline_id applies decay to eligible chunks.
         Feedback mode: applies a net trust delta per chunk (retrieval boost minus
         dissent penalty) and propagates a fraction (``propagation_factor``) of it
-        one hop along ``caused_by`` edges.
+        up to ``propagation_max_hops`` hops along ``caused_by`` ancestry (default
+        1 hop, matching legacy behavior).
         """
         started = time.monotonic()
         report = CalibrationReport(dry_run=dry_run, pipeline_id=pipeline_id)
@@ -1481,6 +1723,23 @@ class SQLiteStore(BaseStore):
                 # CAP-T3: initialize outcome tracking
                 consumed_outcome_ids: list[str] = []
                 if feedback_mode and feedback_rows:
+                    # WI-G3: chunks without a caused_by scalar (e.g. edges added
+                    # via the MCP edges arg only) still get an ancestor via a
+                    # caused_by edge row, so multi-hop propagation can walk them.
+                    missing_parent_ids = [row.chunk_id for row in feedback_rows if not row.caused_by]
+                    if missing_parent_ids and propagation_factor > 0.0 and propagation_max_hops > 0:
+                        fallback_edges = self.get_chunk_edges(
+                            missing_parent_ids, edge_types=["caused_by"], direction="out"
+                        )
+                        fallback_parent = resolve_caused_by_fallback(fallback_edges)
+                        if fallback_parent:
+                            feedback_rows = [
+                                dataclass_replace(row, caused_by=fallback_parent[row.chunk_id])
+                                if row.chunk_id in fallback_parent
+                                else row
+                                for row in feedback_rows
+                            ]
+
                     outcomes = self._load_unconsumed_outcomes(connection)
                     outcome_evidence = None
                     if outcomes:
@@ -1495,10 +1754,12 @@ class SQLiteStore(BaseStore):
                         dissent_weight=dissent_weight,
                         usage_prior_weight=self.config.usage_prior_weight if self.config is not None else 1.0,
                         outcome_evidence=outcome_evidence,
+                        propagation_max_hops=propagation_max_hops,
                     )
                     updates.extend(fb.updates)
                     report.change_log.extend(fb.change_log)
                     report.feedback_adjusted += fb.adjusted
+                    report.outcome_propagated += fb.outcome_propagated
                     report.skipped += fb.skipped
                     consumed_feedback_ids = fb.consumed_chunk_ids
 

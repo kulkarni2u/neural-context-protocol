@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
+from dataclasses import replace as dataclass_replace
 from difflib import SequenceMatcher
 import atexit
 import json
@@ -22,6 +23,12 @@ from ncp.stores.calibration import (
     rollup_reputation,
 )
 from ncp.stores.consolidation import cluster_by_tags, find_merge_candidates
+from ncp.stores.graph import (
+    backfill_edges_for_chunk,
+    infer_edges_for_chunk,
+    parse_supersedes_ids,
+    resolve_caused_by_fallback,
+)
 from ncp.stores.redis_coordination import RedisCoordination
 from ncp.stores.retrieval import (
     DEFAULT_RETRIEVAL_POLICY,
@@ -34,7 +41,7 @@ from ncp.stores.retrieval import (
     score_vector_distance,
 )
 from ncp.tokens import estimate_tokens
-from ncp.types import CalibrationReport, ConsolidationReport, ConsciousBlock, NCPResponse, OutcomeRecord, SubconsciousChunk, TurnRecord, Whisper
+from ncp.types import CalibrationReport, ChunkEdge, ConsolidationReport, ConsciousBlock, NCPResponse, OutcomeRecord, SubconsciousChunk, TurnRecord, Whisper
 
 
 PGVECTOR_SCHEMA_TEMPLATE = """
@@ -217,6 +224,22 @@ CREATE TABLE IF NOT EXISTS {schema}.{prefix}memo_stats (
     stat_key TEXT PRIMARY KEY,
     stat_value BIGINT NOT NULL DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS {schema}.{prefix}chunk_edges (
+    edge_id TEXT PRIMARY KEY,
+    src_chunk_id TEXT NOT NULL,
+    dst_chunk_id TEXT NOT NULL,
+    edge_type TEXT NOT NULL,
+    weight DOUBLE PRECISION NOT NULL DEFAULT 1.0,
+    created_at DOUBLE PRECISION NOT NULL,
+    created_by TEXT,
+    UNIQUE (src_chunk_id, dst_chunk_id, edge_type)
+);
+
+CREATE INDEX IF NOT EXISTS {prefix}idx_chunk_edges_src
+    ON {schema}.{prefix}chunk_edges(src_chunk_id);
+CREATE INDEX IF NOT EXISTS {prefix}idx_chunk_edges_dst
+    ON {schema}.{prefix}chunk_edges(dst_chunk_id);
 """
 
 
@@ -290,6 +313,8 @@ class PgvectorStore(BaseStore):
         self.gc_threshold = gc_threshold
         self.max_working_chunks_per_pipeline = max_working_chunks_per_pipeline
         self.retention_evictions = 0
+        # CAP-C7/WI-P2: see SQLiteStore.last_write_inferred_edge_count.
+        self.last_write_inferred_edge_count = 0
         self._ivfflat_probes = ivfflat_probes
 
         from ncp.stores.rerank import Reranker
@@ -389,6 +414,7 @@ class PgvectorStore(BaseStore):
                 self._close_cursor(cursor)
 
     def write(self, chunk: SubconsciousChunk) -> bool:
+        self.last_write_inferred_edge_count = 0
         chunk = self._validate_chunk_for_write(chunk)
         if self._embedding_adapter is not None and chunk.embedding is None:
             chunk = chunk.model_copy(
@@ -490,10 +516,68 @@ class PgvectorStore(BaseStore):
                 )
             finally:
                 self._close_cursor(cursor)
+            backfilled_edges = backfill_edges_for_chunk(chunk)
+            if backfilled_edges:
+                self._upsert_chunk_edges_rows(connection, backfilled_edges)
+            if self.config is not None and self.config.infer_edges:
+                inferred_edges = infer_edges_for_chunk(
+                    chunk,
+                    self._edge_inference_candidates(
+                        connection, chunk, limit=self.config.infer_scan_limit
+                    ),
+                    threshold=self.config.infer_similarity_threshold,
+                    max_edges=self.config.infer_max_edges,
+                    existing_dst_ids=self._existing_refines_dst_ids(connection, chunk.chunk_id),
+                )
+                if inferred_edges:
+                    self._upsert_chunk_edges_rows(connection, inferred_edges)
+                self.last_write_inferred_edge_count = len(inferred_edges)
             self._hard_gc(connection, pipeline_id=chunk.pipeline_id)
             if self.max_working_chunks_per_pipeline > 0 and chunk.zone == "working":
                 self._enforce_retention(connection, pipeline_id=chunk.pipeline_id)
             return True
+
+    def _edge_inference_candidates(
+        self, connection: Any, chunk: SubconsciousChunk, *, limit: int
+    ) -> list[SubconsciousChunk]:
+        """Bounded, most-recent-first scan of same-pipeline chunks (CAP-C7/WI-P2).
+
+        Exclusion (self, raw backups, empty content, existing edges) is owned
+        by ``infer_edges_for_chunk`` -- this only bounds the scan so inference
+        never issues an unbounded table read.
+        """
+        cursor = connection.cursor()
+        try:
+            cursor.execute(
+                self._sql(
+                    """
+                    SELECT * FROM {schema}.{prefix}chunks
+                    WHERE COALESCE(pipeline_id, '') = COALESCE(%s, '')
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                    """
+                ),
+                (chunk.pipeline_id, max(0, int(limit))),
+            )
+            rows = self._fetchall(cursor)
+        finally:
+            self._close_cursor(cursor)
+        return [self._row_to_chunk(row) for row in rows]
+
+    def _existing_refines_dst_ids(self, connection: Any, src_chunk_id: str) -> set[str]:
+        cursor = connection.cursor()
+        try:
+            cursor.execute(
+                self._sql(
+                    "SELECT dst_chunk_id FROM {schema}.{prefix}chunk_edges"
+                    " WHERE src_chunk_id = %s AND edge_type = 'refines'"
+                ),
+                (src_chunk_id,),
+            )
+            rows = self._fetchall(cursor)
+        finally:
+            self._close_cursor(cursor)
+        return {str(row["dst_chunk_id"]) for row in rows}
 
     def query(
         self,
@@ -789,6 +873,211 @@ class PgvectorStore(BaseStore):
                 return cursor.rowcount > 0
             finally:
                 self._close_cursor(cursor)
+
+    def _upsert_chunk_edges_rows(self, connection: Any, edges: Sequence[ChunkEdge]) -> int:
+        cursor = connection.cursor()
+        try:
+            for edge in edges:
+                cursor.execute(
+                    self._sql(
+                        """
+                        INSERT INTO {schema}.{prefix}chunk_edges (
+                            edge_id, src_chunk_id, dst_chunk_id, edge_type, weight, created_at, created_by
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (src_chunk_id, dst_chunk_id, edge_type) DO UPDATE SET
+                            weight = EXCLUDED.weight,
+                            created_at = EXCLUDED.created_at,
+                            created_by = EXCLUDED.created_by
+                        """
+                    ),
+                    (
+                        edge.edge_id,
+                        edge.src_chunk_id,
+                        edge.dst_chunk_id,
+                        edge.edge_type,
+                        edge.weight,
+                        edge.created_at,
+                        edge.created_by,
+                    ),
+                )
+        finally:
+            self._close_cursor(cursor)
+        return len(edges)
+
+    def add_chunk_edges(self, edges: Sequence[ChunkEdge]) -> int:
+        if not edges:
+            return 0
+        with self._connect() as connection:
+            return self._upsert_chunk_edges_rows(connection, edges)
+
+    def get_chunk_edges(
+        self,
+        chunk_ids: Sequence[str],
+        *,
+        edge_types: Sequence[str] | None = None,
+        direction: str = "out",
+        limit: int = 200,
+    ) -> list[ChunkEdge]:
+        if direction not in ("out", "in", "both"):
+            raise ValueError(f"Unknown direction {direction!r}; expected 'out', 'in', or 'both'")
+        unique_ids = [cid for cid in dict.fromkeys(chunk_ids) if cid]
+        if not unique_ids:
+            return []
+        placeholders = ", ".join(["%s"] * len(unique_ids))
+        params: list[object] = []
+        if direction == "out":
+            where = f"src_chunk_id IN ({placeholders})"
+            params.extend(unique_ids)
+        elif direction == "in":
+            where = f"dst_chunk_id IN ({placeholders})"
+            params.extend(unique_ids)
+        else:
+            where = f"(src_chunk_id IN ({placeholders}) OR dst_chunk_id IN ({placeholders}))"
+            params.extend(unique_ids)
+            params.extend(unique_ids)
+        if edge_types:
+            type_placeholders = ", ".join(["%s"] * len(edge_types))
+            where += f" AND edge_type IN ({type_placeholders})"
+            params.extend(edge_types)
+        capped_limit = max(0, int(limit))
+        with self._connect() as connection:
+            cursor = connection.cursor()
+            try:
+                cursor.execute(
+                    self._sql(
+                        f"SELECT * FROM {{schema}}.{{prefix}}chunk_edges WHERE {where}"
+                        " ORDER BY created_at DESC LIMIT %s"
+                    ),
+                    (*params, capped_limit),
+                )
+                rows = self._fetchall(cursor)
+            finally:
+                self._close_cursor(cursor)
+        return [self._row_to_chunk_edge(row) for row in rows]
+
+    @staticmethod
+    def _row_to_chunk_edge(row: dict[str, Any]) -> ChunkEdge:
+        return ChunkEdge(
+            edge_id=str(row["edge_id"]),
+            src_chunk_id=str(row["src_chunk_id"]),
+            dst_chunk_id=str(row["dst_chunk_id"]),
+            edge_type=str(row["edge_type"]),
+            weight=float(row["weight"]),
+            created_at=float(row["created_at"]),
+            created_by=row["created_by"],
+        )
+
+    def graph_data(
+        self,
+        *,
+        pipeline_id: str | None = None,
+        limit: int = 500,
+        as_of: float | None = None,
+    ) -> dict[str, object]:
+        """See ``BaseStore.graph_data`` for the node/edge shape.
+
+        ``as_of`` (CAP-C5, epoch seconds): ``None`` (default) is exactly the
+        pre-WI-P4 behavior -- no bi-temporal filtering. When given, nodes are
+        filtered with the same point-in-time visibility rule as
+        ``_apply_bitemporal_filter`` (Python post-filter, mirroring the other
+        as_of query paths on this backend), and edges recorded after ``as_of``
+        are excluded.
+        """
+        capped_limit = max(0, int(limit))
+        live_filter = f"chunk_id NOT IN (SELECT chunk_id FROM {self._table_name('tombstones')})"
+        with self._connect() as connection:
+            cursor = connection.cursor()
+            try:
+                select_cols = "chunk_id, layer, base_trust, src, written_by, content, caused_by, supersedes"
+                if as_of is not None:
+                    select_cols += ", created_at, valid_from, valid_to, superseded_by"
+                if pipeline_id is not None:
+                    cursor.execute(
+                        f"SELECT {select_cols} FROM {self._table_name('chunks')}"
+                        f" WHERE {live_filter} AND pipeline_id = %s"
+                        " ORDER BY created_at DESC LIMIT %s",
+                        (pipeline_id, capped_limit),
+                    )
+                else:
+                    cursor.execute(
+                        f"SELECT {select_cols} FROM {self._table_name('chunks')}"
+                        f" WHERE {live_filter}"
+                        " ORDER BY created_at DESC LIMIT %s",
+                        (capped_limit,),
+                    )
+                chunk_rows = self._fetchall(cursor)
+            finally:
+                self._close_cursor(cursor)
+
+            if as_of is not None:
+                successor_ids = collect_successor_ids(chunk_rows)
+                successor_created_at = (
+                    self._load_successor_created_at(connection, successor_ids)
+                    if successor_ids
+                    else {}
+                )
+                chunk_rows = filter_bitemporal(
+                    chunk_rows, as_of=as_of, now=time.time(), successor_created_at=successor_created_at
+                )
+
+            node_ids = [str(r["chunk_id"]) for r in chunk_rows]
+            edge_rows: list[dict[str, Any]] = []
+            if node_ids:
+                placeholders = ", ".join(["%s"] * len(node_ids))
+                select_edge_cols = "src_chunk_id, dst_chunk_id, edge_type, weight"
+                edge_where = f"src_chunk_id IN ({placeholders}) OR dst_chunk_id IN ({placeholders})"
+                edge_params: list[object] = [*node_ids, *node_ids]
+                if as_of is not None:
+                    edge_where = f"({edge_where}) AND created_at <= %s"
+                    edge_params.append(as_of)
+                cursor = connection.cursor()
+                try:
+                    cursor.execute(
+                        f"SELECT {select_edge_cols}"
+                        f" FROM {self._table_name('chunk_edges')}"
+                        f" WHERE {edge_where}",
+                        tuple(edge_params),
+                    )
+                    edge_rows = self._fetchall(cursor)
+                finally:
+                    self._close_cursor(cursor)
+
+        nodes = [
+            {
+                "chunk_id": str(r["chunk_id"]),
+                "layer": str(r["layer"]),
+                "base_trust": float(r["base_trust"]),
+                "src": str(r["src"]),
+                "written_by": str(r["written_by"]),
+                "summary": str(r["content"])[:80],
+            }
+            for r in chunk_rows
+        ]
+
+        edges: list[dict[str, object]] = []
+        seen: set[tuple[str, str, str]] = set()
+        for row in edge_rows:
+            key = (str(row["src_chunk_id"]), str(row["dst_chunk_id"]), str(row["edge_type"]))
+            seen.add(key)
+            edges.append({"src": key[0], "dst": key[1], "type": key[2], "weight": float(row["weight"])})
+
+        # Legacy-column fallback: chunks whose caused_by/supersedes predate the
+        # edge table get a synthesized edge, unless a real row already covers it.
+        for r in chunk_rows:
+            cid = str(r["chunk_id"])
+            cause = r["caused_by"]
+            if cause:
+                key = (cid, str(cause), "caused_by")
+                if key not in seen:
+                    seen.add(key)
+                    edges.append({"src": key[0], "dst": key[1], "type": key[2], "weight": 1.0})
+            for target in parse_supersedes_ids(r["supersedes"]):
+                key = (cid, target, "supersedes")
+                if key not in seen:
+                    seen.add(key)
+                    edges.append({"src": key[0], "dst": key[1], "type": key[2], "weight": 1.0})
+
+        return {"nodes": nodes, "edges": edges}
 
     def record_dissent(self, chunk_id: str) -> bool:
         normalized = chunk_id.removeprefix("ctx://sub/")
@@ -1621,6 +1910,7 @@ class PgvectorStore(BaseStore):
         feedback_weight: float = 0.15,
         propagation_factor: float = 0.5,
         dissent_weight: float = 0.2,
+        propagation_max_hops: int = 1,
     ) -> CalibrationReport:
         """Re-score base_trust on live chunks.
 
@@ -1628,7 +1918,8 @@ class PgvectorStore(BaseStore):
         Batch mode: pipeline_id applies decay to eligible chunks.
         Feedback mode: applies a net trust delta per chunk (retrieval boost minus
         dissent penalty) and propagates a fraction (``propagation_factor``) of it
-        one hop along ``caused_by`` edges.
+        up to ``propagation_max_hops`` hops along ``caused_by`` ancestry (default
+        1 hop, matching legacy behavior).
         """
         started = time.monotonic()
         report = CalibrationReport(dry_run=dry_run, pipeline_id=pipeline_id)
@@ -1751,6 +2042,23 @@ class PgvectorStore(BaseStore):
                 # CAP-T3: initialize outcome tracking
                 consumed_outcome_ids: list[str] = []
                 if feedback_mode and feedback_rows:
+                    # WI-G3: chunks without a caused_by scalar (e.g. edges added
+                    # via the MCP edges arg only) still get an ancestor via a
+                    # caused_by edge row, so multi-hop propagation can walk them.
+                    missing_parent_ids = [row.chunk_id for row in feedback_rows if not row.caused_by]
+                    if missing_parent_ids and propagation_factor > 0.0 and propagation_max_hops > 0:
+                        fallback_edges = self.get_chunk_edges(
+                            missing_parent_ids, edge_types=["caused_by"], direction="out"
+                        )
+                        fallback_parent = resolve_caused_by_fallback(fallback_edges)
+                        if fallback_parent:
+                            feedback_rows = [
+                                dataclass_replace(row, caused_by=fallback_parent[row.chunk_id])
+                                if row.chunk_id in fallback_parent
+                                else row
+                                for row in feedback_rows
+                            ]
+
                     outcomes = self._load_unconsumed_outcomes(connection)
                     outcome_evidence = None
                     if outcomes:
@@ -1765,10 +2073,12 @@ class PgvectorStore(BaseStore):
                         dissent_weight=dissent_weight,
                         usage_prior_weight=self.config.usage_prior_weight if self.config is not None else 1.0,
                         outcome_evidence=outcome_evidence,
+                        propagation_max_hops=propagation_max_hops,
                     )
                     updates.extend(fb.updates)
                     report.change_log.extend(fb.change_log)
                     report.feedback_adjusted += fb.adjusted
+                    report.outcome_propagated += fb.outcome_propagated
                     report.skipped += fb.skipped
                     consumed_feedback_ids = fb.consumed_chunk_ids
 

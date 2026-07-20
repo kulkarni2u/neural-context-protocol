@@ -33,6 +33,10 @@ class FeedbackResult:
     consumed_chunk_ids: list[str] = field(default_factory=list)
     adjusted: int = 0
     skipped: int = 0
+    # Ancestors adjusted via outcome-driven propagation (CAP-T3 multi-hop),
+    # counted separately from retrieval/dissent-driven propagation so the
+    # calibrate report can attribute credit by originating signal.
+    outcome_propagated: int = 0
 
 
 @dataclass(frozen=True)
@@ -58,6 +62,7 @@ def compute_feedback_updates(
     dissent_weight: float = 0.2,
     usage_prior_weight: float = 1.0,
     outcome_evidence: dict[str, float] | None = None,
+    propagation_max_hops: int = 1,
 ) -> FeedbackResult:
     """Compute net trust deltas from retrieval feedback, dissent, and outcomes.
 
@@ -74,11 +79,26 @@ def compute_feedback_updates(
     before (retrieval counts drive the update at their full weight).
 
     Propagation: a fraction (``propagation_factor``) of each chunk's net delta
-    flows one hop to its ``caused_by`` parent — crediting a cause for useful
-    effects and debiting it for disputed ones. The hop is single to keep credit
-    assignment bounded and acyclic; the parent must be among ``rows`` (live and
-    not protected) to be affected. A chunk that is both retrieved and a parent
-    accumulates both contributions.
+    flows up to ``propagation_max_hops`` hops along ``caused_by`` ancestry —
+    crediting a cause for useful effects and debiting it for disputed ones.
+    Hop *h* receives ``propagation_factor ** h`` of the originating delta.
+    ``propagation_max_hops=1`` (the default) reproduces the original single-hop
+    behavior exactly. Each ``FeedbackRow.caused_by`` is taken as the already-
+    resolved parent id (callers pick the current ``caused_by`` scalar, falling
+    back to a ``caused_by`` edge row only when the scalar is absent); walking
+    further ancestry is just following that chain across ``rows``. A visited
+    set per originating chunk makes the walk cycle-safe, and an ancestor must
+    be among ``rows`` (live and not protected) to receive credit. A chunk that
+    is both retrieved and an ancestor of another accumulates both/all
+    contributions, and multiple descendants sharing an ancestor accumulate
+    into that ancestor together. Since ``direct[cid]`` already folds outcome
+    evidence into the same net delta as retrieval/dissent, an outcome-driven
+    delta takes this identical propagation path with no special-casing
+    (WI-P3, CAP-T3 extension). Ancestor entries whose credit originated (at
+    least in part) from an outcome-evidenced descendant are tagged
+    ``reason="outcome_propagation"`` instead of ``"trust_propagation"`` in
+    ``change_log``, and counted in ``FeedbackResult.outcome_propagated``, so
+    callers can attribute propagated credit to outcomes vs. retrieval/dissent.
 
     Caller is responsible for excluding protected (``user_verified``) chunks
     from ``rows`` before calling.
@@ -112,14 +132,29 @@ def compute_feedback_updates(
             direct[cid] = delta
 
     total: dict[str, float] = dict(direct)
-    if propagation_factor > 0.0:
+    # Ancestors that received propagated credit originating (at least in
+    # part) from an outcome-evidenced descendant. A descendant's whole net
+    # delta propagates regardless of source (outcome/retrieval/dissent), but
+    # this set lets the report distinguish outcome-driven propagation from
+    # purely retrieval/dissent-driven propagation for attribution purposes.
+    outcome_sourced_ancestors: set[str] = set()
+    if propagation_factor > 0.0 and propagation_max_hops > 0:
+        parent_of = {row.chunk_id: row.caused_by for row in rows if row.caused_by}
         for row in rows:
             delta = direct.get(row.chunk_id, 0.0)
             if delta == 0.0:
                 continue
-            parent = row.caused_by
-            if parent and parent in base_trust:
-                total[parent] = total.get(parent, 0.0) + delta * propagation_factor
+            is_outcome_sourced = outcome_evidence.get(row.chunk_id, 0.0) != 0.0
+            visited = {row.chunk_id}
+            ancestor = parent_of.get(row.chunk_id)
+            hop = 1
+            while ancestor and ancestor in base_trust and ancestor not in visited and hop <= propagation_max_hops:
+                total[ancestor] = total.get(ancestor, 0.0) + delta * (propagation_factor**hop)
+                if is_outcome_sourced:
+                    outcome_sourced_ancestors.add(ancestor)
+                visited.add(ancestor)
+                hop += 1
+                ancestor = parent_of.get(ancestor)
 
     result = FeedbackResult()
     result.consumed_chunk_ids = [
@@ -156,6 +191,8 @@ def compute_feedback_updates(
             else:
                 entry["reason"] = "retrieval_feedback"
                 entry["retrieval_count"] = rc
+        elif chunk_id in outcome_sourced_ancestors:
+            entry["reason"] = "outcome_propagation"
         else:
             entry["reason"] = "trust_propagation"
         result.change_log.append(entry)
@@ -164,6 +201,9 @@ def compute_feedback_updates(
 
     result.adjusted = len(adjusted_ids)
     result.skipped = len(rows) - len(adjusted_ids)
+    result.outcome_propagated = sum(
+        1 for entry in result.change_log if entry.get("reason") == "outcome_propagation"
+    )
     return result
 
 

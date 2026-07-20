@@ -16,7 +16,9 @@ from __future__ import annotations
 import json
 import math
 import time
+from collections.abc import Sequence
 from contextlib import asynccontextmanager
+from dataclasses import replace as dataclass_replace
 from difflib import SequenceMatcher
 from typing import Any, AsyncIterator
 
@@ -25,6 +27,12 @@ import structlog
 
 from ncp.stores.base import BaseStore, NCPStoreUnavailableError
 from ncp.stores.bitemporal import collect_successor_ids, filter_bitemporal
+from ncp.stores.graph import (
+    backfill_edges_for_chunk,
+    infer_edges_for_chunk,
+    parse_supersedes_ids,
+    resolve_caused_by_fallback,
+)
 from ncp.stores.pgvector import (
     DEFAULT_RETRIEVAL_POLICY,
     PGVECTOR_SCHEMA_TEMPLATE,
@@ -49,6 +57,7 @@ from ncp.stores.consolidation import cluster_by_tags, find_merge_candidates
 from ncp.tokens import estimate_tokens
 from ncp.types import (
     CalibrationReport,
+    ChunkEdge,
     ConsciousBlock,
     ConsolidationReport,
     NCPResponse,
@@ -94,6 +103,8 @@ class AsyncPgvectorStore(BaseStore):
         self.gc_threshold = gc_threshold
         self.max_working_chunks_per_pipeline = max_working_chunks_per_pipeline
         self.retention_evictions = 0
+        # CAP-C7/WI-P2: see SQLiteStore.last_write_inferred_edge_count.
+        self.last_write_inferred_edge_count = 0
         self.reputation_gain = 4.0
         self.reputation_forget = 0.99
         self.reputation_confidence_k = 20
@@ -279,6 +290,7 @@ class AsyncPgvectorStore(BaseStore):
         Matches sync write() behavior: soft_gc → src_immutability → dedup →
         INSERT/upsert → hard_gc.
         """
+        self.last_write_inferred_edge_count = 0
         chunk = self._validate_chunk_for_write(chunk)
         if self._embedding_adapter is not None and chunk.embedding is None:
             _adapter = self._embedding_adapter
@@ -376,10 +388,68 @@ class AsyncPgvectorStore(BaseStore):
                         chunk.superseded_by,
                     ),
                 )
+            backfilled_edges = backfill_edges_for_chunk(chunk)
+            if backfilled_edges:
+                await self._async_upsert_chunk_edges_rows(conn, backfilled_edges)
+            if self.config is not None and self.config.infer_edges:
+                inferred_edges = infer_edges_for_chunk(
+                    chunk,
+                    await self._async_edge_inference_candidates(
+                        conn, chunk, limit=self.config.infer_scan_limit
+                    ),
+                    threshold=self.config.infer_similarity_threshold,
+                    max_edges=self.config.infer_max_edges,
+                    existing_dst_ids=await self._async_existing_refines_dst_ids(
+                        conn, chunk.chunk_id
+                    ),
+                )
+                if inferred_edges:
+                    await self._async_upsert_chunk_edges_rows(conn, inferred_edges)
+                self.last_write_inferred_edge_count = len(inferred_edges)
             await self._async_hard_gc(conn, pipeline_id=chunk.pipeline_id)
             if self.max_working_chunks_per_pipeline > 0 and chunk.zone == "working":
                 await self._async_enforce_retention(conn, pipeline_id=chunk.pipeline_id)
         return True
+
+    async def _async_edge_inference_candidates(
+        self, conn: Any, chunk: SubconsciousChunk, *, limit: int
+    ) -> list[SubconsciousChunk]:
+        """Bounded, most-recent-first scan of same-pipeline chunks (CAP-C7/WI-P2).
+
+        Exclusion (self, raw backups, empty content, existing edges) is owned
+        by ``infer_edges_for_chunk`` -- this only bounds the scan so inference
+        never issues an unbounded table read.
+        """
+        async with conn.cursor() as cur:
+            await cur.execute(
+                self._sql(
+                    """
+                    SELECT * FROM {schema}.{prefix}chunks
+                    WHERE COALESCE(pipeline_id, '') = COALESCE(%s, '')
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                    """
+                ),
+                (chunk.pipeline_id, max(0, int(limit))),
+            )
+            raw_rows = await cur.fetchall()
+            description = cur.description
+        rows = [self._normalize_row(r, description) for r in raw_rows]
+        return [self._row_to_chunk(row) for row in rows]
+
+    async def _async_existing_refines_dst_ids(self, conn: Any, src_chunk_id: str) -> set[str]:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                self._sql(
+                    "SELECT dst_chunk_id FROM {schema}.{prefix}chunk_edges"
+                    " WHERE src_chunk_id = %s AND edge_type = 'refines'"
+                ),
+                (src_chunk_id,),
+            )
+            raw_rows = await cur.fetchall()
+            description = cur.description
+        rows = [self._normalize_row(r, description) for r in raw_rows]
+        return {str(row["dst_chunk_id"]) for row in rows}
 
     # ------------------------------------------------------------------
     # Async dedup/GC helpers — native async equivalents of PgvectorStore
@@ -1193,6 +1263,190 @@ class AsyncPgvectorStore(BaseStore):
                     (new_chunk_id, resolved_valid_to, old_chunk_id),
                 )
                 return cur.rowcount > 0
+
+    async def _async_upsert_chunk_edges_rows(self, connection: Any, edges: Sequence[ChunkEdge]) -> int:
+        async with connection.cursor() as cur:
+            for edge in edges:
+                await cur.execute(
+                    self._sql(
+                        """
+                        INSERT INTO {schema}.{prefix}chunk_edges (
+                            edge_id, src_chunk_id, dst_chunk_id, edge_type, weight, created_at, created_by
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (src_chunk_id, dst_chunk_id, edge_type) DO UPDATE SET
+                            weight = EXCLUDED.weight,
+                            created_at = EXCLUDED.created_at,
+                            created_by = EXCLUDED.created_by
+                        """
+                    ),
+                    (
+                        edge.edge_id,
+                        edge.src_chunk_id,
+                        edge.dst_chunk_id,
+                        edge.edge_type,
+                        edge.weight,
+                        edge.created_at,
+                        edge.created_by,
+                    ),
+                )
+        return len(edges)
+
+    async def async_add_chunk_edges(self, edges: Sequence[ChunkEdge]) -> int:  # type: ignore[override]
+        """Upsert typed chunk edges using native async DB I/O."""
+        if not edges:
+            return 0
+        async with self._aconnect() as conn:
+            return await self._async_upsert_chunk_edges_rows(conn, edges)
+
+    async def async_get_chunk_edges(  # type: ignore[override]
+        self,
+        chunk_ids: Sequence[str],
+        *,
+        edge_types: Sequence[str] | None = None,
+        direction: str = "out",
+        limit: int = 200,
+    ) -> list[ChunkEdge]:
+        """Fetch typed chunk edges using native async DB I/O."""
+        if direction not in ("out", "in", "both"):
+            raise ValueError(f"Unknown direction {direction!r}; expected 'out', 'in', or 'both'")
+        unique_ids = [cid for cid in dict.fromkeys(chunk_ids) if cid]
+        if not unique_ids:
+            return []
+        placeholders = ", ".join(["%s"] * len(unique_ids))
+        params: list[object] = []
+        if direction == "out":
+            where = f"src_chunk_id IN ({placeholders})"
+            params.extend(unique_ids)
+        elif direction == "in":
+            where = f"dst_chunk_id IN ({placeholders})"
+            params.extend(unique_ids)
+        else:
+            where = f"(src_chunk_id IN ({placeholders}) OR dst_chunk_id IN ({placeholders}))"
+            params.extend(unique_ids)
+            params.extend(unique_ids)
+        if edge_types:
+            type_placeholders = ", ".join(["%s"] * len(edge_types))
+            where += f" AND edge_type IN ({type_placeholders})"
+            params.extend(edge_types)
+        capped_limit = max(0, int(limit))
+        async with self._aconnect() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    self._sql(
+                        f"SELECT * FROM {{schema}}.{{prefix}}chunk_edges WHERE {where}"
+                        " ORDER BY created_at DESC LIMIT %s"
+                    ),
+                    (*params, capped_limit),
+                )
+                rows = await self._afetchall(cur)
+        return [self._row_to_chunk_edge(row) for row in rows]
+
+    @staticmethod
+    def _row_to_chunk_edge(row: dict[str, Any]) -> ChunkEdge:
+        return ChunkEdge(
+            edge_id=str(row["edge_id"]),
+            src_chunk_id=str(row["src_chunk_id"]),
+            dst_chunk_id=str(row["dst_chunk_id"]),
+            edge_type=str(row["edge_type"]),
+            weight=float(row["weight"]),
+            created_at=float(row["created_at"]),
+            created_by=row["created_by"],
+        )
+
+    async def async_graph_data(  # type: ignore[override]
+        self,
+        *,
+        pipeline_id: str | None = None,
+        limit: int = 500,
+        as_of: float | None = None,
+    ) -> dict[str, object]:
+        """Build graph export data (nodes + edges) using native async DB I/O.
+
+        ``as_of`` (CAP-C5, epoch seconds): ``None`` (default) is exactly the
+        pre-WI-P4 behavior -- no bi-temporal filtering. When given, nodes are
+        filtered via ``_async_apply_bitemporal_filter`` (same point-in-time
+        rule as the other as_of query paths on this backend), and edges
+        recorded after ``as_of`` are excluded.
+        """
+        capped_limit = max(0, int(limit))
+        live_filter = f"chunk_id NOT IN (SELECT chunk_id FROM {self._table_name('tombstones')})"
+        async with self._aconnect() as conn:
+            select_cols = "chunk_id, layer, base_trust, src, written_by, content, caused_by, supersedes"
+            if as_of is not None:
+                select_cols += ", created_at, valid_from, valid_to, superseded_by"
+            async with conn.cursor() as cur:
+                if pipeline_id is not None:
+                    await cur.execute(
+                        f"SELECT {select_cols} FROM {self._table_name('chunks')}"
+                        f" WHERE {live_filter} AND pipeline_id = %s"
+                        " ORDER BY created_at DESC LIMIT %s",
+                        (pipeline_id, capped_limit),
+                    )
+                else:
+                    await cur.execute(
+                        f"SELECT {select_cols} FROM {self._table_name('chunks')}"
+                        f" WHERE {live_filter}"
+                        " ORDER BY created_at DESC LIMIT %s",
+                        (capped_limit,),
+                    )
+                chunk_rows = await self._afetchall(cur)
+
+            if as_of is not None:
+                chunk_rows = await self._async_apply_bitemporal_filter(conn, chunk_rows, as_of=as_of)
+
+            node_ids = [str(r["chunk_id"]) for r in chunk_rows]
+            edge_rows: list[dict[str, Any]] = []
+            if node_ids:
+                placeholders = ", ".join(["%s"] * len(node_ids))
+                select_edge_cols = "src_chunk_id, dst_chunk_id, edge_type, weight"
+                edge_where = f"src_chunk_id IN ({placeholders}) OR dst_chunk_id IN ({placeholders})"
+                edge_params: list[object] = [*node_ids, *node_ids]
+                if as_of is not None:
+                    edge_where = f"({edge_where}) AND created_at <= %s"
+                    edge_params.append(as_of)
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        f"SELECT {select_edge_cols}"
+                        f" FROM {self._table_name('chunk_edges')}"
+                        f" WHERE {edge_where}",
+                        tuple(edge_params),
+                    )
+                    edge_rows = await self._afetchall(cur)
+
+        nodes = [
+            {
+                "chunk_id": str(r["chunk_id"]),
+                "layer": str(r["layer"]),
+                "base_trust": float(r["base_trust"]),
+                "src": str(r["src"]),
+                "written_by": str(r["written_by"]),
+                "summary": str(r["content"])[:80],
+            }
+            for r in chunk_rows
+        ]
+
+        edges: list[dict[str, object]] = []
+        seen: set[tuple[str, str, str]] = set()
+        for row in edge_rows:
+            key = (str(row["src_chunk_id"]), str(row["dst_chunk_id"]), str(row["edge_type"]))
+            seen.add(key)
+            edges.append({"src": key[0], "dst": key[1], "type": key[2], "weight": float(row["weight"])})
+
+        for r in chunk_rows:
+            cid = str(r["chunk_id"])
+            cause = r["caused_by"]
+            if cause:
+                key = (cid, str(cause), "caused_by")
+                if key not in seen:
+                    seen.add(key)
+                    edges.append({"src": key[0], "dst": key[1], "type": key[2], "weight": 1.0})
+            for target in parse_supersedes_ids(r["supersedes"]):
+                key = (cid, target, "supersedes")
+                if key not in seen:
+                    seen.add(key)
+                    edges.append({"src": key[0], "dst": key[1], "type": key[2], "weight": 1.0})
+
+        return {"nodes": nodes, "edges": edges}
 
     async def async_record_dissent(self, chunk_id: str) -> bool:
         """Increment a chunk's dissent counter via native async DB I/O."""
@@ -2041,6 +2295,7 @@ class AsyncPgvectorStore(BaseStore):
         feedback_weight: float = 0.15,
         propagation_factor: float = 0.5,
         dissent_weight: float = 0.2,
+        propagation_max_hops: int = 1,
     ) -> CalibrationReport:
         """Re-score base_trust on live chunks using async DB I/O. Full parity with calibrate()."""
         started = time.monotonic()
@@ -2165,6 +2420,23 @@ class AsyncPgvectorStore(BaseStore):
         # CAP-T3: initialize outcome tracking
         consumed_outcome_ids: list[str] = []
         if feedback_mode and feedback_rows:
+            # WI-G3: chunks without a caused_by scalar (e.g. edges added via
+            # the MCP edges arg only) still get an ancestor via a caused_by
+            # edge row, so multi-hop propagation can walk them.
+            missing_parent_ids = [row.chunk_id for row in feedback_rows if not row.caused_by]
+            if missing_parent_ids and propagation_factor > 0.0 and propagation_max_hops > 0:
+                fallback_edges = await self.async_get_chunk_edges(
+                    missing_parent_ids, edge_types=["caused_by"], direction="out"
+                )
+                fallback_parent = resolve_caused_by_fallback(fallback_edges)
+                if fallback_parent:
+                    feedback_rows = [
+                        dataclass_replace(row, caused_by=fallback_parent[row.chunk_id])
+                        if row.chunk_id in fallback_parent
+                        else row
+                        for row in feedback_rows
+                    ]
+
             outcome_evidence = None
             async with self._aconnect() as conn:
                 outcomes = await self._aload_unconsumed_outcomes(conn)
@@ -2180,10 +2452,12 @@ class AsyncPgvectorStore(BaseStore):
                 dissent_weight=dissent_weight,
                 usage_prior_weight=self.config.usage_prior_weight if self.config is not None else 1.0,
                 outcome_evidence=outcome_evidence,
+                propagation_max_hops=propagation_max_hops,
             )
             updates.extend(fb.updates)
             report.change_log.extend(fb.change_log)
             report.feedback_adjusted += fb.adjusted
+            report.outcome_propagated += fb.outcome_propagated
             report.skipped += fb.skipped
             consumed_feedback_ids = fb.consumed_chunk_ids
             async with self._aconnect() as conn:

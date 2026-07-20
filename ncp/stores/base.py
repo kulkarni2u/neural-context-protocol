@@ -10,6 +10,7 @@ import anyio
 
 from ncp.types import (
     CalibrationReport,
+    ChunkEdge,
     ConsolidationReport,
     ConsciousBlock,
     NCPResponse,
@@ -159,6 +160,95 @@ class BaseStore(ABC):
     async def async_record_outcome(self, outcome: OutcomeRecord) -> bool:
         """Asynchronously record a task outcome."""
         return await anyio.to_thread.run_sync(self.record_outcome, outcome)
+
+    # ------------------------------------------------------------------
+    # Graph engineering: typed chunk_edges substrate
+
+    def add_chunk_edges(self, edges: Sequence[ChunkEdge]) -> int:
+        """Upsert typed edges between chunks. Returns the number of edges written.
+
+        Idempotent on ``(src_chunk_id, dst_chunk_id, edge_type)``: re-adding
+        an existing edge updates its ``weight``/``created_at``/``created_by``
+        rather than duplicating it. Edges are a purely additive accelerator
+        over the legacy ``caused_by``/``supersedes`` scalar columns, so
+        backends that do not implement a typed edge graph return 0.
+        """
+        return 0
+
+    def get_chunk_edges(
+        self,
+        chunk_ids: Sequence[str],
+        *,
+        edge_types: Sequence[str] | None = None,
+        direction: str = "out",
+        limit: int = 200,
+    ) -> list[ChunkEdge]:
+        """Return typed edges touching ``chunk_ids``.
+
+        ``direction`` controls which endpoint must be in ``chunk_ids``:
+        ``"out"`` (default) matches edges whose ``src_chunk_id`` is in the
+        set, ``"in"`` matches ``dst_chunk_id``, ``"both"`` matches either.
+        ``edge_types`` optionally restricts to a subset of the closed edge
+        type set. Backends that do not implement this return an empty list,
+        which disables graph traversal gracefully.
+        """
+        return []
+
+    def graph_data(
+        self,
+        *,
+        pipeline_id: str | None = None,
+        limit: int = 500,
+        as_of: float | None = None,
+    ) -> dict[str, object]:
+        """Return structured node/edge data for graph export (``ncp graph``).
+
+        Returns a dict with ``nodes`` (chunks, scoped to ``pipeline_id`` when
+        given) and ``edges`` (typed ``chunk_edges`` rows plus legacy
+        ``caused_by``/``supersedes`` column links for chunks that predate the
+        edge table, deduplicated against real edge rows). Backends that do
+        not implement this return empty nodes/edges.
+
+        ``as_of`` (CAP-C5, epoch seconds): ``None`` (default) is the current
+        behavior -- no bi-temporal filtering. When given, nodes are filtered
+        to the same point-in-time visibility as the other ``as_of`` query
+        paths (see ``query``), and edges recorded after ``as_of`` are
+        excluded. Edges stay restricted to endpoints present in the node set.
+        """
+        return {"nodes": [], "edges": []}
+
+    async def async_add_chunk_edges(self, edges: Sequence[ChunkEdge]) -> int:
+        """Asynchronously upsert typed chunk edges using thread pool."""
+        return await anyio.to_thread.run_sync(partial(self.add_chunk_edges, edges))
+
+    async def async_get_chunk_edges(
+        self,
+        chunk_ids: Sequence[str],
+        *,
+        edge_types: Sequence[str] | None = None,
+        direction: str = "out",
+        limit: int = 200,
+    ) -> list[ChunkEdge]:
+        """Asynchronously fetch typed chunk edges using thread pool."""
+        fn = partial(
+            self.get_chunk_edges,
+            chunk_ids,
+            edge_types=edge_types,
+            direction=direction,
+            limit=limit,
+        )
+        return await anyio.to_thread.run_sync(fn)
+
+    async def async_graph_data(
+        self,
+        *,
+        pipeline_id: str | None = None,
+        limit: int = 500,
+        as_of: float | None = None,
+    ) -> dict[str, object]:
+        """Asynchronously build graph export data using thread pool."""
+        fn = partial(self.graph_data, pipeline_id=pipeline_id, limit=limit, as_of=as_of)
+        return await anyio.to_thread.run_sync(fn)
 
     # ------------------------------------------------------------------
     # CAP-C3: Memoization
@@ -403,6 +493,7 @@ class BaseStore(ABC):
         feedback_weight: float = 0.15,
         propagation_factor: float = 0.5,
         dissent_weight: float = 0.2,
+        propagation_max_hops: int = 1,
     ) -> CalibrationReport:
         """Re-score base_trust on existing chunks.
 
@@ -412,8 +503,9 @@ class BaseStore(ABC):
           recency_half_life_seconds, base_trust > 0.5, generation == 0). Chunks with
           src == "user_verified" are always protected.
         - Feedback: apply a net trust delta per chunk (retrieval boost minus dissent
-          penalty) and propagate a fraction (``propagation_factor``) of it one hop
-          along ``caused_by`` edges.
+          penalty) and propagate a fraction (``propagation_factor``) of it up to
+          ``propagation_max_hops`` hops along ``caused_by`` ancestry (default 1
+          hop, matching legacy behavior).
         """
 
     def query_precedents(

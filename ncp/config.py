@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 
 try:
     import tomllib
@@ -79,6 +79,11 @@ DEFAULT_CONFIG = {
         "generation_penalty_base": 0.9,
         "edge_expansion": True,
         "edge_expansion_decay": 0.7,
+        # Graph engineering (WI-G2/G3): bounded multi-hop traversal. Defaults
+        # reproduce the legacy 1-hop caused_by-only behavior exactly.
+        "edge_max_hops": 1,
+        "edge_expansion_types": ["caused_by"],
+        "propagation_max_hops": 1,
         "trust_propagation_factor": 0.5,
         "dissent_weight": 0.2,
         "diversity_lambda": 1.0,
@@ -144,6 +149,16 @@ DEFAULT_CONFIG = {
         # and the fastembed-backed [local-embeddings] extra; silently falls
         # back to lexical-only when the adapter is unavailable.
         "drift_use_embeddings": False,
+    },
+    "graph": {
+        # CAP-C7 (WI-P2): deterministic write-time edge inference. Default
+        # false (opt-in) -- disabled preserves exact legacy write() behavior,
+        # no similarity scan, no extra edges. No model calls; a SequenceMatcher
+        # ratio over recent same-pipeline chunk content decides `refines` edges.
+        "infer_edges": False,
+        "infer_similarity_threshold": 0.6,
+        "infer_scan_limit": 50,
+        "infer_max_edges": 3,
     },
     "providers": {
         "pricing": {
@@ -244,6 +259,31 @@ class NCPConfig:
     @property
     def edge_expansion_decay(self) -> float:
         return float(self.values.get("retrieval", {}).get("edge_expansion_decay", 0.7))
+
+    @property
+    def edge_max_hops(self) -> int:
+        """WI-G2: bound on BFS hops for edge expansion. 1 reproduces legacy behavior."""
+        return max(0, int(self.values.get("retrieval", {}).get("edge_max_hops", 1)))
+
+    @property
+    def edge_expansion_types(self) -> list[str]:
+        """WI-G2: edge types traversed during expansion, validated against the closed set."""
+        from ncp.types import ChunkEdgeType
+
+        valid_types = set(get_args(ChunkEdgeType))
+        raw = self.values.get("retrieval", {}).get("edge_expansion_types", ["caused_by"])
+        types = [str(item) for item in raw]
+        invalid = [t for t in types if t not in valid_types]
+        if invalid:
+            raise ValueError(
+                f"Invalid edge_expansion_types {invalid}; expected a subset of {sorted(valid_types)}"
+            )
+        return types
+
+    @property
+    def propagation_max_hops(self) -> int:
+        """WI-G3: bound on caused_by trust-propagation hops. 1 reproduces legacy behavior."""
+        return max(0, int(self.values.get("retrieval", {}).get("propagation_max_hops", 1)))
 
     @property
     def trust_propagation_factor(self) -> float:
@@ -419,6 +459,24 @@ class NCPConfig:
     def require_signatures(self) -> bool:
         return bool(self.values.get("identity", {}).get("require_signatures", False))
 
+    @property
+    def infer_edges(self) -> bool:
+        """CAP-C7/WI-P2: whether write() infers `refines` edges from recent content. Off by default."""
+        return bool(self.values.get("graph", {}).get("infer_edges", False))
+
+    @property
+    def infer_similarity_threshold(self) -> float:
+        return float(self.values.get("graph", {}).get("infer_similarity_threshold", 0.6))
+
+    @property
+    def infer_scan_limit(self) -> int:
+        return max(0, int(self.values.get("graph", {}).get("infer_scan_limit", 50)))
+
+    @property
+    def infer_max_edges(self) -> int:
+        return max(0, int(self.values.get("graph", {}).get("infer_max_edges", 3)))
+
+
 def load_config(
     path: str | Path | None = None,
     *,
@@ -504,6 +562,14 @@ def _apply_env_overrides(values: dict[str, Any], env: dict[str, str]) -> None:
     if "NCP_EDGE_EXPANSION" in env:
         val = env["NCP_EDGE_EXPANSION"].lower()
         values["retrieval"]["edge_expansion"] = val in {"true", "1", "yes"}
+    if "NCP_EDGE_MAX_HOPS" in env:
+        values["retrieval"]["edge_max_hops"] = int(env["NCP_EDGE_MAX_HOPS"])
+    if "NCP_EDGE_EXPANSION_TYPES" in env:
+        values["retrieval"]["edge_expansion_types"] = [
+            item.strip() for item in env["NCP_EDGE_EXPANSION_TYPES"].split(",") if item.strip()
+        ]
+    if "NCP_PROPAGATION_MAX_HOPS" in env:
+        values["retrieval"]["propagation_max_hops"] = int(env["NCP_PROPAGATION_MAX_HOPS"])
     if "NCP_TRUST_PROPAGATION_FACTOR" in env:
         values["retrieval"]["trust_propagation_factor"] = float(env["NCP_TRUST_PROPAGATION_FACTOR"])
     if "NCP_DISSENT_WEIGHT" in env:
@@ -543,6 +609,15 @@ def _apply_env_overrides(values: dict[str, Any], env: dict[str, str]) -> None:
     if "NCP_DRIFT_USE_EMBEDDINGS" in env:
         val = env["NCP_DRIFT_USE_EMBEDDINGS"].lower()
         values["drift"]["drift_use_embeddings"] = val in {"true", "1", "yes"}
+    if "NCP_INFER_EDGES" in env:
+        val = env["NCP_INFER_EDGES"].lower()
+        values["graph"]["infer_edges"] = val in {"true", "1", "yes"}
+    if "NCP_INFER_SIMILARITY_THRESHOLD" in env:
+        values["graph"]["infer_similarity_threshold"] = float(env["NCP_INFER_SIMILARITY_THRESHOLD"])
+    if "NCP_INFER_SCAN_LIMIT" in env:
+        values["graph"]["infer_scan_limit"] = int(env["NCP_INFER_SCAN_LIMIT"])
+    if "NCP_INFER_MAX_EDGES" in env:
+        values["graph"]["infer_max_edges"] = int(env["NCP_INFER_MAX_EDGES"])
 
 
 def _deep_merge(target: dict[str, Any], updates: dict[str, Any]) -> None:

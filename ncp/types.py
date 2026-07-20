@@ -31,6 +31,18 @@ WhisperType = Literal[
     "consolidation_ready",
     "sensor",
 ]
+# Graph engineering: closed set of typed relationships between chunks.
+# src <type> dst reads "src <type> dst" (e.g. src caused_by dst = dst is the
+# parent/cause of src). Legacy caused_by/supersedes scalar columns remain
+# authoritative; ChunkEdge rows are an additive, queryable mirror of them.
+ChunkEdgeType = Literal[
+    "caused_by",
+    "supersedes",
+    "supports",
+    "contradicts",
+    "refines",
+    "derived_from",
+]
 
 
 def _validate_no_spaces(value: str, field_name: str) -> str:
@@ -303,6 +315,52 @@ class SubconsciousChunk(NCPModel):
         return self
 
 
+class ChunkEdge(NCPModel):
+    """Typed, directed relationship between two chunks (graph engineering)."""
+
+    src_chunk_id: str
+    dst_chunk_id: str
+    edge_type: ChunkEdgeType
+
+    edge_id: str = Field(default_factory=lambda: f"edge_{uuid4().hex[:12]}")
+    weight: float = 1.0
+    created_at: float = Field(default_factory=time.time)
+    created_by: str | None = None
+
+    @field_validator("edge_id", "src_chunk_id", "dst_chunk_id")
+    @classmethod
+    def _edge_fields_no_spaces(cls, value: str, info: object) -> str:
+        field_name = getattr(info, "field_name", "field")
+        return _validate_no_spaces(value, field_name)
+
+    @field_validator("created_by")
+    @classmethod
+    def _optional_edge_no_spaces(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        return _validate_no_spaces(value, "created_by")
+
+    @field_validator("weight")
+    @classmethod
+    def _weight_non_negative(cls, value: float) -> float:
+        if value < 0.0:
+            raise ValueError("weight must be >= 0.0")
+        return value
+
+    @field_validator("created_at")
+    @classmethod
+    def _created_at_non_negative(cls, value: float) -> float:
+        if value < 0.0:
+            raise ValueError("created_at must be >= 0.0")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_no_self_loop(self) -> Self:
+        if self.src_chunk_id == self.dst_chunk_id:
+            raise ValueError("a chunk edge cannot point from a chunk to itself")
+        return self
+
+
 class HandoffPayload(NCPModel):
     """Structured payload for handoff/share/request whispers."""
 
@@ -564,6 +622,10 @@ class CalibrationReport:
     dry_run: bool = False
     pipeline_id: str | None = None
     change_log: list[dict] = field(default_factory=list)
+    # Chunks adjusted via outcome-driven multi-hop propagation (WI-P3,
+    # CAP-T3 extension) — a subset of feedback_adjusted, distinct from
+    # chunks adjusted directly by outcome/retrieval/dissent signal.
+    outcome_propagated: int = 0
 
 
 class OutcomeRecord(NCPModel):
