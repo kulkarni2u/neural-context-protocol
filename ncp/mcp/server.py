@@ -35,10 +35,11 @@ from ncp.types import (
     Whisper,
 )
 
+from ncp.version import __version__
+
 # Graph engineering: closed edge-type set, derived from ncp.types.ChunkEdgeType
 # so the MCP schema/validation can't drift from the pydantic model's Literal.
 _CHUNK_EDGE_TYPES = get_args(ChunkEdgeType)
-from ncp.version import __version__
 
 
 def _err(msg: str) -> None:

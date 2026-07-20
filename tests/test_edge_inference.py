@@ -24,7 +24,7 @@ from ncp.config import NCPConfig, load_config
 from ncp.mcp.server import _handle_request, make_handlers
 from ncp.stores.graph import infer_edges_for_chunk
 from ncp.stores.sqlite import SQLiteStore
-from ncp.types import ChunkEdge, SubconsciousChunk
+from ncp.types import SubconsciousChunk
 
 # Four variants share enough structure with BASE to clear the default 0.6
 # similarity threshold while staying under SQLiteStore._is_duplicate's 0.92
