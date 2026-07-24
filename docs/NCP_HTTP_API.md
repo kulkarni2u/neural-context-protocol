@@ -258,7 +258,9 @@ keepalives, but does not carry JSON-RPC responses.
 `http://127.0.0.1:4242/ui`) for inspecting what the bus remembers: a
 per-agent turn timeline with whisper traffic, a filterable memory-chunk
 browser with trust badges and tombstone/supersede state, a whisper inbox
-with TTL countdowns, and a stats view over store counts and cost telemetry.
+with TTL countdowns, an interactive memory graph over `caused_by`/
+`supersedes` and typed chunk edges, and a stats view over store counts and
+cost telemetry.
 It is plain HTML/CSS/JS served from the package — no build step, no external
 requests.
 

@@ -458,7 +458,8 @@ ncp demo        # run a self-contained demo pipeline
 `ncp serve` hosts a read-only memory visualization at
 `http://127.0.0.1:4242/ui`: a per-agent turn timeline with whisper traffic,
 a filterable chunk browser with trust badges, a whisper inbox with TTL
-countdowns, and store/cost stats. Plain HTML/CSS/JS served from the package
+countdowns, an interactive memory graph (`caused_by`/`supersedes` and typed
+chunk edges), and store/cost stats. Plain HTML/CSS/JS served from the package
 — no build step, no external requests. It reads the `/api/*` endpoints
 documented in [`docs/NCP_HTTP_API.md`](./docs/NCP_HTTP_API.md), which honor
 the same auth token as `/mcp`.
