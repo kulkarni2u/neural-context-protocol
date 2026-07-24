@@ -275,6 +275,53 @@ MCP_TOOLS: list[dict[str, object]] = [
         },
     },
     {
+        "name": "ncp_remember",
+        "description": (
+            "Semantic memory layer: compile content into deterministic atoms, write them to "
+            "the store with derived_from edges, and return the compilation result. No model call."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "content": {"type": "string", "description": "Raw text content to compile into semantic memory"},
+                "written_by": {"type": "string", "description": "Agent writing this memory"},
+                "pipeline_id": {"type": "string", "description": "Pipeline scope"},
+                "max_atoms": {"type": "integer", "description": "Max atom chunks to produce (default 8)"},
+            },
+            "required": ["content"],
+        },
+    },
+    {
+        "name": "ncp_recall",
+        "description": (
+            "Semantic memory layer: query the store for previously compiled semantic memory "
+            "atoms matching the given query. Returns the top-k chunks."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search query text"},
+                "k": {"type": "integer", "description": "Number of results (default 5, max 20)"},
+                "pipeline_id": {"type": "string", "description": "Pipeline scope"},
+                "mode": {"type": "string", "enum": ["auto", "hybrid", "graph"], "description": "Retrieval mode (default auto)"},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "ncp_improve",
+        "description": (
+            "Semantic memory layer: consolidate memory by merging redundant atoms and "
+            "cleaning up tombstones. Returns consolidation report."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pipeline_id": {"type": "string", "description": "Pipeline scope"},
+            },
+        },
+    },
+    {
         "name": "ncp_fetch",
         "description": "Retrieve additional chunks from the store mid-turn. Max 3 calls per turn.",
         "inputSchema": {
@@ -1280,6 +1327,66 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         )
         return {"recorded": recorded, "signature": sig}
 
+    def _handle_remember(args: dict[str, object]) -> object:
+        from ncp.memory import remember
+
+        content = str(args["content"])
+        written_by = str(args.get("written_by", "agent"))
+        pipeline_id = args.get("pipeline_id")
+        if pipeline_id is not None:
+            pipeline_id = str(pipeline_id)
+        try:
+            max_atoms = min(50, max(1, int(args.get("max_atoms", 8))))
+        except (TypeError, ValueError):
+            max_atoms = 8
+        result = remember(
+            content,
+            store=store,
+            config=config,
+            pipeline_id=pipeline_id,
+            written_by=written_by,
+            max_atoms=max_atoms,
+        )
+        return {
+            "remembered": True,
+            "source_chunk_id": result.source_chunk.chunk_id,
+            "atom_chunk_ids": [atom.chunk_id for atom in result.atoms],
+            "atom_count": len(result.atoms),
+            "edge_count": len(result.edges),
+            "filtered": result.filtered,
+            "reduction_ratio": round(result.reduction_ratio, 3) if result.filtered else None,
+        }
+
+    def _handle_recall(args: dict[str, object]) -> object:
+        from ncp.memory import recall
+
+        query = str(args["query"])
+        pipeline_id = args.get("pipeline_id")
+        if pipeline_id is not None:
+            pipeline_id = str(pipeline_id)
+        try:
+            k = min(20, max(1, int(args.get("k", 5))))
+        except (TypeError, ValueError):
+            k = 5
+        mode = str(args.get("mode", "auto"))
+        hits = recall(query, store=store, config=config, pipeline_id=pipeline_id, k=k, mode=mode)
+        lines = [f"ncp_recall:results k:{len(hits)}"]
+        for chunk in hits:
+            lines.append(
+                f"chunk:{chunk.chunk_id} layer:{chunk.layer} "
+                f"score:{chunk.relevance:.1f} src:{chunk.src} trust:{chunk.base_trust:.1f}"
+            )
+            lines.append(f"  {chunk.content}")
+        return {"result": "\n".join(lines)}
+
+    def _handle_improve(args: dict[str, object]) -> object:
+        from ncp.memory import improve
+
+        pipeline_id = args.get("pipeline_id")
+        if pipeline_id is not None:
+            pipeline_id = str(pipeline_id)
+        return improve(store=store, config=config, pipeline_id=pipeline_id)
+
     # Expose the in-memory fetch-session table for observability/testing of the
     # LRU+TTL pruning without widening the returned handler mapping.
     _handle_get_context.fetch_sessions = sessions  # type: ignore[attr-defined]
@@ -1294,6 +1401,9 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         "ncp_record_outcome": _handle_record_outcome,
         "ncp_lookup_memo": _handle_lookup_memo,
         "ncp_record_memo": _handle_record_memo,
+        "ncp_remember": _handle_remember,
+        "ncp_recall": _handle_recall,
+        "ncp_improve": _handle_improve,
     }
 
 

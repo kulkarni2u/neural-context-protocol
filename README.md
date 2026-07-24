@@ -361,11 +361,17 @@ ncp_get_context      — read bounded context for this turn (subscribe)
 ncp_write_memory     — publish durable memory; filters ingestion noise and keeps a reversible raw_ref
 ncp_emit_whisper     — send a bounded, directed signal to another agent
 ncp_post_turn        — persist the turn result and acknowledge consumed whispers
+ncp_remember         — compile raw content into deterministic semantic memory atoms
+ncp_recall           — query compiled semantic memory atoms
+ncp_improve          — consolidate and improve stored memory
 ncp_fetch            — pull additional bounded context mid-turn
 ncp_record_decision  — capture a structured decision trace for precedent queries
+ncp_record_outcome   — attach outcome feedback to chunks or turns
+ncp_lookup_memo      — check for reusable completed work by signature
+ncp_record_memo      — store reusable completed work by signature
 ```
 
-These six calls are the agent-to-agent protocol: read context, publish memory, signal peers, record outcomes.
+The core agent-to-agent protocol is still: read context, publish memory, signal peers, and record outcomes. The memory facade (`ncp_remember` / `ncp_recall` / `ncp_improve`) is an ergonomic layer over the same trust-aware chunks and graph edges.
 
 **Streaming.** `ncp_get_context` accepts `stream: true` and delivers the context blocks progressively — as NDJSON or SSE over HTTP, or as `ncp/stream_chunk` JSON-RPC notifications over stdio — so a host can start consuming context before assembly finishes. The runtime also serves `/healthz`, an `/sse` discovery endpoint, and `/message`, and supports CORS (`--cors-origin`) and MCP protocol-version negotiation across spec versions. A stdio transport is available via `ncp serve-stdio` for hosts that prefer it over HTTP.
 
@@ -506,6 +512,38 @@ ncp migrate check    --cwd /path/to/project   # report pending migrations
 ncp migrate apply    --cwd /path/to/project   # apply pending migrations
 ncp migrate rollback --cwd /path/to/project   # roll back the last migration
 ```
+
+-----
+
+## Semantic memory layer
+
+A deterministic compiler that ingests raw text, splits it into semantic atoms, and persists them as `SubconsciousChunk` graph nodes connected by `derived_from` edges. No model calls — compilation is pure Python.
+
+```python
+from ncp import compile_memory, remember, recall, improve
+
+# Compile only (no persistence)
+result = compile_memory("Alice likes fast feedback. Bob owns release verification.")
+print(result.source_chunk.chunk_id, len(result.atoms))  # chunks, 2
+
+# Compile + persist
+remember("Trial users need ACH retry guards.", pipeline_id="pipe_demo")
+
+# Query persisted memory
+hits = recall("ACH retry guards", pipeline_id="pipe_demo")
+
+# Consolidate redundant atoms
+improve(pipeline_id="pipe_demo")
+```
+
+**CLI:**
+```bash
+echo "Alice values fast feedback loops." | ncp memory remember --stdin --pipeline-id pipe_demo
+ncp memory recall "fast feedback" --pipeline-id pipe_demo
+ncp memory improve --pipeline-id pipe_demo
+```
+
+**MCP tools:** `ncp_remember`, `ncp_recall`, `ncp_improve` registered automatically when the server starts.
 
 -----
 

@@ -1235,6 +1235,116 @@ def handoff_opencode_command(
     console.print(response)
 
 
+@main.group("memory")
+def memory_group() -> None:
+    """Semantic memory layer: compile, recall, and consolidate."""
+
+
+@memory_group.command("remember")
+@click.argument("content", required=False)
+@click.option("--cwd", type=click.Path(path_type=Path), default=Path.cwd)
+@click.option("--pipeline-id", default=None, help="Pipeline scope")
+@click.option("--written-by", default="cli", help="Agent writing this memory")
+@click.option("--max-atoms", default=8, show_default=True, type=int, help="Max atom chunks")
+@click.option("--stdin", "stdin_flag", is_flag=True, help="Read content from stdin")
+def memory_remember_command(
+    content: str | None,
+    cwd: Path,
+    pipeline_id: str | None,
+    written_by: str,
+    max_atoms: int,
+    stdin_flag: bool,
+) -> None:
+    """Compile content into semantic memory atoms and persist them."""
+    if stdin_flag:
+        content = sys.stdin.read().strip()
+    if not content:
+        raise click.UsageError("Content required via argument or --stdin")
+
+    from ncp.memory import remember as remember_fn
+
+    config = ncp.configure(cwd=cwd)
+    result = remember_fn(
+        content,
+        config=config,
+        pipeline_id=pipeline_id,
+        written_by=written_by,
+        max_atoms=max_atoms,
+    )
+    table = Table(title="Memory Remember", box=box.SIMPLE_HEAVY)
+    table.add_column("Metric")
+    table.add_column("Value", justify="right")
+    table.add_row("Source chunk", result.source_chunk.chunk_id)
+    table.add_row("Atoms", str(len(result.atoms)))
+    table.add_row("Edges", str(len(result.edges)))
+    table.add_row("Filtered", str(result.filtered))
+    if result.filtered:
+        table.add_row("Reduction ratio", f"{result.reduction_ratio:.3f}")
+    console.print(table)
+
+
+@memory_group.command("recall")
+@click.argument("query", required=True)
+@click.option("--cwd", type=click.Path(path_type=Path), default=Path.cwd)
+@click.option("--pipeline-id", default=None, help="Pipeline scope")
+@click.option("--k", default=5, show_default=True, type=int, help="Number of results")
+@click.option("--mode", default="auto", show_default=True, type=click.Choice(["auto", "hybrid", "graph"]))
+@click.option("--json-output", is_flag=True, help="Emit machine-readable JSON")
+def memory_recall_command(
+    query: str,
+    cwd: Path,
+    pipeline_id: str | None,
+    k: int,
+    mode: str,
+    json_output: bool,
+) -> None:
+    """Query compiled semantic memory."""
+    from ncp.memory import recall as recall_fn
+
+    config = ncp.configure(cwd=cwd)
+    hits = recall_fn(query, config=config, pipeline_id=pipeline_id, k=k, mode=mode)
+    if json_output:
+        console.print_json(data={
+            "query": query,
+            "count": len(hits),
+            "results": [
+                {"chunk_id": c.chunk_id, "layer": c.layer, "trust": round(c.base_trust, 3), "content": c.content}
+                for c in hits
+            ],
+        })
+        return
+
+    if not hits:
+        console.print("[dim]No matching memory found.[/dim]")
+        return
+
+    table = Table(title="Memory Recall", box=box.SIMPLE_HEAVY)
+    table.add_column("Chunk ID")
+    table.add_column("Layer")
+    table.add_column("Trust", justify="right")
+    table.add_column("Content")
+    for hit in hits:
+        table.add_row(hit.chunk_id[:16], hit.layer, f"{hit.base_trust:.3f}", hit.content[:80])
+    console.print(table)
+
+
+@memory_group.command("improve")
+@click.option("--cwd", type=click.Path(path_type=Path), default=Path.cwd)
+@click.option("--pipeline-id", default=None, help="Pipeline scope")
+def memory_improve_command(
+    cwd: Path,
+    pipeline_id: str | None,
+) -> None:
+    """Consolidate memory: merge redundant atoms, clean up tombstones."""
+    from ncp.memory import improve as improve_fn
+
+    config = ncp.configure(cwd=cwd)
+    result = improve_fn(config=config, pipeline_id=pipeline_id)
+    console.print(f"[green]Improved memory: {result['consolidated_groups']} group(s) consolidated.[/green]")
+    if result.get("error"):
+        console.print(f"[red]Error: {result['error']}[/red]")
+
+
 @main.command("emit")
 @click.option("--from-agent", "from_agent", required=True)
 @click.option("--to", "target", required=True)
