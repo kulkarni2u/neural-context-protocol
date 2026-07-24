@@ -437,3 +437,62 @@ class TestUiStaticServing:
                 resp2.read()
             finally:
                 conn2.close()
+
+    def test_ui_absolute_path_request_is_404(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An absolute path must not escape the static root.
+
+        ``Path("/root") / "/etc/x.css"`` yields ``/etc/x.css`` under pathlib
+        join semantics, so this is the traversal case a naive join misses.
+        """
+        static_root = tmp_path / "static"
+        static_root.mkdir()
+        (static_root / "index.html").write_text("<html></html>")
+        outside = tmp_path / "outside.css"
+        outside.write_text("body { color: leaked; }")
+        import ncp.mcp.server as server_mod
+        monkeypatch.setattr(server_mod, "_ui_static_root", lambda: static_root)
+
+        with _RunningServer(tmp_path) as running:
+            conn = http.client.HTTPConnection("127.0.0.1", running.port, timeout=5)
+            try:
+                conn.request("GET", "/ui/" + str(outside))
+                resp = conn.getresponse()
+                body = resp.read()
+                assert resp.status == 404
+                assert b"leaked" not in body
+            finally:
+                conn.close()
+
+    def test_ui_serves_only_flat_top_level_files(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The asset directory is flat: nested paths are never served."""
+        static_root = tmp_path / "static"
+        static_root.mkdir()
+        (static_root / "index.html").write_text("<html></html>")
+        nested = static_root / "sub"
+        nested.mkdir()
+        (nested / "deep.css") .write_text("body { color: red; }")
+        import ncp.mcp.server as server_mod
+        monkeypatch.setattr(server_mod, "_ui_static_root", lambda: static_root)
+
+        with _RunningServer(tmp_path) as running:
+            with running.client() as client:
+                assert client.get("/ui/sub/deep.css").status_code == 404
+                # A directory whose name looks like an asset is not a file.
+                assert client.get("/ui/sub").status_code == 404
+
+
+class TestCorsOriginEcho:
+    def test_allowed_origin_header_matches_configured_value(self, tmp_path: Path) -> None:
+        """The emitted CORS header comes from config, not from the request."""
+        configured = "https://allowed.example"
+        with _RunningServer(tmp_path, cors_allowed_origins=[configured]) as running:
+            with running.client() as client:
+                allowed = client.get("/healthz", headers={"Origin": configured})
+                assert allowed.headers.get("access-control-allow-origin") == configured
+
+                denied = client.get("/healthz", headers={"Origin": "https://evil.example"})
+                assert "access-control-allow-origin" not in denied.headers

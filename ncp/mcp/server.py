@@ -13,7 +13,7 @@ import time
 import traceback
 import urllib.parse
 from collections.abc import Callable
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import BinaryIO, get_args
 
 from ncp.adaptive_budget import AdaptiveBudgetResult, compute_adaptive_budget
@@ -1909,8 +1909,12 @@ class _MCPHTTPHandler(BaseHTTPRequestHandler):
         allowed = self.server.cors_allowed_origins
         if "*" in allowed:
             return "*"
-        if origin in allowed:
-            return origin
+        # Return the configured entry rather than echoing the request header
+        # back: the emitted header value can then only ever be an
+        # operator-configured string, so no request data reaches the response.
+        for configured in allowed:
+            if configured == origin:
+                return configured
         return None
 
     def _send_cors_headers(self) -> None:
@@ -2056,31 +2060,35 @@ class _MCPHTTPHandler(BaseHTTPRequestHandler):
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
     def _serve_ui_asset(self, rel_path: str) -> None:
-        """Serve a static file from ``_ui_static_root()`` for ``/ui`` and ``/ui/<asset>``.
+        """Serve a static file from ``_ui_static_root()`` for ``/ui/`` and ``/ui/<asset>``.
 
-        No auth required (static shell only, no data). Only a fixed set of
-        extensions are servable; the resolved path must stay inside the
-        static root or the request is treated as not found (path traversal).
+        No auth required (static shell only, no data). The request never
+        contributes to the path that is opened: it is reduced to a bare
+        filename (dropping any directory component, and with it any traversal
+        sequence), then matched by name against the actual entries of the
+        static root. The path finally read therefore always originates from
+        the directory listing, never from request data. Only a fixed set of
+        extensions is servable.
         """
-        rel_path = urllib.parse.unquote(rel_path) or "index.html"
-        ext = Path(rel_path).suffix
-        if ext not in _UI_CONTENT_TYPES:
+        requested = PurePosixPath(urllib.parse.unquote(rel_path) or "index.html").name
+        ext = PurePosixPath(requested).suffix
+        if not requested or ext not in _UI_CONTENT_TYPES:
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
             return
 
-        root = _ui_static_root()
+        target: Path | None = None
         try:
-            root_resolved = root.resolve()
-            candidate = (root / rel_path).resolve()
-            candidate.relative_to(root_resolved)
-        except (OSError, ValueError):
-            self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
-            return
-        if not candidate.is_file():
+            for entry in _ui_static_root().iterdir():
+                if entry.name == requested and entry.is_file():
+                    target = entry
+                    break
+        except OSError:
+            target = None
+        if target is None:
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
             return
 
-        body = candidate.read_bytes()
+        body = target.read_bytes()
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", _UI_CONTENT_TYPES[ext])
         self.send_header("Content-Length", str(len(body)))
