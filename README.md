@@ -453,6 +453,16 @@ ncp emit        # emit a whisper from the CLI
 ncp demo        # run a self-contained demo pipeline
 ```
 
+### Web UI
+
+`ncp serve` hosts a read-only memory visualization at
+`http://127.0.0.1:4242/ui`: a per-agent turn timeline with whisper traffic,
+a filterable chunk browser with trust badges, a whisper inbox with TTL
+countdowns, and store/cost stats. Plain HTML/CSS/JS served from the package
+— no build step, no external requests. It reads the `/api/*` endpoints
+documented in [`docs/NCP_HTTP_API.md`](./docs/NCP_HTTP_API.md), which honor
+the same auth token as `/mcp`.
+
 `ncp calibrate --feedback` runs the self-improvement pass: it boosts chunks that
 keep getting retrieved, penalizes chunks that drew dissent, and propagates the
 net trust change one hop along `caused_by` edges so a cause is credited or
