@@ -1069,3 +1069,53 @@ def test_cli_dogfood_attempts_require_continuation_adapter(tmp_path: Path) -> No
 
     assert result.exit_code != 0
     assert "--attempts requires --continuation-adapter" in result.output
+
+
+def test_cli_memory_remember_recall_improve(tmp_path: Path) -> None:
+    runner = CliRunner()
+    runner.invoke(main, ["init", "--cwd", str(tmp_path)])
+
+    remember_result = runner.invoke(
+        main,
+        [
+            "memory",
+            "remember",
+            "ACH retries need guards.",
+            "--cwd",
+            str(tmp_path),
+            "--pipeline-id",
+            "pipe_memory",
+        ],
+    )
+    assert remember_result.exit_code == 0
+    assert "Memory Remember" in remember_result.output
+    assert "Atoms" in remember_result.output
+
+    recall_result = runner.invoke(
+        main,
+        [
+            "memory",
+            "recall",
+            "ACH guards",
+            "--cwd",
+            str(tmp_path),
+            "--pipeline-id",
+            "pipe_memory",
+        ],
+    )
+    assert recall_result.exit_code == 0
+    assert "ACH retries need guards." in recall_result.output
+
+    improve_result = runner.invoke(
+        main,
+        [
+            "memory",
+            "improve",
+            "--cwd",
+            str(tmp_path),
+            "--pipeline-id",
+            "pipe_memory",
+        ],
+    )
+    assert improve_result.exit_code == 0
+    assert "Improved memory" in improve_result.output

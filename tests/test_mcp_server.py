@@ -192,7 +192,20 @@ class TestToolsList:
         resp = _handle_request(_req("tools/list"), {})
         result = _result(resp)
         names = [t["name"] for t in result["tools"]]
-        assert names == ["ncp_get_context", "ncp_write_memory", "ncp_emit_whisper", "ncp_post_turn", "ncp_fetch", "ncp_record_decision", "ncp_record_outcome", "ncp_lookup_memo", "ncp_record_memo"]
+        assert names == [
+            "ncp_get_context",
+            "ncp_write_memory",
+            "ncp_emit_whisper",
+            "ncp_post_turn",
+            "ncp_remember",
+            "ncp_recall",
+            "ncp_improve",
+            "ncp_fetch",
+            "ncp_record_decision",
+            "ncp_record_outcome",
+            "ncp_lookup_memo",
+            "ncp_record_memo",
+        ]
 
     def test_tool_names_match_constants(self) -> None:
         resp = _handle_request(_req("tools/list"), {})
@@ -211,6 +224,44 @@ class TestToolsList:
         assert "ttl_seconds" in properties
         assert "share/request" in properties["payload"]["description"]
         assert "dissent" in properties["payload"]["description"]
+
+
+class TestMemoryTools:
+    def test_remember_recall_improve_round_trip(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "test.db")
+        handlers = make_handlers(store)
+
+        remembered = _content(_handle_request(
+            _call("ncp_remember", {
+                "content": "ACH trial retries need a null guard. Release checks run preflight.",
+                "pipeline_id": "pipe_memory",
+                "written_by": "tester",
+            }),
+            handlers,
+        ))
+
+        assert remembered["remembered"] is True
+        assert len(remembered["atom_chunk_ids"]) == 2
+        assert remembered["edge_count"] == 2
+
+        recalled = _content(_handle_request(
+            _call("ncp_recall", {
+                "query": "ACH null guard",
+                "pipeline_id": "pipe_memory",
+            }),
+            handlers,
+        ))
+
+        assert recalled["result"].startswith("ncp_recall:results")
+        assert "ACH trial retries need a null guard." in recalled["result"]
+
+        improved = _content(_handle_request(
+            _call("ncp_improve", {"pipeline_id": "pipe_memory"}),
+            handlers,
+        ))
+
+        assert improved["improved"] is True
+        assert improved["consolidated_groups"] >= 0
 
 
 class TestGetContext:
