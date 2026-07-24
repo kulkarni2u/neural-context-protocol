@@ -252,6 +252,38 @@ There is no `Mcp-Session-Id` header: each `POST /mcp` is self-contained. The
 `GET /sse` endpoint is discovery-only — it advertises the RPC path and emits
 keepalives, but does not carry JSON-RPC responses.
 
+## Memory visualization UI
+
+`ncp serve` also hosts a read-only web UI at `/ui` (e.g.
+`http://127.0.0.1:4242/ui`) for inspecting what the bus remembers: a
+per-agent turn timeline with whisper traffic, a filterable memory-chunk
+browser with trust badges and tombstone/supersede state, a whisper inbox
+with TTL countdowns, an interactive memory graph over `caused_by`/
+`supersedes` and typed chunk edges, and a stats view over store counts and
+cost telemetry.
+It is plain HTML/CSS/JS served from the package — no build step, no external
+requests.
+
+The UI polls a set of read-only JSON endpoints. These are plain `GET`
+endpoints (not MCP tools — they do not appear in `tools/list`) and require
+the same bearer token as `/mcp` when one is configured; the static `/ui`
+shell itself is served without auth and prompts for the token in-browser.
+
+| Endpoint        | Query params                                              | Backed by              |
+|-----------------|-----------------------------------------------------------|------------------------|
+| `/api/status`   | `pipeline_id`                                             | `status_detail()` + memo stats |
+| `/api/chunks`   | `pipeline_id`, `layer`, `zone`, `src`, `written_by`, `limit` (≤200), `offset` | chunk listing |
+| `/api/turns`    | `pipeline_id`, `limit` (≤200)                             | `recent_turns()`       |
+| `/api/whispers` | `pipeline_id`, `target`, `include_expired`, `limit`       | whisper listing        |
+| `/api/graph`    | `pipeline_id`, `limit`                                    | `graph_data()`         |
+| `/api/cost`     | `pipeline_id`, `limit`                                    | `cost_summary()`       |
+
+Responses are plain JSON objects (no JSON-RPC envelope, no
+`result.content[0].text` unwrapping). Chunk listings include tombstoned and
+superseded rows flagged as such rather than hiding them, matching the
+store's bi-temporal honesty model. All endpoints are read-only: the UI
+cannot write memory, emit whispers, or mutate trust.
+
 ## Errors
 
 | Condition              | Response                                          |

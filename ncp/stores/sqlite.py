@@ -1396,6 +1396,26 @@ class SQLiteStore(BaseStore):
         records.reverse()
         return records
 
+    def list_turns(self, *, pipeline_id: str | None = None, limit: int = 50) -> list[TurnRecord]:
+        """See ``BaseStore.list_turns``: ``pipeline_id=None`` means all pipelines."""
+        capped_limit = max(0, int(limit))
+        if capped_limit == 0:
+            return []
+        with self._connect() as connection:
+            if pipeline_id is None:
+                rows = connection.execute(
+                    "SELECT * FROM turn_records ORDER BY created_at DESC LIMIT ?",
+                    (capped_limit,),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT * FROM turn_records WHERE pipeline_id = ? ORDER BY created_at DESC LIMIT ?",
+                    (pipeline_id, capped_limit),
+                ).fetchall()
+        records = [TurnRecord(**dict(row)) for row in rows]
+        records.reverse()
+        return records
+
     def log_conscious(self, conscious: ConsciousBlock, *, snapshot_hash: str) -> None:
         with self._connect() as connection:
             connection.execute(
@@ -2290,6 +2310,135 @@ class SQLiteStore(BaseStore):
                 for row in recent_rows
             ],
         }
+
+    def list_chunks(
+        self,
+        *,
+        pipeline_id: str | None = None,
+        layer: str | None = None,
+        zone: str | None = None,
+        src: str | None = None,
+        written_by: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> dict[str, object]:
+        """Return ``{"chunks": [...], "total": N}`` for UI inspection (embedding bytes excluded)."""
+        clauses: list[str] = []
+        params: list[object] = []
+        if pipeline_id is not None:
+            clauses.append("pipeline_id = ?")
+            params.append(pipeline_id)
+        if layer is not None:
+            clauses.append("layer = ?")
+            params.append(layer)
+        if zone is not None:
+            clauses.append("zone = ?")
+            params.append(zone)
+        if src is not None:
+            clauses.append("src = ?")
+            params.append(src)
+        if written_by is not None:
+            clauses.append("written_by = ?")
+            params.append(written_by)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+
+        with self._connect() as connection:
+            total = int(
+                connection.execute(
+                    f"SELECT COUNT(*) AS count FROM chunks {where}", params
+                ).fetchone()["count"]
+            )
+            rows = connection.execute(
+                f"""
+                SELECT
+                    c.chunk_id, c.pipeline_id, c.scope, c.zone, c.layer, c.chunk_type,
+                    c.content, c.src, c.written_by, c.caused_by, c.supersedes,
+                    c.superseded_by, c.version, c.base_trust, c.created_at,
+                    t.chunk_id AS tombstone_chunk_id
+                FROM chunks c
+                LEFT JOIN tombstones t ON t.chunk_id = c.chunk_id
+                {where}
+                ORDER BY c.created_at DESC
+                LIMIT ? OFFSET ?
+                """,
+                [*params, max(1, min(200, int(limit))), max(0, int(offset))],
+            ).fetchall()
+
+        chunks = [
+            {
+                "chunk_id": str(row["chunk_id"]),
+                "pipeline_id": row["pipeline_id"],
+                "scope": str(row["scope"]),
+                "zone": str(row["zone"]),
+                "layer": str(row["layer"]),
+                "chunk_type": str(row["chunk_type"]),
+                "content": str(row["content"]),
+                "src": str(row["src"]),
+                "written_by": str(row["written_by"]),
+                "caused_by": row["caused_by"],
+                "supersedes": row["supersedes"],
+                "superseded_by": row["superseded_by"],
+                "version": int(row["version"]),
+                "base_trust": float(row["base_trust"]),
+                "created_at": float(row["created_at"]),
+                "tombstoned": row["tombstone_chunk_id"] is not None,
+            }
+            for row in rows
+        ]
+        return {"chunks": chunks, "total": total}
+
+    def list_whispers(
+        self,
+        *,
+        pipeline_id: str | None = None,
+        target: str | None = None,
+        include_expired: bool = False,
+        limit: int = 100,
+    ) -> list[dict]:
+        """Return whisper rows for UI inspection, newest first."""
+        clauses: list[str] = []
+        params: list[object] = []
+        if pipeline_id is not None:
+            clauses.append("pipeline_id = ?")
+            params.append(pipeline_id)
+        if target is not None:
+            clauses.append("target = ?")
+            params.append(target)
+        now = time.time()
+        if not include_expired:
+            clauses.append("expires_at > ?")
+            params.append(now)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT whisper_id, pipeline_id, from_agent, target, whisper_type,
+                       payload, confidence, ref, created_at, expires_at
+                FROM whispers
+                {where}
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                [*params, max(1, min(200, int(limit)))],
+            ).fetchall()
+
+        return [
+            {
+                "whisper_id": str(row["whisper_id"]),
+                "pipeline_id": row["pipeline_id"],
+                "from_agent": str(row["from_agent"]),
+                "target": str(row["target"]),
+                "whisper_type": str(row["whisper_type"]),
+                "payload": str(row["payload"]),
+                "confidence": float(row["confidence"]),
+                "ref": row["ref"],
+                "created_at": float(row["created_at"]),
+                "expires_at": float(row["expires_at"]),
+                "expired": float(row["expires_at"]) <= now,
+            }
+            for row in rows
+        ]
 
     def query_precedents(
         self,

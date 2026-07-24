@@ -525,6 +525,46 @@ class BaseStore(ABC):
         """
         raise NotImplementedError("query_precedents not implemented for this backend")
 
+    def list_chunks(
+        self,
+        *,
+        pipeline_id: str | None = None,
+        layer: str | None = None,
+        zone: str | None = None,
+        src: str | None = None,
+        written_by: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> dict[str, object]:
+        """Return ``{"chunks": [dict, ...], "total": int}`` for UI inspection.
+
+        Backends that do not implement this return an empty page.
+        """
+        return {"chunks": [], "total": 0}
+
+    def list_whispers(
+        self,
+        *,
+        pipeline_id: str | None = None,
+        target: str | None = None,
+        include_expired: bool = False,
+        limit: int = 100,
+    ) -> list[dict]:
+        """Return whisper rows for UI inspection, newest first.
+
+        Backends that do not implement this return an empty list.
+        """
+        return []
+
+    def list_turns(self, *, pipeline_id: str | None = None, limit: int = 50) -> list[TurnRecord]:
+        """Return recent turn records for UI inspection, oldest-first.
+
+        Unlike ``recent_turns`` (where ``pipeline_id=None`` means turns
+        recorded without a pipeline), ``None`` here means all pipelines.
+        Backends that do not implement this return an empty list.
+        """
+        return []
+
     def trust_drift_data(
         self,
         *,

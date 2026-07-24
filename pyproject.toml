@@ -92,6 +92,7 @@ ncp = [
   "templates/provider_hooks/opencode/*",
   "templates/provider_hooks/opencode/plugins/*",
   "migrations/*.sql",
+  "ui/static/*",
 ]
 
 [tool.pytest.ini_options]

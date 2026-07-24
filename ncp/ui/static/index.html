@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NCP Memory</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='7' fill='%232c6fd6'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app">
+
+  <header id="app-header">
+    <div class="header-row">
+      <h1>NCP Memory</h1>
+
+      <label class="field">
+        <span class="field-label">Pipeline</span>
+        <select id="pipeline-select">
+          <option value="">All pipelines</option>
+        </select>
+      </label>
+
+      <div class="header-spacer"></div>
+
+      <button id="token-btn" type="button" class="btn-ghost" title="Set API token">Token</button>
+      <button id="refresh-toggle" type="button" class="btn-ghost" aria-pressed="false">Pause</button>
+      <span id="last-updated" class="muted">never updated</span>
+    </div>
+    <div id="error-banner" class="error-banner" hidden>
+      <span id="error-banner-text"></span>
+      <button id="error-banner-close" type="button" class="btn-ghost">&times;</button>
+    </div>
+  </header>
+
+  <nav id="tabs" class="tabs">
+    <button type="button" class="tab-btn active" data-tab="timeline">Timeline</button>
+    <button type="button" class="tab-btn" data-tab="memory">Memory</button>
+    <button type="button" class="tab-btn" data-tab="whispers">Whispers</button>
+    <button type="button" class="tab-btn" data-tab="graph">Graph</button>
+    <button type="button" class="tab-btn" data-tab="stats">Stats</button>
+  </nav>
+
+  <main id="views">
+
+    <section id="view-timeline" class="view">
+      <div id="timeline-legend" class="legend"></div>
+      <div id="timeline-grid" class="timeline-grid"></div>
+      <div id="timeline-empty" class="empty-state" hidden>No turns yet &mdash; agents write turns via <code>ncp_post_turn</code>.</div>
+    </section>
+
+    <section id="view-memory" class="view" hidden>
+      <div class="toolbar">
+        <input type="search" id="memory-search" placeholder="Search content&hellip;" class="search-input">
+        <select id="memory-filter-layer"><option value="">Layer: all</option></select>
+        <select id="memory-filter-zone"><option value="">Zone: all</option></select>
+        <select id="memory-filter-src"><option value="">Src: all</option></select>
+        <select id="memory-filter-written-by"><option value="">Written by: all</option></select>
+      </div>
+      <div class="table-wrap">
+        <table id="memory-table">
+          <thead>
+            <tr>
+              <th>Time</th><th>Layer</th><th>Zone</th><th>Src</th><th>Written by</th><th>Trust</th><th>Content</th>
+            </tr>
+          </thead>
+          <tbody id="memory-tbody"></tbody>
+        </table>
+      </div>
+      <div id="memory-empty" class="empty-state" hidden>No memory chunks yet &mdash; agents write chunks via <code>ncp_write_memory</code>.</div>
+      <div class="pager">
+        <button id="memory-prev" type="button" class="btn-ghost">&laquo; Prev</button>
+        <span id="memory-pager-label" class="muted"></span>
+        <button id="memory-next" type="button" class="btn-ghost">Next &raquo;</button>
+      </div>
+    </section>
+
+    <section id="view-whispers" class="view" hidden>
+      <div class="toolbar">
+        <label class="checkbox-field">
+          <input type="checkbox" id="whisper-include-expired">
+          Include expired
+        </label>
+      </div>
+      <div class="table-wrap">
+        <table id="whispers-table">
+          <thead>
+            <tr>
+              <th>Time</th><th>From &rarr; Target</th><th>Type</th><th>Confidence</th><th>Payload</th><th>Status</th>
+            </tr>
+          </thead>
+          <tbody id="whispers-tbody"></tbody>
+        </table>
+      </div>
+      <div id="whispers-empty" class="empty-state" hidden>No whispers yet &mdash; agents send whispers via <code>ncp_emit_whisper</code>.</div>
+    </section>
+
+    <section id="view-graph" class="view" hidden>
+      <div class="toolbar graph-toolbar">
+        <div id="graph-legend" class="legend"></div>
+        <div class="header-spacer"></div>
+        <button id="graph-reset-view" type="button" class="btn-ghost">Reset view</button>
+      </div>
+      <div class="graph-layout">
+        <div class="graph-svg-wrap">
+          <svg id="graph-svg" class="graph-svg" viewBox="0 0 1000 700" preserveAspectRatio="xMidYMid meet"></svg>
+        </div>
+        <div id="graph-detail" class="graph-detail">
+          <div class="muted graph-detail-empty">Click a node to see details.</div>
+        </div>
+      </div>
+      <div id="graph-empty" class="empty-state" hidden>No memory graph yet &mdash; edges appear when agents record decisions and supersede chunks.</div>
+    </section>
+
+    <section id="view-stats" class="view" hidden>
+      <h2>Overview</h2>
+      <div class="cards" id="stats-cards"></div>
+      <div id="stats-empty" class="empty-state" hidden>No activity yet &mdash; stats populate once agents start using NCP.</div>
+
+      <h2>Chunks by layer</h2>
+      <div id="stats-layers" class="bar-list"></div>
+      <div id="stats-layers-empty" class="empty-state" hidden>No layer data yet.</div>
+
+      <h2>Cost summary</h2>
+      <div class="cards" id="cost-cards"></div>
+      <div id="cost-empty" class="empty-state" hidden>No cost telemetry recorded yet.</div>
+
+      <h2>Cost by agent</h2>
+      <div class="table-wrap">
+        <table id="cost-by-agent-table">
+          <thead><tr><th>Agent</th><th>Turns</th><th>Cost (USD)</th></tr></thead>
+          <tbody id="cost-by-agent-tbody"></tbody>
+        </table>
+      </div>
+      <div id="cost-by-agent-empty" class="empty-state" hidden>No per-agent cost data yet.</div>
+
+      <div id="memo-section">
+        <h2>Memoization</h2>
+        <div class="cards" id="memo-cards"></div>
+        <div id="memo-empty" class="empty-state" hidden>Memoization stats are not available from this store.</div>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<div id="auth-modal" class="modal-backdrop" hidden>
+  <form id="token-form" class="modal">
+    <h2>API token required</h2>
+    <p class="muted">This NCP server requires a bearer token to read <code>/api/*</code> data. Enter it below &mdash; it is stored only in this browser (localStorage).</p>
+    <input type="password" id="token-input" autocomplete="off" placeholder="Bearer token" class="search-input">
+    <div class="modal-actions">
+      <button type="button" id="token-modal-close" class="btn-ghost">Close</button>
+      <button type="submit" class="btn-primary">Save &amp; retry</button>
+    </div>
+  </form>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
