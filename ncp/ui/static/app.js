@@ -15,7 +15,7 @@
     '#e06ba0', '#5ce0a0', '#a0785c', '#7c9cf2'
   ];
 
-  var WHISPER_TYPES = ['share', 'request', 'dissent', 'handoff'];
+  var WHISPER_TYPES = ['share', 'request', 'dissent', 'nudge', 'alert'];
 
   /* ---------------------------------------------------------------- */
   /* state                                                             */

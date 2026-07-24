@@ -16,7 +16,8 @@
   --w-share: #4f8fea;
   --w-request: #a778e0;
   --w-dissent: #e0645c;
-  --w-handoff: #4fbf7a;
+  --w-nudge: #4fbf7a;
+  --w-alert: #e8a13c;
   --w-other: #7a8592;
 
   --font-ui: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
@@ -40,7 +41,8 @@
     --w-share: #2c6fd6;
     --w-request: #7440b8;
     --w-dissent: #c8392f;
-    --w-handoff: #1f8a4c;
+    --w-nudge: #1f8a4c;
+    --w-alert: #b26e0a;
     --w-other: #6b7480;
   }
 }
@@ -175,6 +177,8 @@ button {
   gap: 10px;
   font-size: 12.5px;
 }
+.error-banner[hidden] { display: none; }
+
 .error-banner button { border: none; background: transparent; color: var(--red); font-size: 15px; }
 
 /* ---------- tabs ---------- */
@@ -294,7 +298,8 @@ button {
 .whisper-type-share { color: var(--w-share); border-color: var(--w-share); }
 .whisper-type-request { color: var(--w-request); border-color: var(--w-request); }
 .whisper-type-dissent { color: var(--w-dissent); border-color: var(--w-dissent); }
-.whisper-type-handoff { color: var(--w-handoff); border-color: var(--w-handoff); }
+.whisper-type-nudge { color: var(--w-nudge); border-color: var(--w-nudge); }
+.whisper-type-alert { color: var(--w-alert); border-color: var(--w-alert); }
 .whisper-type-other { color: var(--w-other); border-color: var(--w-other); }
 
 .whisper-type-label {

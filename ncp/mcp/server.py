@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 import traceback
+import urllib.parse
 from collections.abc import Callable
 from pathlib import Path
 from typing import BinaryIO, get_args
@@ -1635,17 +1636,26 @@ def _write_message(output_stream: BinaryIO, payload: str) -> None:
     output_stream.flush()
 
 
-def _create_handlers(
+def _create_handlers_with_store(
     *,
     store_path: str | Path | None = None,
     cwd: Path | None = None,
-) -> dict[str, ToolHandler]:
+) -> tuple[dict[str, ToolHandler], BaseStore]:
     if store_path:
         config = load_config(env={"NCP_STORE_PATH": str(store_path)})
     else:
         config = load_config(cwd=cwd or Path.cwd())
     store = create_store(config)
-    return make_handlers(store, config=config)
+    return make_handlers(store, config=config), store
+
+
+def _create_handlers(
+    *,
+    store_path: str | Path | None = None,
+    cwd: Path | None = None,
+) -> dict[str, ToolHandler]:
+    handlers, _store = _create_handlers_with_store(store_path=store_path, cwd=cwd)
+    return handlers
 
 
 def serve_streams(
@@ -1704,6 +1714,158 @@ def serve(store_path: str | Path | None = None, *, cwd: Path | None = None) -> N
     serve_streams(sys.stdin.buffer, sys.stdout.buffer, store_path=store_path, cwd=cwd)
 
 
+# ----------------------------------------------------------------------
+# Read-only UI: /ui static assets and /api/* JSON endpoints.
+# These are plain HTTP routes on the same server, not MCP tools -- they
+# must never appear in tools/list.
+
+def _ui_static_root() -> Path:
+    """Directory containing the built-in read-only UI's static assets.
+
+    A plain ``Path(__file__)``-relative resolution (rather than
+    ``importlib.resources``) so tests can monkeypatch this function to
+    point at a tmp directory of fixture assets.
+    """
+    return Path(__file__).resolve().parent.parent / "ui" / "static"
+
+
+_UI_CONTENT_TYPES: dict[str, str] = {
+    ".html": "text/html; charset=utf-8",
+    ".js": "application/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".ico": "image/x-icon",
+}
+
+
+class _InvalidParam(Exception):
+    """Raised by ``/api/*`` query-param parsing on a malformed value."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(detail)
+        self.detail = detail
+
+
+def _query_params(query: str) -> dict[str, str]:
+    """Parse a URL query string, keeping the last value for repeated keys."""
+    parsed = urllib.parse.parse_qs(query, keep_blank_values=True)
+    return {key: values[-1] for key, values in parsed.items()}
+
+
+def _parse_int_param(
+    params: dict[str, str],
+    name: str,
+    default: int,
+    *,
+    minimum: int,
+    maximum: int | None = None,
+) -> int:
+    raw = params.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        raise _InvalidParam(f"{name} must be an integer") from None
+    value = max(minimum, value)
+    if maximum is not None:
+        value = min(maximum, value)
+    return value
+
+
+def _parse_bool_param(params: dict[str, str], name: str, default: bool) -> bool:
+    raw = params.get(name)
+    if raw is None or raw == "":
+        return default
+    lowered = raw.strip().lower()
+    if lowered in ("true", "1"):
+        return True
+    if lowered in ("false", "0"):
+        return False
+    raise _InvalidParam(f"{name} must be one of: true, false, 1, 0")
+
+
+def _api_status_payload(store: BaseStore, params: dict[str, str]) -> dict[str, object]:
+    pipeline_id = params.get("pipeline_id") or None
+    payload = dict(store.status_detail(pipeline_id=pipeline_id))
+    memo_stats_fn = getattr(store, "memo_stats", None)
+    if memo_stats_fn is None:
+        payload["memoization"] = None
+    else:
+        try:
+            payload["memoization"] = memo_stats_fn()
+        except Exception:
+            payload["memoization"] = None
+    return payload
+
+
+def _api_chunks_payload(store: BaseStore, params: dict[str, str]) -> dict[str, object]:
+    limit = _parse_int_param(params, "limit", 100, minimum=1, maximum=200)
+    offset = _parse_int_param(params, "offset", 0, minimum=0)
+    return store.list_chunks(
+        pipeline_id=params.get("pipeline_id") or None,
+        layer=params.get("layer") or None,
+        zone=params.get("zone") or None,
+        src=params.get("src") or None,
+        written_by=params.get("written_by") or None,
+        limit=limit,
+        offset=offset,
+    )
+
+
+def _api_turns_payload(store: BaseStore, params: dict[str, str]) -> dict[str, object]:
+    limit = _parse_int_param(params, "limit", 50, minimum=1, maximum=200)
+    turns = store.list_turns(pipeline_id=params.get("pipeline_id") or None, limit=limit)
+    return {
+        "turns": [
+            {
+                "turn_id": turn.turn_id,
+                "agent_id": turn.agent_id,
+                "pipeline_id": turn.pipeline_id,
+                "task": turn.task,
+                "slot": turn.slot,
+                "result": turn.result,
+                "result_full": turn.result_full,
+                "created_at": turn.created_at,
+            }
+            for turn in turns
+        ]
+    }
+
+
+def _api_whispers_payload(store: BaseStore, params: dict[str, str]) -> dict[str, object]:
+    limit = _parse_int_param(params, "limit", 100, minimum=1, maximum=200)
+    include_expired = _parse_bool_param(params, "include_expired", False)
+    whispers = store.list_whispers(
+        pipeline_id=params.get("pipeline_id") or None,
+        target=params.get("target") or None,
+        include_expired=include_expired,
+        limit=limit,
+    )
+    return {"whispers": whispers}
+
+
+def _api_graph_payload(store: BaseStore, params: dict[str, str]) -> dict[str, object]:
+    limit = _parse_int_param(params, "limit", 200, minimum=1)
+    return store.graph_data(pipeline_id=params.get("pipeline_id") or None, limit=limit)
+
+
+def _api_cost_payload(store: BaseStore, params: dict[str, str]) -> dict[str, object]:
+    limit = _parse_int_param(params, "limit", 10, minimum=1)
+    return store.cost_summary(pipeline_id=params.get("pipeline_id") or None, limit=limit)
+
+
+_API_ROUTES: dict[str, Callable[[BaseStore, dict[str, str]], object]] = {
+    "/api/status": _api_status_payload,
+    "/api/chunks": _api_chunks_payload,
+    "/api/turns": _api_turns_payload,
+    "/api/whispers": _api_whispers_payload,
+    "/api/graph": _api_graph_payload,
+    "/api/cost": _api_cost_payload,
+}
+
+
 class _MCPHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -1713,6 +1875,7 @@ class _MCPHTTPServer(ThreadingHTTPServer):
         server_address: tuple[str, int],
         *,
         handlers: dict[str, ToolHandler],
+        store: BaseStore,
         sse_path: str,
         rpc_path: str,
         keepalive_seconds: float,
@@ -1721,6 +1884,7 @@ class _MCPHTTPServer(ThreadingHTTPServer):
         max_body_bytes: int,
     ) -> None:
         self.handlers = handlers
+        self.store = store
         self.sse_path = sse_path
         self.rpc_path = rpc_path
         self.keepalive_seconds = keepalive_seconds
@@ -1847,29 +2011,103 @@ class _MCPHTTPHandler(BaseHTTPRequestHandler):
                 {"ok": True, "transport": "http_sse", "rpc_path": self.server.rpc_path, "sse_path": self.server.sse_path},
             )
             return
-        if self.path != self.server.sse_path:
+        if self.path == self.server.sse_path:
+            if not self._authorized():
+                self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
+                return
+
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self._send_cors_headers()
+            self.end_headers()
+            try:
+                endpoint_event = f"event: endpoint\ndata: {self.server.rpc_path}\n\n".encode("utf-8")
+                self.wfile.write(endpoint_event)
+                self.wfile.flush()
+                while not self.server._shutdown_event.is_set():
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+                    time.sleep(self.server.keepalive_seconds)
+            except (BrokenPipeError, ConnectionResetError):
+                return
+            return
+
+        parsed = urllib.parse.urlsplit(self.path)
+        path = parsed.path
+        if path == "/ui":
+            # Redirect so the page's relative asset URLs resolve under /ui/.
+            self.send_response(HTTPStatus.MOVED_PERMANENTLY)
+            self.send_header("Location", "/ui/")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if path == "/ui/":
+            self._serve_ui_asset("index.html")
+            return
+        if path.startswith("/ui/"):
+            self._serve_ui_asset(path[len("/ui/"):])
+            return
+        if path.startswith("/api/"):
+            self._handle_api_get(path, parsed.query)
+            return
+
+        self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+
+    def _serve_ui_asset(self, rel_path: str) -> None:
+        """Serve a static file from ``_ui_static_root()`` for ``/ui`` and ``/ui/<asset>``.
+
+        No auth required (static shell only, no data). Only a fixed set of
+        extensions are servable; the resolved path must stay inside the
+        static root or the request is treated as not found (path traversal).
+        """
+        rel_path = urllib.parse.unquote(rel_path) or "index.html"
+        ext = Path(rel_path).suffix
+        if ext not in _UI_CONTENT_TYPES:
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
             return
+
+        root = _ui_static_root()
+        try:
+            root_resolved = root.resolve()
+            candidate = (root / rel_path).resolve()
+            candidate.relative_to(root_resolved)
+        except (OSError, ValueError):
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+            return
+        if not candidate.is_file():
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+            return
+
+        body = candidate.read_bytes()
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", _UI_CONTENT_TYPES[ext])
+        self.send_header("Content-Length", str(len(body)))
+        self._send_cors_headers()
+        self.end_headers()
+        self.wfile.write(body)
+        self.wfile.flush()
+
+    def _handle_api_get(self, path: str, query: str) -> None:
+        """Dispatch a ``/api/*`` GET request. Auth-gated; JSON responses only."""
         if not self._authorized():
             self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
             return
-
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
-        self._send_cors_headers()
-        self.end_headers()
-        try:
-            endpoint_event = f"event: endpoint\ndata: {self.server.rpc_path}\n\n".encode("utf-8")
-            self.wfile.write(endpoint_event)
-            self.wfile.flush()
-            while not self.server._shutdown_event.is_set():
-                self.wfile.write(b": keepalive\n\n")
-                self.wfile.flush()
-                time.sleep(self.server.keepalive_seconds)
-        except (BrokenPipeError, ConnectionResetError):
+        route = _API_ROUTES.get(path)
+        if route is None:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
             return
+        params = _query_params(query)
+        try:
+            payload = route(self.server.store, params)
+        except _InvalidParam as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_param", "detail": exc.detail})
+            return
+        except Exception as exc:
+            self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal", "detail": str(exc)})
+            return
+        self._send_json(HTTPStatus.OK, payload)
 
     def _drain_request_body(self) -> None:
         """Consume the request body before an early error response.
@@ -1948,10 +2186,11 @@ def create_http_server(
     cors_allowed_origins: list[str] | None = None,
     max_body_bytes: int = 10_485_760,
 ) -> _MCPHTTPServer:
-    handlers = _create_handlers(store_path=store_path, cwd=cwd)
+    handlers, store = _create_handlers_with_store(store_path=store_path, cwd=cwd)
     return _MCPHTTPServer(
         (host, port),
         handlers=handlers,
+        store=store,
         sse_path=sse_path,
         rpc_path=rpc_path,
         keepalive_seconds=keepalive_seconds,
