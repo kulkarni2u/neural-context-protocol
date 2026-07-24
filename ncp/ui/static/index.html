@@ -37,6 +37,7 @@
     <button type="button" class="tab-btn active" data-tab="timeline">Timeline</button>
     <button type="button" class="tab-btn" data-tab="memory">Memory</button>
     <button type="button" class="tab-btn" data-tab="whispers">Whispers</button>
+    <button type="button" class="tab-btn" data-tab="graph">Graph</button>
     <button type="button" class="tab-btn" data-tab="stats">Stats</button>
   </nav>
 
@@ -92,6 +93,23 @@
         </table>
       </div>
       <div id="whispers-empty" class="empty-state" hidden>No whispers yet &mdash; agents send whispers via <code>ncp_emit_whisper</code>.</div>
+    </section>
+
+    <section id="view-graph" class="view" hidden>
+      <div class="toolbar graph-toolbar">
+        <div id="graph-legend" class="legend"></div>
+        <div class="header-spacer"></div>
+        <button id="graph-reset-view" type="button" class="btn-ghost">Reset view</button>
+      </div>
+      <div class="graph-layout">
+        <div class="graph-svg-wrap">
+          <svg id="graph-svg" class="graph-svg" viewBox="0 0 1000 700" preserveAspectRatio="xMidYMid meet"></svg>
+        </div>
+        <div id="graph-detail" class="graph-detail">
+          <div class="muted graph-detail-empty">Click a node to see details.</div>
+        </div>
+      </div>
+      <div id="graph-empty" class="empty-state" hidden>No memory graph yet &mdash; edges appear when agents record decisions and supersede chunks.</div>
     </section>
 
     <section id="view-stats" class="view" hidden>

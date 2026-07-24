@@ -454,6 +454,111 @@ tbody tr.row-dim { opacity: 0.55; }
   font-size: 12.5px;
 }
 
+/* ---------- graph ---------- */
+
+.graph-toolbar { align-items: center; }
+
+.graph-layout {
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
+  align-items: stretch;
+}
+
+.graph-svg-wrap {
+  flex: 3 1 520px;
+  min-width: 280px;
+  height: 70vh;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-elevated);
+  overflow: hidden;
+}
+
+.graph-svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+  cursor: grab;
+  touch-action: none;
+}
+.graph-svg:active { cursor: grabbing; }
+
+.graph-detail {
+  flex: 1 1 260px;
+  min-width: 220px;
+  max-height: 70vh;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 14px;
+  background: var(--bg-elevated);
+}
+
+.graph-detail-empty { padding: 8px 0; }
+
+.graph-node-circle {
+  stroke: var(--bg-elevated);
+  stroke-width: 1.5;
+  cursor: pointer;
+}
+.graph-node-circle:hover { stroke: var(--accent); stroke-width: 2; }
+
+.graph-node-ring {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 2.5;
+}
+
+.graph-node-label {
+  fill: var(--text-muted);
+  font-size: 9px;
+  font-family: var(--font-ui);
+  pointer-events: none;
+}
+
+.graph-edge {
+  stroke: var(--text-muted);
+  stroke-width: 1.4;
+  fill: none;
+  opacity: 0.85;
+}
+.graph-edge-solid { stroke-dasharray: none; }
+.graph-edge-dashed { stroke-dasharray: 6 4; }
+.graph-edge-dotted { stroke-dasharray: 1.5 3.5; }
+
+.graph-legend-line {
+  display: inline-block;
+  width: 22px;
+  height: 0;
+  border-top: 2px solid var(--text-muted);
+}
+.graph-legend-line.legend-line-dashed { border-top-style: dashed; }
+.graph-legend-line.legend-line-dotted { border-top-style: dotted; }
+
+.graph-edge-list-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  margin-top: 10px;
+}
+
+.graph-edge-list {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+}
+.graph-edge-list li {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
 /* ---------- stats ---------- */
 
 .cards {
