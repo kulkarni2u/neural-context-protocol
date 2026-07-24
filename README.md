@@ -7,19 +7,21 @@
 
 -----
 
-## A protocol for agent-to-agent communication over MCP
+## Agent-to-agent communication with graph-native memory
 
-NCP is an **agent-to-agent communication protocol** for multi-agent systems — and, underneath it, a **memory bus over MCP**. It lets agents talk to each other, hand off work, and build on prior results without replaying transcripts or stuffing prompts.
+NCP is an **agent-to-agent communication protocol over MCP, backed by a graph-native, trust-aware memory layer**. It lets agents talk to each other, hand off work, and build on prior results without replaying transcripts or stuffing prompts.
 
-MCP standardized how a single agent talks to its tools. NCP standardizes how **agents talk to each other**. It exposes one MCP endpoint that every host — Claude, Codex, OpenCode, n8n, LangGraph, or a custom orchestrator — connects to as a peer. Each agent reads bounded, trust-weighted context, writes durable memory, and sends bounded signals (whispers) to other agents, all through the same protocol.
+MCP standardized how a single agent talks to its tools. NCP standardizes how **agents talk to each other and build shared memory**. It exposes one MCP endpoint that every host — Claude, Codex, OpenCode, n8n, LangGraph, or a custom orchestrator — connects to as a peer. Each agent reads bounded, trust-weighted context, writes durable memory, links related knowledge, and sends bounded signals (whispers) to other agents, all through the same protocol.
 
-The protocol rides on a memory bus: durable shared state, relevance-bounded retrieval, and trust scoring are what make the conversation between agents reliable. Making token spend compound is the payoff that follows.
+The protocol rides on a memory bus with semantic compilation, typed relationships, graph-aware retrieval, consolidation, temporal views, and trust calibration. Making token spend compound is the payoff that follows.
 
 | Problem | What the bus provides |
 |---------|-------------------|
 | Agents have no shared channel between turns | One MCP memory bus every host connects to |
 | Agents replay growing transcripts | Bounded context assembly per turn |
 | Useful work disappears after a turn | Durable memory and turn records |
+| Stored memory stays flat and disconnected | Typed memory graphs with multi-hop retrieval |
+| Raw notes are hard to reuse reliably | Semantic atoms with remember, recall, and improve workflows |
 | Multi-agent handoff is brittle | Whispers and shared pipeline memory |
 | All context looks equally credible | Trust scores, drift markers, dissent, calibration |
 | Token spend does not compound | Reusable memory, cost telemetry, reputation signals |
@@ -37,7 +39,7 @@ Three properties make it a bus and not just a store:
 
 - **Bounded reads.** Every agent gets a budget-bounded working context, not the whole history — so the channel scales as turns and agents grow.
 - **Directed signals.** Agents emit whispers to specific peers (handoffs, dissent, drift reports) without broadcasting full state.
-- **Trust-aware transport.** Every message on the bus carries a trust score and drift marker — self-reported, advisory inputs, not runtime-verified truth — so a receiving agent knows how much to believe what it reads.
+- **Trust-aware transport.** Every message on the bus carries a trust score and drift marker. These are client-provided advisory inputs by default; computed drift can be enabled explicitly. A receiving agent can use those signals to decide how much to believe what it reads.
 
 The payoff compounds at the organization level as **token capital efficiency** — the business value captured per dollar spent on model reasoning. Because work persists as reusable, trusted state instead of being thrown away at the end of each turn, token spend accrues into shared organizational memory rather than resetting: decisions, evidence, outcomes, trust signals, and cost records that future runs, teams, and pipelines draw on. Future agents — including cheaper or smaller models — stand on prior work without replaying the whole history. That does not make NCP a model router or eval platform; it is the context substrate those loops need. The [Benchmarks](#benchmarks) section quantifies the effect.
 
@@ -49,6 +51,15 @@ The payoff compounds at the organization level as **token capital efficiency** �
 pip install neural-context-protocol
 ncp init
 ncp serve --host 127.0.0.1 --port 4242 --cwd /path/to/project
+```
+
+Compile knowledge into semantic memory, recall it, and inspect its graph:
+
+```bash
+echo "Alice owns release verification." \
+  | ncp memory remember --stdin --pipeline-id demo
+ncp memory recall "who owns release verification?" --pipeline-id demo
+ncp graph --pipeline-id demo --format json
 ```
 
 For Claude Code:
@@ -159,19 +170,46 @@ flowchart TD
 flowchart LR
     A["Claude / Codex / OpenCode / n8n / other MCP hosts"]
     B["ncp serve<br/>HTTP/SSE MCP runtime"]
-    C["Assembler<br/>bounded context + retrieval"]
-    D["SQLite mode<br/>local-first store"]
-    E["pgvector mode<br/>durable memory"]
-    F["Redis<br/>whispers + fetch-session state"]
+    C["Memory layer<br/>semantic compiler + typed graph"]
+    D["Assembler<br/>bounded context + graph-aware retrieval"]
+    E["SQLite mode<br/>local-first memory"]
+    F["pgvector mode<br/>durable semantic memory"]
+    G["Redis<br/>whispers + fetch-session state"]
 
     A --> B
     B --> C
-    C --> D
+    B --> D
     C --> E
     C --> F
+    D --> E
+    D --> F
+    B --> G
 ```
 
-Every connected agent is a peer on the bus (`A`); `ncp serve` is the transport; the assembler and stores are the bus internals.
+Every connected agent is a peer on the bus (`A`); `ncp serve` is the transport; the memory layer, assembler, and stores are the bus internals.
+
+### Graph-native memory layer
+
+NCP's memory layer is more than persistence. It compiles raw content into
+reusable semantic atoms, connects chunks with typed directional edges, and
+retrieves bounded context across those relationships. The same substrate
+supports consolidation, bi-temporal point-in-time views, trust calibration,
+and outcome-credit propagation along causal paths.
+
+- **Remember:** deterministically compile raw content into semantic memory
+  atoms connected to their source with `derived_from` edges.
+- **Recall:** use hybrid lexical, recency, and trust scoring, with optional
+  vector and bounded multi-hop graph signals, without replaying full history.
+- **Improve:** consolidate redundant memory while retaining provenance and
+  tombstones.
+- **Inspect:** export the typed graph as JSON or Graphviz DOT, including an
+  `--as-of` temporal view.
+
+See [Graph engineering](#graph-engineering) for the relationship model and
+[Semantic memory layer](#semantic-memory-layer) for the Python, CLI, and MCP
+interfaces. NCP still does not schedule agents or own workflow execution; the
+orchestrator decides *who runs when*, while NCP owns *what agents know and
+share*.
 
 -----
 
@@ -196,12 +234,12 @@ The valid layers are `episodic`, `procedural`, `semantic`, `social`, and `reason
 
 Most frameworks treat stored context as equally credible. The bus doesn't. Trust is part of the protocol, so a receiving agent always knows how much to believe a message.
 
-Every memory chunk carries a `base_trust` score (derived from its `src` at write time) and a `written_at_drift` marker. Both `base_trust` and `drift_score` are **self-reported, client-asserted advisory inputs** — NCP does not yet compute drift itself. Retrieval scoring discounts chunks written during high-drift periods, and the `CoherenceChecker` reads the per-turn `drift_score` agents report and fires alerts when it crosses threshold. Agents emit `world_check` whispers to report drift back onto the bus. A runtime-computed drift signal is future work — see the [north-star roadmap](./docs/NCP_NORTH_STAR_CAPABILITY_ROADMAP.md) (WI-016).
+Every memory chunk carries a `base_trust` score (derived from its `src` at write time) and a `written_at_drift` marker. `base_trust` and `drift_score` remain **client-provided advisory inputs by default**. Retrieval scoring discounts chunks written during high-drift periods, and the `CoherenceChecker` reads the per-turn drift signal and fires alerts when it crosses threshold. When `[drift].drift_computed_enabled` is enabled, NCP computes drift from recent turn history and uses the runtime score during context assembly; the default is `false`, preserving client-reported behavior. Agents can also emit `world_check` whispers to report drift back onto the bus.
 
 ```
 ChunkSource:      user_verified | tool_result | agent_inferred | synthesis
 base_trust:       float (0.0–1.0) — advisory weight applied at retrieval time
-drift_score:      float (0.0–1.0) — self-reported coherence signal (advisory; not runtime-computed)
+drift_score:      float (0.0–1.0) — client-reported by default; optionally runtime-computed
 written_at_drift: float — drift level reported when this memory was written
 ```
 
