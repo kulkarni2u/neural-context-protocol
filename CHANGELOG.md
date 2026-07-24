@@ -4,6 +4,8 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-07-23
+
 ### Added
 
 - **Typed chunk relationship graph** (`ncp/types.py`, `ncp/stores/graph.py`,
