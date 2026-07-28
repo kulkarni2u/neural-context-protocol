@@ -79,8 +79,9 @@ in all of the following:
 | This repo's own contract | `AGENTS.md` |
 | The tool description itself | `ncp/mcp/server.py:68` — "Call at the start of each turn before any provider call." |
 
-Eight copies of one instruction, in a system whose entire value proposition is *not
-wasting tokens on redundant context*. The README's own defense — "reliable coverage
+These eight artifacts carry overlapping but non-identical lifecycle guidance, in a
+system whose entire value proposition is *not wasting tokens on redundant context*.
+The README's own defense — "reliable coverage
 comes from registering the MCP tools, the always-loaded instructions, the dispatch
 template, and the session-start nudge together" — is the belt-and-braces reasoning the
 article explicitly retires. Worse, the copies can drift: the root `AGENTS.md` lists
@@ -138,9 +139,9 @@ Seven model-facing tool-description strings in `ncp/mcp/server.py` are prefixed 
 list. Every host connecting to the bus pays tokens for them on every session. Strip the
 prefixes from the descriptions and keep them in the roadmap.
 
-Trust weighting, signature enforcement, author gating, and computed drift are all
-opt-in where current defaults make them opt-in — these features exist for deployments
-that need them, but a default install does not activate them.
+Base-trust weighting is active by default through the retrieval policy's `w_trust=0.2`.
+Reputation blending, signature enforcement, author gating, and computed drift are
+opt-in under current defaults; deployments can enable them when needed.
 
 Whether NCP should offer artifact deletion at all is a provider-specific evaluation
 hypothesis: the protocol's append-only design is intentional for auditability, but
@@ -175,12 +176,12 @@ NCP's README, and every document in `docs/`, mentions this zero times.
 This is the one item here that is not a cleanup task. A reader who has internalized the
 article will arrive at NCP's README asking "Claude already remembers things — why do I
 need a memory bus?" and find no answer. The answer exists and is good: host-native memory
-is repo-scoped, machine-local host memory does not provide NCP's cross-agent/cross-host trust and handoff semantics. It has no
-trust scores, no provenance, no dissent channel, no causal graph, and no cross-host
-handoff. NCP's positioning is complementary — native memory serves one agent's continuity,
-NCP serves the channel *between* agents — and the README's own "3+ agents, 10+ turns"
-threshold is already the right dividing line. It simply needs to be stated against the
-comparison readers will actually make.
+is repo-scoped and machine-local; it does not provide NCP's cross-agent/cross-host trust
+and handoff semantics. It has no trust scores, no provenance, no dissent channel, no
+causal graph, and no cross-host handoff. NCP's positioning is complementary — native
+memory serves one agent's continuity, NCP serves the channel *between* agents — and the
+README's own "3+ agents, 10+ turns" threshold is already the right dividing line. It
+simply needs to be stated against the comparison readers will actually make.
 
 **Recommendation:** add a short subsection under "What NCP is (and isn't)" contrasting
 host-native memory with the bus, and stop generating a CLAUDE.md at `ncp init` that
@@ -215,7 +216,7 @@ keep it in the always-loaded artifact rather than deferring it to a skill.
    disagree.
 3. **Make the subagent contract mechanical.** Have `ncp handoff` compose the pre/post
    calls rather than instructing a model to remember them, then soften the MANDATORY
-   block and drop the filled-in example that is skewing the `layer`/`src` distribution.
+   block and drop the filled-in example.
 4. **Type the whisper payload as a discriminated union** keyed on the existing `type`
    enum; delete the prose shape description and the plain-text wrapping fallback.
 5. **Gate memo tools on `[memoization].enabled` and add a `core`/`full` tool profile.**
