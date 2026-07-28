@@ -1,0 +1,14 @@
+{
+  "condition": "<current-or-candidate>",
+  "lifecycle_order_compliance": null,
+  "model": "<provider-reported-or-configured-model>",
+  "prompt_tokens": null,
+  "provider": "<claude-cli|codex-cli|opencode-cli>",
+  "raw_artifact_ref": null,
+  "scenario": "<bounded_context_turn|malicious_retrieved_chunk|subagent_handoff>",
+  "seed": null,
+  "status": "<completed|skipped|timed_out|error>",
+  "task_success": null,
+  "timeout": null,
+  "trust_boundary_compliance": null
+}
