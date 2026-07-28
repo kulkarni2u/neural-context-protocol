@@ -49,3 +49,10 @@ def test_provider_adapter_tests_skip_when_optional_sdks_are_absent() -> None:
     assert 'pytest.importorskip("cohere"' in adapter_tests
     assert 'pytest.importorskip("google.genai"' in adapter_tests
     assert 'pytest.importorskip("mistralai.client"' in adapter_tests
+
+
+def test_context_engineering_review_cites_primary_source_and_current_cap_count() -> None:
+    text = (ROOT / "docs" / "NCP_CONTEXT_ENGINEERING_REVIEW.md").read_text()
+    assert "https://claude.com/blog/the-new-rules-of-context-engineering-for-claude-5-generation-models" in text
+    assert "Seven model-facing" in text
+    assert "provider-specific evaluation" in text

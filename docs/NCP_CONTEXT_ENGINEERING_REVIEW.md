@@ -1,6 +1,6 @@
 # NCP reviewed against Anthropic's context-engineering guidance
 
-A review of the Anthropic article on context engineering for Claude 5-class models
+A review of the [Anthropic article on context engineering for Claude 5-class models](https://claude.com/blog/the-new-rules-of-context-engineering-for-claude-5-generation-models)
 ("we removed over 80% of Claude Code's system prompt … with no measurable loss")
 against what NCP actually ships. The article's thesis is that newer models need
 *fewer* rules, *fewer* examples, and *less* upfront context — and that the artifacts
@@ -8,8 +8,9 @@ we used to stuff full of guidance (system prompt, CLAUDE.md, skills) should get
 smaller while tool interfaces and progressive disclosure do the work.
 
 NCP is squarely in scope for that thesis, because NCP is not only a runtime — it is a
-*context-artifact generator*. `ncp init` writes a CLAUDE.md, installs a skill, installs
-a SessionStart hook, and registers twelve MCP tools. Every one of those is the kind of
+*context-artifact generator*. `ncp init` always creates a basic
+`CLAUDE.md`, while provider hooks and skills are installed only when detected and accepted interactively,
+and registers twelve MCP tools. Every one of those is the kind of
 artifact the article says to rightsize.
 
 The short version: NCP's **runtime design is validated** by the article, and NCP's
@@ -60,7 +61,7 @@ and is the most valuable thing this review surfaces.
 
 Every item here is in NCP's *generated instruction artifacts*, not its runtime.
 
-### 2.1 The same five instructions are duplicated across eight artifacts
+### 2.1 Overlapping but non-identical lifecycle guidance across eight artifacts
 
 The article's "Then: repeat yourself / Now: simple tool descriptions" says older models
 needed instructions echoed in both the system prompt and the tool description, and that
@@ -103,12 +104,6 @@ a real payload. This collides with two of the article's five reversals at once:
 - *"Then: give Claude rules / Now: let Claude use judgement."* The all-caps mandate with
   no-exceptions framing is the same register as the old "Never write multi-paragraph
   docstrings" rule the article quotes as an example of over-constraint.
-- *"Then: give Claude examples / Now: design interfaces."* The article's specific finding
-  is that examples **constrain the model to a certain exploration space**. The filled-in
-  OpenCode example here pins `layer:"episodic"` and `src:"tool_result"` in every dispatch
-  a model patterns off it — which is very likely why episodic/tool_result dominate in
-  practice, and it quietly defeats the five-layer taxonomy NCP built.
-
 The underlying requirement is real: a subagent that skips `ncp_get_context` starts cold.
 But the article's answer to "make sure the model does X" is to move X into the interface.
 The stronger fix is mechanical, not textual — have `ncp handoff` compose the pre/post
@@ -131,13 +126,26 @@ the lossy plain-text wrapping path, and makes malformed dissent whispers a valid
 error instead of a silent degradation — which matters, because `dissent` whispers feed
 trust calibration.
 
+Pydantic already validates type-specific whisper payloads at the application layer; the
+remaining gap is that MCP schema definitions do not natively support discriminated unions,
+and there is no canonical compatibility layer between the two schema systems.
+
 ### 2.4 Internal roadmap IDs leak into model-facing context
 
-Ten tool-description strings in `ncp/mcp/server.py` are prefixed with `CAP-C5:`,
-`CAP-T3:`, `CAP-T4:`, or `CAP-C3:`. These identifiers are meaningful in
+Seven model-facing tool-description strings in `ncp/mcp/server.py` are prefixed with `CAP-C5:`,
+`CAP-T3:`, or `CAP-C3:`. These identifiers are meaningful in
 `docs/NCP_NORTH_STAR_CAPABILITY_ROADMAP.md` and meaningless to a model reading the tool
 list. Every host connecting to the bus pays tokens for them on every session. Strip the
 prefixes from the descriptions and keep them in the roadmap.
+
+Trust weighting, signature enforcement, author gating, and computed drift are all
+opt-in where current defaults make them opt-in — these features exist for deployments
+that need them, but a default install does not activate them.
+
+Whether NCP should offer artifact deletion at all is a provider-specific evaluation
+hypothesis: the protocol's append-only design is intentional for auditability, but
+some deployments may need a deletion capability that balances audit requirements
+against operational needs.
 
 ### 2.5 Twelve always-loaded tools where the protocol core is five
 
@@ -167,7 +175,7 @@ NCP's README, and every document in `docs/`, mentions this zero times.
 This is the one item here that is not a cleanup task. A reader who has internalized the
 article will arrive at NCP's README asking "Claude already remembers things — why do I
 need a memory bus?" and find no answer. The answer exists and is good: host-native memory
-is per-user and per-host, and it does not span agents, hosts, or processes. It has no
+is repo-scoped, machine-local host memory does not provide NCP's cross-agent/cross-host trust and handoff semantics. It has no
 trust scores, no provenance, no dissent channel, no causal graph, and no cross-host
 handoff. NCP's positioning is complementary — native memory serves one agent's continuity,
 NCP serves the channel *between* agents — and the README's own "3+ agents, 10+ turns"
