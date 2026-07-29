@@ -316,7 +316,11 @@ It sits underneath your existing agent framework — LangGraph ([runnable exampl
 
 It is not a vector database. Not a model training framework. Not an orchestrator. Not the right default for simple single-agent or very short-lived tasks.
 
-Use it when you have **3+ agents, 10+ turns, and real shared state to preserve**.
+### Host-native memory
+
+Host-native memory is useful for continuity within one host or user's workflow, although its exact scope varies by provider. NCP complements it with a shared repo/runtime channel for agent-to-agent work across agents and, with a shared backend, across hosts. This is distinct from machine-local continuity: it makes the relevant context available to the collaborators doing the work.
+
+NCP adds bounded retrieval, provenance, optional authenticated authorship, dissent, graph relationships, and explicit handoff to that shared context. Use it when you have **3+ agents, 10+ turns, and real shared state to preserve**.
 
 -----
 

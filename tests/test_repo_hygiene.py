@@ -7,6 +7,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_readme_positions_host_native_memory_as_complementary() -> None:
+    text = (ROOT / "README.md").read_text()
+    assert "Host-native memory" in text
+    assert "agent-to-agent" in text
+    assert "machine-local" in text
+
+
 def test_dev_up_script_and_makefile_target_are_present() -> None:
     script = ROOT / "scripts" / "dev_up.sh"
     makefile = ROOT / "Makefile"

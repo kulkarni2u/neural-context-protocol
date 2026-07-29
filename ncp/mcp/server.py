@@ -96,7 +96,7 @@ MCP_TOOLS: list[dict[str, object]] = [
                 "as_of": {
                     "type": "string",
                     "description": (
-                        "CAP-C5: optional ISO-8601 timestamp (or epoch seconds). When given, "
+                        "Optional ISO-8601 timestamp (or epoch seconds). When given, "
                         "assembles the bi-temporal view as of that transaction time -- only "
                         "chunks recorded by then, not superseded by a chunk recorded by then, "
                         "and valid (valid_from/valid_to) at that instant. Omit for the default "
@@ -140,14 +140,14 @@ MCP_TOOLS: list[dict[str, object]] = [
                 "valid_from": {
                     "type": "string",
                     "description": (
-                        "CAP-C5: optional ISO-8601 timestamp (or epoch seconds) for when this "
+                        "Optional ISO-8601 timestamp (or epoch seconds) for when this "
                         "fact became true in the world (valid time). Defaults to unset (no bound)."
                     ),
                 },
                 "valid_to": {
                     "type": "string",
                     "description": (
-                        "CAP-C5: optional ISO-8601 timestamp (or epoch seconds) for when this "
+                        "Optional ISO-8601 timestamp (or epoch seconds) for when this "
                         "chunk's own fact stops being true in the world. Defaults to unset (no "
                         "bound). Independent of 'supersedes', which sets the *previous* chunk's "
                         "valid_to, not this one's."
@@ -156,7 +156,7 @@ MCP_TOOLS: list[dict[str, object]] = [
                 "supersedes": {
                     "type": "string",
                     "description": (
-                        "CAP-C5: chunk_id of an existing chunk this write honestly replaces. "
+                        "Chunk ID of an existing chunk this write honestly replaces. "
                         "The old chunk is NOT deleted: its superseded_by is set to this new "
                         "chunk's id and its own valid_to is set to this chunk's valid_from (or "
                         "now if valid_from is omitted). Default (non-as_of) reads then return "
@@ -426,7 +426,7 @@ MCP_TOOLS: list[dict[str, object]] = [
     {
         "name": "ncp_record_outcome",
         "description": (
-            "Record a task outcome for outcome-calibrated reputation (CAP-T3). "
+            "Record a task outcome for outcome-calibrated reputation. "
             "Provide either chunk_ids (explicit) or turn_id (resolved to chunk_ids). "
             "Success=True increases author reputation; success=False decreases it."
         ),
@@ -464,7 +464,7 @@ MCP_TOOLS: list[dict[str, object]] = [
     {
         "name": "ncp_lookup_memo",
         "description": (
-            "Look up a previously recorded work memo by task+context signature (CAP-C3). "
+            "Look up a previously recorded work memo by task+context signature. "
             "Returns the memo if found, not stale, and meeting minimum outcome/verified criteria. "
             "Provide either task+context or an explicit signature."
         ),
@@ -489,7 +489,7 @@ MCP_TOOLS: list[dict[str, object]] = [
     {
         "name": "ncp_record_memo",
         "description": (
-            "Record a work memo for CAP-C3 semantic memoization. "
+            "Record a work memo for semantic memoization. "
             "Stores a signature-keyed entry that can be looked up later to skip redundant work."
         ),
         "inputSchema": {

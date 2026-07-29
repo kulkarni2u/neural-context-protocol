@@ -202,6 +202,10 @@ class TestInitialize:
 
 
 class TestToolsList:
+    def test_model_facing_tool_descriptions_hide_roadmap_ids(self) -> None:
+        serialized = json.dumps(MCP_TOOLS)
+        assert "CAP-" not in serialized
+
     def test_lists_all_tools(self) -> None:
         resp = _handle_request(_req("tools/list"), {})
         result = _result(resp)
