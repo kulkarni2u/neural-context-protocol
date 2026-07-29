@@ -344,6 +344,34 @@ class TestSignedAuthorship:
         )
         assert drained[0].payload == expected_stored
 
+        raw_signature = sign(
+            canonical_authorship_payload(identity_id, legacy_payload, "pipe_sign"),
+            identity_id=identity_id,
+            keystore_dir=keystore,
+        )
+        rejected = _handle_request(
+            _call(
+                "ncp_emit_whisper",
+                {
+                    "from": identity_id,
+                    "target": "reviewer",
+                    "type": "alert",
+                    "payload": legacy_payload,
+                    "confidence": 0.8,
+                    "pipeline_id": "pipe_sign",
+                    "signature": raw_signature,
+                },
+            ),
+            handlers,
+        )
+
+        error = _error(rejected)
+        assert error["code"] == -32603
+        assert "require_signatures" in error["message"]
+        assert store.drain_whispers(
+            agent_id="reviewer", pipeline_id="pipe_sign", max_items=1
+        ) == []
+
     def test_legacy_world_check_json_signature_normalizes_float_before_verifying(
         self, tmp_path: Path
     ) -> None:
