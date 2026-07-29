@@ -402,9 +402,11 @@ Semantics:
 
 ```
 Config gate:
-  Memoization is OFF by default. `ncp_lookup_memo` only returns memos when
-  `[memoization].enabled = true` (default false). Staleness
-  (`max_age_hours`), `min_outcome`, and `allow_unverified` gates also apply.
+  Memoization is OFF by default. When `[memoization].enabled = false`
+  (the default), both handlers return the disabled result variant below before
+  reading/writing memo entries or hit/miss telemetry. Staleness
+  (`max_age_hours`), `min_outcome`, and `allow_unverified` gates apply when
+  memoization is enabled.
 
 ncp_lookup_memo arguments:
   task:      str?  — task description; hashed with context into the signature
@@ -414,16 +416,22 @@ ncp_lookup_memo arguments:
 ncp_lookup_memo result:
   {"found": bool, "memo": {...} | null,
    "stats": {"hits": int, "misses": int}}   # cumulative store totals (S4.1)
+  Disabled variant:
+  {"recorded": false, "disabled": true, "reason": "memoization_disabled"}
+  # This variant deliberately has no `found` field and no `stats` field.
 
 ncp_record_memo arguments:
   task:              str    (required)
+  context:           str?   — optional context string for signature computation
   chunk_ids:         [str]  (required) — chunks produced by this work
   result_summary:    str?   — summary of the work result
-  signature:         str?   — explicit signature (overrides task hash)
+  signature:         str?   — explicit signature (overrides task+context hash)
   output_tokens_est: int?   — real output token count; estimated from
                               result_summary via estimate_tokens when omitted
 
 ncp_record_memo result: {"recorded": bool, "signature": str}
+  Disabled variant:
+  {"recorded": false, "disabled": true, "reason": "memoization_disabled"}
 
 Semantics:
   Signatures are SHA-256 over whitespace-normalized, lowercased task+context.
