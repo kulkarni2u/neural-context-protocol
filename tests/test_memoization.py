@@ -183,6 +183,86 @@ def test_ncp_record_memo_end_to_end(tmp_path: Path) -> None:
     assert json.loads(memo["chunk_ids"]) == ["c1", "c2"]
 
 
+def test_ncp_record_memo_context_matches_lookup_signature(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "store.db")
+    handlers = make_handlers(store)
+
+    recorded = _content(_handle_request(
+        _call("ncp_record_memo", {
+            "task": "contextual task",
+            "context": "repository=a",
+            "chunk_ids": ["c1"],
+        }),
+        handlers,
+    ))
+    found = _content(_handle_request(
+        _call("ncp_lookup_memo", {"task": "contextual task", "context": "repository=a"}),
+        handlers,
+    ))
+    different_context = _content(_handle_request(
+        _call("ncp_lookup_memo", {"task": "contextual task", "context": "repository=b"}),
+        handlers,
+    ))
+
+    assert recorded["recorded"] is True
+    assert found["found"] is True
+    assert found["memo"]["signature"] == recorded["signature"]
+    assert different_context["found"] is False
+
+
+def test_ncp_disabled_record_and_lookup_do_not_mutate_store_or_telemetry(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "store.db")
+    config = NCPConfig(
+        values={"memoization": {"enabled": False}},
+        project_root=tmp_path,
+    )
+    handlers = make_handlers(store, config=config)
+
+    recorded = _content(_handle_request(
+        _call("ncp_record_memo", {"task": "disabled task", "chunk_ids": ["c1"]}),
+        handlers,
+    ))
+    looked_up = _content(_handle_request(
+        _call("ncp_lookup_memo", {"task": "disabled task"}),
+        handlers,
+    ))
+
+    assert recorded == {
+        "recorded": False,
+        "disabled": True,
+        "reason": "memoization_disabled",
+    }
+    assert looked_up == {
+        "recorded": False,
+        "disabled": True,
+        "reason": "memoization_disabled",
+    }
+    assert store.memo_stats() == {
+        "entry_count": 0,
+        "hits": 0,
+        "misses": 0,
+        "estimated_tokens_saved": 0,
+    }
+
+
+def test_ncp_record_memo_without_context_remains_task_only(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "store.db")
+    handlers = make_handlers(store)
+
+    recorded = _content(_handle_request(
+        _call("ncp_record_memo", {"task": "task only", "chunk_ids": ["c1"]}),
+        handlers,
+    ))
+    found = _content(_handle_request(
+        _call("ncp_lookup_memo", {"task": "task only"}),
+        handlers,
+    ))
+
+    assert recorded["recorded"] is True
+    assert recorded["signature"] == compute_memo_signature("task only")
+    assert found["found"] is True
+
+
 # ---------------------------------------------------------------------------
 # S4.1: memoization telemetry — hits, misses, estimated tokens saved
 # ---------------------------------------------------------------------------

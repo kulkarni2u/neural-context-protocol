@@ -455,6 +455,10 @@ MCP_TOOLS: list[dict[str, object]] = [
                     "type": "string",
                     "description": "Task description for signature computation (ignored if signature is provided)",
                 },
+                "context": {
+                    "type": "string",
+                    "description": "Optional context string for signature computation",
+                },
                 "chunk_ids": {
                     "type": "array",
                     "items": {"type": "string"},
@@ -1290,6 +1294,12 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
 
     def _handle_lookup_memo(args: dict[str, object]) -> object:
         from ncp.stores.memo import compute_memo_signature
+        if config is not None and not config.memoization_enabled:
+            return {
+                "recorded": False,
+                "disabled": True,
+                "reason": "memoization_disabled",
+            }
         sig = args.get("signature")
         if sig is None:
             task = str(args.get("task", ""))
@@ -1327,10 +1337,17 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
 
     def _handle_record_memo(args: dict[str, object]) -> object:
         from ncp.stores.memo import compute_memo_signature, validate_code_memo_ast
+        if config is not None and not config.memoization_enabled:
+            return {
+                "recorded": False,
+                "disabled": True,
+                "reason": "memoization_disabled",
+            }
         task = str(args.get("task", ""))
+        context = str(args.get("context", ""))
         sig = args.get("signature")
         if sig is None:
-            sig = compute_memo_signature(task)
+            sig = compute_memo_signature(task, context)
         sig = str(sig)
         chunk_ids = [str(c) for c in list(args.get("chunk_ids", []) or [])]
         result_summary = args.get("result_summary")
