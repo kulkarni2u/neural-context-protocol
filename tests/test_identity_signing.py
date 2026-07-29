@@ -302,6 +302,117 @@ class TestSignedAuthorship:
         )
         assert drained[0].payload == expected_stored
 
+    def test_legacy_alert_json_string_signature_uses_normalized_payload(
+        self, tmp_path: Path
+    ) -> None:
+        store = SQLiteStore(tmp_path / "store.db")
+        keystore = tmp_path / "keys"
+        identity_id = _make_identity(store, keystore)
+        legacy_payload = '{"description": "Store unavailable", "alert_code": "store_down"}'
+        expected_stored = '{"alert_code":"store_down","description":"Store unavailable"}'
+        signature = sign(
+            canonical_authorship_payload(identity_id, expected_stored, "pipe_sign"),
+            identity_id=identity_id,
+            keystore_dir=keystore,
+        )
+        handlers = make_handlers(store, config=_config(tmp_path, require_signatures=True))
+
+        resp = _handle_request(
+            _call(
+                "ncp_emit_whisper",
+                {
+                    "from": identity_id,
+                    "target": "reviewer",
+                    "type": "alert",
+                    "payload": legacy_payload,
+                    "confidence": 0.8,
+                    "pipeline_id": "pipe_sign",
+                    "signature": signature,
+                },
+            ),
+            handlers,
+        )
+
+        result = _content(resp)
+        assert result == {
+            "emitted": True,
+            "payload_format": "legacy",
+            "verified": True,
+        }
+        drained = store.drain_whispers(
+            agent_id="reviewer", pipeline_id="pipe_sign", max_items=1
+        )
+        assert drained[0].payload == expected_stored
+
+    def test_legacy_world_check_json_signature_normalizes_float_before_verifying(
+        self, tmp_path: Path
+    ) -> None:
+        store = SQLiteStore(tmp_path / "store.db")
+        keystore = tmp_path / "keys"
+        identity_id = _make_identity(store, keystore)
+        legacy_payload = '{"detected_drift": 0.2500, "anchor_intent": "ship_task_6"}'
+        expected_stored = '{"anchor_intent":"ship_task_6","detected_drift":0.25}'
+        handlers = make_handlers(store, config=_config(tmp_path, require_signatures=True))
+
+        normalized_signature = sign(
+            canonical_authorship_payload(identity_id, expected_stored, "pipe_sign"),
+            identity_id=identity_id,
+            keystore_dir=keystore,
+        )
+        verified = _handle_request(
+            _call(
+                "ncp_emit_whisper",
+                {
+                    "from": identity_id,
+                    "target": "reviewer",
+                    "type": "world_check",
+                    "payload": legacy_payload,
+                    "confidence": 0.8,
+                    "pipeline_id": "pipe_sign",
+                    "signature": normalized_signature,
+                },
+            ),
+            handlers,
+        )
+
+        assert _content(verified) == {
+            "emitted": True,
+            "payload_format": "legacy",
+            "verified": True,
+        }
+        drained = store.drain_whispers(
+            agent_id="reviewer", pipeline_id="pipe_sign", max_items=1
+        )
+        assert drained[0].payload == expected_stored
+
+        source_order_signature = sign(
+            canonical_authorship_payload(identity_id, legacy_payload, "pipe_sign"),
+            identity_id=identity_id,
+            keystore_dir=keystore,
+        )
+        rejected = _handle_request(
+            _call(
+                "ncp_emit_whisper",
+                {
+                    "from": identity_id,
+                    "target": "reviewer",
+                    "type": "world_check",
+                    "payload": legacy_payload,
+                    "confidence": 0.8,
+                    "pipeline_id": "pipe_sign",
+                    "signature": source_order_signature,
+                },
+            ),
+            handlers,
+        )
+
+        error = _error(rejected)
+        assert error["code"] == -32603
+        assert "require_signatures" in error["message"]
+        assert store.drain_whispers(
+            agent_id="reviewer", pipeline_id="pipe_sign", max_items=1
+        ) == []
+
     def test_noncanonical_structured_whisper_signature_is_rejected(
         self, tmp_path: Path
     ) -> None:
