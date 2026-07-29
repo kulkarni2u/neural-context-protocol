@@ -34,6 +34,7 @@ from ncp.types import (
     OutcomeRecord,
     SubconsciousChunk,
     Whisper,
+    normalize_whisper_payload,
 )
 
 from ncp.version import __version__
@@ -195,12 +196,55 @@ MCP_TOOLS: list[dict[str, object]] = [
                 "target": {"type": "string", "description": "Receiving agent ID or '*' for pipeline broadcast"},
                 "type": {"type": "string", "enum": ["nudge", "alert", "share", "request", "dissent", "world_check", "consolidation_ready"]},
                 "payload": {
-                    "type": "string",
+                    "oneOf": [
+                        {"type": "string"},
+                        {
+                            "type": "object",
+                            "title": "HandoffPayload",
+                            "properties": {
+                                "slice": {"type": ["string", "null"]},
+                                "files": {"type": "array", "items": {"type": "string"}},
+                                "ask": {"type": "string"},
+                            },
+                            "required": ["ask"],
+                        },
+                        {
+                            "type": "object",
+                            "title": "DissentPayload",
+                            "properties": {
+                                "issue": {"type": "string"},
+                                "alternatives": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                },
+                            },
+                            "required": ["issue"],
+                        },
+                        {
+                            "type": "object",
+                            "title": "AlertPayload",
+                            "properties": {
+                                "alert_code": {"type": "string"},
+                                "description": {"type": "string"},
+                            },
+                            "required": ["alert_code", "description"],
+                        },
+                        {
+                            "type": "object",
+                            "title": "WorldCheckPayload",
+                            "properties": {
+                                "anchor_intent": {"type": "string"},
+                                "detected_drift": {"type": "number"},
+                            },
+                            "required": ["anchor_intent", "detected_drift"],
+                        },
+                    ],
                     "description": (
-                        "Whisper message (max 600 chars). share/request expect JSON "
-                        "{\"ask\": str, \"files\": [str], \"slice\": str?}; dissent expects "
-                        "JSON {\"issue\": str, \"alternatives\": [str]}. Plain text is accepted "
-                        "by MCP and wrapped into the required shape."
+                        "Whisper message (max 600 normalized chars). Structured-v1 objects "
+                        "are recommended and type-validated: share/request use HandoffPayload; "
+                        "dissent uses DissentPayload; alert and world_check use their named "
+                        "payloads. Legacy strings remain accepted; plain share/request/dissent "
+                        "text is wrapped into the required shape."
                     ),
                 },
                 "confidence": {"type": "number", "description": "Confidence 0.0-1.0"},
@@ -1066,7 +1110,10 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
 
     def _handle_emit_whisper(args: dict[str, object]) -> object:
         whisper_type = str(args["type"])
-        payload = _normalize_mcp_whisper_payload(whisper_type, str(args["payload"]))
+        payload, payload_format = normalize_whisper_payload(
+            whisper_type,  # type: ignore[arg-type]
+            args["payload"],
+        )
         try:
             ttl_seconds = max(1, int(args.get("ttl_seconds", default_whisper_ttl)))
         except (TypeError, ValueError):
@@ -1074,20 +1121,7 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         ref = args.get("ref")
         from_agent = str(args["from"])
         pipeline_id = args.get("pipeline_id")
-        # CAP-T1/WI-013: sign whispers over (from | sha256(payload) | pipeline_id).
         signature = args.get("signature")
-        verified = _verify_authorship(
-            store,
-            identity_id=from_agent,
-            content=payload,
-            pipeline_id=None if pipeline_id is None else str(pipeline_id),
-            signature=None if signature is None else str(signature),
-        )
-        if require_signatures and not verified:
-            raise ValueError(
-                "ncp_emit_whisper rejected: require_signatures is enabled and authorship "
-                "could not be verified (missing/invalid signature or revoked identity)."
-            )
         whisper = Whisper(
             from_agent=from_agent,
             target=str(args["target"]),
@@ -1097,10 +1131,27 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             pipeline_id=pipeline_id,
             ttl_seconds=ttl_seconds,
             ref=None if ref is None else str(ref),
-            verified=verified,
+            verified=False,
         )
+        # Signatures cover the exact normalized payload value that is stored.
+        verified = _verify_authorship(
+            store,
+            identity_id=from_agent,
+            content=whisper.payload,
+            pipeline_id=None if pipeline_id is None else str(pipeline_id),
+            signature=None if signature is None else str(signature),
+        )
+        if require_signatures and not verified:
+            raise ValueError(
+                "ncp_emit_whisper rejected: require_signatures is enabled and authorship "
+                "could not be verified (missing/invalid signature or revoked identity)."
+            )
+        whisper.verified = verified
         store.emit_whisper(whisper)
-        result: dict[str, object] = {"emitted": True}
+        result: dict[str, object] = {
+            "emitted": True,
+            "payload_format": payload_format,
+        }
         if signature is not None:
             result["verified"] = verified
         if whisper_type == "dissent" and ref:
@@ -1561,17 +1612,6 @@ def _trust_from_args(args: dict[str, object]) -> float:
         "agent_inferred": 0.60,
         "subcon_retrieved": 0.55,
     }.get(str(args.get("src", "")), 0.70)
-
-
-def _normalize_mcp_whisper_payload(whisper_type: str, payload: str) -> str:
-    trimmed = payload.strip()
-    if trimmed.startswith("{") and trimmed.endswith("}"):
-        return payload
-    if whisper_type in {"share", "request"}:
-        return json.dumps({"ask": payload})
-    if whisper_type == "dissent":
-        return json.dumps({"issue": payload})
-    return payload
 
 
 _SUPPORTED_VERSIONS = {"2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"}

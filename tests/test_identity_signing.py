@@ -224,3 +224,121 @@ class TestSignedAuthorship:
         result = _content(resp)
         assert result["emitted"] is True
         assert result["verified"] is True
+
+    def test_structured_whisper_canonical_key_order_has_one_signature_payload(
+        self, tmp_path: Path
+    ) -> None:
+        store = SQLiteStore(tmp_path / "store.db")
+        keystore = tmp_path / "keys"
+        identity_id = _make_identity(store, keystore)
+        expected_stored = '{"ask":"review","files":["ncp/types.py"],"slice":"payloads"}'
+        canonical = canonical_authorship_payload(identity_id, expected_stored, "pipe_sign")
+        signature = sign(canonical, identity_id=identity_id, keystore_dir=keystore)
+        handlers = make_handlers(store, config=_config(tmp_path, require_signatures=True))
+
+        for payload in (
+            {"slice": "payloads", "files": ["ncp/types.py"], "ask": "review"},
+            {"ask": "review", "files": ["ncp/types.py"], "slice": "payloads"},
+        ):
+            resp = _handle_request(
+                _call(
+                    "ncp_emit_whisper",
+                    {
+                        "from": identity_id,
+                        "target": "reviewer",
+                        "type": "share",
+                        "payload": payload,
+                        "confidence": 0.8,
+                        "pipeline_id": "pipe_sign",
+                        "signature": signature,
+                    },
+                ),
+                handlers,
+            )
+            result = _content(resp)
+            assert result["emitted"] is True
+            assert result["payload_format"] == "structured-v1"
+            assert result["verified"] is True
+
+        drained = store.drain_whispers(
+            agent_id="reviewer", pipeline_id="pipe_sign", max_items=2
+        )
+        assert [whisper.payload for whisper in drained] == [expected_stored, expected_stored]
+
+    def test_legacy_json_whisper_canonical_signature_still_verifies(
+        self, tmp_path: Path
+    ) -> None:
+        store = SQLiteStore(tmp_path / "store.db")
+        keystore = tmp_path / "keys"
+        identity_id = _make_identity(store, keystore)
+        legacy_payload = '{"ask": "review", "files": ["ncp/types.py"]}'
+        expected_stored = '{"slice":null,"files":["ncp/types.py"],"ask":"review"}'
+        canonical = canonical_authorship_payload(identity_id, expected_stored, "pipe_sign")
+        signature = sign(canonical, identity_id=identity_id, keystore_dir=keystore)
+        handlers = make_handlers(store, config=_config(tmp_path, require_signatures=True))
+
+        resp = _handle_request(
+            _call(
+                "ncp_emit_whisper",
+                {
+                    "from": identity_id,
+                    "target": "reviewer",
+                    "type": "share",
+                    "payload": legacy_payload,
+                    "confidence": 0.8,
+                    "pipeline_id": "pipe_sign",
+                    "signature": signature,
+                },
+            ),
+            handlers,
+        )
+
+        result = _content(resp)
+        assert result["emitted"] is True
+        assert result["payload_format"] == "legacy"
+        assert result["verified"] is True
+        drained = store.drain_whispers(
+            agent_id="reviewer", pipeline_id="pipe_sign", max_items=1
+        )
+        assert drained[0].payload == expected_stored
+
+    def test_noncanonical_structured_whisper_signature_is_rejected(
+        self, tmp_path: Path
+    ) -> None:
+        store = SQLiteStore(tmp_path / "store.db")
+        keystore = tmp_path / "keys"
+        identity_id = _make_identity(store, keystore)
+        noncanonical = '{"slice":"payloads","files":["ncp/types.py"],"ask":"review"}'
+        signature = sign(
+            canonical_authorship_payload(identity_id, noncanonical, "pipe_sign"),
+            identity_id=identity_id,
+            keystore_dir=keystore,
+        )
+        handlers = make_handlers(store, config=_config(tmp_path, require_signatures=True))
+
+        resp = _handle_request(
+            _call(
+                "ncp_emit_whisper",
+                {
+                    "from": identity_id,
+                    "target": "reviewer",
+                    "type": "share",
+                    "payload": {
+                        "slice": "payloads",
+                        "files": ["ncp/types.py"],
+                        "ask": "review",
+                    },
+                    "confidence": 0.8,
+                    "pipeline_id": "pipe_sign",
+                    "signature": signature,
+                },
+            ),
+            handlers,
+        )
+
+        error = _error(resp)
+        assert error["code"] == -32603
+        assert "require_signatures" in error["message"]
+        assert store.drain_whispers(
+            agent_id="reviewer", pipeline_id="pipe_sign", max_items=1
+        ) == []

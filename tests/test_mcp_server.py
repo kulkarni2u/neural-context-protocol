@@ -239,6 +239,24 @@ class TestToolsList:
         assert "share/request" in properties["payload"]["description"]
         assert "dissent" in properties["payload"]["description"]
 
+    def test_emit_whisper_payload_schema_is_additive_for_structured_payloads(self) -> None:
+        emit_tool = next(tool for tool in MCP_TOOLS if tool["name"] == "ncp_emit_whisper")
+        schema = emit_tool["inputSchema"]
+        payload_schema = schema["properties"]["payload"]  # type: ignore[index]
+
+        assert "payload" in schema["required"]  # type: ignore[operator]
+        assert payload_schema["oneOf"][0] == {"type": "string"}
+        assert [branch["title"] for branch in payload_schema["oneOf"][1:]] == [
+            "HandoffPayload",
+            "DissentPayload",
+            "AlertPayload",
+            "WorldCheckPayload",
+        ]
+        assert payload_schema["oneOf"][1]["required"] == ["ask"]
+        assert payload_schema["oneOf"][2]["required"] == ["issue"]
+        assert payload_schema["oneOf"][3]["required"] == ["alert_code", "description"]
+        assert payload_schema["oneOf"][4]["required"] == ["anchor_intent", "detected_drift"]
+
     def test_tool_profile_core_tools_list_advertises_only_context_lifecycle(self, tmp_path: Path) -> None:
         project = tmp_path / "repo"
         (project / ".git").mkdir(parents=True)
@@ -893,6 +911,7 @@ class TestEmitWhisper:
 
         result = _content(resp)
         assert result["emitted"] is True
+        assert result["payload_format"] == "legacy"
         drained = store.drain_whispers(agent_id="executor", max_items=1)
         payload = json.loads(drained[0].payload)
         assert payload["ask"] == "please review the retry slice"
@@ -913,6 +932,7 @@ class TestEmitWhisper:
 
         result = _content(resp)
         assert result["emitted"] is True
+        assert result["payload_format"] == "legacy"
         drained = store.drain_whispers(agent_id="executor", max_items=1)
         payload = json.loads(drained[0].payload)
         assert payload["ask"] == "review retry slice"
@@ -934,9 +954,78 @@ class TestEmitWhisper:
 
         result = _content(resp)
         assert result["emitted"] is True
+        assert result["payload_format"] == "legacy"
         drained = store.drain_whispers(agent_id="builder", max_items=1)
         payload = json.loads(drained[0].payload)
         assert payload["issue"] == "missing rollback path"
+
+    def test_emit_accepts_type_specific_structured_payloads(self, tmp_path: Path) -> None:
+        cases = [
+            (
+                "share",
+                {"files": ["ncp/types.py"], "ask": "review", "slice": "payloads"},
+                '{"ask":"review","files":["ncp/types.py"],"slice":"payloads"}',
+            ),
+            (
+                "request",
+                {"ask": "run tests"},
+                '{"ask":"run tests","files":[],"slice":null}',
+            ),
+            (
+                "dissent",
+                {"alternatives": ["retain legacy"], "issue": "breaking change"},
+                '{"alternatives":["retain legacy"],"issue":"breaking change"}',
+            ),
+            (
+                "alert",
+                {"description": "Store unavailable", "alert_code": "store_down"},
+                '{"alert_code":"store_down","description":"Store unavailable"}',
+            ),
+            (
+                "world_check",
+                {"detected_drift": 0.25, "anchor_intent": "ship_task_6"},
+                '{"anchor_intent":"ship_task_6","detected_drift":0.25}',
+            ),
+        ]
+
+        for whisper_type, payload, expected in cases:
+            store = SQLiteStore(tmp_path / f"{whisper_type}.db")
+            handlers = make_handlers(store)
+            result = _content(_handle_request(
+                _call("ncp_emit_whisper", {
+                    "from": "builder",
+                    "target": "executor",
+                    "type": whisper_type,
+                    "payload": payload,
+                    "confidence": 0.9,
+                }),
+                handlers,
+            ))
+
+            assert result["emitted"] is True
+            assert result["payload_format"] == "structured-v1"
+            drained = store.drain_whispers(agent_id="executor", max_items=1)
+            assert drained[0].payload == expected
+
+    def test_emit_rejects_structured_payload_that_does_not_match_type(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "test.db")
+        handlers = make_handlers(store)
+
+        resp = _handle_request(
+            _call("ncp_emit_whisper", {
+                "from": "builder",
+                "target": "executor",
+                "type": "dissent",
+                "payload": {"ask": "this is a handoff, not dissent"},
+                "confidence": 0.9,
+            }),
+            handlers,
+        )
+
+        error = _error(resp)
+        assert error["code"] == -32603
+        assert "payload validation failed for whisper_type 'dissent'" in error["message"]
+        assert store.drain_whispers(agent_id="executor", max_items=1) == []
 
     def test_rejects_dissent_broadcast(self, tmp_path: Path) -> None:
         store = SQLiteStore(tmp_path / "test.db")

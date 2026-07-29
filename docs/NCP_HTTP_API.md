@@ -177,7 +177,25 @@ curl -s $BASE/mcp -H "$AUTH" -H 'Content-Type: application/json' -d '{
 
 `target: "*"` broadcasts to every agent in the pipeline (each receives it
 once). Plain-text payloads for `share`/`request`/`dissent` are wrapped into
-the required JSON shape server-side.
+the required JSON shape server-side. Dissent remains non-broadcast: a
+`dissent` call with `target: "*"` is rejected.
+
+`payload` is required and supports an additive compatibility union:
+
+- Legacy string payloads remain supported for the current major version. Their
+  current normalization is retained, including plain-text wrapping for
+  `share`/`request`/`dissent`; no removal version is planned until provider
+  telemetry shows that legacy use is negligible.
+- Structured-v1 objects are recommended. `share` and `request` require a
+  HandoffPayload (`ask`, optional `files` and `slice`); `dissent` requires a
+  DissentPayload (`issue`, optional `alternatives`); `alert` requires
+  `alert_code` and `description`; `world_check` requires `anchor_intent` and
+  `detected_drift`. An object whose shape does not match its `type` is rejected.
+
+Structured-v1 values are stored as sorted, compact JSON. A successful response
+includes `payload_format` (`"legacy"` or `"structured-v1"`). If `signature` is
+provided, the response also includes `verified`; signatures cover the exact
+normalized payload that is stored, rather than the input object's key order.
 
 ### ncp_fetch — bounded mid-turn retrieval
 

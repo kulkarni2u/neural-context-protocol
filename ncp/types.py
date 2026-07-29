@@ -390,6 +390,85 @@ class WorldCheckPayload(NCPModel):
     detected_drift: float
 
 
+WhisperPayloadFormat = Literal["legacy", "structured-v1"]
+
+
+def _whisper_payload_model(
+    whisper_type: WhisperType,
+) -> type[HandoffPayload] | type[DissentPayload] | type[AlertPayload] | type[WorldCheckPayload] | None:
+    if whisper_type in {"share", "request"}:
+        return HandoffPayload
+    if whisper_type == "dissent":
+        return DissentPayload
+    if whisper_type == "alert":
+        return AlertPayload
+    if whisper_type == "world_check":
+        return WorldCheckPayload
+    return None
+
+
+def normalize_whisper_payload(
+    whisper_type: WhisperType,
+    payload: object,
+) -> tuple[str, WhisperPayloadFormat]:
+    """Validate and normalize an MCP whisper payload for storage and signing.
+
+    Object input is the structured-v1 representation and is serialized as
+    canonical JSON. String input remains the legacy representation: existing
+    JSON shapes retain their prior Pydantic normalization, plain-text
+    share/request/dissent payloads retain their prior wrapping, and all other
+    strings pass through unchanged.
+    """
+
+    schema_model = _whisper_payload_model(whisper_type)
+    if not isinstance(payload, str):
+        if schema_model is None:
+            raise ValueError(
+                f"structured payload is not supported for whisper_type '{whisper_type}'"
+            )
+        raw_object = payload.model_dump() if isinstance(payload, NCPModel) else payload
+        try:
+            validated = schema_model.model_validate(raw_object)
+        except Exception as exc:
+            raise ValueError(
+                f"payload validation failed for whisper_type '{whisper_type}': {exc}"
+            ) from exc
+        canonical = json.dumps(
+            validated.model_dump(by_alias=True),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return canonical, "structured-v1"
+
+    if schema_model is None:
+        return payload, "legacy"
+
+    parsed: object | None = None
+    trimmed = payload.strip()
+    if trimmed.startswith("{") and trimmed.endswith("}"):
+        try:
+            parsed = json.loads(trimmed)
+        except (json.JSONDecodeError, ValueError):
+            pass
+    elif whisper_type in {"share", "request"}:
+        parsed = {"ask": payload}
+    elif whisper_type == "dissent":
+        parsed = {"issue": payload}
+
+    if parsed is None:
+        raise ValueError(
+            f"payload for whisper_type '{whisper_type}' must be a valid JSON string "
+            "or matching structured object."
+        )
+    try:
+        validated = schema_model.model_validate(parsed)
+    except Exception as exc:
+        raise ValueError(
+            f"payload validation failed for whisper_type '{whisper_type}': {exc}"
+        ) from exc
+    return validated.model_dump_json(by_alias=True), "legacy"
+
+
 class Whisper(NCPModel):
     """Short agent-to-agent signal scoped to a pipeline."""
 
@@ -463,15 +542,7 @@ class Whisper(NCPModel):
                 except (json.JSONDecodeError, ValueError):
                     pass
 
-        schema_model = None
-        if self.whisper_type in {"share", "request"}:
-            schema_model = HandoffPayload
-        elif self.whisper_type == "dissent":
-            schema_model = DissentPayload
-        elif self.whisper_type == "alert":
-            schema_model = AlertPayload
-        elif self.whisper_type == "world_check":
-            schema_model = WorldCheckPayload
+        schema_model = _whisper_payload_model(self.whisper_type)
 
         if schema_model is not None:
             if parsed is None:
@@ -481,7 +552,14 @@ class Whisper(NCPModel):
                 )
             try:
                 validated_model = schema_model.model_validate(parsed)
-                self.payload = validated_model.model_dump_json(by_alias=True)
+                if isinstance(raw_payload, str):
+                    self.payload = raw_payload
+                else:
+                    self.payload = json.dumps(
+                        validated_model.model_dump(by_alias=True),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
             except Exception as exc:
                 raise ValueError(
                     f"payload validation failed for whisper_type '{self.whisper_type}': {exc}"

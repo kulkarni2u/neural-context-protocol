@@ -214,6 +214,23 @@ Routing rules:
   broadcast (*): scoped to pipeline_id — cannot cross pipelines
 ```
 
+`ncp_emit_whisper` accepts either a legacy string or a `structured-v1` object.
+Structured-v1 is the recommended representation: `share` and `request` use
+`HandoffPayload` (`ask`, optional `files` and `slice`), `dissent` uses
+`DissentPayload` (`issue`, optional `alternatives`), `alert` uses
+`AlertPayload` (`alert_code`, `description`), and `world_check` uses
+`WorldCheckPayload` (`anchor_intent`, `detected_drift`). The object shape MUST
+match its whisper type; in particular, dissent stays type-validated and is
+never broadcast.
+
+Strings remain supported for the current major version. This includes the
+existing plain-text wrapping for `share`, `request`, and `dissent`, and legacy
+JSON strings retain their existing normalized representation. No removal
+version is claimed until provider telemetry shows that legacy use is
+negligible. Structured objects are serialized as sorted, compact JSON before
+storage. When authorship signing is enabled, a whisper signature covers that
+exact normalized stored payload, not the caller's source-object key order.
+
 ### 2.4 TurnRecord
 
 ```
@@ -884,7 +901,9 @@ and `ncp_emit_whisper` accept an optional `signature` over the canonical
 `written_by | sha256(content) | pipeline_id` payload; NCP verifies it against
 the author's registered Ed25519 public key, persists the outcome (`verified`
 column), and surfaces a `verified` marker in fetch results and the pidgin wire
-format. This is gated behind `[identity].require_signatures`, which **defaults
+format. For structured-v1 whispers, `content` is the normalized stored payload
+(sorted, compact JSON), so signatures are independent of source-object key
+order. This is gated behind `[identity].require_signatures`, which **defaults
 to `false`** — unsigned writes still work and authorship is *not* authenticated
 unless an operator enables enforcement. With `require_signatures = true`, writes
 that cannot be verified (including from revoked identities) are rejected. Signing
