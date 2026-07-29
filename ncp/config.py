@@ -124,6 +124,9 @@ DEFAULT_CONFIG = {
         "allow_unverified": False,
         "similarity_threshold": 0.95,
     },
+    "tools": {
+        "profile": "full",
+    },
     "identity": {
         # OPT-IN authorship enforcement. When false (default) unsigned writes and
         # whispers keep working exactly as before and any supplied signature is
@@ -459,6 +462,11 @@ class NCPConfig:
         return float(self.values.get("memoization", {}).get("similarity_threshold", 0.95))
 
     @property
+    def tool_profile(self) -> str:
+        profile = str(self.values.get("tools", {}).get("profile", "full")).lower()
+        return profile if profile in {"core", "full"} else "full"
+
+    @property
     def require_signatures(self) -> bool:
         return bool(self.values.get("identity", {}).get("require_signatures", False))
 
@@ -535,6 +543,8 @@ def _apply_env_overrides(values: dict[str, Any], env: dict[str, str]) -> None:
         values["observability"]["log_level"] = env["NCP_LOG_LEVEL"]
     if "NCP_STORE_TYPE" in env:
         values["store"]["type"] = env["NCP_STORE_TYPE"]
+    if "NCP_TOOL_PROFILE" in env:
+        values["tools"]["profile"] = env["NCP_TOOL_PROFILE"]
     if "NCP_HANDOFF_REQUIRE_VERIFIED" in env:
         val = env["NCP_HANDOFF_REQUIRE_VERIFIED"].lower()
         values["handoff"]["require_verified"] = val in {"true", "1", "yes"}

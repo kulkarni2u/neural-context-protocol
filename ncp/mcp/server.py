@@ -14,7 +14,7 @@ import traceback
 import urllib.parse
 from collections.abc import Callable
 from pathlib import Path, PurePosixPath
-from typing import BinaryIO, get_args
+from typing import BinaryIO, Sequence, get_args
 
 from ncp.adaptive_budget import AdaptiveBudgetResult, compute_adaptive_budget
 from ncp.assembler import Assembler
@@ -491,6 +491,37 @@ MCP_TOOLS: list[dict[str, object]] = [
         },
     },
 ]
+
+CORE_TOOL_NAMES = frozenset({
+    "ncp_get_context",
+    "ncp_write_memory",
+    "ncp_emit_whisper",
+    "ncp_post_turn",
+    "ncp_fetch",
+})
+MEMO_TOOL_NAMES = frozenset({"ncp_lookup_memo", "ncp_record_memo"})
+
+
+def tools_for_config(config: NCPConfig | None) -> list[dict[str, object]]:
+    """Return the MCP tools enabled by a normalized server configuration."""
+    if config is None:
+        return list(MCP_TOOLS)
+
+    enabled_names = CORE_TOOL_NAMES if config.tool_profile == "core" else {
+        str(tool["name"]) for tool in MCP_TOOLS
+    }
+    if not config.memoization_enabled:
+        enabled_names -= MEMO_TOOL_NAMES
+    return [tool for tool in MCP_TOOLS if str(tool["name"]) in enabled_names]
+
+
+def handlers_for_tools(
+    handlers: dict[str, ToolHandler],
+    tools: Sequence[dict[str, object]],
+) -> dict[str, ToolHandler]:
+    """Restrict handler reachability to the advertised tool catalog."""
+    enabled_names = {str(tool["name"]) for tool in tools}
+    return {name: handler for name, handler in handlers.items() if name in enabled_names}
 
 
 def _encode_fetch_results(chunks: list[SubconsciousChunk]) -> str:
@@ -1536,7 +1567,12 @@ def _negotiate_version(client_version: str) -> str:
     return _LATEST_VERSION
 
 
-def _handle_request(req: dict[str, object], handlers: dict[str, ToolHandler]) -> str | StreamResponse:
+def _handle_request(
+    req: dict[str, object],
+    handlers: dict[str, ToolHandler],
+    *,
+    tools: Sequence[dict[str, object]] = MCP_TOOLS,
+) -> str | StreamResponse:
     req_id = req.get("id")
     method = str(req.get("method", ""))
     params: dict[str, object] = req.get("params", {}) or {}
@@ -1562,14 +1598,15 @@ def _handle_request(req: dict[str, object], handlers: dict[str, ToolHandler]) ->
         return _ok(req_id, {})
 
     if method == "tools/list":
-        return _ok(req_id, {"tools": MCP_TOOLS})
+        return _ok(req_id, {"tools": tools})
 
     if method == "tools/call":
         tool_name = str(params.get("name", ""))
         arguments: dict[str, object] = params.get("arguments", {}) or {}
         if not isinstance(arguments, dict):
             arguments = {}
-        handler = handlers.get(tool_name)
+        enabled_names = {str(tool["name"]) for tool in tools}
+        handler = handlers.get(tool_name) if tool_name in enabled_names else None
         if handler is None:
             return _err_response(req_id, -32601, f"Tool not found: {tool_name}")
         try:
@@ -1640,13 +1677,15 @@ def _create_handlers_with_store(
     *,
     store_path: str | Path | None = None,
     cwd: Path | None = None,
-) -> tuple[dict[str, ToolHandler], BaseStore]:
+) -> tuple[dict[str, ToolHandler], BaseStore, list[dict[str, object]]]:
     if store_path:
         config = load_config(env={"NCP_STORE_PATH": str(store_path)})
     else:
         config = load_config(cwd=cwd or Path.cwd())
     store = create_store(config)
-    return make_handlers(store, config=config), store
+    tools = tools_for_config(config)
+    handlers = handlers_for_tools(make_handlers(store, config=config), tools)
+    return handlers, store, tools
 
 
 def _create_handlers(
@@ -1654,7 +1693,7 @@ def _create_handlers(
     store_path: str | Path | None = None,
     cwd: Path | None = None,
 ) -> dict[str, ToolHandler]:
-    handlers, _store = _create_handlers_with_store(store_path=store_path, cwd=cwd)
+    handlers, _store, _tools = _create_handlers_with_store(store_path=store_path, cwd=cwd)
     return handlers
 
 
@@ -1667,7 +1706,7 @@ def serve_streams(
 ) -> None:
     """Run the MCP server against arbitrary binary streams."""
     try:
-        handlers = _create_handlers(store_path=store_path, cwd=cwd)
+        handlers, _store, tools = _create_handlers_with_store(store_path=store_path, cwd=cwd)
     except Exception as exc:
         _err(f"NCP server failed to start: {exc}\n{traceback.format_exc()}")
         sys.exit(1)
@@ -1686,7 +1725,7 @@ def serve_streams(
         if req is None:
             break
 
-        response = _handle_request(req, handlers)
+        response = _handle_request(req, handlers, tools=tools)
         if isinstance(response, StreamResponse):
             for i, (label, text) in enumerate(response.sections):
                 notif = json.dumps({
@@ -1875,6 +1914,7 @@ class _MCPHTTPServer(ThreadingHTTPServer):
         server_address: tuple[str, int],
         *,
         handlers: dict[str, ToolHandler],
+        tools: Sequence[dict[str, object]],
         store: BaseStore,
         sse_path: str,
         rpc_path: str,
@@ -1884,6 +1924,7 @@ class _MCPHTTPServer(ThreadingHTTPServer):
         max_body_bytes: int,
     ) -> None:
         self.handlers = handlers
+        self.tools = tools
         self.store = store
         self.sse_path = sse_path
         self.rpc_path = rpc_path
@@ -2165,7 +2206,7 @@ class _MCPHTTPHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_payload"})
             return
 
-        response = _handle_request(payload, self.server.handlers)
+        response = _handle_request(payload, self.server.handlers, tools=self.server.tools)
         prefers_sse = self._prefers_event_stream()
         if isinstance(response, StreamResponse):
             if prefers_sse:
@@ -2194,10 +2235,11 @@ def create_http_server(
     cors_allowed_origins: list[str] | None = None,
     max_body_bytes: int = 10_485_760,
 ) -> _MCPHTTPServer:
-    handlers, store = _create_handlers_with_store(store_path=store_path, cwd=cwd)
+    handlers, store, tools = _create_handlers_with_store(store_path=store_path, cwd=cwd)
     return _MCPHTTPServer(
         (host, port),
         handlers=handlers,
+        tools=tools,
         store=store,
         sse_path=sse_path,
         rpc_path=rpc_path,

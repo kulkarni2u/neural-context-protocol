@@ -27,6 +27,20 @@ from ncp.stores.sqlite import SQLiteStore
 from ncp.types import ConsciousBlock, SubconsciousChunk, Whisper
 
 
+FULL_NON_MEMO_TOOL_NAMES = [
+    "ncp_get_context",
+    "ncp_write_memory",
+    "ncp_emit_whisper",
+    "ncp_post_turn",
+    "ncp_remember",
+    "ncp_recall",
+    "ncp_improve",
+    "ncp_fetch",
+    "ncp_record_decision",
+    "ncp_record_outcome",
+]
+
+
 def _req(method: str, params: object | None = None, req_id: int = 1) -> dict:
     d: dict = {"jsonrpc": "2.0", "id": req_id, "method": method}
     if params is not None:
@@ -89,7 +103,7 @@ class TestInitialize:
 
         framed_response = _read_message(io.BytesIO(output_stream.getvalue()))
         assert framed_response is not None
-        assert framed_response["result"]["tools"] == MCP_TOOLS
+        assert [tool["name"] for tool in framed_response["result"]["tools"]] == FULL_NON_MEMO_TOOL_NAMES
 
     def test_http_transport_handles_initialize_and_tools_list(self, tmp_path: Path) -> None:
         port = _free_port()
@@ -121,7 +135,7 @@ class TestInitialize:
 
                 tools = client.post("/mcp", json=_req("tools/list"))
                 assert tools.status_code == 200
-                assert tools.json()["result"]["tools"] == MCP_TOOLS
+                assert [tool["name"] for tool in tools.json()["result"]["tools"]] == FULL_NON_MEMO_TOOL_NAMES
         finally:
             server._shutdown_event.set()
             server.shutdown()
@@ -224,6 +238,100 @@ class TestToolsList:
         assert "ttl_seconds" in properties
         assert "share/request" in properties["payload"]["description"]
         assert "dissent" in properties["payload"]["description"]
+
+    def test_tool_profile_core_tools_list_advertises_only_context_lifecycle(self, tmp_path: Path) -> None:
+        project = tmp_path / "repo"
+        (project / ".git").mkdir(parents=True)
+        (project / ".ncp").mkdir()
+        (project / ".ncp" / "config.toml").write_text('[tools]\nprofile = "core"\n')
+        input_stream = io.BytesIO(_frame(_req("tools/list")))
+        output_stream = io.BytesIO()
+
+        serve_streams(input_stream, output_stream, cwd=project)
+
+        response = _read_message(io.BytesIO(output_stream.getvalue()))
+        assert response is not None
+        assert [tool["name"] for tool in response["result"]["tools"]] == [
+            "ncp_get_context",
+            "ncp_write_memory",
+            "ncp_emit_whisper",
+            "ncp_post_turn",
+            "ncp_fetch",
+        ]
+
+    def test_tool_profile_full_tools_list_hides_disabled_memo_tools(self, tmp_path: Path) -> None:
+        project = tmp_path / "repo"
+        (project / ".git").mkdir(parents=True)
+        (project / ".ncp").mkdir()
+        (project / ".ncp" / "config.toml").write_text('[tools]\nprofile = "full"\n')
+        input_stream = io.BytesIO(_frame(_req("tools/list")))
+        output_stream = io.BytesIO()
+
+        serve_streams(input_stream, output_stream, cwd=project)
+
+        response = _read_message(io.BytesIO(output_stream.getvalue()))
+        assert response is not None
+        assert [tool["name"] for tool in response["result"]["tools"]] == FULL_NON_MEMO_TOOL_NAMES
+
+    def test_tool_profile_full_memo_tools_are_advertised_when_enabled(self, tmp_path: Path) -> None:
+        project = tmp_path / "repo"
+        (project / ".git").mkdir(parents=True)
+        (project / ".ncp").mkdir()
+        (project / ".ncp" / "config.toml").write_text(
+            '[tools]\nprofile = "full"\n\n[memoization]\nenabled = true\n'
+        )
+        input_stream = io.BytesIO(_frame(_req("tools/list")))
+        output_stream = io.BytesIO()
+
+        serve_streams(input_stream, output_stream, cwd=project)
+
+        response = _read_message(io.BytesIO(output_stream.getvalue()))
+        assert response is not None
+        assert [tool["name"] for tool in response["result"]["tools"]] == [tool["name"] for tool in MCP_TOOLS]
+
+    def test_disabled_memo_tools_are_not_callable(self, tmp_path: Path) -> None:
+        project = tmp_path / "repo"
+        (project / ".git").mkdir(parents=True)
+        input_stream = io.BytesIO(_frame(_call("ncp_lookup_memo", {"task": "task", "context": "context"})))
+        output_stream = io.BytesIO()
+
+        serve_streams(input_stream, output_stream, cwd=project)
+
+        response = _read_message(io.BytesIO(output_stream.getvalue()))
+        assert response is not None
+        assert response["error"]["code"] == -32601
+
+    def test_tool_profile_http_and_stdio_share_the_core_catalog(self, tmp_path: Path) -> None:
+        project = tmp_path / "repo"
+        (project / ".git").mkdir(parents=True)
+        (project / ".ncp").mkdir()
+        (project / ".ncp" / "config.toml").write_text('[tools]\nprofile = "core"\n')
+        input_stream = io.BytesIO(_frame(_req("tools/list")))
+        output_stream = io.BytesIO()
+        serve_streams(input_stream, output_stream, cwd=project)
+        stdio_response = _read_message(io.BytesIO(output_stream.getvalue()))
+        assert stdio_response is not None
+
+        port = _free_port()
+        server = create_http_server(host="127.0.0.1", port=port, cwd=project)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with httpx.Client(base_url=f"http://127.0.0.1:{port}", timeout=5.0) as client:
+                http_response = client.post("/mcp", json=_req("tools/list"))
+            assert http_response.status_code == 200
+            assert http_response.json()["result"]["tools"] == stdio_response["result"]["tools"]
+            assert [tool["name"] for tool in http_response.json()["result"]["tools"]] == [
+                "ncp_get_context",
+                "ncp_write_memory",
+                "ncp_emit_whisper",
+                "ncp_post_turn",
+                "ncp_fetch",
+            ]
+        finally:
+            server._shutdown_event.set()
+            server.shutdown()
+            thread.join(timeout=5)
 
 
 class TestMemoryTools:
