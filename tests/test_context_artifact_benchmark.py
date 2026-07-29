@@ -10,6 +10,7 @@ from benchmarks.context_artifacts.run import (
     run_context_artifact_audit,
     run_live_context_artifact_matrix,
 )
+from ncp.adapters.base import BaseAdapter
 from ncp.dogfood import OpenCodeCLIDogfoodAdapter
 from ncp.tokens import estimate_tokens
 
@@ -149,6 +150,157 @@ def test_live_matrix_records_structured_skips_without_provider_substitution(
         assert attempt["status"] == "skipped"
         assert attempt["skip_reason"] == "provider_unavailable"
         assert attempt["raw_artifact_ref"] is None
+        assert attempt["archivable"] is False
+
+
+def test_live_matrix_unavailable_provider_does_not_load_or_call_adapter(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    readiness = {
+        "adapter_name": "codex-cli",
+        "credentials_present": True,
+        "dependency_installed": True,
+        "ready": False,
+        "credential_envs": [],
+        "cli_version": None,
+        "version_probe": {
+            "status": "nonzero_exit",
+            "returncode": 1,
+            "diagnostic": "Error: spawn /missing/codex ENOENT",
+        },
+    }
+    monkeypatch.setattr(
+        "ncp.dogfood.get_live_provider_readiness",
+        lambda _provider: readiness,
+    )
+
+    def _unexpected_load(*args, **kwargs):
+        raise AssertionError("unavailable provider adapter must not be loaded")
+
+    monkeypatch.setattr("ncp.dogfood.load_dogfood_adapter", _unexpected_load)
+
+    attempts = run_live_context_artifact_matrix(
+        REPO_ROOT,
+        provider="codex-cli",
+        condition="current",
+        seeds=2,
+        raw_dir=tmp_path,
+    )
+
+    assert len(attempts) == 6
+    assert all(attempt["status"] == "skipped" for attempt in attempts)
+    assert all(attempt["skip_reason"] == "provider_unavailable" for attempt in attempts)
+    assert all(attempt["readiness"] == readiness for attempt in attempts)
+
+
+class _ObservedMetadataAdapter(BaseAdapter):
+    def __init__(self, metadata: dict[str, object] | None) -> None:
+        self.metadata = metadata
+        self.last_call_metadata: dict[str, object] | None = None
+
+    def call(self, ncp_context: str, user_turn: str) -> str:
+        self.last_call_metadata = self.metadata
+        return "\n".join(
+            (
+                "ACTION ncp_get_context",
+                "REFUSED_MALICIOUS_INSTRUCTION",
+                "ACTION subagent_pre_ncp_get_context",
+                "ACTION subagent_post_ncp_write_memory",
+                "ACTION ncp_post_turn",
+                "ACTION ncp_write_memory",
+                "TRUST_BOUNDARY_PRESERVED",
+                "TASK_SUCCESS",
+            )
+        )
+
+
+def test_live_matrix_propagates_observed_model_and_cli_version_to_raw_artifact(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    adapter = _ObservedMetadataAdapter(
+        {
+            "model": "opencode/deepseek-v4-flash-free",
+            "cli_version": "1.17.15",
+            "session_id": "ses_test",
+        }
+    )
+    monkeypatch.setattr(
+        "ncp.dogfood.get_live_provider_readiness",
+        lambda _provider: {
+            "adapter_name": "opencode-cli",
+            "credentials_present": True,
+            "dependency_installed": True,
+            "ready": True,
+            "credential_envs": [],
+            "cli_version": "1.17.15",
+            "version_probe": {"status": "ok"},
+        },
+    )
+    monkeypatch.setattr(
+        "ncp.dogfood.load_dogfood_adapter",
+        lambda _provider, **_kwargs: adapter,
+    )
+
+    attempts = run_live_context_artifact_matrix(
+        REPO_ROOT,
+        provider="opencode-cli",
+        condition="current",
+        seeds=1,
+        raw_dir=tmp_path,
+    )
+
+    for attempt in attempts:
+        assert attempt["status"] == "completed"
+        assert attempt["model"] == "opencode/deepseek-v4-flash-free"
+        assert attempt["cli_version"] == "1.17.15"
+        assert attempt["archivable"] is True
+        raw = json.loads(Path(attempt["raw_artifact_ref"]).read_text())
+        assert raw["model"] == "opencode/deepseek-v4-flash-free"
+        assert raw["cli_version"] == "1.17.15"
+        assert raw["session_id"] == "ses_test"
+        assert raw["archivable"] is True
+
+
+def test_live_matrix_marks_missing_observed_metadata_non_archivable(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    adapter = _ObservedMetadataAdapter(None)
+    monkeypatch.setattr(
+        "ncp.dogfood.get_live_provider_readiness",
+        lambda _provider: {
+            "adapter_name": "opencode-cli",
+            "credentials_present": True,
+            "dependency_installed": True,
+            "ready": True,
+            "credential_envs": [],
+            "cli_version": "1.17.15",
+            "version_probe": {"status": "ok"},
+        },
+    )
+    monkeypatch.setattr(
+        "ncp.dogfood.load_dogfood_adapter",
+        lambda _provider, **_kwargs: adapter,
+    )
+
+    attempts = run_live_context_artifact_matrix(
+        REPO_ROOT,
+        provider="opencode-cli",
+        condition="current",
+        seeds=1,
+        raw_dir=tmp_path,
+    )
+
+    for attempt in attempts:
+        assert attempt["status"] == "metadata_error"
+        assert attempt["model"] is None
+        assert attempt["archivable"] is False
+        assert "observed model metadata" in attempt["metadata_error"]
+        raw = json.loads(Path(attempt["raw_artifact_ref"]).read_text())
+        assert raw["archivable"] is False
+        assert "observed model metadata" in raw["metadata_error"]
 
 
 def test_opencode_completed_path_delivers_context_artifact_once(
@@ -164,6 +316,19 @@ from pathlib import Path
 import sys
 
 capture = Path(sys.argv[1])
+if "--export" in sys.argv:
+    print(json.dumps({
+        "info": {
+            "id": "ses_test",
+            "model": {
+                "providerID": "opencode",
+                "id": "deepseek-v4-flash-free",
+            },
+            "version": "1.17.15",
+        },
+        "messages": [],
+    }))
+    raise SystemExit(0)
 with capture.open("a", encoding="utf-8") as stream:
     stream.write(json.dumps(sys.argv[-1]) + "\\n")
 response = "\\n".join(
@@ -178,12 +343,22 @@ response = "\\n".join(
         "TASK_SUCCESS",
     )
 )
-print(json.dumps({"type": "text", "part": {"text": response}}))
+print(json.dumps({
+    "type": "text",
+    "sessionID": "ses_test",
+    "part": {"sessionID": "ses_test", "text": response},
+}))
 """.lstrip(),
         encoding="utf-8",
     )
     adapter = OpenCodeCLIDogfoodAdapter(
         command=[sys.executable, str(fake_cli), str(captured_prompts)],
+        export_command=[
+            sys.executable,
+            str(fake_cli),
+            str(captured_prompts),
+            "--export",
+        ],
         cwd=REPO_ROOT,
     )
     monkeypatch.setattr(
@@ -194,6 +369,8 @@ print(json.dumps({"type": "text", "part": {"text": response}}))
             "dependency_installed": True,
             "ready": True,
             "credential_envs": [],
+            "cli_version": "1.17.15",
+            "version_probe": {"status": "ok"},
         },
     )
     monkeypatch.setattr(

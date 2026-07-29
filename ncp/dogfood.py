@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import socket
 import subprocess
@@ -80,6 +81,35 @@ class FinalDirective:
     content: str
 
 
+class CLIProviderMetadataError(RuntimeError):
+    """A live CLI call completed without authoritative provider metadata."""
+
+
+def _extract_claude_json_result(output: str) -> tuple[str, dict[str, str]]:
+    try:
+        payload = json.loads(output)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Claude CLI returned invalid JSON") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("Claude CLI JSON response must be an object")
+
+    result = payload.get("result")
+    if not isinstance(result, str) or not result.strip():
+        raise RuntimeError("Claude CLI JSON response has no result text")
+
+    model_usage = payload.get("modelUsage")
+    if not isinstance(model_usage, dict) or len(model_usage) != 1:
+        raise CLIProviderMetadataError(
+            "Claude CLI JSON response must report exactly one resolved model"
+        )
+    model = next(iter(model_usage))
+    if not isinstance(model, str) or not model.strip():
+        raise CLIProviderMetadataError(
+            "Claude CLI JSON response has invalid resolved model metadata"
+        )
+    return result.strip(), {"model": model.strip()}
+
+
 class DogfoodLocalAdapter(LocalAdapter):
     """Deterministic adapter that follows the dogfood fetch/final contract."""
 
@@ -115,7 +145,7 @@ class ClaudeCLIDogfoodAdapter(BaseAdapter):
     def __init__(
         self,
         *,
-        model: str = "claude-sonnet-4-20250514",
+        model: str = "sonnet",
         command: list[str] | None = None,
         cwd: str | Path | None = None,
         timeout_seconds: float = 30.0,
@@ -123,16 +153,27 @@ class ClaudeCLIDogfoodAdapter(BaseAdapter):
     ) -> None:
         self._cwd = Path(cwd) if cwd is not None else Path.cwd()
         self._timeout_seconds = timeout_seconds
+        self.last_call_metadata: dict[str, str] | None = None
         if command is not None:
             self._command = command
         else:
             tools = allowed_tools if allowed_tools is not None else self.DEFAULT_ALLOWED_TOOLS
-            base = ["claude", "-p", "--model", model, "--allowedTools", ",".join(tools)]
+            base = [
+                "claude",
+                "-p",
+                "--model",
+                model,
+                "--output-format",
+                "json",
+                "--allowedTools",
+                ",".join(tools),
+            ]
             self._command = base + ["--add-dir", str(self._cwd), "--"]
 
     def call(self, ncp_context: str, user_turn: str) -> str:
         # Skip the full assembled context: it adds latency and may already contain
         # the answer, causing Claude to bypass the required fetch step.
+        self.last_call_metadata = None
         completed = subprocess.run(
             self._command + [user_turn],
             cwd=self._cwd,
@@ -142,8 +183,13 @@ class ClaudeCLIDogfoodAdapter(BaseAdapter):
             timeout=self._timeout_seconds,
         )
         if completed.returncode != 0:
-            raise RuntimeError(completed.stderr.strip() or completed.stdout.strip() or "Claude CLI call failed")
-        return completed.stdout.strip()
+            diagnostic = completed.stderr.strip() or completed.stdout.strip()
+            raise RuntimeError(
+                _sanitize_cli_diagnostic(diagnostic) or "Claude CLI call failed"
+            )
+        result, metadata = _extract_claude_json_result(completed.stdout)
+        self.last_call_metadata = metadata
+        return result
 
 
 class OpenCodeCLIDogfoodAdapter(BaseAdapter):
@@ -158,11 +204,18 @@ class OpenCodeCLIDogfoodAdapter(BaseAdapter):
         *,
         model: str | None = None,
         command: list[str] | None = None,
+        export_command: list[str] | None = None,
         cwd: str | Path | None = None,
         timeout_seconds: float = 16.0,
     ) -> None:
         self._cwd = Path(cwd) if cwd is not None else Path.cwd()
         self._timeout_seconds = timeout_seconds
+        self.last_call_metadata: dict[str, str] | None = None
+        self._export_command = export_command or [
+            "opencode",
+            "export",
+            "--sanitize",
+        ]
         if command is not None:
             self._command = command
         else:
@@ -172,7 +225,9 @@ class OpenCodeCLIDogfoodAdapter(BaseAdapter):
 
     def call(self, ncp_context: str, user_turn: str) -> str:
         prompt = f"NCP_CONTEXT:\n{ncp_context}\n\n{user_turn}"
+        self.last_call_metadata = None
         last_error: Exception | None = None
+        completed: subprocess.CompletedProcess[str] | None = None
         for _ in range(2):
             try:
                 completed = subprocess.run(
@@ -184,12 +239,48 @@ class OpenCodeCLIDogfoodAdapter(BaseAdapter):
                     timeout=self._timeout_seconds,
                 )
                 if completed.returncode != 0:
-                    raise RuntimeError(completed.stderr.strip() or completed.stdout.strip() or "OpenCode CLI call failed")
-                return _extract_opencode_text(completed.stdout)
+                    diagnostic = completed.stderr.strip() or completed.stdout.strip()
+                    raise RuntimeError(
+                        _sanitize_cli_diagnostic(diagnostic)
+                        or "OpenCode CLI call failed"
+                    )
+                break
             except subprocess.TimeoutExpired as exc:
                 last_error = exc
                 continue
-        raise RuntimeError("OpenCode CLI call failed after 2 attempts") from last_error
+        if completed is None:
+            raise RuntimeError(
+                "OpenCode CLI call failed after 2 attempts"
+            ) from last_error
+
+        response, session_id = _extract_opencode_response(completed.stdout)
+        try:
+            exported = subprocess.run(
+                [*self._export_command, session_id],
+                cwd=self._cwd,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=self._timeout_seconds,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise CLIProviderMetadataError(
+                "OpenCode session metadata export timed out"
+            ) from exc
+        if exported.returncode != 0:
+            diagnostic = exported.stderr.strip() or exported.stdout.strip()
+            raise CLIProviderMetadataError(
+                "OpenCode session metadata export failed: "
+                + (
+                    _sanitize_cli_diagnostic(diagnostic)
+                    or "unknown CLI error"
+                )
+            )
+        self.last_call_metadata = _extract_opencode_export_metadata(
+            exported.stdout,
+            expected_session_id=session_id,
+        )
+        return response
 
 
 class CodexCLIDogfoodAdapter(BaseAdapter):
@@ -317,6 +408,96 @@ _PROVIDER_ENV_VARS: dict[str, str | tuple[str, ...]] = {
     "cursor-cli": "",
     "cursor": "CURSOR_API_KEY",
 }
+
+_CLI_ADAPTER_EXECUTABLES = {
+    "claude-cli": "claude",
+    "codex-cli": "codex",
+    "opencode-cli": "opencode",
+    "cursor-cli": "cursor",
+}
+_CLI_VERSION_PROBE_TIMEOUT_SECONDS = 5.0
+_CLI_DIAGNOSTIC_SECRET_PATTERNS = (
+    re.compile(
+        r"(?i)\b(?:access[_-]?token|refresh[_-]?token|client[_-]?secret|"
+        r"api[_-]?key|password|secret|token)\s*[:=]\s*"
+        r"(?:\"[^\"]*\"|'[^']*'|[^\s,;}\]]+)"
+    ),
+    re.compile(r"\b(?:sk|ghp|github_pat)-[A-Za-z0-9_-]{8,}\b"),
+    re.compile(r"(?i)\bBearer\s+\S+"),
+)
+
+
+def _sanitize_cli_diagnostic(value: str, *, max_chars: int = 600) -> str:
+    sanitized = " ".join(value.strip().split())
+    for pattern in _CLI_DIAGNOSTIC_SECRET_PATTERNS:
+        sanitized = pattern.sub("[REDACTED]", sanitized)
+    if len(sanitized) <= max_chars:
+        return sanitized
+    return sanitized[: max_chars - 3].rstrip() + "..."
+
+
+def _probe_cli_version(executable_name: str) -> dict[str, object]:
+    executable = shutil.which(executable_name)
+    if executable is None:
+        return {
+            "executable": None,
+            "dependency_installed": False,
+            "cli_version": None,
+            "version_probe": {
+                "status": "missing_executable",
+                "diagnostic": f"{executable_name} executable not found on PATH",
+            },
+        }
+
+    result: dict[str, object] = {
+        "executable": executable,
+        "dependency_installed": True,
+        "cli_version": None,
+    }
+    command = [executable, "--version"]
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_CLI_VERSION_PROBE_TIMEOUT_SECONDS,
+            stdin=subprocess.DEVNULL,
+        )
+    except subprocess.TimeoutExpired:
+        result["version_probe"] = {
+            "status": "timed_out",
+            "timeout_seconds": _CLI_VERSION_PROBE_TIMEOUT_SECONDS,
+        }
+        return result
+    except OSError as exc:
+        result["version_probe"] = {
+            "status": "execution_error",
+            "diagnostic": _sanitize_cli_diagnostic(str(exc)),
+        }
+        return result
+
+    if completed.returncode != 0:
+        diagnostic = completed.stderr.strip() or completed.stdout.strip()
+        result["version_probe"] = {
+            "status": "nonzero_exit",
+            "returncode": completed.returncode,
+            "diagnostic": (
+                _sanitize_cli_diagnostic(diagnostic)
+                or f"{executable_name} --version exited nonzero"
+            ),
+        }
+        return result
+
+    version = _sanitize_cli_diagnostic(
+        completed.stdout.strip() or completed.stderr.strip()
+    )
+    if not version:
+        result["version_probe"] = {"status": "empty_version"}
+        return result
+    result["cli_version"] = version
+    result["version_probe"] = {"status": "ok"}
+    return result
 
 
 class MCPStdioClient:
@@ -1327,41 +1508,20 @@ def get_live_provider_readiness(name: str) -> dict[str, object]:
             "ready": True,
             "credential_envs": [],
         }
-    if normalized == "claude-cli":
-        installed = shutil.which("claude") is not None
+    executable_name = _CLI_ADAPTER_EXECUTABLES.get(normalized)
+    if executable_name is not None:
+        probe = _probe_cli_version(executable_name)
+        installed = bool(probe["dependency_installed"])
+        ready = installed and probe["version_probe"] == {"status": "ok"}
         return {
             "adapter_name": normalized,
             "credentials_present": installed,
             "dependency_installed": installed,
-            "ready": installed,
+            "ready": ready,
             "credential_envs": [],
-        }
-    if normalized == "codex-cli":
-        installed = shutil.which("codex") is not None
-        return {
-            "adapter_name": normalized,
-            "credentials_present": installed,
-            "dependency_installed": installed,
-            "ready": installed,
-            "credential_envs": [],
-        }
-    if normalized == "opencode-cli":
-        installed = shutil.which("opencode") is not None
-        return {
-            "adapter_name": normalized,
-            "credentials_present": installed,
-            "dependency_installed": installed,
-            "ready": installed,
-            "credential_envs": [],
-        }
-    if normalized == "cursor-cli":
-        installed = shutil.which("cursor") is not None
-        return {
-            "adapter_name": normalized,
-            "credentials_present": installed,
-            "dependency_installed": installed,
-            "ready": installed,
-            "credential_envs": [],
+            "executable": probe["executable"],
+            "cli_version": probe["cli_version"],
+            "version_probe": probe["version_probe"],
         }
 
     try:
@@ -1417,8 +1577,9 @@ def _normalize_env_spec(spec: str | tuple[str, ...] | None) -> list[str]:
     return [spec]
 
 
-def _extract_opencode_text(output: str) -> str:
+def _extract_opencode_response(output: str) -> tuple[str, str]:
     texts: list[str] = []
+    session_ids: set[str] = set()
     for line in output.splitlines():
         line = line.strip()
         if not line:
@@ -1427,12 +1588,96 @@ def _extract_opencode_text(output: str) -> str:
             event = json.loads(line)
         except json.JSONDecodeError:
             continue
+        if not isinstance(event, dict):
+            continue
+        event_session_id = event.get("sessionID")
+        if isinstance(event_session_id, str) and event_session_id.strip():
+            session_ids.add(event_session_id.strip())
         if event.get("type") == "text":
             part = event.get("part", {})
             if isinstance(part, dict):
+                part_session_id = part.get("sessionID")
+                if isinstance(part_session_id, str) and part_session_id.strip():
+                    session_ids.add(part_session_id.strip())
                 text = part.get("text")
                 if isinstance(text, str):
                     texts.append(text.strip())
     if not texts:
         raise RuntimeError("OpenCode CLI returned no text event")
+    if len(session_ids) != 1:
+        raise CLIProviderMetadataError(
+            "OpenCode CLI JSON events must report exactly one session ID"
+        )
+    return texts[-1], next(iter(session_ids))
+
+
+def _extract_opencode_text(output: str) -> str:
+    """Return the last OpenCode text event without requiring session metadata."""
+
+    texts: list[str] = []
+    for line in output.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict) or event.get("type") != "text":
+            continue
+        part = event.get("part")
+        if isinstance(part, dict) and isinstance(part.get("text"), str):
+            texts.append(part["text"].strip())
+    if not texts:
+        raise RuntimeError("OpenCode CLI returned no text event")
     return texts[-1]
+
+
+def _extract_opencode_export_metadata(
+    output: str,
+    *,
+    expected_session_id: str,
+) -> dict[str, str]:
+    try:
+        payload = json.loads(output)
+    except json.JSONDecodeError as exc:
+        raise CLIProviderMetadataError(
+            "OpenCode session export returned invalid JSON"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise CLIProviderMetadataError(
+            "OpenCode session export must be a JSON object"
+        )
+    info = payload.get("info")
+    if not isinstance(info, dict):
+        raise CLIProviderMetadataError(
+            "OpenCode session export has no info metadata"
+        )
+
+    session_id = info.get("id")
+    if session_id != expected_session_id:
+        raise CLIProviderMetadataError(
+            "OpenCode session export ID does not match run events"
+        )
+    model = info.get("model")
+    if not isinstance(model, dict):
+        raise CLIProviderMetadataError(
+            "OpenCode session export has no model metadata"
+        )
+    provider_id = model.get("providerID")
+    model_id = model.get("id")
+    version = info.get("version")
+    if not isinstance(provider_id, str) or not provider_id.strip():
+        raise CLIProviderMetadataError(
+            "OpenCode session export has invalid provider metadata"
+        )
+    if not isinstance(model_id, str) or not model_id.strip():
+        raise CLIProviderMetadataError(
+            "OpenCode session export has invalid model metadata"
+        )
+    if not isinstance(version, str) or not version.strip():
+        raise CLIProviderMetadataError(
+            "OpenCode session export has invalid CLI version metadata"
+        )
+    return {
+        "model": f"{provider_id.strip()}/{model_id.strip()}",
+        "cli_version": version.strip(),
+        "session_id": expected_session_id,
+    }

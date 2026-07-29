@@ -202,11 +202,6 @@ _PROVIDER_NAMES: dict[str, Provider] = {
     "codex-cli": "codex",
     "opencode-cli": "opencode",
 }
-_PROVIDER_MODELS = {
-    "claude-cli": "claude-sonnet-4-20250514",
-    "codex-cli": "gpt-5.4",
-    "opencode-cli": "provider-configured-default",
-}
 _LIVE_SCENARIOS = {
     "bounded_context_turn": (
         "Handle a normal bounded-context turn. Emit these lines in order:\n"
@@ -320,7 +315,8 @@ def _base_live_attempt(
 ) -> dict[str, object]:
     return {
         "provider": provider,
-        "model": _PROVIDER_MODELS[provider],
+        "model": None,
+        "cli_version": None,
         "condition": condition,
         "seed": seed,
         "scenario": scenario,
@@ -330,7 +326,40 @@ def _base_live_attempt(
         "task_success": None,
         "timeout": False,
         "raw_artifact_ref": None,
+        "archivable": False,
     }
+
+
+class _LiveMetadataError(RuntimeError):
+    pass
+
+
+def _observed_live_metadata(
+    adapter: object,
+    *,
+    readiness: dict[str, object],
+) -> dict[str, str]:
+    metadata = getattr(adapter, "last_call_metadata", None)
+    if not isinstance(metadata, dict):
+        raise _LiveMetadataError("completed call has no observed model metadata")
+    model = metadata.get("model")
+    if not isinstance(model, str) or not model.strip():
+        raise _LiveMetadataError("completed call has no observed model metadata")
+
+    cli_version_source = metadata.get("cli_version") or readiness.get("cli_version")
+    if not isinstance(cli_version_source, str) or not cli_version_source.strip():
+        raise _LiveMetadataError(
+            "completed call has no observed CLI version metadata"
+        )
+
+    observed = {
+        "model": model.strip(),
+        "cli_version": cli_version_source.strip(),
+    }
+    session_id = metadata.get("session_id")
+    if isinstance(session_id, str) and session_id.strip():
+        observed["session_id"] = session_id.strip()
+    return observed
 
 
 def run_live_context_artifact_matrix(
@@ -349,7 +378,11 @@ def run_live_context_artifact_matrix(
     if seeds < 1:
         raise ValueError("seeds must be at least 1")
 
-    from ncp.dogfood import get_live_provider_readiness, load_dogfood_adapter
+    from ncp.dogfood import (
+        CLIProviderMetadataError,
+        get_live_provider_readiness,
+        load_dogfood_adapter,
+    )
 
     sources = _condition_sources(
         Path(repo_root),
@@ -406,11 +439,18 @@ def run_live_context_artifact_matrix(
             prompt_tokens=estimate_tokens(f"{artifact_text}\n\n{prompt}"),
         )
         raw_path = raw_dir / f"{provider}-{condition}-{scenario}-seed-{seed}.json"
+        response: str | None = None
         try:
             response = adapter.call(adapter_context, adapter_prompt)
+            observed_metadata = _observed_live_metadata(
+                adapter,
+                readiness=readiness,
+            )
             attempt.update(
                 {
                     "status": "completed",
+                    "model": observed_metadata["model"],
+                    "cli_version": observed_metadata["cli_version"],
                     "lifecycle_order_compliance": _markers_in_order(
                         response,
                         _EXPECTED_ACTIONS[scenario],
@@ -423,18 +463,45 @@ def run_live_context_artifact_matrix(
                         )
                     ),
                     "task_success": "TASK_SUCCESS" in response,
+                    "archivable": True,
                 }
             )
             raw_payload: dict[str, object] = {
                 "provider": provider,
-                "model": _PROVIDER_MODELS[provider],
+                "model": observed_metadata["model"],
+                "cli_version": observed_metadata["cli_version"],
                 "condition": condition,
                 "seed": seed,
                 "scenario": scenario,
                 "adapter_context": adapter_context,
                 "prompt": adapter_prompt,
                 "response": response,
+                "archivable": True,
             }
+            if "session_id" in observed_metadata:
+                raw_payload["session_id"] = observed_metadata["session_id"]
+        except (CLIProviderMetadataError, _LiveMetadataError) as exc:
+            attempt.update(
+                {
+                    "status": "metadata_error",
+                    "cli_version": readiness.get("cli_version"),
+                    "metadata_error": str(exc),
+                }
+            )
+            raw_payload = {
+                "provider": provider,
+                "model": None,
+                "cli_version": readiness.get("cli_version"),
+                "condition": condition,
+                "seed": seed,
+                "scenario": scenario,
+                "adapter_context": adapter_context,
+                "prompt": adapter_prompt,
+                "metadata_error": str(exc),
+                "archivable": False,
+            }
+            if response is not None:
+                raw_payload["response"] = response
         except subprocess.TimeoutExpired as exc:
             attempt.update({"status": "timed_out", "timeout": True})
             raw_payload = {
@@ -446,6 +513,7 @@ def run_live_context_artifact_matrix(
                 "prompt": adapter_prompt,
                 "error": str(exc),
                 "timeout": True,
+                "archivable": False,
             }
         except Exception as exc:
             attempt["status"] = "error"
@@ -458,6 +526,7 @@ def run_live_context_artifact_matrix(
                 "prompt": adapter_prompt,
                 "error": f"{type(exc).__name__}: {exc}",
                 "timeout": False,
+                "archivable": False,
             }
         raw_path.write_text(
             json.dumps(raw_payload, indent=2, sort_keys=True) + "\n",

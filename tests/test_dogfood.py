@@ -251,12 +251,114 @@ def test_repeatability_runner_short_circuits_missing_credentials(monkeypatch: ob
 
 def test_cli_adapter_readiness_uses_binary_presence(monkeypatch: object) -> None:
     monkeypatch.setattr("ncp.dogfood.shutil.which", lambda name: "/usr/bin/fake" if name == "opencode" else None)
+    monkeypatch.setattr(
+        "ncp.dogfood.subprocess.run",
+        lambda command, **kwargs: subprocess.CompletedProcess(
+            command,
+            0,
+            stdout="1.17.15\n",
+            stderr="",
+        ),
+    )
     readiness = get_live_provider_readiness("opencode-cli")
 
     assert readiness["adapter_name"] == "opencode-cli"
     assert readiness["dependency_installed"] is True
     assert readiness["credentials_present"] is True
     assert readiness["ready"] is True
+    assert readiness["cli_version"] == "1.17.15"
+    assert readiness["version_probe"] == {"status": "ok"}
+
+
+def test_cli_adapter_readiness_rejects_nonzero_version_probe_and_sanitizes_stderr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "ncp.dogfood.shutil.which",
+        lambda name: "/usr/bin/codex" if name == "codex" else None,
+    )
+    monkeypatch.setattr(
+        "ncp.dogfood.subprocess.run",
+        lambda command, **kwargs: subprocess.CompletedProcess(
+            command,
+            1,
+            stdout="",
+            stderr=(
+                "Error: spawn /missing/codex ENOENT\n"
+                "token=super-secret-value"
+            ),
+        ),
+    )
+
+    readiness = get_live_provider_readiness("codex-cli")
+
+    assert readiness["dependency_installed"] is True
+    assert readiness["ready"] is False
+    assert readiness["cli_version"] is None
+    assert readiness["version_probe"]["status"] == "nonzero_exit"
+    assert readiness["version_probe"]["returncode"] == 1
+    assert "ENOENT" in readiness["version_probe"]["diagnostic"]
+    assert "super-secret-value" not in readiness["version_probe"]["diagnostic"]
+
+
+def test_cli_adapter_readiness_rejects_timed_out_version_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "ncp.dogfood.shutil.which",
+        lambda name: "/usr/bin/claude" if name == "claude" else None,
+    )
+
+    def _time_out(command, **kwargs):
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr("ncp.dogfood.subprocess.run", _time_out)
+
+    readiness = get_live_provider_readiness("claude-cli")
+
+    assert readiness["ready"] is False
+    assert readiness["cli_version"] is None
+    assert readiness["version_probe"]["status"] == "timed_out"
+    assert readiness["version_probe"]["timeout_seconds"] == 5.0
+
+
+def test_cli_adapter_readiness_rejects_empty_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "ncp.dogfood.shutil.which",
+        lambda name: "/usr/bin/opencode" if name == "opencode" else None,
+    )
+    monkeypatch.setattr(
+        "ncp.dogfood.subprocess.run",
+        lambda command, **kwargs: subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=" \n",
+            stderr="",
+        ),
+    )
+
+    readiness = get_live_provider_readiness("opencode-cli")
+
+    assert readiness["ready"] is False
+    assert readiness["cli_version"] is None
+    assert readiness["version_probe"]["status"] == "empty_version"
+
+
+def test_cli_adapter_readiness_reports_missing_executable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("ncp.dogfood.shutil.which", lambda _name: None)
+
+    readiness = get_live_provider_readiness("claude-cli")
+
+    assert readiness["dependency_installed"] is False
+    assert readiness["ready"] is False
+    assert readiness["version_probe"] == {
+        "status": "missing_executable",
+        "diagnostic": "claude executable not found on PATH",
+    }
 
 
 def test_extract_opencode_text_uses_last_text_event() -> None:
@@ -269,10 +371,30 @@ def test_extract_opencode_text_uses_last_text_event() -> None:
     assert _extract_opencode_text(output) == "NCP_FINAL\ncontent:done"
 
 
-def test_claude_cli_adapter_returns_stdout_text(tmp_path: Path) -> None:
-    adapter = ClaudeCLIDogfoodAdapter(command=["python3", "-c", "print('NCP_FINAL\\ncontent:done')"], cwd=tmp_path)
+def test_claude_cli_adapter_parses_json_result_and_resolved_model(
+    tmp_path: Path,
+) -> None:
+    payload = json_line(
+        {
+            "type": "result",
+            "result": "NCP_FINAL\ncontent:done",
+            "modelUsage": {
+                "claude-sonnet-5": {
+                    "inputTokens": 10,
+                    "outputTokens": 5,
+                }
+            },
+        }
+    )
+    adapter = ClaudeCLIDogfoodAdapter(
+        command=["python3", "-c", f"print({payload!r})"],
+        cwd=tmp_path,
+    )
+
     result = adapter.call("ctx", "turn")
+
     assert result == "NCP_FINAL\ncontent:done"
+    assert adapter.last_call_metadata == {"model": "claude-sonnet-5"}
 
 
 def test_claude_cli_adapter_default_command_adds_repo_dir(
@@ -280,11 +402,17 @@ def test_claude_cli_adapter_default_command_adds_repo_dir(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured: dict[str, object] = {}
+    payload = json_line(
+        {
+            "result": "NCP_FINAL\ncontent:done",
+            "modelUsage": {"claude-sonnet-5": {}},
+        }
+    )
 
     def _fake_run(command, **kwargs):
         captured["command"] = command
         captured["cwd"] = kwargs.get("cwd")
-        return subprocess.CompletedProcess(command, 0, stdout="NCP_FINAL\ncontent:done", stderr="")
+        return subprocess.CompletedProcess(command, 0, stdout=payload, stderr="")
 
     monkeypatch.setattr("ncp.dogfood.subprocess.run", _fake_run)
     adapter = ClaudeCLIDogfoodAdapter(cwd=tmp_path)
@@ -294,6 +422,8 @@ def test_claude_cli_adapter_default_command_adds_repo_dir(
     assert result == "NCP_FINAL\ncontent:done"
     command = captured["command"]
     assert isinstance(command, list)
+    assert command[command.index("--model") + 1] == "sonnet"
+    assert command[command.index("--output-format") + 1] == "json"
     assert "--add-dir" in command
     assert command[command.index("--add-dir") + 1] == str(tmp_path)
     assert "--" in command
@@ -317,27 +447,88 @@ def test_codex_cli_adapter_reads_output_last_message_file(tmp_path: Path) -> Non
     assert result == "NCP_FINAL\ncontent:done"
 
 
-def test_opencode_cli_adapter_parses_json_events(tmp_path: Path) -> None:
-    payload = json_line({"type": "text", "part": {"text": "NCP_FINAL\ncontent:done"}})
-    adapter = OpenCodeCLIDogfoodAdapter(
-        command=["python3", "-c", f"print({payload!r})"],
-        cwd=tmp_path,
+def test_opencode_cli_adapter_parses_events_and_sanitized_export_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = json_line(
+        {
+            "type": "text",
+            "sessionID": "ses_test",
+            "part": {
+                "sessionID": "ses_test",
+                "text": "NCP_FINAL\ncontent:done",
+            },
+        }
     )
+    exported = json_line(
+        {
+            "info": {
+                "id": "ses_test",
+                "model": {
+                    "providerID": "opencode",
+                    "id": "deepseek-v4-flash-free",
+                },
+                "version": "1.17.15",
+            },
+            "messages": [],
+        }
+    )
+    commands: list[list[str]] = []
+
+    def _fake_run(command, **kwargs):
+        commands.append(command)
+        output = payload if len(commands) == 1 else exported
+        return subprocess.CompletedProcess(command, 0, stdout=output, stderr="")
+
+    monkeypatch.setattr("ncp.dogfood.subprocess.run", _fake_run)
+    adapter = OpenCodeCLIDogfoodAdapter(cwd=tmp_path)
+
     result = adapter.call("ctx", "turn")
+
     assert result == "NCP_FINAL\ncontent:done"
+    assert commands[1] == ["opencode", "export", "--sanitize", "ses_test"]
+    assert adapter.last_call_metadata == {
+        "model": "opencode/deepseek-v4-flash-free",
+        "cli_version": "1.17.15",
+        "session_id": "ses_test",
+    }
 
 
 def test_opencode_cli_adapter_default_command_sets_dir(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    payload = json_line({"type": "text", "part": {"text": "NCP_FINAL\ncontent:done"}})
+    payload = json_line(
+        {
+            "type": "text",
+            "sessionID": "ses_test",
+            "part": {
+                "sessionID": "ses_test",
+                "text": "NCP_FINAL\ncontent:done",
+            },
+        }
+    )
+    exported = json_line(
+        {
+            "info": {
+                "id": "ses_test",
+                "model": {"providerID": "opencode", "id": "model"},
+                "version": "1.17.15",
+            }
+        }
+    )
     captured: dict[str, object] = {}
+    calls = 0
 
     def _fake_run(command, **kwargs):
-        captured["command"] = command
-        captured["cwd"] = kwargs.get("cwd")
-        return subprocess.CompletedProcess(command, 0, stdout=payload, stderr="")
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            captured["command"] = command
+            captured["cwd"] = kwargs.get("cwd")
+            return subprocess.CompletedProcess(command, 0, stdout=payload, stderr="")
+        return subprocess.CompletedProcess(command, 0, stdout=exported, stderr="")
 
     monkeypatch.setattr("ncp.dogfood.subprocess.run", _fake_run)
     adapter = OpenCodeCLIDogfoodAdapter(cwd=tmp_path)
@@ -402,12 +593,22 @@ def test_opencode_provider_continuation_prompt_is_tightened() -> None:
 
 def test_codex_cli_readiness_uses_binary_presence(monkeypatch: object) -> None:
     monkeypatch.setattr("ncp.dogfood.shutil.which", lambda name: "/usr/bin/fake" if name == "codex" else None)
+    monkeypatch.setattr(
+        "ncp.dogfood.subprocess.run",
+        lambda command, **kwargs: subprocess.CompletedProcess(
+            command,
+            0,
+            stdout="codex-cli 0.86.0\n",
+            stderr="",
+        ),
+    )
     readiness = get_live_provider_readiness("codex-cli")
 
     assert readiness["adapter_name"] == "codex-cli"
     assert readiness["dependency_installed"] is True
     assert readiness["credentials_present"] is True
     assert readiness["ready"] is True
+    assert readiness["cli_version"] == "codex-cli 0.86.0"
 
 
 def json_line(payload: dict[str, object]) -> str:
