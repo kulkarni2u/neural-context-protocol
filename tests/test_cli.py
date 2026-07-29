@@ -754,7 +754,7 @@ def test_cli_handoff_claude_consumes_and_emits_follow_up(
 
     assert result.exit_code == 0
     assert "claude finished the slice and handed it off" in result.output
-    assert events == ["provider", "follow_up", "complete"]
+    assert events == ["provider", "complete", "follow_up"]
     assert provider_args["cwd"] == tmp_path
     assert "[NCP:CONSCIOUS]" in str(provider_args["context"])
     assert store.peek_whispers(agent_id="claude", pipeline_id="pipe_handoff_cli") == []
@@ -767,6 +767,58 @@ def test_cli_handoff_claude_consumes_and_emits_follow_up(
     assert len(completion) == 1
     assert '"runner":"claude"' in completion[0].content
     assert source.whisper_id in completion[0].content
+
+
+def test_cli_handoff_persistence_failure_emits_no_follow_up(
+    tmp_path: Path,
+    monkeypatch: object,
+) -> None:
+    runner = CliRunner()
+    runner.invoke(main, ["init", "--cwd", str(tmp_path)])
+    store = SQLiteStore(tmp_path / ".ncp" / "store.db")
+    source = Whisper(
+        from_agent="codex",
+        target="claude",
+        whisper_type="nudge",
+        payload="do not emit until completion persists",
+        confidence=0.95,
+        pipeline_id="pipe_handoff_ordering",
+    )
+    store.emit_whisper(source)
+    monkeypatch.setattr(
+        "ncp.agent_handoff.run_claude_partner",
+        lambda **_: "provider completed",
+    )
+    monkeypatch.setattr("ncp.api.write_memory", lambda *_args, **_kwargs: False)
+
+    result = runner.invoke(
+        main,
+        [
+            "handoff",
+            "claude",
+            "--cwd",
+            str(tmp_path),
+            "--pipeline-id",
+            "pipe_handoff_ordering",
+            "--emit-to",
+            "opencode",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "completion memory" in result.output
+    assert store.whisper_pending(source.whisper_id) is True
+    assert (
+        store.peek_whispers(
+            agent_id="opencode",
+            pipeline_id="pipe_handoff_ordering",
+        )
+        == []
+    )
+    assert store.get_working_zone(
+        pipeline_id="pipe_handoff_ordering",
+        layer="episodic",
+    ) == []
 
 
 def test_cli_handoff_opencode_requires_json_and_emits_follow_up(

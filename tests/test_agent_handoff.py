@@ -949,3 +949,62 @@ def test_complete_handoff_persistence_failure_leaves_handoffs_queued(
 
     assert acknowledged is False
     assert prepared.store.whisper_pending(prepared.handoffs[0].whisper_id) is True
+
+
+@pytest.mark.parametrize(
+    ("credential_shape", "secret_value"),
+    [
+        ('"access_token": "oauth-access-token-value"', "oauth-access-token-value"),
+        ("'refresh_token'='oauth-refresh-token-value'", "oauth-refresh-token-value"),
+        ("oauth response ya29.a0AfH6SM-example-token", "ya29.a0AfH6SM-example-token"),
+        (
+            "slack response xox" + "b-123456789012-123456789012-abcdefghijklmnop",
+            "xox" + "b-123456789012-123456789012-abcdefghijklmnop",
+        ),
+        ("aws access AKIAIOSFODNN7EXAMPLE", "AKIAIOSFODNN7EXAMPLE"),
+        ("aws temporary access ASIAIOSFODNN7EXAMPLE", "ASIAIOSFODNN7EXAMPLE"),
+        (
+            'aws_secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"',
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        ),
+        (
+            'AWS_SESSION_TOKEN="IQoJb3JpZ2luX2VjEExampleSessionToken=="',
+            "IQoJb3JpZ2luX2VjEExampleSessionToken==",
+        ),
+        ('"client_secret": "quoted-client-secret-value"', "quoted-client-secret-value"),
+    ],
+)
+def test_complete_handoff_redacts_common_oauth_aws_and_quoted_credentials(
+    tmp_path: Path,
+    credential_shape: str,
+    secret_value: str,
+) -> None:
+    runner = CliRunner()
+    runner.invoke(main, ["init", "--cwd", str(tmp_path)])
+    store = SQLiteStore(tmp_path / ".ncp" / "store.db")
+    _seed_whisper(
+        store,
+        target="claude",
+        payload="persist a safely redacted completion",
+        pipeline_id="pipe_redaction",
+    )
+    prepared = agent_handoff.prepare_handoff(
+        cwd=tmp_path,
+        agent_id="claude",
+        runner="claude",
+        pipeline_id="pipe_redaction",
+    )
+
+    agent_handoff.complete_handoff(
+        prepared,
+        runner="claude",
+        response=f"provider result: {credential_shape}",
+    )
+
+    chunks = prepared.store.get_working_zone(
+        pipeline_id="pipe_redaction",
+        layer="episodic",
+    )
+    assert len(chunks) == 1
+    assert secret_value not in chunks[0].content
+    assert "[REDACTED]" in chunks[0].content

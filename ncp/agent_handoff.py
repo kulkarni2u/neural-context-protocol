@@ -486,7 +486,29 @@ def acknowledge_handoffs(store: BaseStore, handoffs: list[Whisper]) -> int:
 
 
 _SECRET_PATTERNS = (
+    re.compile(
+        r"""
+        ["']?
+        (?:
+            access[_-]?token
+            | refresh[_-]?token
+            | client[_-]?secret
+            | api[_-]?key
+            | aws[_-]?secret[_-]?access[_-]?key
+            | aws[_-]?session[_-]?token
+            | password
+            | secret
+            | token
+        )
+        ["']?
+        \s*[:=]\s*
+        (?:"[^"]*"|'[^']*'|[^\s,;}\]]+)
+        """,
+        re.IGNORECASE | re.VERBOSE,
+    ),
     re.compile(r"\b(?:sk|ghp|github_pat)-[A-Za-z0-9_-]{8,}\b"),
+    re.compile(r"\b(?:xox[baprs]-[A-Za-z0-9-]{10,}|ya29\.[A-Za-z0-9._-]{10,})\b"),
+    re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"),
     re.compile(r"(?i)\bBearer\s+\S+"),
     re.compile(r"(?i)\b(?:api[_-]?key|password|secret|token)\s*[:=]\s*[^\s,;]+"),
 )

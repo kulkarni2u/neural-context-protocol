@@ -278,6 +278,10 @@ def _run_handoff_command(
     except (RuntimeError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
 
+    try:
+        complete_handoff(prepared, runner=runner, response=response)
+    except RuntimeError as exc:
+        raise click.ClickException(str(exc)) from exc
     if emit_to:
         emit_follow_up_whisper(
             cwd=prepared.workspace,
@@ -288,10 +292,6 @@ def _run_handoff_command(
             whisper_type=emit_type,
             confidence=emit_confidence,
         )
-    try:
-        complete_handoff(prepared, runner=runner, response=response)
-    except RuntimeError as exc:
-        raise click.ClickException(str(exc)) from exc
     return response
 
 
