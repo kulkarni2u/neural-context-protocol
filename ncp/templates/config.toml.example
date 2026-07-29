@@ -60,6 +60,9 @@ min_confidence = 0.60
 # matters.
 # min_author_reputation = 0.0
 
+[handoff]
+require_verified = false
+
 [observability]
 log_level = "info"
 log_format = "pretty"

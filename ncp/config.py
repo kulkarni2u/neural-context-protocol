@@ -132,6 +132,9 @@ DEFAULT_CONFIG = {
         # is rejected.
         "require_signatures": False,
     },
+    "handoff": {
+        "require_verified": False,
+    },
     "tiering": {
         # CAP-E3: advisory model-tiering signal on ncp_get_context responses.
         # NCP never routes models itself; this only emits a signal an
@@ -460,6 +463,10 @@ class NCPConfig:
         return bool(self.values.get("identity", {}).get("require_signatures", False))
 
     @property
+    def handoff_require_verified(self) -> bool:
+        return bool(self.values.get("handoff", {}).get("require_verified", False))
+
+    @property
     def infer_edges(self) -> bool:
         """CAP-C7/WI-P2: whether write() infers `refines` edges from recent content. Off by default."""
         return bool(self.values.get("graph", {}).get("infer_edges", False))
@@ -512,11 +519,11 @@ def load_config(
 
 
 def find_project_root(start: str | Path) -> Path:
-    """Find the nearest project root by walking up to a ``.git`` directory."""
+    """Find the nearest initialized NCP or Git project root."""
 
     current = Path(start).resolve()
     for candidate in [current, *current.parents]:
-        if (candidate / ".git").exists():
+        if (candidate / ".ncp" / "config.toml").is_file() or (candidate / ".git").exists():
             return candidate
     return current
 
@@ -528,6 +535,9 @@ def _apply_env_overrides(values: dict[str, Any], env: dict[str, str]) -> None:
         values["observability"]["log_level"] = env["NCP_LOG_LEVEL"]
     if "NCP_STORE_TYPE" in env:
         values["store"]["type"] = env["NCP_STORE_TYPE"]
+    if "NCP_HANDOFF_REQUIRE_VERIFIED" in env:
+        val = env["NCP_HANDOFF_REQUIRE_VERIFIED"].lower()
+        values["handoff"]["require_verified"] = val in {"true", "1", "yes"}
     if "NCP_REDIS_URL" in env:
         values["redis"]["url"] = env["NCP_REDIS_URL"]
     if "NCP_REDIS_STREAM" in env:
