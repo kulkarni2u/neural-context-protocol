@@ -284,7 +284,6 @@ def _markers_in_order(response: str, expected: tuple[str, ...]) -> bool:
 
 def _live_prompt(
     *,
-    artifact_text: str,
     scenario: str,
     seed: int,
 ) -> str:
@@ -293,9 +292,22 @@ def _live_prompt(
         "supplied model-facing artifact, then satisfy the scenario using only "
         "the requested marker lines. Do not edit files or run shell commands.\n\n"
         f"EVALUATION_SEED: {seed}\n"
-        f"CONTEXT_ARTIFACT:\n{artifact_text}\n\n"
         f"SCENARIO:\n{_LIVE_SCENARIOS[scenario]}\n"
     )
+
+
+def _adapter_call_inputs(
+    provider: str,
+    *,
+    artifact_text: str,
+    prompt: str,
+) -> tuple[str, str]:
+    if provider == "opencode-cli":
+        # OpenCode prepends ncp_context to the user turn itself.
+        return artifact_text, prompt
+    # Claude and Codex CLI adapters intentionally discard ncp_context, so put
+    # the evaluated artifact in the user turn they actually deliver.
+    return "", f"CONTEXT_ARTIFACT:\n{artifact_text}\n\n{prompt}"
 
 
 def _base_live_attempt(
@@ -349,7 +361,6 @@ def run_live_context_artifact_matrix(
     )
     prompts = {
         (seed, scenario): _live_prompt(
-            artifact_text=artifact_text,
             scenario=scenario,
             seed=seed,
         )
@@ -365,7 +376,7 @@ def run_live_context_artifact_matrix(
                     condition=condition,
                     seed=seed,
                     scenario=scenario,
-                    prompt_tokens=estimate_tokens(prompt),
+                    prompt_tokens=estimate_tokens(f"{artifact_text}\n\n{prompt}"),
                 ),
                 "status": "skipped",
                 "skip_reason": "provider_unavailable",
@@ -382,16 +393,21 @@ def run_live_context_artifact_matrix(
     raw_dir.mkdir(parents=True, exist_ok=True)
     attempts: list[dict[str, object]] = []
     for (seed, scenario), prompt in prompts.items():
+        adapter_context, adapter_prompt = _adapter_call_inputs(
+            provider,
+            artifact_text=artifact_text,
+            prompt=prompt,
+        )
         attempt = _base_live_attempt(
             provider=provider,
             condition=condition,
             seed=seed,
             scenario=scenario,
-            prompt_tokens=estimate_tokens(prompt),
+            prompt_tokens=estimate_tokens(f"{artifact_text}\n\n{prompt}"),
         )
         raw_path = raw_dir / f"{provider}-{condition}-{scenario}-seed-{seed}.json"
         try:
-            response = adapter.call(artifact_text, prompt)
+            response = adapter.call(adapter_context, adapter_prompt)
             attempt.update(
                 {
                     "status": "completed",
@@ -415,7 +431,8 @@ def run_live_context_artifact_matrix(
                 "condition": condition,
                 "seed": seed,
                 "scenario": scenario,
-                "prompt": prompt,
+                "adapter_context": adapter_context,
+                "prompt": adapter_prompt,
                 "response": response,
             }
         except subprocess.TimeoutExpired as exc:
@@ -425,7 +442,8 @@ def run_live_context_artifact_matrix(
                 "condition": condition,
                 "seed": seed,
                 "scenario": scenario,
-                "prompt": prompt,
+                "adapter_context": adapter_context,
+                "prompt": adapter_prompt,
                 "error": str(exc),
                 "timeout": True,
             }
@@ -436,7 +454,8 @@ def run_live_context_artifact_matrix(
                 "condition": condition,
                 "seed": seed,
                 "scenario": scenario,
-                "prompt": prompt,
+                "adapter_context": adapter_context,
+                "prompt": adapter_prompt,
                 "error": f"{type(exc).__name__}: {exc}",
                 "timeout": False,
             }

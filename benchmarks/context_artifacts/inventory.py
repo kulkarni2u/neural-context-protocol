@@ -101,6 +101,67 @@ def _shared_tool_descriptions() -> str:
     return json.dumps(MCP_TOOLS, sort_keys=True, separators=(",", ":"))
 
 
+def _extract_shell_context(source: str, path: str) -> str:
+    messages = re.findall(
+        r"read\s+-r\s+-d\s+''\s+MSG\s+<<EOF\s+\|\|\s+true\s*\n"
+        r"(?P<message>.*?)\nEOF",
+        source,
+        flags=re.DOTALL,
+    )
+    if not messages:
+        raise ValueError(f"No model-facing MSG heredoc found in {path}")
+    # A session receives exactly one liveness branch. Audit the larger possible
+    # payload rather than adding mutually exclusive branches together.
+    return max(
+        (message.replace(r"\`", "`").strip() for message in messages),
+        key=estimate_tokens,
+    )
+
+
+def _extract_javascript_context(source: str, path: str) -> str:
+    function_start = source.find("function contextFor(result)")
+    function_end = source.find("\n}\n\nexport const", function_start)
+    if function_start < 0 or function_end < 0:
+        raise ValueError(f"No contextFor function found in {path}")
+    function_source = source[function_start:function_end]
+    returned_templates = re.findall(
+        r"return\s+`(?P<message>(?:\\.|[^`])*)`",
+        function_source,
+        flags=re.DOTALL,
+    )
+    if not returned_templates:
+        raise ValueError(f"No model-facing return template found in {path}")
+
+    candidates: list[str] = []
+    prefix_match = re.search(
+        r"const\s+prefix\s*=.*?\?\s*`(?P<up>(?:\\.|[^`])*)`"
+        r"\s*:\s*`(?P<down>(?:\\.|[^`])*)`",
+        function_source,
+        flags=re.DOTALL,
+    )
+    for template in returned_templates:
+        if "${prefix}" not in template:
+            candidates.append(template)
+            continue
+        if prefix_match is None:
+            raise ValueError(f"Unresolved contextFor prefix in {path}")
+        candidates.extend(
+            template.replace("${prefix}", prefix_match.group(branch))
+            for branch in ("up", "down")
+        )
+    # contextFor returns one branch per session, so retain the maximum actual
+    # model-facing payload instead of executable code or mutually exclusive text.
+    return max((candidate.strip() for candidate in candidates), key=estimate_tokens)
+
+
+def _model_facing_text(source: str, path: str) -> str:
+    if path.endswith(".sh"):
+        return _extract_shell_context(source, path)
+    if path.endswith(".js"):
+        return _extract_javascript_context(source, path)
+    return source
+
+
 def collect_provider_sources(repo_root: Path) -> dict[Provider, list[_ProviderSource]]:
     """Load canonical sources and checked-in example mirrors without executing hooks."""
 
@@ -118,12 +179,13 @@ def collect_provider_sources(repo_root: Path) -> dict[Provider, list[_ProviderSo
     )
     for provider in PROVIDERS:
         for surface, relative_path in _FILE_SOURCES[provider]:
+            source = (root / relative_path).read_text(encoding="utf-8")
             sources[provider].append(
                 _ProviderSource(
                     provider=provider,
                     surface=surface,
                     path=relative_path,
-                    text=(root / relative_path).read_text(encoding="utf-8"),
+                    text=_model_facing_text(source, relative_path),
                 )
             )
         sources[provider].append(

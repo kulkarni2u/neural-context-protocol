@@ -15,13 +15,15 @@ python3 benchmarks/context_artifacts/run.py \
   --output /tmp/ncp-context-artifacts.json
 ```
 
-The inventory imports `CLAUDE_MD_TEMPLATE` from Python, reads shell and
-JavaScript sources without executing them, includes checked-in example mirrors,
-and counts the shared MCP tool metadata exactly once for each provider. Token
-counts use the unit reported in `token_unit`. Candidate comparisons report
-current and candidate metrics plus per-provider deltas. Every candidate remains
-`live_evaluation_required`: fewer tokens alone never establish that it is
-better.
+The inventory imports `CLAUDE_MD_TEMPLATE` from Python and statically extracts
+only the model-facing `MSG`/`contextFor` payloads from shell and JavaScript
+sources. It never executes a hook. For mutually exclusive liveness branches it
+counts the larger possible payload, not both branches or executable plumbing.
+The inventory includes checked-in example mirrors and counts shared MCP tool
+metadata exactly once for each provider. Token counts use the unit reported in
+`token_unit`. Candidate comparisons report current and candidate metrics plus
+per-provider deltas. Every candidate remains `live_evaluation_required`: fewer
+tokens alone never establishes that it is better.
 
 The `rightsized-v1` candidate contains model-facing text only. It keeps the
 complete retrieved-content trust boundary and core lifecycle coverage, removes
@@ -56,10 +58,11 @@ scenario. Every attempt includes `provider`, `model`, `condition`, `seed`,
 markers in the saved raw provider response; they remain `null` on skips,
 timeouts, and errors.
 
-Raw prompts and responses default to `/tmp/ncp-context-artifact-live`; override
-that with `--raw-dir`. If the requested provider CLI is unavailable, the
-harness emits a structured `provider_unavailable` skip for every seed and
-scenario and makes no live call.
+Raw adapter contexts, prompts, and responses default to
+`/tmp/ncp-context-artifact-live`; override that with `--raw-dir`. The evaluated
+artifact is delivered exactly once according to each adapter's input contract.
+If the requested provider CLI is unavailable, the harness emits a structured
+`provider_unavailable` skip for every seed and scenario and makes no live call.
 
 `TEMPLATE.json` documents the JSONL shape. Its placeholders and `null` values
 are a schema example, not claimed live results.
