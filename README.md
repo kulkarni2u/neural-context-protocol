@@ -318,7 +318,7 @@ It is not a vector database. Not a model training framework. Not an orchestrator
 
 ### Host-native memory
 
-Host-native memory is useful for continuity within one host or user's workflow, although its exact scope varies by provider. NCP complements it with a shared repo/runtime channel for agent-to-agent work across agents and, with a shared backend, across hosts. This is distinct from machine-local continuity: it makes the relevant context available to the collaborators doing the work.
+Host-native memory is useful for continuity within a host or user's workflow, but its scope varies by provider: it may be machine-local or more broadly synchronized. NCP complements that provider-native continuity with an explicit shared repo/runtime agent-to-agent channel and, with a shared backend, cross-host collaboration.
 
 NCP adds bounded retrieval, provenance, optional authenticated authorship, dissent, graph relationships, and explicit handoff to that shared context. Use it when you have **3+ agents, 10+ turns, and real shared state to preserve**.
 

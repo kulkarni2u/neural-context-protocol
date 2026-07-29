@@ -9,9 +9,12 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def test_readme_positions_host_native_memory_as_complementary() -> None:
     text = (ROOT / "README.md").read_text()
-    assert "Host-native memory" in text
-    assert "agent-to-agent" in text
-    assert "machine-local" in text
+    subsection = text.split("### Host-native memory", 1)[1].split("-----", 1)[0]
+
+    assert "scope varies by provider" in subsection
+    assert "may be machine-local or more broadly synchronized" in subsection
+    assert "shared repo/runtime agent-to-agent channel" in subsection
+    assert "with a shared backend" in subsection
 
 
 def test_dev_up_script_and_makefile_target_are_present() -> None:
