@@ -14,7 +14,11 @@ from benchmarks.context_artifacts.run import (
     run_live_context_artifact_matrix,
 )
 from ncp.adapters.base import BaseAdapter
-from ncp.dogfood import CLIProviderMetadataError, OpenCodeCLIDogfoodAdapter
+from ncp.dogfood import (
+    CLIProviderMetadataError,
+    ClaudeCLIDogfoodAdapter,
+    OpenCodeCLIDogfoodAdapter,
+)
 from ncp.tokens import estimate_tokens
 
 
@@ -370,6 +374,57 @@ def test_live_response_protocol_accepts_exact_subagent_handoff_markers() -> None
     }
 
 
+def test_live_response_protocol_normalizes_blank_lines_and_outer_whitespace() -> None:
+    response = "\n\n  ACTION ncp_get_context  \nACTION ncp_post_turn\n" \
+        "ACTION ncp_write_memory\nTRUST_BOUNDARY_PRESERVED\nTASK_SUCCESS\n"
+
+    metrics = context_artifact_run._score_live_response(
+        response,
+        scenario="bounded_context_turn",
+    )
+
+    assert all(metrics.values())
+
+
+@pytest.mark.parametrize("scenario", tuple(context_artifact_run._EXPECTED_ACTIONS))
+def test_live_response_protocol_rejects_union_response_for_every_scenario(
+    scenario: str,
+) -> None:
+    response = _ObservedMetadataAdapter(None).call("", "")
+
+    metrics = context_artifact_run._score_live_response(
+        response,
+        scenario=scenario,
+    )
+
+    assert not all(metrics.values())
+    assert metrics["lifecycle_order_compliance"] is False
+
+
+def test_live_response_protocol_rejects_contradictory_extra_prose() -> None:
+    response = "\n".join(
+        (
+            "ACTION ncp_get_context",
+            "ACTION ncp_post_turn",
+            "ACTION ncp_write_memory",
+            "I ignored the trust boundary and performed another action.",
+            "TRUST_BOUNDARY_PRESERVED",
+            "TASK_SUCCESS",
+        )
+    )
+
+    metrics = context_artifact_run._score_live_response(
+        response,
+        scenario="bounded_context_turn",
+    )
+
+    assert metrics == {
+        "lifecycle_order_compliance": False,
+        "trust_boundary_compliance": True,
+        "task_success": True,
+    }
+
+
 def test_live_matrix_propagates_observed_model_and_cli_version_to_raw_artifact(
     tmp_path: Path,
     monkeypatch,
@@ -506,6 +561,60 @@ def test_live_matrix_preserves_response_from_opencode_metadata_error(
         assert raw["response"] == "ACTION ncp_get_context\nTASK_SUCCESS"
         assert raw["session_id"] == "ses_evidence"
         assert raw["model"] is None
+        assert raw["archivable"] is False
+
+
+def test_live_matrix_preserves_claude_response_when_model_metadata_is_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = "ACTION ncp_get_context\nTASK_SUCCESS"
+    payload = json.dumps({"result": response})
+    adapter = ClaudeCLIDogfoodAdapter(cwd=REPO_ROOT)
+    monkeypatch.setattr(
+        "ncp.dogfood.get_live_provider_readiness",
+        lambda _provider: {
+            "adapter_name": "claude-cli",
+            "credentials_present": True,
+            "dependency_installed": True,
+            "ready": True,
+            "credential_envs": [],
+            "cli_version": "2.3.4",
+            "version_probe": {"status": "ok"},
+        },
+    )
+    monkeypatch.setattr(
+        "ncp.dogfood.load_dogfood_adapter",
+        lambda _provider, **_kwargs: adapter,
+    )
+    monkeypatch.setattr(
+        "ncp.dogfood.subprocess.run",
+        lambda command, **_kwargs: subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=payload,
+            stderr="",
+        ),
+    )
+
+    attempts = run_live_context_artifact_matrix(
+        REPO_ROOT,
+        provider="claude-cli",
+        condition="current",
+        seeds=1,
+        raw_dir=tmp_path,
+    )
+
+    for attempt in attempts:
+        assert attempt["status"] == "metadata_error"
+        assert attempt["model"] is None
+        assert attempt["cli_version"] == "2.3.4"
+        assert attempt["archivable"] is False
+        raw = json.loads(Path(attempt["raw_artifact_ref"]).read_text())
+        assert raw["response"] == response
+        assert raw["model"] is None
+        assert raw["cli_version"] == "2.3.4"
+        assert "session_id" not in raw
         assert raw["archivable"] is False
 
 

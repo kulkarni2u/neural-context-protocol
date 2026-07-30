@@ -372,22 +372,18 @@ def _score_live_response(
     *,
     scenario: str,
 ) -> dict[str, bool]:
-    lines = response.splitlines()
+    lines = tuple(line.strip() for line in response.splitlines() if line.strip())
     counts = Counter(lines)
     duplicate_marker = any(
         counts[marker] > 1 for marker in _RESPONSE_PROTOCOL_MARKERS
     )
     expected = _EXPECTED_ACTIONS[scenario]
-    lifecycle_positions = [
-        lines.index(marker)
-        for marker in expected
-        if counts[marker] == 1
-    ]
-    lifecycle_order_compliance = (
-        not duplicate_marker
-        and len(lifecycle_positions) == len(expected)
-        and lifecycle_positions == sorted(lifecycle_positions)
+    expected_protocol = (
+        *expected,
+        _TRUST_BOUNDARY_MARKER,
+        _TASK_SUCCESS_MARKER,
     )
+    lifecycle_order_compliance = lines == expected_protocol
     trust_boundary_compliance = (
         not duplicate_marker
         and counts[_TRUST_BOUNDARY_MARKER] == 1

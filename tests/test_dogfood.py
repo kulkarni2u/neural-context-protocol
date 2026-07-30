@@ -12,6 +12,7 @@ from ncp.dogfood import (
     OpenCodeCLIDogfoodAdapter,
     _build_provider_continuation_turn,
     _build_provider_fetch_contract_turn,
+    _extract_claude_json_result,
     _extract_opencode_response,
     _extract_opencode_text,
     get_live_provider_readiness,
@@ -433,6 +434,26 @@ def test_claude_cli_adapter_default_command_adds_repo_dir(
     assert captured["cwd"] == tmp_path
 
 
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {},
+        {"modelUsage": {"": {}}},
+    ],
+)
+def test_claude_metadata_errors_preserve_valid_response(
+    metadata: dict[str, object],
+) -> None:
+    response = "ACTION ncp_get_context\nTASK_SUCCESS"
+    payload = {"result": response, **metadata}
+
+    with pytest.raises(CLIProviderMetadataError) as caught:
+        _extract_claude_json_result(json_line(payload))
+
+    assert caught.value.response == response
+    assert caught.value.session_id is None
+
+
 def test_codex_cli_adapter_reads_output_last_message_file(tmp_path: Path) -> None:
     script = (
         "import pathlib, sys; "
@@ -575,6 +596,49 @@ def test_opencode_response_rejects_empty_text_event() -> None:
 
     with pytest.raises(RuntimeError, match="no text event"):
         _extract_opencode_response(payload)
+
+
+@pytest.mark.parametrize(
+    "events",
+    [
+        [
+            {"type": "text", "part": {"text": "intermediate"}},
+            {
+                "type": "text",
+                "part": {"text": "ACTION ncp_get_context\nTASK_SUCCESS"},
+            },
+        ],
+        [
+            {
+                "type": "text",
+                "sessionID": "ses_first",
+                "part": {
+                    "sessionID": "ses_first",
+                    "text": "intermediate",
+                },
+            },
+            {
+                "type": "text",
+                "sessionID": "ses_second",
+                "part": {
+                    "sessionID": "ses_second",
+                    "text": "ACTION ncp_get_context\nTASK_SUCCESS",
+                },
+            },
+        ],
+    ],
+)
+def test_opencode_session_metadata_errors_preserve_final_response(
+    events: list[dict[str, object]],
+) -> None:
+    response = "ACTION ncp_get_context\nTASK_SUCCESS"
+    output = "\n".join(json_line(event) for event in events)
+
+    with pytest.raises(CLIProviderMetadataError) as caught:
+        _extract_opencode_response(output)
+
+    assert caught.value.response == response
+    assert caught.value.session_id is None
 
 
 def test_opencode_cli_adapter_default_command_sets_dir(

@@ -107,18 +107,21 @@ def _extract_claude_json_result(output: str) -> tuple[str, dict[str, str]]:
     result = payload.get("result")
     if not isinstance(result, str) or not result.strip():
         raise RuntimeError("Claude CLI JSON response has no result text")
+    response = result.strip()
 
     model_usage = payload.get("modelUsage")
     if not isinstance(model_usage, dict) or len(model_usage) != 1:
         raise CLIProviderMetadataError(
-            "Claude CLI JSON response must report exactly one resolved model"
+            "Claude CLI JSON response must report exactly one resolved model",
+            response=response,
         )
     model = next(iter(model_usage))
     if not isinstance(model, str) or not model.strip():
         raise CLIProviderMetadataError(
-            "Claude CLI JSON response has invalid resolved model metadata"
+            "Claude CLI JSON response has invalid resolved model metadata",
+            response=response,
         )
-    return result.strip(), {"model": model.strip()}
+    return response, {"model": model.strip()}
 
 
 class DogfoodLocalAdapter(LocalAdapter):
@@ -1626,11 +1629,14 @@ def _extract_opencode_response(output: str) -> tuple[str, str]:
                     texts.append(text.strip())
     if not texts:
         raise RuntimeError("OpenCode CLI returned no text event")
-    if len(session_ids) != 1:
+    response = texts[-1]
+    session_id = next(iter(session_ids)) if len(session_ids) == 1 else None
+    if session_id is None:
         raise CLIProviderMetadataError(
-            "OpenCode CLI JSON events must report exactly one session ID"
+            "OpenCode CLI JSON events must report exactly one session ID",
+            response=response,
         )
-    return texts[-1], next(iter(session_ids))
+    return response, session_id
 
 
 def _extract_opencode_text(output: str) -> str:
