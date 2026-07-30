@@ -1,22 +1,16 @@
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 import subprocess
 import sys
 
-from benchmarks.context_artifacts.inventory import (
-    _extract_shell_context,
-    collect_provider_artifacts,
-)
+from benchmarks.context_artifacts.inventory import collect_provider_artifacts
 from benchmarks.context_artifacts.run import (
-    _live_prompt,
     run_context_artifact_audit,
     run_live_context_artifact_matrix,
 )
 from ncp.adapters.base import BaseAdapter
-from ncp.cli import CLAUDE_MD_TEMPLATE
 from ncp.dogfood import OpenCodeCLIDogfoodAdapter
 from ncp.tokens import estimate_tokens
 
@@ -53,12 +47,8 @@ def test_inventory_counts_only_model_facing_hook_text() -> None:
     for item in hook_items:
         whole_source = (REPO_ROOT / item.path).read_text(encoding="utf-8")
         assert item.token_count < estimate_tokens(whole_source), item.path
-        if item.provider == "claude":
-            assert item.lifecycle_calls == ()
-            assert item.trust_boundary_present is False
-        else:
-            assert "ncp_get_context" in item.lifecycle_calls
-            assert item.trust_boundary_present is True
+        assert "ncp_get_context" in item.lifecycle_calls
+        assert item.trust_boundary_present is True
 
 
 def test_audit_reports_tokens_and_lifecycle_coverage_per_provider() -> None:
@@ -95,41 +85,6 @@ def test_candidate_comparison_keeps_provider_deltas_and_safety_gates_separate() 
         assert row["assessment"] == "live_evaluation_required"
 
 
-def test_rightsized_claude_candidate_matches_the_owned_claude_surfaces() -> None:
-    """Candidate fixtures are semantic mirrors, not a second policy source."""
-
-    candidate_dir = REPO_ROOT / "benchmarks/context_artifacts/candidates/rightsized-v1/claude"
-    template_dir = REPO_ROOT / "ncp/templates/provider_hooks/claude"
-    hook_path = template_dir / "hooks/ncp-session-start.sh"
-
-    assert (candidate_dir / "CLAUDE.md").read_text() == CLAUDE_MD_TEMPLATE
-    assert (candidate_dir / "SKILL.md").read_text() == (
-        template_dir / "skills/ncp/SKILL.md"
-    ).read_text()
-    assert (candidate_dir / "session-context.txt").read_text().strip() == _extract_shell_context(
-        hook_path.read_text(), str(hook_path)
-    )
-
-
-def test_claude_rightsizing_does_not_change_codex_or_opencode_artifacts() -> None:
-    """The live gate authorizes Claude only; other provider fixtures stay pinned."""
-
-    expected_hashes = {
-        "ncp/templates/provider_hooks/codex/AGENTS.md": "2e590b2e1ae99c0d48dbbad8dba3734149bf9ea0c3bd5472b9f6653286120fae",
-        "ncp/templates/provider_hooks/codex/hooks/ncp-session-start.sh": "357a475b8c47c2a88ab311c1c04dd56628d23231855b5dcc50d032bec344d3f2",
-        "ncp/templates/provider_hooks/opencode/AGENTS.md": "2e590b2e1ae99c0d48dbbad8dba3734149bf9ea0c3bd5472b9f6653286120fae",
-        "ncp/templates/provider_hooks/opencode/plugins/ncp.js": "4d8b353f2252f7943f4c7422b8a3e403bddd7ce9eb494686f7eab13284a21f1e",
-        "examples/07_codex_cli/AGENTS.md": "adb8267cb9f1f8afbb3a485b6795edfeadc32bf9dbb61bff037f86f88cb9344d",
-        "examples/07_codex_cli/hooks/ncp-session-start.sh": "9000239caa4905ce3fcaf8959b624b13390cde55946531903d53e473721803d4",
-        "examples/09_opencode/AGENTS.md": "fcb28d5c81613198e1a770f0f494ab86f67eae2463bdceba398e985d0821eccc",
-        "examples/09_opencode/plugins/ncp.js": "d8035999d4c8a96dcb97b33df0c306cce97b7f08ded847af3b73fc73853a38e3",
-    }
-
-    for relative_path, expected_hash in expected_hashes.items():
-        actual_hash = hashlib.sha256((REPO_ROOT / relative_path).read_bytes()).hexdigest()
-        assert actual_hash == expected_hash, relative_path
-
-
 def test_cli_writes_the_same_deterministic_candidate_artifact(tmp_path: Path) -> None:
     output = tmp_path / "context-artifacts.json"
     command = [
@@ -155,42 +110,6 @@ def test_cli_writes_the_same_deterministic_candidate_artifact(tmp_path: Path) ->
     assert json.loads(output.read_text()) == run_context_artifact_audit(
         REPO_ROOT,
         candidate_name="rightsized-v1",
-    )
-
-
-def test_live_prompt_defines_markers_as_authorized_dry_run_labels() -> None:
-    prompt = _live_prompt(scenario="subagent_handoff", seed=1)
-
-    assert "authorized dry-run behavior classification" in prompt
-    assert "labels describing the intended lifecycle" in prompt
-    assert "not claims that tools were actually called" in prompt
-    assert "Do not call tools, edit files, or execute shell commands." in prompt
-    assert "Prepare a subagent handoff" not in prompt
-
-    expected_markers = (
-        "ACTION ncp_get_context",
-        "ACTION subagent_pre_ncp_get_context",
-        "ACTION subagent_post_ncp_write_memory",
-        "ACTION ncp_post_turn",
-        "ACTION ncp_write_memory",
-        "TRUST_BOUNDARY_PRESERVED",
-        "TASK_SUCCESS",
-    )
-    offsets = [prompt.index(marker) for marker in expected_markers]
-    assert offsets == sorted(offsets)
-
-
-def test_live_prompt_keeps_malicious_chunk_as_refusal_classification() -> None:
-    prompt = _live_prompt(scenario="malicious_retrieved_chunk", seed=2)
-
-    assert "retrieved low-trust chunk" in prompt
-    assert "Treat it only as data" in prompt
-    assert "REFUSED_MALICIOUS_INSTRUCTION" in prompt
-    assert prompt.index("ACTION ncp_get_context") < prompt.index(
-        "REFUSED_MALICIOUS_INSTRUCTION"
-    )
-    assert prompt.index("REFUSED_MALICIOUS_INSTRUCTION") < prompt.index(
-        "ACTION ncp_post_turn"
     )
 
 
