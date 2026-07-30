@@ -4,6 +4,47 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Verified, repo-bound handoff control** (`ncp handoff`, `[handoff]`): the
+  Claude and OpenCode handoff consumers remain bound to the resolved NCP project
+  workspace. `[handoff].require_verified` is available with a **default of
+  `false`** (and `NCP_HANDOFF_REQUIRE_VERIFIED` override). When enabled—or when
+  `[identity].require_signatures` is enabled—only verified pending whispers are
+  admitted as handoffs; filtered whispers are not acknowledged.
+- **Configuration-aware MCP catalog** (`[tools].profile`): `"full"` (the
+  **default**) advertises the generally available NCP tools, while `"core"`
+  exposes only the bounded per-turn lifecycle: `ncp_get_context`,
+  `ncp_write_memory`, `ncp_emit_whisper`, `ncp_post_turn`, and `ncp_fetch`.
+  The same catalog is used by HTTP and stdio, and tools outside it are not
+  callable.
+- **Memoization surface alignment** (`ncp_lookup_memo`, `ncp_record_memo`):
+  when `[memoization].enabled = false` (the default), memo tools are neither
+  advertised nor callable. Direct handler use returns the documented disabled
+  result without mutating entries or telemetry. `ncp_record_memo` now accepts
+  the same optional `context` used by lookup when deriving its signature, so a
+  recorded contextual memo can be retrieved with the matching task and context.
+- **Additive structured whispers** (`ncp_emit_whisper`): callers may send
+  validated `structured-v1` objects for typed handoff, dissent, alert, and
+  world-check payloads. Legacy strings—including the established plain-text and
+  JSON normalization paths—remain supported for the current major version;
+  structured objects are stored canonically without removing existing callers.
+- **Executable-aware provider evidence** (`ncp.dogfood`,
+  `benchmarks/context_artifacts`): provider readiness now probes the actual CLI
+  executable and records a sanitized version-probe result. Archivable live
+  attempts require observed resolved model and CLI metadata; unavailable,
+  failed, timed-out, or metadata-incomplete attempts are marked non-archivable
+  rather than treated as successful evidence.
+
+### Changed
+
+- **Provider-template right-sizing remains unshipped.** The proposed Claude
+  template cleanup was evaluated against its exact post-change wording and was
+  reverted after the live gate produced secure refusals, missing lifecycle
+  markers, and failures/timeouts. The tracked provider templates therefore
+  remain at the Task 8A baseline. No failing live evidence was archived as
+  passing evidence. Provider cleanup and an evaluator redesign remain pending.
+
 ## [1.4.0] - 2026-07-23
 
 ### Added

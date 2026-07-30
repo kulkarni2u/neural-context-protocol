@@ -112,32 +112,24 @@ calls into the dispatched instruction itself, so correctness does not depend on 
 dispatching model having read and obeyed a template. That converts a rule into a
 guarantee, which is strictly better than either the rule or the model's judgement.
 
-### 2.3 Prose examples where the schema should carry the shape
+### 2.3 Structured whisper payloads now carry the shape, without breaking callers
 
-`ncp/mcp/server.py:200` types the whisper `payload` as a plain `string`, then uses the
-description to explain that `share`/`request` expect `{"ask", "files", "slice"}` and
-`dissent` expects `{"issue", "alternatives"}` — JSON structure described in English, in
-a field typed as free text, with "plain text is accepted and wrapped into the required
-shape" as the escape hatch.
+This compatibility gap has been addressed additively. `ncp_emit_whisper` accepts
+validated `structured-v1` objects for `share`/`request` handoffs, `dissent`, `alert`,
+and `world_check`; invalid object shapes are rejected and structured values are stored
+as canonical compact JSON. The runtime validation is the authoritative shape contract.
 
-This is the exact inversion of "design interfaces." The whisper `type` enum already
-discriminates the case; the payload should be a discriminated union in the schema so the
-shape is enforced rather than described. That deletes prose from the description, removes
-the lossy plain-text wrapping path, and makes malformed dissent whispers a validation
-error instead of a silent degradation — which matters, because `dissent` whispers feed
-trust calibration.
+Legacy strings remain deliberately supported for the current major version, including
+the established plain-text wrapping and legacy JSON normalization paths. That is a
+compatibility decision, not an unimplemented validator: no removal version is claimed
+until provider telemetry establishes that legacy use is negligible. NCP therefore adds
+an executable, typed path without falsely claiming an incompatible schema migration.
 
-Pydantic already validates type-specific whisper payloads at the application layer; the
-remaining gap is that MCP schema definitions do not natively support discriminated unions,
-and there is no canonical compatibility layer between the two schema systems.
+### 2.4 Seven model-facing roadmap markers were removed
 
-### 2.4 Internal roadmap IDs leak into model-facing context
-
-Seven model-facing tool-description strings in `ncp/mcp/server.py` are prefixed with `CAP-C5:`,
-`CAP-T3:`, or `CAP-C3:`. These identifiers are meaningful in
-`docs/NCP_NORTH_STAR_CAPABILITY_ROADMAP.md` and meaningless to a model reading the tool
-list. Every host connecting to the bus pays tokens for them on every session. Strip the
-prefixes from the descriptions and keep them in the roadmap.
+`CAP-*` identifiers no longer appear in MCP tool descriptions. They remain implementation
+comments and roadmap vocabulary, where they belong, instead of recurring model-facing
+context.
 
 Base-trust weighting is active by default through the retrieval policy's `w_trust=0.2`.
 Reputation blending, signature enforcement, author gating, and computed drift are
@@ -148,21 +140,22 @@ hypothesis: the protocol's append-only design is intentional for auditability, b
 some deployments may need a deletion capability that balances audit requirements
 against operational needs.
 
-### 2.5 Twelve always-loaded tools where the protocol core is five
+### 2.5 Configuration-aware tool profiles replace the always-loaded catalog
 
 The article describes deferred loading — tools whose definitions the agent must search
 for before use — as the way to offer many tools without paying for them upfront. MCP has
-no ToolSearch equivalent, so NCP cannot defer in the same way. But NCP does control what
-it advertises, and it currently advertises all twelve tools to every host regardless of
-configuration. Two of them (`ncp_lookup_memo`, `ncp_record_memo`) are inert unless
-`[memoization].enabled` is true, which defaults to false — so a default install is
-publishing two tools that cannot do anything. The memory facade
+no ToolSearch equivalent, so NCP cannot defer in the same way. NCP now controls what it
+advertises: `[tools].profile = "full" | "core"` defaults to `"full"`; `"core"` exposes
+only the five-call bounded context lifecycle. The catalog and reachable handlers agree
+for both HTTP and stdio. When `[memoization].enabled = false` (the default),
+`ncp_lookup_memo` and `ncp_record_memo` are hidden and disabled rather than advertised as
+inert tools. `ncp_record_memo.context` uses the same optional signature context as lookup,
+so recording and lookup have symmetric keys. The memory facade
 (`ncp_remember`/`ncp_recall`/`ncp_improve`) is, by the README's own description, an
 ergonomic layer over the same chunks the core tools already reach.
 
-**Recommendation:** gate memo tool advertisement on `[memoization].enabled` (a
-correctness fix, not just a token one), and add a config-selectable tool profile —
-`core` for the five-call protocol loop, `full` for everything.
+This is a correctness fix as well as a context reduction: a host cannot invoke an
+unadvertised disabled memo tool.
 
 ---
 
@@ -170,8 +163,6 @@ correctness fix, not just a token one), and add a config-selectable tool profile
 
 The article's "Then: memory in CLAUDE.md / Now: auto-memory" states that Claude now
 saves memories automatically rather than users writing them to CLAUDE.md with `#`.
-
-NCP's README, and every document in `docs/`, mentions this zero times.
 
 This is the one item here that is not a cleanup task. A reader who has internalized the
 article will arrive at NCP's README asking "Claude already remembers things — why do I
@@ -183,9 +174,9 @@ memory serves one agent's continuity, NCP serves the channel *between* agents �
 README's own "3+ agents, 10+ turns" threshold is already the right dividing line. It
 simply needs to be stated against the comparison readers will actually make.
 
-**Recommendation:** add a short subsection under "What NCP is (and isn't)" contrasting
-host-native memory with the bus, and stop generating a CLAUDE.md at `ncp init` that
-reads like the memory-in-CLAUDE.md pattern the article just retired.
+The README now states that host-native memory can provide local continuity but does not
+replace NCP's cross-agent trust and handoff channel. That keeps the product boundary
+honest: NCP is not an orchestrator, model router, or replacement for a host's own memory.
 
 ---
 
@@ -208,20 +199,31 @@ keep it in the always-loaded artifact rather than deferring it to a skill.
 
 ## 5. Ranked backlog
 
-1. **Add native-memory positioning to the README.** Highest value, lowest effort, and the
-   only item that changes how NCP is understood rather than how it is packaged.
-2. **Collapse the eight duplicate turn-loop instructions to one source of truth.** Tool
-   descriptions own how-to-call; generated CLAUDE.md owns project-specific facts; the
-   hook owns liveness only. Fixes real drift between three artifacts that already
-   disagree.
-3. **Make the subagent contract mechanical.** Have `ncp handoff` compose the pre/post
-   calls rather than instructing a model to remember them, then soften the MANDATORY
-   block and drop the filled-in example.
-4. **Type the whisper payload as a discriminated union** keyed on the existing `type`
-   enum; delete the prose shape description and the plain-text wrapping fallback.
-5. **Gate memo tools on `[memoization].enabled` and add a `core`/`full` tool profile.**
-   The gating half is a correctness fix.
-6. **Strip `CAP-*` prefixes from tool descriptions.**
+Completed compatibility work:
 
-Items 2–6 are all instances of one pattern: NCP applies bounded, progressive, trust-weighted
-context discipline to *its users' data* and does not yet apply it to *its own instructions*.
+1. **Done — native-memory positioning.** The README distinguishes host-local continuity
+   from NCP's cross-agent context and handoff channel without broadening NCP into an
+   orchestrator.
+2. **Done — structured whisper objects.** Typed structured-v1 payloads are validated and
+   canonicalized; legacy strings remain intentionally supported for this major version.
+3. **Done — memo gating and `core`/`full` profiles.** Disabled memo tools are hidden and
+   unreachable, and the five-tool core is selectable.
+4. **Done — remove roadmap IDs from tool descriptions.**
+5. **Done — executable-aware provider readiness and observed model/CLI metadata.** Only
+   complete metadata-bearing live attempts can be archived as passing evidence.
+
+Open work:
+
+1. **Pending — provider-template cleanup.** The Claude right-sizing attempt was reverted
+   after the exact-wording live gate produced secure refusals, missing lifecycle markers,
+   and failures/timeouts. Provider templates remain at the Task 8A baseline; no failing
+   evidence was archived as passing.
+2. **Pending — redesign the provider evaluator before retrying cleanup.** The next attempt
+   needs an evaluation architecture that separates the static contract from the prompt
+   interaction and produces complete, observed-metadata evidence for each provider.
+3. **Pending — make the subagent lifecycle contract mechanical.** `ncp handoff` should
+   compose the required lifecycle calls rather than relying solely on instruction text.
+
+The remaining work is deliberately provider- and evidence-bound. NCP can continue to
+reduce its own context surface without pretending that a failed provider experiment has
+validated a template change.
