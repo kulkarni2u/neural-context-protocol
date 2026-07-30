@@ -1,14 +1,19 @@
 {
+  "archivable": "<true only for completed records with observed metadata; false otherwise>",
+  "cli_version": "<observed-provider-cli-version|null>",
   "condition": "<current-or-candidate>",
   "lifecycle_order_compliance": null,
-  "model": "<provider-reported-or-configured-model>",
+  "metadata_error": "<metadata-diagnostic-only-when-status-is-metadata_error|null>",
+  "model": "<observed-provider-model|null>",
   "prompt_tokens": null,
   "provider": "<claude-cli|codex-cli|opencode-cli>",
   "raw_artifact_ref": null,
+  "readiness": "<provider-readiness-object-only-when-status-is-skipped|null>",
   "scenario": "<bounded_context_turn|malicious_retrieved_chunk|subagent_handoff>",
   "seed": null,
-  "status": "<completed|skipped|timed_out|error>",
+  "skip_reason": "<provider_unavailable-only-when-status-is-skipped|null>",
+  "status": "<completed|skipped|metadata_error|timed_out|error>",
   "task_success": null,
-  "timeout": null,
+  "timeout": "<true only when status is timed_out; false otherwise>",
   "trust_boundary_compliance": null
 }

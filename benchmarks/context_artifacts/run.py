@@ -604,6 +604,12 @@ def run_live_context_artifact_matrix(
             if "session_id" in observed_metadata:
                 raw_payload["session_id"] = observed_metadata["session_id"]
         except (CLIProviderMetadataError, _LiveMetadataError) as exc:
+            if isinstance(exc, CLIProviderMetadataError):
+                if response is None and exc.response is not None:
+                    response = exc.response
+                session_id = exc.session_id
+            else:
+                session_id = None
             attempt.update(
                 {
                     "status": "metadata_error",
@@ -625,6 +631,8 @@ def run_live_context_artifact_matrix(
             }
             if response is not None:
                 raw_payload["response"] = response
+            if session_id is not None:
+                raw_payload["session_id"] = session_id
         except subprocess.TimeoutExpired as exc:
             attempt.update({"status": "timed_out", "timeout": True})
             raw_payload = {

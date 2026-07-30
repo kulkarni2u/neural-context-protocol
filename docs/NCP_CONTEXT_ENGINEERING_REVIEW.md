@@ -9,8 +9,10 @@ smaller while tool interfaces and progressive disclosure do the work.
 
 NCP is squarely in scope for that thesis, because NCP is not only a runtime — it is a
 *context-artifact generator*. `ncp init` always creates a basic
-`CLAUDE.md`, while provider hooks and skills are installed only when detected and accepted interactively,
-and registers twelve MCP tools. Every one of those is the kind of
+`CLAUDE.md`, while provider hooks and skills are installed only when detected and
+accepted interactively. NCP owns an immutable catalog of twelve MCP tools. With
+memoization disabled by default, the full profile advertises ten of those tools; the two
+memo tools remain hidden until enabled. Every advertised definition is the kind of
 artifact the article says to rightsize.
 
 The short version: NCP's **runtime design is validated** by the article, and NCP's
@@ -227,6 +229,7 @@ Open work:
 2. **Pending — redesign the provider evaluator before retrying cleanup.** The next attempt
    needs an evaluation architecture that separates the static contract from the prompt
    interaction and produces complete, observed-metadata evidence for each provider.
+
 The remaining work is deliberately provider- and evidence-bound. NCP can continue to
 reduce its own context surface without pretending that a failed provider experiment has
 validated a template change.

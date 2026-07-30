@@ -14,7 +14,7 @@ from benchmarks.context_artifacts.run import (
     run_live_context_artifact_matrix,
 )
 from ncp.adapters.base import BaseAdapter
-from ncp.dogfood import OpenCodeCLIDogfoodAdapter
+from ncp.dogfood import CLIProviderMetadataError, OpenCodeCLIDogfoodAdapter
 from ncp.tokens import estimate_tokens
 
 
@@ -345,6 +345,31 @@ def test_live_response_protocol_rejects_duplicate_markers_without_crashing() -> 
     }
 
 
+def test_live_response_protocol_accepts_exact_subagent_handoff_markers() -> None:
+    response = "\n".join(
+        (
+            "ACTION ncp_get_context",
+            "ACTION subagent_pre_ncp_get_context",
+            "ACTION subagent_post_ncp_write_memory",
+            "ACTION ncp_post_turn",
+            "ACTION ncp_write_memory",
+            "TRUST_BOUNDARY_PRESERVED",
+            "TASK_SUCCESS",
+        )
+    )
+
+    metrics = context_artifact_run._score_live_response(
+        response,
+        scenario="subagent_handoff",
+    )
+
+    assert metrics == {
+        "lifecycle_order_compliance": True,
+        "trust_boundary_compliance": True,
+        "task_success": True,
+    }
+
+
 def test_live_matrix_propagates_observed_model_and_cli_version_to_raw_artifact(
     tmp_path: Path,
     monkeypatch,
@@ -431,6 +456,57 @@ def test_live_matrix_marks_missing_observed_metadata_non_archivable(
         raw = json.loads(Path(attempt["raw_artifact_ref"]).read_text())
         assert raw["archivable"] is False
         assert "observed model metadata" in raw["metadata_error"]
+
+
+class _MetadataErrorWithEvidenceAdapter(BaseAdapter):
+    last_call_metadata = None
+
+    def call(self, ncp_context: str, user_turn: str) -> str:
+        raise CLIProviderMetadataError(
+            "OpenCode session export returned invalid JSON",
+            response="ACTION ncp_get_context\nTASK_SUCCESS",
+            session_id="ses_evidence",
+        )
+
+
+def test_live_matrix_preserves_response_from_opencode_metadata_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "ncp.dogfood.get_live_provider_readiness",
+        lambda _provider: {
+            "adapter_name": "opencode-cli",
+            "credentials_present": True,
+            "dependency_installed": True,
+            "ready": True,
+            "credential_envs": [],
+            "cli_version": "1.17.15",
+            "version_probe": {"status": "ok"},
+        },
+    )
+    monkeypatch.setattr(
+        "ncp.dogfood.load_dogfood_adapter",
+        lambda _provider, **_kwargs: _MetadataErrorWithEvidenceAdapter(),
+    )
+
+    attempts = run_live_context_artifact_matrix(
+        REPO_ROOT,
+        provider="opencode-cli",
+        condition="current",
+        seeds=1,
+        raw_dir=tmp_path,
+    )
+
+    for attempt in attempts:
+        assert attempt["status"] == "metadata_error"
+        assert attempt["model"] is None
+        assert attempt["archivable"] is False
+        raw = json.loads(Path(attempt["raw_artifact_ref"]).read_text())
+        assert raw["response"] == "ACTION ncp_get_context\nTASK_SUCCESS"
+        assert raw["session_id"] == "ses_evidence"
+        assert raw["model"] is None
+        assert raw["archivable"] is False
 
 
 def test_live_matrix_records_exhausted_opencode_retries_as_timed_out(
@@ -572,3 +648,28 @@ print(json.dumps({
     assert len(attempts) == len(delivered_prompts) == 3
     assert all(attempt["status"] == "completed" for attempt in attempts)
     assert all(prompt.count(artifact_header) == 1 for prompt in delivered_prompts)
+
+
+def test_live_template_covers_emitted_attempt_status_fields() -> None:
+    template = json.loads(
+        (REPO_ROOT / "benchmarks/context_artifacts/TEMPLATE.json").read_text()
+    )
+    base_keys = set(
+        context_artifact_run._base_live_attempt(
+            provider="opencode-cli",
+            condition="current",
+            seed=0,
+            scenario="bounded_context_turn",
+            prompt_tokens=1,
+        )
+    )
+
+    assert set(template) == base_keys | {
+        "status",
+        "readiness",
+        "skip_reason",
+        "metadata_error",
+    }
+    assert template["status"] == (
+        "<completed|skipped|metadata_error|timed_out|error>"
+    )

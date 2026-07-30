@@ -6,11 +6,13 @@ import subprocess
 import ncp
 import pytest
 from ncp.dogfood import (
+    CLIProviderMetadataError,
     ClaudeCLIDogfoodAdapter,
     CodexCLIDogfoodAdapter,
     OpenCodeCLIDogfoodAdapter,
     _build_provider_continuation_turn,
     _build_provider_fetch_contract_turn,
+    _extract_opencode_response,
     _extract_opencode_text,
     get_live_provider_readiness,
     load_dogfood_adapter,
@@ -493,6 +495,86 @@ def test_opencode_cli_adapter_parses_events_and_sanitized_export_metadata(
         "cli_version": "1.17.15",
         "session_id": "ses_test",
     }
+
+
+@pytest.mark.parametrize(
+    ("export_result", "expected_message"),
+    [
+        (
+            subprocess.TimeoutExpired(["opencode", "export"], 1.0),
+            "OpenCode session metadata export timed out",
+        ),
+        (
+            subprocess.CompletedProcess(
+                ["opencode", "export"],
+                1,
+                stdout="",
+                stderr="export unavailable",
+            ),
+            "OpenCode session metadata export failed: export unavailable",
+        ),
+        (
+            subprocess.CompletedProcess(
+                ["opencode", "export"],
+                0,
+                stdout="not-json",
+                stderr="",
+            ),
+            "OpenCode session export returned invalid JSON",
+        ),
+    ],
+)
+def test_opencode_metadata_errors_preserve_valid_response_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    export_result: subprocess.CompletedProcess[str] | subprocess.TimeoutExpired,
+    expected_message: str,
+) -> None:
+    response = "ACTION ncp_get_context\nTASK_SUCCESS"
+    payload = json_line(
+        {
+            "type": "text",
+            "sessionID": "ses_test",
+            "part": {
+                "sessionID": "ses_test",
+                "text": response,
+            },
+        }
+    )
+    calls = 0
+
+    def _fake_run(command, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return subprocess.CompletedProcess(command, 0, stdout=payload, stderr="")
+        if isinstance(export_result, subprocess.TimeoutExpired):
+            raise export_result
+        return export_result
+
+    monkeypatch.setattr("ncp.dogfood.subprocess.run", _fake_run)
+    adapter = OpenCodeCLIDogfoodAdapter(cwd=tmp_path)
+
+    with pytest.raises(CLIProviderMetadataError) as caught:
+        adapter.call("ctx", "turn")
+
+    assert str(caught.value) == expected_message
+    assert caught.value.response == response
+    assert caught.value.session_id == "ses_test"
+    assert adapter.last_call_metadata is None
+
+
+def test_opencode_response_rejects_empty_text_event() -> None:
+    payload = json_line(
+        {
+            "type": "text",
+            "sessionID": "ses_test",
+            "part": {"sessionID": "ses_test", "text": ""},
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="no text event"):
+        _extract_opencode_response(payload)
 
 
 def test_opencode_cli_adapter_default_command_sets_dir(

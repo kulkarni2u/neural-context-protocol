@@ -84,6 +84,17 @@ class FinalDirective:
 class CLIProviderMetadataError(RuntimeError):
     """A live CLI call completed without authoritative provider metadata."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        response: str | None = None,
+        session_id: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.response = response
+        self.session_id = session_id
+
 
 def _extract_claude_json_result(output: str) -> tuple[str, dict[str, str]]:
     try:
@@ -265,7 +276,9 @@ class OpenCodeCLIDogfoodAdapter(BaseAdapter):
             )
         except subprocess.TimeoutExpired as exc:
             raise CLIProviderMetadataError(
-                "OpenCode session metadata export timed out"
+                "OpenCode session metadata export timed out",
+                response=response,
+                session_id=session_id,
             ) from exc
         if exported.returncode != 0:
             diagnostic = exported.stderr.strip() or exported.stdout.strip()
@@ -274,12 +287,21 @@ class OpenCodeCLIDogfoodAdapter(BaseAdapter):
                 + (
                     _sanitize_cli_diagnostic(diagnostic)
                     or "unknown CLI error"
-                )
+                ),
+                response=response,
+                session_id=session_id,
             )
-        self.last_call_metadata = _extract_opencode_export_metadata(
-            exported.stdout,
-            expected_session_id=session_id,
-        )
+        try:
+            self.last_call_metadata = _extract_opencode_export_metadata(
+                exported.stdout,
+                expected_session_id=session_id,
+            )
+        except CLIProviderMetadataError as exc:
+            raise CLIProviderMetadataError(
+                str(exc),
+                response=response,
+                session_id=session_id,
+            ) from exc
         return response
 
 
@@ -1600,7 +1622,7 @@ def _extract_opencode_response(output: str) -> tuple[str, str]:
                 if isinstance(part_session_id, str) and part_session_id.strip():
                     session_ids.add(part_session_id.strip())
                 text = part.get("text")
-                if isinstance(text, str):
+                if isinstance(text, str) and text.strip():
                     texts.append(text.strip())
     if not texts:
         raise RuntimeError("OpenCode CLI returned no text event")
@@ -1623,7 +1645,11 @@ def _extract_opencode_text(output: str) -> str:
         if not isinstance(event, dict) or event.get("type") != "text":
             continue
         part = event.get("part")
-        if isinstance(part, dict) and isinstance(part.get("text"), str):
+        if (
+            isinstance(part, dict)
+            and isinstance(part.get("text"), str)
+            and part["text"].strip()
+        ):
             texts.append(part["text"].strip())
     if not texts:
         raise RuntimeError("OpenCode CLI returned no text event")
