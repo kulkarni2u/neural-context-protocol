@@ -32,6 +32,41 @@ def test_load_config_reads_file_and_env_overrides(tmp_path: Path) -> None:
     assert config.values["observability"]["log_level"] == "warning"
 
 
+def test_tool_profile_defaults_to_full(tmp_path: Path) -> None:
+    project = tmp_path / "repo"
+    (project / ".git").mkdir(parents=True)
+
+    assert load_config(cwd=project).tool_profile == "full"
+
+
+@pytest.mark.parametrize("profile", ["core", "full"])
+def test_tool_profile_accepts_supported_toml_values(tmp_path: Path, profile: str) -> None:
+    project = tmp_path / "repo"
+    (project / ".git").mkdir(parents=True)
+    (project / ".ncp").mkdir()
+    (project / ".ncp" / "config.toml").write_text(f"[tools]\nprofile = \"{profile}\"\n")
+
+    assert load_config(cwd=project).tool_profile == profile
+
+
+def test_tool_profile_invalid_value_falls_back_to_full(tmp_path: Path) -> None:
+    project = tmp_path / "repo"
+    (project / ".git").mkdir(parents=True)
+    (project / ".ncp").mkdir()
+    (project / ".ncp" / "config.toml").write_text('[tools]\nprofile = "minimal"\n')
+
+    assert load_config(cwd=project).tool_profile == "full"
+
+
+def test_tool_profile_env_override_wins_over_toml(tmp_path: Path) -> None:
+    project = tmp_path / "repo"
+    (project / ".git").mkdir(parents=True)
+    (project / ".ncp").mkdir()
+    (project / ".ncp" / "config.toml").write_text('[tools]\nprofile = "full"\n')
+
+    assert load_config(cwd=project, env={"NCP_TOOL_PROFILE": "core"}).tool_profile == "core"
+
+
 def test_load_config_exposes_redis_and_pgvector_settings(tmp_path: Path) -> None:
     project = tmp_path / "repo"
     (project / ".git").mkdir(parents=True)

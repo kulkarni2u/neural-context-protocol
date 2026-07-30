@@ -27,6 +27,20 @@ from ncp.stores.sqlite import SQLiteStore
 from ncp.types import ConsciousBlock, SubconsciousChunk, Whisper
 
 
+FULL_NON_MEMO_TOOL_NAMES = [
+    "ncp_get_context",
+    "ncp_write_memory",
+    "ncp_emit_whisper",
+    "ncp_post_turn",
+    "ncp_remember",
+    "ncp_recall",
+    "ncp_improve",
+    "ncp_fetch",
+    "ncp_record_decision",
+    "ncp_record_outcome",
+]
+
+
 def _req(method: str, params: object | None = None, req_id: int = 1) -> dict:
     d: dict = {"jsonrpc": "2.0", "id": req_id, "method": method}
     if params is not None:
@@ -89,7 +103,7 @@ class TestInitialize:
 
         framed_response = _read_message(io.BytesIO(output_stream.getvalue()))
         assert framed_response is not None
-        assert framed_response["result"]["tools"] == MCP_TOOLS
+        assert [tool["name"] for tool in framed_response["result"]["tools"]] == FULL_NON_MEMO_TOOL_NAMES
 
     def test_http_transport_handles_initialize_and_tools_list(self, tmp_path: Path) -> None:
         port = _free_port()
@@ -121,7 +135,7 @@ class TestInitialize:
 
                 tools = client.post("/mcp", json=_req("tools/list"))
                 assert tools.status_code == 200
-                assert tools.json()["result"]["tools"] == MCP_TOOLS
+                assert [tool["name"] for tool in tools.json()["result"]["tools"]] == FULL_NON_MEMO_TOOL_NAMES
         finally:
             server._shutdown_event.set()
             server.shutdown()
@@ -188,6 +202,10 @@ class TestInitialize:
 
 
 class TestToolsList:
+    def test_model_facing_tool_descriptions_hide_roadmap_ids(self) -> None:
+        serialized = json.dumps(MCP_TOOLS)
+        assert "CAP-" not in serialized
+
     def test_lists_all_tools(self) -> None:
         resp = _handle_request(_req("tools/list"), {})
         result = _result(resp)
@@ -224,6 +242,132 @@ class TestToolsList:
         assert "ttl_seconds" in properties
         assert "share/request" in properties["payload"]["description"]
         assert "dissent" in properties["payload"]["description"]
+
+    def test_emit_whisper_payload_schema_is_additive_for_structured_payloads(self) -> None:
+        emit_tool = next(tool for tool in MCP_TOOLS if tool["name"] == "ncp_emit_whisper")
+        schema = emit_tool["inputSchema"]
+        payload_schema = schema["properties"]["payload"]  # type: ignore[index]
+
+        assert "payload" in schema["required"]  # type: ignore[operator]
+        assert payload_schema["oneOf"] == [
+            {"type": "string"},
+            {"type": "object"},
+        ]
+
+    def test_emit_whisper_schema_discriminates_structured_payloads_by_type(self) -> None:
+        emit_tool = next(tool for tool in MCP_TOOLS if tool["name"] == "ncp_emit_whisper")
+        schema = emit_tool["inputSchema"]
+        conditionals = schema["allOf"]  # type: ignore[index]
+
+        payload_titles_by_types = {
+            tuple(branch["if"]["properties"]["type"]["enum"]): [
+                option.get("title", option["type"])
+                for option in branch["then"]["properties"]["payload"]["oneOf"]
+            ]
+            for branch in conditionals
+        }
+
+        assert payload_titles_by_types == {
+            ("share", "request"): ["string", "HandoffPayload"],
+            ("dissent",): ["string", "DissentPayload"],
+            ("alert",): ["string", "AlertPayload"],
+            ("world_check",): ["string", "WorldCheckPayload"],
+            ("nudge", "consolidation_ready"): ["string"],
+        }
+
+    def test_tool_profile_core_tools_list_advertises_only_context_lifecycle(self, tmp_path: Path) -> None:
+        project = tmp_path / "repo"
+        (project / ".git").mkdir(parents=True)
+        (project / ".ncp").mkdir()
+        (project / ".ncp" / "config.toml").write_text('[tools]\nprofile = "core"\n')
+        input_stream = io.BytesIO(_frame(_req("tools/list")))
+        output_stream = io.BytesIO()
+
+        serve_streams(input_stream, output_stream, cwd=project)
+
+        response = _read_message(io.BytesIO(output_stream.getvalue()))
+        assert response is not None
+        assert [tool["name"] for tool in response["result"]["tools"]] == [
+            "ncp_get_context",
+            "ncp_write_memory",
+            "ncp_emit_whisper",
+            "ncp_post_turn",
+            "ncp_fetch",
+        ]
+
+    def test_tool_profile_full_tools_list_hides_disabled_memo_tools(self, tmp_path: Path) -> None:
+        project = tmp_path / "repo"
+        (project / ".git").mkdir(parents=True)
+        (project / ".ncp").mkdir()
+        (project / ".ncp" / "config.toml").write_text('[tools]\nprofile = "full"\n')
+        input_stream = io.BytesIO(_frame(_req("tools/list")))
+        output_stream = io.BytesIO()
+
+        serve_streams(input_stream, output_stream, cwd=project)
+
+        response = _read_message(io.BytesIO(output_stream.getvalue()))
+        assert response is not None
+        assert [tool["name"] for tool in response["result"]["tools"]] == FULL_NON_MEMO_TOOL_NAMES
+
+    def test_tool_profile_full_memo_tools_are_advertised_when_enabled(self, tmp_path: Path) -> None:
+        project = tmp_path / "repo"
+        (project / ".git").mkdir(parents=True)
+        (project / ".ncp").mkdir()
+        (project / ".ncp" / "config.toml").write_text(
+            '[tools]\nprofile = "full"\n\n[memoization]\nenabled = true\n'
+        )
+        input_stream = io.BytesIO(_frame(_req("tools/list")))
+        output_stream = io.BytesIO()
+
+        serve_streams(input_stream, output_stream, cwd=project)
+
+        response = _read_message(io.BytesIO(output_stream.getvalue()))
+        assert response is not None
+        assert [tool["name"] for tool in response["result"]["tools"]] == [tool["name"] for tool in MCP_TOOLS]
+
+    def test_disabled_memo_tools_are_not_callable(self, tmp_path: Path) -> None:
+        project = tmp_path / "repo"
+        (project / ".git").mkdir(parents=True)
+        input_stream = io.BytesIO(_frame(_call("ncp_lookup_memo", {"task": "task", "context": "context"})))
+        output_stream = io.BytesIO()
+
+        serve_streams(input_stream, output_stream, cwd=project)
+
+        response = _read_message(io.BytesIO(output_stream.getvalue()))
+        assert response is not None
+        assert response["error"]["code"] == -32601
+
+    def test_tool_profile_http_and_stdio_share_the_core_catalog(self, tmp_path: Path) -> None:
+        project = tmp_path / "repo"
+        (project / ".git").mkdir(parents=True)
+        (project / ".ncp").mkdir()
+        (project / ".ncp" / "config.toml").write_text('[tools]\nprofile = "core"\n')
+        input_stream = io.BytesIO(_frame(_req("tools/list")))
+        output_stream = io.BytesIO()
+        serve_streams(input_stream, output_stream, cwd=project)
+        stdio_response = _read_message(io.BytesIO(output_stream.getvalue()))
+        assert stdio_response is not None
+
+        port = _free_port()
+        server = create_http_server(host="127.0.0.1", port=port, cwd=project)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with httpx.Client(base_url=f"http://127.0.0.1:{port}", timeout=5.0) as client:
+                http_response = client.post("/mcp", json=_req("tools/list"))
+            assert http_response.status_code == 200
+            assert http_response.json()["result"]["tools"] == stdio_response["result"]["tools"]
+            assert [tool["name"] for tool in http_response.json()["result"]["tools"]] == [
+                "ncp_get_context",
+                "ncp_write_memory",
+                "ncp_emit_whisper",
+                "ncp_post_turn",
+                "ncp_fetch",
+            ]
+        finally:
+            server._shutdown_event.set()
+            server.shutdown()
+            thread.join(timeout=5)
 
 
 class TestMemoryTools:
@@ -785,6 +929,7 @@ class TestEmitWhisper:
 
         result = _content(resp)
         assert result["emitted"] is True
+        assert result["payload_format"] == "legacy"
         drained = store.drain_whispers(agent_id="executor", max_items=1)
         payload = json.loads(drained[0].payload)
         assert payload["ask"] == "please review the retry slice"
@@ -805,6 +950,7 @@ class TestEmitWhisper:
 
         result = _content(resp)
         assert result["emitted"] is True
+        assert result["payload_format"] == "legacy"
         drained = store.drain_whispers(agent_id="executor", max_items=1)
         payload = json.loads(drained[0].payload)
         assert payload["ask"] == "review retry slice"
@@ -826,9 +972,98 @@ class TestEmitWhisper:
 
         result = _content(resp)
         assert result["emitted"] is True
+        assert result["payload_format"] == "legacy"
         drained = store.drain_whispers(agent_id="builder", max_items=1)
         payload = json.loads(drained[0].payload)
         assert payload["issue"] == "missing rollback path"
+
+    def test_emit_accepts_type_specific_structured_payloads(self, tmp_path: Path) -> None:
+        cases = [
+            (
+                "share",
+                {"files": ["ncp/types.py"], "ask": "review", "slice": "payloads"},
+                '{"ask":"review","files":["ncp/types.py"],"slice":"payloads"}',
+            ),
+            (
+                "request",
+                {"ask": "run tests"},
+                '{"ask":"run tests","files":[],"slice":null}',
+            ),
+            (
+                "dissent",
+                {"alternatives": ["retain legacy"], "issue": "breaking change"},
+                '{"alternatives":["retain legacy"],"issue":"breaking change"}',
+            ),
+            (
+                "alert",
+                {"description": "Store unavailable", "alert_code": "store_down"},
+                '{"alert_code":"store_down","description":"Store unavailable"}',
+            ),
+            (
+                "world_check",
+                {"detected_drift": 0.25, "anchor_intent": "ship_task_6"},
+                '{"anchor_intent":"ship_task_6","detected_drift":0.25}',
+            ),
+        ]
+
+        for whisper_type, payload, expected in cases:
+            store = SQLiteStore(tmp_path / f"{whisper_type}.db")
+            handlers = make_handlers(store)
+            result = _content(_handle_request(
+                _call("ncp_emit_whisper", {
+                    "from": "builder",
+                    "target": "executor",
+                    "type": whisper_type,
+                    "payload": payload,
+                    "confidence": 0.9,
+                }),
+                handlers,
+            ))
+
+            assert result["emitted"] is True
+            assert result["payload_format"] == "structured-v1"
+            drained = store.drain_whispers(agent_id="executor", max_items=1)
+            assert drained[0].payload == expected
+
+    def test_emit_rejects_structured_payload_that_does_not_match_type(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "test.db")
+        handlers = make_handlers(store)
+
+        resp = _handle_request(
+            _call("ncp_emit_whisper", {
+                "from": "builder",
+                "target": "executor",
+                "type": "dissent",
+                "payload": {"ask": "this is a handoff, not dissent"},
+                "confidence": 0.9,
+            }),
+            handlers,
+        )
+
+        error = _error(resp)
+        assert error["code"] == -32603
+        assert "payload validation failed for whisper_type 'dissent'" in error["message"]
+        assert store.drain_whispers(agent_id="executor", max_items=1) == []
+
+    def test_emit_rejects_structured_nudge_without_mutating_queue(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "test.db")
+        handlers = make_handlers(store)
+
+        resp = _handle_request(
+            _call("ncp_emit_whisper", {
+                "from": "builder",
+                "target": "executor",
+                "type": "nudge",
+                "payload": {"ask": "object nudges are not a runtime payload"},
+                "confidence": 0.9,
+            }),
+            handlers,
+        )
+
+        error = _error(resp)
+        assert error["code"] == -32603
+        assert "structured payload is not supported for whisper_type 'nudge'" in error["message"]
+        assert store.peek_whispers(agent_id="executor") == []
 
     def test_rejects_dissent_broadcast(self, tmp_path: Path) -> None:
         store = SQLiteStore(tmp_path / "test.db")

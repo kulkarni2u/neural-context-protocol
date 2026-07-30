@@ -234,42 +234,43 @@ def _run_handoff_command(
     runner: str,
 ) -> str:
     from ncp.agent_handoff import (
-        acknowledge_handoffs,
+        complete_handoff,
         emit_follow_up_whisper,
-        load_handoffs,
         parse_json_review,
+        prepare_handoff,
         run_claude_partner,
         run_opencode_reviewer,
         truncate_whisper_payload,
     )
 
     try:
-        store, handoffs = load_handoffs(
+        prepared = prepare_handoff(
             cwd=cwd,
             agent_id=agent_id,
+            runner=runner,
             pipeline_id=pipeline_id,
             max_items=max_items,
             min_confidence=min_confidence,
         )
-    except NotImplementedError as exc:
+    except (NotImplementedError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
-    if not handoffs:
-        raise click.ClickException(f"No pending NCP handoffs for {agent_id}.")
 
     try:
         if runner == "claude":
             response = run_claude_partner(
-                cwd=cwd,
+                cwd=prepared.workspace,
                 agent_id=agent_id,
-                handoffs=handoffs,
+                handoffs=prepared.handoffs,
+                context=prepared.context,
                 instruction=instruction,
                 timeout_seconds=timeout_seconds,
             )
         else:
             response = run_opencode_reviewer(
-                cwd=cwd,
+                cwd=prepared.workspace,
                 agent_id=agent_id,
-                handoffs=handoffs,
+                handoffs=prepared.handoffs,
+                context=prepared.context,
                 instruction=instruction,
                 timeout_seconds=timeout_seconds,
             )
@@ -277,17 +278,20 @@ def _run_handoff_command(
     except (RuntimeError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
 
+    try:
+        complete_handoff(prepared, runner=runner, response=response)
+    except (RuntimeError, OSError) as exc:
+        raise click.ClickException(str(exc)) from exc
     if emit_to:
         emit_follow_up_whisper(
-            cwd=cwd,
+            cwd=prepared.workspace,
             from_agent=agent_id,
             target=emit_to,
-            pipeline_id=pipeline_id or handoffs[0].pipeline_id,
+            pipeline_id=pipeline_id or prepared.handoffs[0].pipeline_id,
             payload=truncate_whisper_payload(response, max_chars=max_payload_chars),
             whisper_type=emit_type,
             confidence=emit_confidence,
         )
-    acknowledge_handoffs(store, handoffs)
     return response
 
 

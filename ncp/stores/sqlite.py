@@ -3066,7 +3066,11 @@ class SQLiteStore(BaseStore):
         acknowledged = 0
         now = time.time()
         for whisper in whispers:
-            if whisper.target == "*" and agent_id is not None:
+            if whisper.target == "*":
+                if agent_id is None:
+                    # Cannot attribute a broadcast acknowledgement to a specific
+                    # recipient; skip rather than deleting it for every recipient.
+                    continue
                 cursor = connection.execute(
                     """
                     INSERT OR IGNORE INTO whisper_deliveries (whisper_id, agent_id, delivered_at)

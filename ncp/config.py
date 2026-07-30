@@ -124,6 +124,9 @@ DEFAULT_CONFIG = {
         "allow_unverified": False,
         "similarity_threshold": 0.95,
     },
+    "tools": {
+        "profile": "full",
+    },
     "identity": {
         # OPT-IN authorship enforcement. When false (default) unsigned writes and
         # whispers keep working exactly as before and any supplied signature is
@@ -131,6 +134,9 @@ DEFAULT_CONFIG = {
         # authorship cannot be verified (missing/bad signature or revoked identity)
         # is rejected.
         "require_signatures": False,
+    },
+    "handoff": {
+        "require_verified": False,
     },
     "tiering": {
         # CAP-E3: advisory model-tiering signal on ncp_get_context responses.
@@ -456,8 +462,17 @@ class NCPConfig:
         return float(self.values.get("memoization", {}).get("similarity_threshold", 0.95))
 
     @property
+    def tool_profile(self) -> str:
+        profile = str(self.values.get("tools", {}).get("profile", "full")).lower()
+        return profile if profile in {"core", "full"} else "full"
+
+    @property
     def require_signatures(self) -> bool:
         return bool(self.values.get("identity", {}).get("require_signatures", False))
+
+    @property
+    def handoff_require_verified(self) -> bool:
+        return bool(self.values.get("handoff", {}).get("require_verified", False))
 
     @property
     def infer_edges(self) -> bool:
@@ -512,11 +527,11 @@ def load_config(
 
 
 def find_project_root(start: str | Path) -> Path:
-    """Find the nearest project root by walking up to a ``.git`` directory."""
+    """Find the nearest initialized NCP or Git project root."""
 
     current = Path(start).resolve()
     for candidate in [current, *current.parents]:
-        if (candidate / ".git").exists():
+        if (candidate / ".ncp" / "config.toml").is_file() or (candidate / ".git").exists():
             return candidate
     return current
 
@@ -528,6 +543,11 @@ def _apply_env_overrides(values: dict[str, Any], env: dict[str, str]) -> None:
         values["observability"]["log_level"] = env["NCP_LOG_LEVEL"]
     if "NCP_STORE_TYPE" in env:
         values["store"]["type"] = env["NCP_STORE_TYPE"]
+    if "NCP_TOOL_PROFILE" in env:
+        values["tools"]["profile"] = env["NCP_TOOL_PROFILE"]
+    if "NCP_HANDOFF_REQUIRE_VERIFIED" in env:
+        val = env["NCP_HANDOFF_REQUIRE_VERIFIED"].lower()
+        values["handoff"]["require_verified"] = val in {"true", "1", "yes"}
     if "NCP_REDIS_URL" in env:
         values["redis"]["url"] = env["NCP_REDIS_URL"]
     if "NCP_REDIS_STREAM" in env:

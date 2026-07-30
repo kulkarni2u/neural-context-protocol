@@ -214,6 +214,23 @@ Routing rules:
   broadcast (*): scoped to pipeline_id — cannot cross pipelines
 ```
 
+`ncp_emit_whisper` accepts either a legacy string or a `structured-v1` object.
+Structured-v1 is the recommended representation: `share` and `request` use
+`HandoffPayload` (`ask`, optional `files` and `slice`), `dissent` uses
+`DissentPayload` (`issue`, optional `alternatives`), `alert` uses
+`AlertPayload` (`alert_code`, `description`), and `world_check` uses
+`WorldCheckPayload` (`anchor_intent`, `detected_drift`). The object shape MUST
+match its whisper type; in particular, dissent stays type-validated and is
+never broadcast.
+
+Strings remain supported for the current major version. This includes the
+existing plain-text wrapping for `share`, `request`, and `dissent`, and legacy
+JSON strings retain their existing normalized representation. No removal
+version is claimed until provider telemetry shows that legacy use is
+negligible. Structured objects are serialized as sorted, compact JSON before
+storage. When authorship signing is enabled, a whisper signature covers that
+exact normalized stored payload, not the caller's source-object key order.
+
 ### 2.4 TurnRecord
 
 ```
@@ -402,9 +419,11 @@ Semantics:
 
 ```
 Config gate:
-  Memoization is OFF by default. `ncp_lookup_memo` only returns memos when
-  `[memoization].enabled = true` (default false). Staleness
-  (`max_age_hours`), `min_outcome`, and `allow_unverified` gates also apply.
+  Memoization is OFF by default. When `[memoization].enabled = false`
+  (the default), both handlers return the disabled result variant below before
+  reading/writing memo entries or hit/miss telemetry. Staleness
+  (`max_age_hours`), `min_outcome`, and `allow_unverified` gates apply when
+  memoization is enabled.
 
 ncp_lookup_memo arguments:
   task:      str?  — task description; hashed with context into the signature
@@ -414,16 +433,22 @@ ncp_lookup_memo arguments:
 ncp_lookup_memo result:
   {"found": bool, "memo": {...} | null,
    "stats": {"hits": int, "misses": int}}   # cumulative store totals (S4.1)
+  Disabled variant:
+  {"recorded": false, "disabled": true, "reason": "memoization_disabled"}
+  # This variant deliberately has no `found` field and no `stats` field.
 
 ncp_record_memo arguments:
   task:              str    (required)
+  context:           str?   — optional context string for signature computation
   chunk_ids:         [str]  (required) — chunks produced by this work
   result_summary:    str?   — summary of the work result
-  signature:         str?   — explicit signature (overrides task hash)
+  signature:         str?   — explicit signature (overrides task+context hash)
   output_tokens_est: int?   — real output token count; estimated from
                               result_summary via estimate_tokens when omitted
 
 ncp_record_memo result: {"recorded": bool, "signature": str}
+  Disabled variant:
+  {"recorded": false, "disabled": true, "reason": "memoization_disabled"}
 
 Semantics:
   Signatures are SHA-256 over whitespace-normalized, lowercased task+context.
@@ -876,7 +901,9 @@ and `ncp_emit_whisper` accept an optional `signature` over the canonical
 `written_by | sha256(content) | pipeline_id` payload; NCP verifies it against
 the author's registered Ed25519 public key, persists the outcome (`verified`
 column), and surfaces a `verified` marker in fetch results and the pidgin wire
-format. This is gated behind `[identity].require_signatures`, which **defaults
+format. For structured-v1 whispers, `content` is the normalized stored payload
+(sorted, compact JSON), so signatures are independent of source-object key
+order. This is gated behind `[identity].require_signatures`, which **defaults
 to `false`** — unsigned writes still work and authorship is *not* authenticated
 unless an operator enables enforcement. With `require_signatures = true`, writes
 that cannot be verified (including from revoked identities) are rejected. Signing

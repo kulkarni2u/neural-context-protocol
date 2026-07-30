@@ -14,7 +14,7 @@ import traceback
 import urllib.parse
 from collections.abc import Callable
 from pathlib import Path, PurePosixPath
-from typing import BinaryIO, get_args
+from typing import BinaryIO, Sequence, get_args
 
 from ncp.adaptive_budget import AdaptiveBudgetResult, compute_adaptive_budget
 from ncp.assembler import Assembler
@@ -34,6 +34,7 @@ from ncp.types import (
     OutcomeRecord,
     SubconsciousChunk,
     Whisper,
+    normalize_whisper_payload,
 )
 
 from ncp.version import __version__
@@ -95,7 +96,7 @@ MCP_TOOLS: list[dict[str, object]] = [
                 "as_of": {
                     "type": "string",
                     "description": (
-                        "CAP-C5: optional ISO-8601 timestamp (or epoch seconds). When given, "
+                        "Optional ISO-8601 timestamp (or epoch seconds). When given, "
                         "assembles the bi-temporal view as of that transaction time -- only "
                         "chunks recorded by then, not superseded by a chunk recorded by then, "
                         "and valid (valid_from/valid_to) at that instant. Omit for the default "
@@ -139,14 +140,14 @@ MCP_TOOLS: list[dict[str, object]] = [
                 "valid_from": {
                     "type": "string",
                     "description": (
-                        "CAP-C5: optional ISO-8601 timestamp (or epoch seconds) for when this "
+                        "Optional ISO-8601 timestamp (or epoch seconds) for when this "
                         "fact became true in the world (valid time). Defaults to unset (no bound)."
                     ),
                 },
                 "valid_to": {
                     "type": "string",
                     "description": (
-                        "CAP-C5: optional ISO-8601 timestamp (or epoch seconds) for when this "
+                        "Optional ISO-8601 timestamp (or epoch seconds) for when this "
                         "chunk's own fact stops being true in the world. Defaults to unset (no "
                         "bound). Independent of 'supersedes', which sets the *previous* chunk's "
                         "valid_to, not this one's."
@@ -155,7 +156,7 @@ MCP_TOOLS: list[dict[str, object]] = [
                 "supersedes": {
                     "type": "string",
                     "description": (
-                        "CAP-C5: chunk_id of an existing chunk this write honestly replaces. "
+                        "Chunk ID of an existing chunk this write honestly replaces. "
                         "The old chunk is NOT deleted: its superseded_by is set to this new "
                         "chunk's id and its own valid_to is set to this chunk's valid_from (or "
                         "now if valid_from is omitted). Default (non-as_of) reads then return "
@@ -195,12 +196,16 @@ MCP_TOOLS: list[dict[str, object]] = [
                 "target": {"type": "string", "description": "Receiving agent ID or '*' for pipeline broadcast"},
                 "type": {"type": "string", "enum": ["nudge", "alert", "share", "request", "dissent", "world_check", "consolidation_ready"]},
                 "payload": {
-                    "type": "string",
+                    "oneOf": [
+                        {"type": "string"},
+                        {"type": "object"},
+                    ],
                     "description": (
-                        "Whisper message (max 600 chars). share/request expect JSON "
-                        "{\"ask\": str, \"files\": [str], \"slice\": str?}; dissent expects "
-                        "JSON {\"issue\": str, \"alternatives\": [str]}. Plain text is accepted "
-                        "by MCP and wrapped into the required shape."
+                        "Whisper message (max 600 normalized chars). Structured-v1 objects "
+                        "are recommended and type-validated: share/request use HandoffPayload; "
+                        "dissent uses DissentPayload; alert and world_check use their named "
+                        "payloads. Legacy strings remain accepted; plain share/request/dissent "
+                        "text is wrapped into the required shape."
                     ),
                 },
                 "confidence": {"type": "number", "description": "Confidence 0.0-1.0"},
@@ -224,6 +229,131 @@ MCP_TOOLS: list[dict[str, object]] = [
                 },
             },
             "required": ["from", "target", "type", "payload", "confidence"],
+            "allOf": [
+                {
+                    "if": {
+                        "properties": {"type": {"enum": ["share", "request"]}},
+                        "required": ["type"],
+                    },
+                    "then": {
+                        "properties": {
+                            "payload": {
+                                "oneOf": [
+                                    {"type": "string"},
+                                    {
+                                        "type": "object",
+                                        "title": "HandoffPayload",
+                                        "properties": {
+                                            "slice": {"type": ["string", "null"]},
+                                            "files": {
+                                                "type": "array",
+                                                "items": {"type": "string"},
+                                            },
+                                            "ask": {"type": "string"},
+                                        },
+                                        "required": ["ask"],
+                                    },
+                                ],
+                            },
+                        },
+                    },
+                },
+                {
+                    "if": {
+                        "properties": {"type": {"enum": ["dissent"]}},
+                        "required": ["type"],
+                    },
+                    "then": {
+                        "properties": {
+                            "payload": {
+                                "oneOf": [
+                                    {"type": "string"},
+                                    {
+                                        "type": "object",
+                                        "title": "DissentPayload",
+                                        "properties": {
+                                            "issue": {"type": "string"},
+                                            "alternatives": {
+                                                "type": "array",
+                                                "items": {"type": "string"},
+                                            },
+                                        },
+                                        "required": ["issue"],
+                                    },
+                                ],
+                            },
+                        },
+                    },
+                },
+                {
+                    "if": {
+                        "properties": {"type": {"enum": ["alert"]}},
+                        "required": ["type"],
+                    },
+                    "then": {
+                        "properties": {
+                            "payload": {
+                                "oneOf": [
+                                    {"type": "string"},
+                                    {
+                                        "type": "object",
+                                        "title": "AlertPayload",
+                                        "properties": {
+                                            "alert_code": {"type": "string"},
+                                            "description": {"type": "string"},
+                                        },
+                                        "required": ["alert_code", "description"],
+                                    },
+                                ],
+                            },
+                        },
+                    },
+                },
+                {
+                    "if": {
+                        "properties": {"type": {"enum": ["world_check"]}},
+                        "required": ["type"],
+                    },
+                    "then": {
+                        "properties": {
+                            "payload": {
+                                "oneOf": [
+                                    {"type": "string"},
+                                    {
+                                        "type": "object",
+                                        "title": "WorldCheckPayload",
+                                        "properties": {
+                                            "anchor_intent": {"type": "string"},
+                                            "detected_drift": {"type": "number"},
+                                        },
+                                        "required": [
+                                            "anchor_intent",
+                                            "detected_drift",
+                                        ],
+                                    },
+                                ],
+                            },
+                        },
+                    },
+                },
+                {
+                    "if": {
+                        "properties": {
+                            "type": {
+                                "enum": ["nudge", "consolidation_ready"],
+                            },
+                        },
+                        "required": ["type"],
+                    },
+                    "then": {
+                        "properties": {
+                            "payload": {
+                                "oneOf": [{"type": "string"}],
+                            },
+                        },
+                    },
+                },
+            ],
         },
     },
     {
@@ -382,7 +512,7 @@ MCP_TOOLS: list[dict[str, object]] = [
     {
         "name": "ncp_record_outcome",
         "description": (
-            "Record a task outcome for outcome-calibrated reputation (CAP-T3). "
+            "Record a task outcome for outcome-calibrated reputation. "
             "Provide either chunk_ids (explicit) or turn_id (resolved to chunk_ids). "
             "Success=True increases author reputation; success=False decreases it."
         ),
@@ -420,7 +550,7 @@ MCP_TOOLS: list[dict[str, object]] = [
     {
         "name": "ncp_lookup_memo",
         "description": (
-            "Look up a previously recorded work memo by task+context signature (CAP-C3). "
+            "Look up a previously recorded work memo by task+context signature. "
             "Returns the memo if found, not stale, and meeting minimum outcome/verified criteria. "
             "Provide either task+context or an explicit signature."
         ),
@@ -445,7 +575,7 @@ MCP_TOOLS: list[dict[str, object]] = [
     {
         "name": "ncp_record_memo",
         "description": (
-            "Record a work memo for CAP-C3 semantic memoization. "
+            "Record a work memo for semantic memoization. "
             "Stores a signature-keyed entry that can be looked up later to skip redundant work."
         ),
         "inputSchema": {
@@ -454,6 +584,10 @@ MCP_TOOLS: list[dict[str, object]] = [
                 "task": {
                     "type": "string",
                     "description": "Task description for signature computation (ignored if signature is provided)",
+                },
+                "context": {
+                    "type": "string",
+                    "description": "Optional context string for signature computation",
                 },
                 "chunk_ids": {
                     "type": "array",
@@ -491,6 +625,37 @@ MCP_TOOLS: list[dict[str, object]] = [
         },
     },
 ]
+
+CORE_TOOL_NAMES = frozenset({
+    "ncp_get_context",
+    "ncp_write_memory",
+    "ncp_emit_whisper",
+    "ncp_post_turn",
+    "ncp_fetch",
+})
+MEMO_TOOL_NAMES = frozenset({"ncp_lookup_memo", "ncp_record_memo"})
+
+
+def tools_for_config(config: NCPConfig | None) -> list[dict[str, object]]:
+    """Return the MCP tools enabled by a normalized server configuration."""
+    if config is None:
+        return [tool for tool in MCP_TOOLS if str(tool["name"]) in CORE_TOOL_NAMES]
+
+    enabled_names = CORE_TOOL_NAMES if config.tool_profile == "core" else {
+        str(tool["name"]) for tool in MCP_TOOLS
+    }
+    if not config.memoization_enabled:
+        enabled_names -= MEMO_TOOL_NAMES
+    return [tool for tool in MCP_TOOLS if str(tool["name"]) in enabled_names]
+
+
+def handlers_for_tools(
+    handlers: dict[str, ToolHandler],
+    tools: Sequence[dict[str, object]],
+) -> dict[str, ToolHandler]:
+    """Restrict handler reachability to the advertised tool catalog."""
+    enabled_names = {str(tool["name"]) for tool in tools}
+    return {name: handler for name, handler in handlers.items() if name in enabled_names}
 
 
 def _encode_fetch_results(chunks: list[SubconsciousChunk]) -> str:
@@ -1031,7 +1196,10 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
 
     def _handle_emit_whisper(args: dict[str, object]) -> object:
         whisper_type = str(args["type"])
-        payload = _normalize_mcp_whisper_payload(whisper_type, str(args["payload"]))
+        payload, payload_format = normalize_whisper_payload(
+            whisper_type,  # type: ignore[arg-type]
+            args["payload"],
+        )
         try:
             ttl_seconds = max(1, int(args.get("ttl_seconds", default_whisper_ttl)))
         except (TypeError, ValueError):
@@ -1039,20 +1207,7 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         ref = args.get("ref")
         from_agent = str(args["from"])
         pipeline_id = args.get("pipeline_id")
-        # CAP-T1/WI-013: sign whispers over (from | sha256(payload) | pipeline_id).
         signature = args.get("signature")
-        verified = _verify_authorship(
-            store,
-            identity_id=from_agent,
-            content=payload,
-            pipeline_id=None if pipeline_id is None else str(pipeline_id),
-            signature=None if signature is None else str(signature),
-        )
-        if require_signatures and not verified:
-            raise ValueError(
-                "ncp_emit_whisper rejected: require_signatures is enabled and authorship "
-                "could not be verified (missing/invalid signature or revoked identity)."
-            )
         whisper = Whisper(
             from_agent=from_agent,
             target=str(args["target"]),
@@ -1062,10 +1217,27 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             pipeline_id=pipeline_id,
             ttl_seconds=ttl_seconds,
             ref=None if ref is None else str(ref),
-            verified=verified,
+            verified=False,
         )
+        # Signatures cover the exact normalized payload value that is stored.
+        verified = _verify_authorship(
+            store,
+            identity_id=from_agent,
+            content=whisper.payload,
+            pipeline_id=None if pipeline_id is None else str(pipeline_id),
+            signature=None if signature is None else str(signature),
+        )
+        if require_signatures and not verified:
+            raise ValueError(
+                "ncp_emit_whisper rejected: require_signatures is enabled and authorship "
+                "could not be verified (missing/invalid signature or revoked identity)."
+            )
+        whisper.verified = verified
         store.emit_whisper(whisper)
-        result: dict[str, object] = {"emitted": True}
+        result: dict[str, object] = {
+            "emitted": True,
+            "payload_format": payload_format,
+        }
         if signature is not None:
             result["verified"] = verified
         if whisper_type == "dissent" and ref:
@@ -1259,6 +1431,12 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
 
     def _handle_lookup_memo(args: dict[str, object]) -> object:
         from ncp.stores.memo import compute_memo_signature
+        if config is not None and not config.memoization_enabled:
+            return {
+                "recorded": False,
+                "disabled": True,
+                "reason": "memoization_disabled",
+            }
         sig = args.get("signature")
         if sig is None:
             task = str(args.get("task", ""))
@@ -1274,7 +1452,7 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         result: dict[str, object] = {"found": False, "memo": None}
         cfg = config
         usable = False
-        if memo is not None and (cfg is None or cfg.memoization_enabled):
+        if memo is not None:
             # Apply outcome and verified gating at the handler level
             gated = False
             if cfg is not None:
@@ -1296,10 +1474,17 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
 
     def _handle_record_memo(args: dict[str, object]) -> object:
         from ncp.stores.memo import compute_memo_signature, validate_code_memo_ast
+        if config is not None and not config.memoization_enabled:
+            return {
+                "recorded": False,
+                "disabled": True,
+                "reason": "memoization_disabled",
+            }
         task = str(args.get("task", ""))
         sig = args.get("signature")
         if sig is None:
-            sig = compute_memo_signature(task)
+            context = str(args.get("context", ""))
+            sig = compute_memo_signature(task, context)
         sig = str(sig)
         chunk_ids = [str(c) for c in list(args.get("chunk_ids", []) or [])]
         result_summary = args.get("result_summary")
@@ -1515,17 +1700,6 @@ def _trust_from_args(args: dict[str, object]) -> float:
     }.get(str(args.get("src", "")), 0.70)
 
 
-def _normalize_mcp_whisper_payload(whisper_type: str, payload: str) -> str:
-    trimmed = payload.strip()
-    if trimmed.startswith("{") and trimmed.endswith("}"):
-        return payload
-    if whisper_type in {"share", "request"}:
-        return json.dumps({"ask": payload})
-    if whisper_type == "dissent":
-        return json.dumps({"issue": payload})
-    return payload
-
-
 _SUPPORTED_VERSIONS = {"2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"}
 _LATEST_VERSION = "2025-11-25"
 
@@ -1536,7 +1710,12 @@ def _negotiate_version(client_version: str) -> str:
     return _LATEST_VERSION
 
 
-def _handle_request(req: dict[str, object], handlers: dict[str, ToolHandler]) -> str | StreamResponse:
+def _handle_request(
+    req: dict[str, object],
+    handlers: dict[str, ToolHandler],
+    *,
+    tools: Sequence[dict[str, object]] = MCP_TOOLS,
+) -> str | StreamResponse:
     req_id = req.get("id")
     method = str(req.get("method", ""))
     params: dict[str, object] = req.get("params", {}) or {}
@@ -1562,14 +1741,15 @@ def _handle_request(req: dict[str, object], handlers: dict[str, ToolHandler]) ->
         return _ok(req_id, {})
 
     if method == "tools/list":
-        return _ok(req_id, {"tools": MCP_TOOLS})
+        return _ok(req_id, {"tools": tools})
 
     if method == "tools/call":
         tool_name = str(params.get("name", ""))
         arguments: dict[str, object] = params.get("arguments", {}) or {}
         if not isinstance(arguments, dict):
             arguments = {}
-        handler = handlers.get(tool_name)
+        enabled_names = {str(tool["name"]) for tool in tools}
+        handler = handlers.get(tool_name) if tool_name in enabled_names else None
         if handler is None:
             return _err_response(req_id, -32601, f"Tool not found: {tool_name}")
         try:
@@ -1640,22 +1820,15 @@ def _create_handlers_with_store(
     *,
     store_path: str | Path | None = None,
     cwd: Path | None = None,
-) -> tuple[dict[str, ToolHandler], BaseStore]:
+) -> tuple[dict[str, ToolHandler], BaseStore, list[dict[str, object]]]:
     if store_path:
         config = load_config(env={"NCP_STORE_PATH": str(store_path)})
     else:
         config = load_config(cwd=cwd or Path.cwd())
     store = create_store(config)
-    return make_handlers(store, config=config), store
-
-
-def _create_handlers(
-    *,
-    store_path: str | Path | None = None,
-    cwd: Path | None = None,
-) -> dict[str, ToolHandler]:
-    handlers, _store = _create_handlers_with_store(store_path=store_path, cwd=cwd)
-    return handlers
+    tools = tools_for_config(config)
+    handlers = handlers_for_tools(make_handlers(store, config=config), tools)
+    return handlers, store, tools
 
 
 def serve_streams(
@@ -1667,7 +1840,7 @@ def serve_streams(
 ) -> None:
     """Run the MCP server against arbitrary binary streams."""
     try:
-        handlers = _create_handlers(store_path=store_path, cwd=cwd)
+        handlers, _store, tools = _create_handlers_with_store(store_path=store_path, cwd=cwd)
     except Exception as exc:
         _err(f"NCP server failed to start: {exc}\n{traceback.format_exc()}")
         sys.exit(1)
@@ -1686,7 +1859,7 @@ def serve_streams(
         if req is None:
             break
 
-        response = _handle_request(req, handlers)
+        response = _handle_request(req, handlers, tools=tools)
         if isinstance(response, StreamResponse):
             for i, (label, text) in enumerate(response.sections):
                 notif = json.dumps({
@@ -1875,6 +2048,7 @@ class _MCPHTTPServer(ThreadingHTTPServer):
         server_address: tuple[str, int],
         *,
         handlers: dict[str, ToolHandler],
+        tools: Sequence[dict[str, object]],
         store: BaseStore,
         sse_path: str,
         rpc_path: str,
@@ -1884,6 +2058,7 @@ class _MCPHTTPServer(ThreadingHTTPServer):
         max_body_bytes: int,
     ) -> None:
         self.handlers = handlers
+        self.tools = tools
         self.store = store
         self.sse_path = sse_path
         self.rpc_path = rpc_path
@@ -2165,7 +2340,7 @@ class _MCPHTTPHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_payload"})
             return
 
-        response = _handle_request(payload, self.server.handlers)
+        response = _handle_request(payload, self.server.handlers, tools=self.server.tools)
         prefers_sse = self._prefers_event_stream()
         if isinstance(response, StreamResponse):
             if prefers_sse:
@@ -2194,10 +2369,11 @@ def create_http_server(
     cors_allowed_origins: list[str] | None = None,
     max_body_bytes: int = 10_485_760,
 ) -> _MCPHTTPServer:
-    handlers, store = _create_handlers_with_store(store_path=store_path, cwd=cwd)
+    handlers, store, tools = _create_handlers_with_store(store_path=store_path, cwd=cwd)
     return _MCPHTTPServer(
         (host, port),
         handlers=handlers,
+        tools=tools,
         store=store,
         sse_path=sse_path,
         rpc_path=rpc_path,

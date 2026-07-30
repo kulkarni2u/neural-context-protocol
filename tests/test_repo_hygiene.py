@@ -7,6 +7,16 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_readme_positions_host_native_memory_as_complementary() -> None:
+    text = (ROOT / "README.md").read_text()
+    subsection = text.split("### Host-native memory", 1)[1].split("-----", 1)[0]
+
+    assert "scope varies by provider" in subsection
+    assert "may be machine-local or more broadly synchronized" in subsection
+    assert "shared repo/runtime agent-to-agent channel" in subsection
+    assert "with a shared backend" in subsection
+
+
 def test_dev_up_script_and_makefile_target_are_present() -> None:
     script = ROOT / "scripts" / "dev_up.sh"
     makefile = ROOT / "Makefile"
@@ -49,3 +59,10 @@ def test_provider_adapter_tests_skip_when_optional_sdks_are_absent() -> None:
     assert 'pytest.importorskip("cohere"' in adapter_tests
     assert 'pytest.importorskip("google.genai"' in adapter_tests
     assert 'pytest.importorskip("mistralai.client"' in adapter_tests
+
+
+def test_context_engineering_review_cites_primary_source_and_current_cap_count() -> None:
+    text = (ROOT / "docs" / "NCP_CONTEXT_ENGINEERING_REVIEW.md").read_text()
+    assert "https://claude.com/blog/the-new-rules-of-context-engineering-for-claude-5-generation-models" in text
+    assert "Seven model-facing" in text
+    assert "provider-specific evaluation" in text

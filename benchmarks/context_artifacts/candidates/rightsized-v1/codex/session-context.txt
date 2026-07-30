@@ -1,0 +1,2 @@
+NCP endpoint liveness: if connected, use http://${HOST}:${PORT}/mcp. If it is
+not reachable, report NCP unavailable and continue without cross-agent memory.
