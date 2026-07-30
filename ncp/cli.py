@@ -280,7 +280,7 @@ def _run_handoff_command(
 
     try:
         complete_handoff(prepared, runner=runner, response=response)
-    except RuntimeError as exc:
+    except (RuntimeError, OSError) as exc:
         raise click.ClickException(str(exc)) from exc
     if emit_to:
         emit_follow_up_whisper(

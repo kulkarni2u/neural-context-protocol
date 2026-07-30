@@ -821,6 +821,50 @@ def test_cli_handoff_persistence_failure_emits_no_follow_up(
     ) == []
 
 
+def test_cli_handoff_filesystem_failure_is_reported_without_traceback(
+    tmp_path: Path,
+    monkeypatch: object,
+) -> None:
+    runner = CliRunner()
+    runner.invoke(main, ["init", "--cwd", str(tmp_path)])
+    store = SQLiteStore(tmp_path / ".ncp" / "store.db")
+    source = Whisper(
+        from_agent="codex",
+        target="claude",
+        whisper_type="nudge",
+        payload="persist completion before acknowledging",
+        confidence=0.95,
+        pipeline_id="pipe_handoff_os_error",
+    )
+    store.emit_whisper(source)
+    monkeypatch.setattr(
+        "ncp.agent_handoff.run_claude_partner",
+        lambda **_: "provider completed",
+    )
+    monkeypatch.setattr(
+        "ncp.agent_handoff.complete_handoff",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OSError("completion store is read-only")
+        ),
+    )
+
+    result = runner.invoke(
+        main,
+        [
+            "handoff",
+            "claude",
+            "--cwd",
+            str(tmp_path),
+            "--pipeline-id",
+            "pipe_handoff_os_error",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "Error: completion store is read-only" in result.output
+    assert store.whisper_pending(source.whisper_id) is True
+
+
 def test_cli_handoff_opencode_requires_json_and_emits_follow_up(
     tmp_path: Path,
     monkeypatch: object,

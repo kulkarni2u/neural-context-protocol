@@ -249,17 +249,31 @@ class TestToolsList:
         payload_schema = schema["properties"]["payload"]  # type: ignore[index]
 
         assert "payload" in schema["required"]  # type: ignore[operator]
-        assert payload_schema["oneOf"][0] == {"type": "string"}
-        assert [branch["title"] for branch in payload_schema["oneOf"][1:]] == [
-            "HandoffPayload",
-            "DissentPayload",
-            "AlertPayload",
-            "WorldCheckPayload",
+        assert payload_schema["oneOf"] == [
+            {"type": "string"},
+            {"type": "object"},
         ]
-        assert payload_schema["oneOf"][1]["required"] == ["ask"]
-        assert payload_schema["oneOf"][2]["required"] == ["issue"]
-        assert payload_schema["oneOf"][3]["required"] == ["alert_code", "description"]
-        assert payload_schema["oneOf"][4]["required"] == ["anchor_intent", "detected_drift"]
+
+    def test_emit_whisper_schema_discriminates_structured_payloads_by_type(self) -> None:
+        emit_tool = next(tool for tool in MCP_TOOLS if tool["name"] == "ncp_emit_whisper")
+        schema = emit_tool["inputSchema"]
+        conditionals = schema["allOf"]  # type: ignore[index]
+
+        payload_titles_by_types = {
+            tuple(branch["if"]["properties"]["type"]["enum"]): [
+                option.get("title", option["type"])
+                for option in branch["then"]["properties"]["payload"]["oneOf"]
+            ]
+            for branch in conditionals
+        }
+
+        assert payload_titles_by_types == {
+            ("share", "request"): ["string", "HandoffPayload"],
+            ("dissent",): ["string", "DissentPayload"],
+            ("alert",): ["string", "AlertPayload"],
+            ("world_check",): ["string", "WorldCheckPayload"],
+            ("nudge", "consolidation_ready"): ["string"],
+        }
 
     def test_tool_profile_core_tools_list_advertises_only_context_lifecycle(self, tmp_path: Path) -> None:
         project = tmp_path / "repo"
@@ -1030,6 +1044,26 @@ class TestEmitWhisper:
         assert error["code"] == -32603
         assert "payload validation failed for whisper_type 'dissent'" in error["message"]
         assert store.drain_whispers(agent_id="executor", max_items=1) == []
+
+    def test_emit_rejects_structured_nudge_without_mutating_queue(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "test.db")
+        handlers = make_handlers(store)
+
+        resp = _handle_request(
+            _call("ncp_emit_whisper", {
+                "from": "builder",
+                "target": "executor",
+                "type": "nudge",
+                "payload": {"ask": "object nudges are not a runtime payload"},
+                "confidence": 0.9,
+            }),
+            handlers,
+        )
+
+        error = _error(resp)
+        assert error["code"] == -32603
+        assert "structured payload is not supported for whisper_type 'nudge'" in error["message"]
+        assert store.peek_whispers(agent_id="executor") == []
 
     def test_rejects_dissent_broadcast(self, tmp_path: Path) -> None:
         store = SQLiteStore(tmp_path / "test.db")

@@ -74,16 +74,6 @@ def canonical_authorship_payload(
     return "|".join([written_by, content_hash, pipeline_id or ""]).encode("utf-8")
 
 
-def canonical_whisper_authorship_payload(
-    from_agent: str,
-    normalized_payload: str,
-    pipeline_id: str | None,
-) -> bytes:
-    """Return authorship bytes for the exact normalized whisper payload stored."""
-
-    return canonical_authorship_payload(from_agent, normalized_payload, pipeline_id)
-
-
 def sign(payload: bytes | str, *, identity_id: str, keystore_dir: Path) -> str:
     """Sign ``payload`` with the local private key for ``identity_id``.
 

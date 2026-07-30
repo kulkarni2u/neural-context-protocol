@@ -198,46 +198,7 @@ MCP_TOOLS: list[dict[str, object]] = [
                 "payload": {
                     "oneOf": [
                         {"type": "string"},
-                        {
-                            "type": "object",
-                            "title": "HandoffPayload",
-                            "properties": {
-                                "slice": {"type": ["string", "null"]},
-                                "files": {"type": "array", "items": {"type": "string"}},
-                                "ask": {"type": "string"},
-                            },
-                            "required": ["ask"],
-                        },
-                        {
-                            "type": "object",
-                            "title": "DissentPayload",
-                            "properties": {
-                                "issue": {"type": "string"},
-                                "alternatives": {
-                                    "type": "array",
-                                    "items": {"type": "string"},
-                                },
-                            },
-                            "required": ["issue"],
-                        },
-                        {
-                            "type": "object",
-                            "title": "AlertPayload",
-                            "properties": {
-                                "alert_code": {"type": "string"},
-                                "description": {"type": "string"},
-                            },
-                            "required": ["alert_code", "description"],
-                        },
-                        {
-                            "type": "object",
-                            "title": "WorldCheckPayload",
-                            "properties": {
-                                "anchor_intent": {"type": "string"},
-                                "detected_drift": {"type": "number"},
-                            },
-                            "required": ["anchor_intent", "detected_drift"],
-                        },
+                        {"type": "object"},
                     ],
                     "description": (
                         "Whisper message (max 600 normalized chars). Structured-v1 objects "
@@ -268,6 +229,131 @@ MCP_TOOLS: list[dict[str, object]] = [
                 },
             },
             "required": ["from", "target", "type", "payload", "confidence"],
+            "allOf": [
+                {
+                    "if": {
+                        "properties": {"type": {"enum": ["share", "request"]}},
+                        "required": ["type"],
+                    },
+                    "then": {
+                        "properties": {
+                            "payload": {
+                                "oneOf": [
+                                    {"type": "string"},
+                                    {
+                                        "type": "object",
+                                        "title": "HandoffPayload",
+                                        "properties": {
+                                            "slice": {"type": ["string", "null"]},
+                                            "files": {
+                                                "type": "array",
+                                                "items": {"type": "string"},
+                                            },
+                                            "ask": {"type": "string"},
+                                        },
+                                        "required": ["ask"],
+                                    },
+                                ],
+                            },
+                        },
+                    },
+                },
+                {
+                    "if": {
+                        "properties": {"type": {"enum": ["dissent"]}},
+                        "required": ["type"],
+                    },
+                    "then": {
+                        "properties": {
+                            "payload": {
+                                "oneOf": [
+                                    {"type": "string"},
+                                    {
+                                        "type": "object",
+                                        "title": "DissentPayload",
+                                        "properties": {
+                                            "issue": {"type": "string"},
+                                            "alternatives": {
+                                                "type": "array",
+                                                "items": {"type": "string"},
+                                            },
+                                        },
+                                        "required": ["issue"],
+                                    },
+                                ],
+                            },
+                        },
+                    },
+                },
+                {
+                    "if": {
+                        "properties": {"type": {"enum": ["alert"]}},
+                        "required": ["type"],
+                    },
+                    "then": {
+                        "properties": {
+                            "payload": {
+                                "oneOf": [
+                                    {"type": "string"},
+                                    {
+                                        "type": "object",
+                                        "title": "AlertPayload",
+                                        "properties": {
+                                            "alert_code": {"type": "string"},
+                                            "description": {"type": "string"},
+                                        },
+                                        "required": ["alert_code", "description"],
+                                    },
+                                ],
+                            },
+                        },
+                    },
+                },
+                {
+                    "if": {
+                        "properties": {"type": {"enum": ["world_check"]}},
+                        "required": ["type"],
+                    },
+                    "then": {
+                        "properties": {
+                            "payload": {
+                                "oneOf": [
+                                    {"type": "string"},
+                                    {
+                                        "type": "object",
+                                        "title": "WorldCheckPayload",
+                                        "properties": {
+                                            "anchor_intent": {"type": "string"},
+                                            "detected_drift": {"type": "number"},
+                                        },
+                                        "required": [
+                                            "anchor_intent",
+                                            "detected_drift",
+                                        ],
+                                    },
+                                ],
+                            },
+                        },
+                    },
+                },
+                {
+                    "if": {
+                        "properties": {
+                            "type": {
+                                "enum": ["nudge", "consolidation_ready"],
+                            },
+                        },
+                        "required": ["type"],
+                    },
+                    "then": {
+                        "properties": {
+                            "payload": {
+                                "oneOf": [{"type": "string"}],
+                            },
+                        },
+                    },
+                },
+            ],
         },
     },
     {
@@ -1366,7 +1452,7 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         result: dict[str, object] = {"found": False, "memo": None}
         cfg = config
         usable = False
-        if memo is not None and (cfg is None or cfg.memoization_enabled):
+        if memo is not None:
             # Apply outcome and verified gating at the handler level
             gated = False
             if cfg is not None:
@@ -1395,9 +1481,9 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
                 "reason": "memoization_disabled",
             }
         task = str(args.get("task", ""))
-        context = str(args.get("context", ""))
         sig = args.get("signature")
         if sig is None:
+            context = str(args.get("context", ""))
             sig = compute_memo_signature(task, context)
         sig = str(sig)
         chunk_ids = [str(c) for c in list(args.get("chunk_ids", []) or [])]
@@ -1743,15 +1829,6 @@ def _create_handlers_with_store(
     tools = tools_for_config(config)
     handlers = handlers_for_tools(make_handlers(store, config=config), tools)
     return handlers, store, tools
-
-
-def _create_handlers(
-    *,
-    store_path: str | Path | None = None,
-    cwd: Path | None = None,
-) -> dict[str, ToolHandler]:
-    handlers, _store, _tools = _create_handlers_with_store(store_path=store_path, cwd=cwd)
-    return handlers
 
 
 def serve_streams(
