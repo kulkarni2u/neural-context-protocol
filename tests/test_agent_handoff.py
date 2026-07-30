@@ -981,6 +981,62 @@ def test_provider_diagnostics_are_bounded_and_redact_prompts_and_secrets(
     assert store.whisper_pending(handoffs[0].whisper_id) is True
 
 
+def test_timeout_diagnostic_globally_bounds_combined_stdout_and_stderr(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prompt = "Repository root: /sensitive/project\nDO_NOT_LEAK_DUAL_STREAM_PROMPT"
+    stdout = "\n".join(
+        [
+            prompt,
+            "Authorization: Bearer stdout-bearer-secret",
+            '"access_token": "stdout-oauth-secret"',
+            "stdout detail " * 100,
+        ]
+    )
+    stderr = "\n".join(
+        [
+            "provider prompt> Repository root: /sensitive/project",
+            "provider prompt> DO_NOT_LEAK_DUAL_STREAM_PROMPT",
+            "aws access AKIAIOSFODNN7EXAMPLE",
+            'aws_secret_access_key = "stderr-aws-secret"',
+            '"client_secret": "stderr-quoted-secret"',
+            "stderr detail " * 100,
+        ]
+    )
+
+    def _timeout(*args: object, **kwargs: object) -> None:
+        raise subprocess.TimeoutExpired(
+            cmd=args[0],
+            timeout=1.0,
+            output=stdout,
+            stderr=stderr,
+        )
+
+    monkeypatch.setattr(subprocess, "run", _timeout)
+
+    with pytest.raises(RuntimeError) as raised:
+        agent_handoff._run_handoff_subprocess(
+            runner_name="Claude",
+            command=["provider"],
+            cwd=tmp_path,
+            prompt=prompt,
+            timeout_seconds=1.0,
+        )
+
+    message = str(raised.value)
+    assert message.startswith("Claude handoff timed out after 1.0s")
+    assert len(message) <= 320
+    assert "DO_NOT_LEAK_DUAL_STREAM_PROMPT" not in message
+    assert "/sensitive/project" not in message
+    assert "stdout-bearer-secret" not in message
+    assert "stdout-oauth-secret" not in message
+    assert "AKIAIOSFODNN7EXAMPLE" not in message
+    assert "stderr-aws-secret" not in message
+    assert "stderr-quoted-secret" not in message
+    assert "[REDACTED]" in message
+
+
 def test_complete_handoff_persists_bounded_memory_before_acknowledgement(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

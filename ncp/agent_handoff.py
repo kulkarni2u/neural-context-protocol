@@ -29,6 +29,8 @@ DEFAULT_OPENCODE_REVIEW_INSTRUCTION = (
     "and missing tests. Be concise."
 )
 
+_TIMEOUT_ERROR_MAX_CHARS = 320
+
 
 def _render_timeout_error(
     *,
@@ -49,7 +51,10 @@ def _render_timeout_error(
         details.append(
             f"stderr={_sanitize_provider_diagnostic(stderr_text, prompt=prompt)}"
         )
-    return " | ".join(details)
+    rendered = " | ".join(details)
+    if len(rendered) <= _TIMEOUT_ERROR_MAX_CHARS:
+        return rendered
+    return rendered[: _TIMEOUT_ERROR_MAX_CHARS - 1].rstrip() + "…"
 
 
 def _run_handoff_subprocess(
