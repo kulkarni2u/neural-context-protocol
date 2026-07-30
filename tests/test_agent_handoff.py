@@ -338,6 +338,50 @@ def test_handoff_require_verified_filters_unsigned_handoffs(tmp_path: Path) -> N
     ] == ["unsigned", "signed"]
 
 
+def test_handoff_require_verified_finds_verified_entries_beyond_unsigned_prefix(
+    tmp_path: Path,
+) -> None:
+    runner = CliRunner()
+    runner.invoke(main, ["init", "--cwd", str(tmp_path)])
+    config_path = tmp_path / ".ncp" / "config.toml"
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8").replace(
+            "require_verified = false",
+            "require_verified = true",
+        ),
+        encoding="utf-8",
+    )
+    store = SQLiteStore(tmp_path / ".ncp" / "store.db")
+    for payload in ("unsigned-1", "unsigned-2", "unsigned-3"):
+        _seed_whisper(store, target="claude", payload=payload)
+    for payload in ("verified-1", "verified-2", "verified-3"):
+        _seed_whisper(store, target="claude", payload=payload, verified=True)
+
+    _, _, handoffs = load_handoffs(
+        cwd=tmp_path,
+        agent_id="claude",
+        pipeline_id="pipe_handoff",
+        max_items=2,
+    )
+
+    assert [whisper.payload for whisper in handoffs] == ["verified-1", "verified-2"]
+    assert [
+        whisper.payload
+        for whisper in store.peek_whispers(
+            agent_id="claude",
+            pipeline_id="pipe_handoff",
+            max_items=10,
+        )
+    ] == [
+        "unsigned-1",
+        "unsigned-2",
+        "unsigned-3",
+        "verified-1",
+        "verified-2",
+        "verified-3",
+    ]
+
+
 def test_identity_signature_requirement_rejects_unsigned_handoffs_without_acknowledging(
     tmp_path: Path,
 ) -> None:
@@ -622,6 +666,7 @@ def test_opencode_review_launches_with_inline_permission_override(
     assert captured["env"] == agent_handoff.opencode_review_environment()
     command = captured["command"]
     assert isinstance(command, list)
+    assert command[:3] == ["opencode", "--pure", "run"]
     assert command[command.index("--agent") + 1] == "ncp-review"
     assert command[command.index("--dir") + 1] == str(tmp_path)
     assert captured["cwd"] == tmp_path
@@ -845,6 +890,97 @@ def test_provider_failure_writes_no_completion_memory_and_acknowledges_nothing(
     assert prepared.store.whisper_pending(prepared.handoffs[0].whisper_id) is True
 
 
+@pytest.mark.parametrize("runner_name", ["claude", "opencode"])
+@pytest.mark.parametrize("failure_mode", ["timeout", "nonzero"])
+def test_provider_diagnostics_are_bounded_and_redact_prompts_and_secrets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    runner_name: str,
+    failure_mode: str,
+) -> None:
+    runner = CliRunner()
+    runner.invoke(main, ["init", "--cwd", str(tmp_path)])
+    store = SQLiteStore(tmp_path / ".ncp" / "store.db")
+    _seed_whisper(
+        store,
+        target=runner_name,
+        payload="DO_NOT_LEAK_HANDOFF_PROMPT",
+        pipeline_id="pipe_diagnostics",
+    )
+    _, _, handoffs = load_handoffs(
+        cwd=tmp_path,
+        agent_id=runner_name,
+        pipeline_id="pipe_diagnostics",
+    )
+    if runner_name == "claude":
+        prompt = agent_handoff.build_claude_partner_prompt(
+            cwd=tmp_path,
+            handoffs=handoffs,
+        )
+        provider = run_claude_partner
+    else:
+        prompt = agent_handoff.build_opencode_review_prompt(
+            cwd=tmp_path,
+            handoffs=handoffs,
+        )
+        provider = run_opencode_reviewer
+    diagnostic = "\n".join(
+        [
+            "\n".join(
+                f"provider prompt> {line}"
+                for line in prompt.splitlines()
+            ),
+            "Authorization: Bearer bearer-super-secret",
+            '"access_token": "oauth-access-token-value"',
+            "aws access AKIAIOSFODNN7EXAMPLE",
+            'aws_secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"',
+            '"client_secret": "quoted-client-secret-value"',
+            "provider detail " * 100,
+        ]
+    )
+    if failure_mode == "timeout":
+        timeout_seconds = 1.0
+
+        def _timeout(*args: object, **kwargs: object) -> None:
+            raise subprocess.TimeoutExpired(
+                cmd=args[0],
+                timeout=timeout_seconds,
+                stderr=diagnostic,
+            )
+
+        monkeypatch.setattr(subprocess, "run", _timeout)
+        command = ["provider"]
+    else:
+        script = (
+            "import sys; "
+            f"sys.stderr.write({diagnostic!r}); "
+            "sys.exit(1)"
+        )
+        timeout_seconds = 1.0
+        command = [sys.executable, "-c", script]
+
+    with pytest.raises(RuntimeError) as raised:
+        provider(
+            cwd=tmp_path,
+            agent_id=runner_name,
+            handoffs=handoffs,
+            command=command,
+            timeout_seconds=timeout_seconds,
+        )
+
+    message = str(raised.value)
+    assert "DO_NOT_LEAK_HANDOFF_PROMPT" not in message
+    assert "Repository root:" not in message
+    assert "bearer-super-secret" not in message
+    assert "oauth-access-token-value" not in message
+    assert "AKIAIOSFODNN7EXAMPLE" not in message
+    assert "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" not in message
+    assert "quoted-client-secret-value" not in message
+    assert "[REDACTED]" in message
+    assert len(message) <= 320
+    assert store.whisper_pending(handoffs[0].whisper_id) is True
+
+
 def test_complete_handoff_persists_bounded_memory_before_acknowledgement(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -906,6 +1042,62 @@ def test_complete_handoff_persists_bounded_memory_before_acknowledgement(
     assert len(chunk.content) <= 2000
     assert response not in chunk.content
     assert prepared.store.whisper_pending(prepared.handoffs[0].whisper_id) is False
+
+
+def test_complete_handoff_acknowledges_broadcast_per_consuming_agent(
+    tmp_path: Path,
+) -> None:
+    runner = CliRunner()
+    runner.invoke(main, ["init", "--cwd", str(tmp_path)])
+    store = SQLiteStore(tmp_path / ".ncp" / "store.db")
+    _seed_whisper(
+        store,
+        target="*",
+        payload="shared review handoff",
+        pipeline_id="pipe_broadcast",
+    )
+
+    claude_run = agent_handoff.prepare_handoff(
+        cwd=tmp_path,
+        agent_id="claude",
+        runner="claude",
+        pipeline_id="pipe_broadcast",
+    )
+    assert claude_run.agent_id == "claude"
+    agent_handoff.complete_handoff(
+        claude_run,
+        runner="claude",
+        response="implemented broadcast request",
+    )
+
+    assert store.peek_whispers(
+        agent_id="claude",
+        pipeline_id="pipe_broadcast",
+    ) == []
+    assert [
+        whisper.payload
+        for whisper in store.peek_whispers(
+            agent_id="opencode",
+            pipeline_id="pipe_broadcast",
+        )
+    ] == ["shared review handoff"]
+
+    opencode_run = agent_handoff.prepare_handoff(
+        cwd=tmp_path,
+        agent_id="opencode",
+        runner="opencode",
+        pipeline_id="pipe_broadcast",
+    )
+    agent_handoff.complete_handoff(
+        opencode_run,
+        runner="opencode",
+        response='{"verdict":"pass"}',
+    )
+
+    assert store.peek_whispers(
+        agent_id="opencode",
+        pipeline_id="pipe_broadcast",
+    ) == []
 
 
 def test_complete_handoff_persistence_failure_leaves_handoffs_queued(

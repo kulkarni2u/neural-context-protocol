@@ -42,9 +42,13 @@ def _render_timeout_error(
     stdout_text = (exc.stdout.decode() if isinstance(exc.stdout, bytes) else exc.stdout) or ""
     stderr_text = (exc.stderr.decode() if isinstance(exc.stderr, bytes) else exc.stderr) or ""
     if stdout_text.strip():
-        details.append(f"stdout={stdout_text.strip()[:240]}")
+        details.append(
+            f"stdout={_sanitize_provider_diagnostic(stdout_text, prompt=prompt)}"
+        )
     if stderr_text.strip():
-        details.append(f"stderr={stderr_text.strip()[:240]}")
+        details.append(
+            f"stderr={_sanitize_provider_diagnostic(stderr_text, prompt=prompt)}"
+        )
     return " | ".join(details)
 
 
@@ -93,13 +97,19 @@ class HandoffStore(Protocol):
         min_confidence: float = 0.60,
     ) -> list[Whisper]: ...
 
-    def acknowledge_whispers(self, whisper_ids: list[str]) -> int: ...
+    def acknowledge_whispers(
+        self,
+        whisper_ids: list[str],
+        *,
+        agent_id: str | None = None,
+    ) -> int: ...
 
 
 @dataclass
 class PreparedHandoff:
     """Inputs assembled by the wrapper before provider execution."""
 
+    agent_id: str
     config: NCPConfig
     store: BaseStore
     handoffs: list[Whisper]
@@ -133,17 +143,31 @@ def load_handoffs(
 
     config = configure(cwd=cwd)
     store = create_store(config)
-    handoffs = store.peek_whispers(
-        agent_id=agent_id,
-        pipeline_id=pipeline_id,
-        max_items=max_items,
-        min_confidence=min_confidence,
-    )
     require_verified = config.require_signatures or config.handoff_require_verified
     if require_verified:
-        handoffs = [whisper for whisper in handoffs if whisper.verified]
+        fetch_limit = max_items
+        while True:
+            candidates = store.peek_whispers(
+                agent_id=agent_id,
+                pipeline_id=pipeline_id,
+                max_items=fetch_limit,
+                min_confidence=min_confidence,
+            )
+            handoffs = [
+                whisper for whisper in candidates if whisper.verified
+            ][:max_items]
+            if len(handoffs) >= max_items or len(candidates) < fetch_limit:
+                break
+            fetch_limit *= 2
         if not handoffs:
             raise ValueError(f"No verified NCP handoffs for {agent_id}.")
+    else:
+        handoffs = store.peek_whispers(
+            agent_id=agent_id,
+            pipeline_id=pipeline_id,
+            max_items=max_items,
+            min_confidence=min_confidence,
+        )
     return config, store, handoffs
 
 
@@ -200,6 +224,7 @@ def prepare_handoff(
     )
     context = _without_whisper_context(context)
     return PreparedHandoff(
+        agent_id=agent_id,
         config=config,
         store=store,
         handoffs=handoffs,
@@ -432,7 +457,11 @@ def run_claude_partner(
         timeout_seconds=timeout_seconds,
     )
     if completed.returncode != 0:
-        raise RuntimeError(completed.stderr.strip() or completed.stdout.strip() or "Claude partner run failed")
+        diagnostic = completed.stderr.strip() or completed.stdout.strip()
+        raise RuntimeError(
+            _sanitize_provider_diagnostic(diagnostic, prompt=prompt)
+            or "Claude partner run failed"
+        )
     return completed.stdout.strip()
 
 
@@ -460,6 +489,7 @@ def run_opencode_reviewer(
         command=command
         or [
             "opencode",
+            "--pure",
             "run",
             "--format",
             "json",
@@ -475,14 +505,26 @@ def run_opencode_reviewer(
         env=opencode_review_environment(),
     )
     if completed.returncode != 0:
-        raise RuntimeError(completed.stderr.strip() or completed.stdout.strip() or "OpenCode review run failed")
+        diagnostic = completed.stderr.strip() or completed.stdout.strip()
+        raise RuntimeError(
+            _sanitize_provider_diagnostic(diagnostic, prompt=prompt)
+            or "OpenCode review run failed"
+        )
     return _extract_opencode_text(completed.stdout)
 
 
-def acknowledge_handoffs(store: BaseStore, handoffs: list[Whisper]) -> int:
+def acknowledge_handoffs(
+    store: BaseStore,
+    handoffs: list[Whisper],
+    *,
+    agent_id: str | None = None,
+) -> int:
     """Delete handoffs after a successful consumer run."""
 
-    return store.acknowledge_whispers([whisper.whisper_id for whisper in handoffs])
+    whisper_ids = [whisper.whisper_id for whisper in handoffs]
+    if agent_id is None:
+        return store.acknowledge_whispers(whisper_ids)
+    return store.acknowledge_whispers(whisper_ids, agent_id=agent_id)
 
 
 _SECRET_PATTERNS = (
@@ -514,15 +556,49 @@ _SECRET_PATTERNS = (
 )
 
 
+def _redact_secrets(text: str) -> str:
+    redacted = text
+    for pattern in _SECRET_PATTERNS:
+        redacted = pattern.sub("[REDACTED]", redacted)
+    return redacted
+
+
+def _redact_prompt_content(text: str, *, prompt: str) -> str:
+    if prompt in text:
+        return text.replace(prompt, "[PROMPT REDACTED]")
+    prompt_lines = [line for line in prompt.splitlines() if line.strip()]
+    sanitized_lines: list[str] = []
+    redacted_prompt_line = False
+    for diagnostic_line in text.splitlines():
+        if any(prompt_line in diagnostic_line for prompt_line in prompt_lines):
+            if not redacted_prompt_line:
+                sanitized_lines.append("[PROMPT REDACTED]")
+                redacted_prompt_line = True
+            continue
+        sanitized_lines.append(diagnostic_line)
+    return "\n".join(sanitized_lines)
+
+
+def _sanitize_provider_diagnostic(
+    text: str,
+    *,
+    prompt: str,
+    max_chars: int = 240,
+) -> str:
+    diagnostic = _redact_prompt_content(text.strip(), prompt=prompt)
+    diagnostic = " ".join(_redact_secrets(diagnostic).split())
+    if len(diagnostic) <= max_chars:
+        return diagnostic
+    return diagnostic[: max_chars - 1].rstrip() + "…"
+
+
 def _bounded_completion_content(
     *,
     runner: str,
     handoffs: Sequence[Whisper],
     response: str,
 ) -> str:
-    summary = " ".join(response.strip().split())
-    for pattern in _SECRET_PATTERNS:
-        summary = pattern.sub("[REDACTED]", summary)
+    summary = _redact_secrets(" ".join(response.strip().split()))
     source_ids = [whisper.whisper_id for whisper in handoffs]
     envelope = {
         "result_summary": "",
@@ -573,7 +649,11 @@ def complete_handoff(run: PreparedHandoff, *, runner: str, response: str) -> Non
     persisted = api.write_memory(chunk, store=run.store, config=run.config)
     if not persisted:
         raise RuntimeError("Failed to persist NCP handoff completion memory.")
-    acknowledge_handoffs(run.store, run.handoffs)
+    acknowledge_handoffs(
+        run.store,
+        run.handoffs,
+        agent_id=run.agent_id,
+    )
 
 
 def parse_json_review(text: str) -> dict[str, object]:
