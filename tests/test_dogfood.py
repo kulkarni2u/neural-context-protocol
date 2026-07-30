@@ -545,6 +545,29 @@ def test_opencode_cli_adapter_default_command_sets_dir(
     assert captured["cwd"] == tmp_path
 
 
+def test_opencode_cli_adapter_preserves_timeout_type_after_retries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commands: list[list[str]] = []
+
+    def _timeout(command, **kwargs):
+        commands.append(command)
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr("ncp.dogfood.subprocess.run", _timeout)
+    adapter = OpenCodeCLIDogfoodAdapter(
+        command=["opencode"],
+        cwd=tmp_path,
+        timeout_seconds=1.0,
+    )
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        adapter.call("ctx", "turn")
+
+    assert len(commands) == 2
+
+
 def test_claude_provider_prompt_is_tightened() -> None:
     adapter = ClaudeCLIDogfoodAdapter(command=["true"])
 

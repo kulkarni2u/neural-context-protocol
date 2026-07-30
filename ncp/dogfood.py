@@ -226,7 +226,7 @@ class OpenCodeCLIDogfoodAdapter(BaseAdapter):
     def call(self, ncp_context: str, user_turn: str) -> str:
         prompt = f"NCP_CONTEXT:\n{ncp_context}\n\n{user_turn}"
         self.last_call_metadata = None
-        last_error: Exception | None = None
+        last_timeout: subprocess.TimeoutExpired | None = None
         completed: subprocess.CompletedProcess[str] | None = None
         for _ in range(2):
             try:
@@ -246,12 +246,12 @@ class OpenCodeCLIDogfoodAdapter(BaseAdapter):
                     )
                 break
             except subprocess.TimeoutExpired as exc:
-                last_error = exc
+                last_timeout = exc
                 continue
         if completed is None:
-            raise RuntimeError(
-                "OpenCode CLI call failed after 2 attempts"
-            ) from last_error
+            if last_timeout is None:  # pragma: no cover - loop always assigns
+                raise RuntimeError("OpenCode CLI call failed without a result")
+            raise last_timeout
 
         response, session_id = _extract_opencode_response(completed.stdout)
         try:
