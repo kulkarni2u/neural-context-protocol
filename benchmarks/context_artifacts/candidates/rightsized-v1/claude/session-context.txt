@@ -1,2 +1,4 @@
-NCP endpoint liveness: if connected, use http://${HOST}:${PORT}/mcp. If it is
-not reachable, report NCP unavailable and continue without cross-agent memory.
+NCP memory bus is not connected: http://${HOST}:${PORT}/mcp is NOT reachable.
+Autostart was unavailable or did not connect. Start it with
+`ncp serve --host ${HOST} --port ${PORT} --cwd ${PROJECT_DIR}`; until then,
+continue without cross-agent memory.
