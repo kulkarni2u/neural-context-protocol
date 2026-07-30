@@ -164,19 +164,20 @@ unadvertised disabled memo tool.
 The article's "Then: memory in CLAUDE.md / Now: auto-memory" states that Claude now
 saves memories automatically rather than users writing them to CLAUDE.md with `#`.
 
-This is the one item here that is not a cleanup task. A reader who has internalized the
-article will arrive at NCP's README asking "Claude already remembers things — why do I
-need a memory bus?" and find no answer. The answer exists and is good: host-native memory
-is repo-scoped and machine-local; it does not provide NCP's cross-agent/cross-host trust
-and handoff semantics. It has no trust scores, no provenance, no dissent channel, no
-causal graph, and no cross-host handoff. NCP's positioning is complementary — native
-memory serves one agent's continuity, NCP serves the channel *between* agents — and the
-README's own "3+ agents, 10+ turns" threshold is already the right dividing line. It
-simply needs to be stated against the comparison readers will actually make.
+This was a positioning gap, not a cleanup task. A reader who has internalized the article
+will ask "Claude already remembers things — why do I need a memory bus?" The README now
+answers: host-native memory can provide continuity within a host or user's workflow, but
+its scope is provider-qualified—it may be machine-local or more broadly synchronized. It
+does not itself provide NCP's explicit cross-agent trust and handoff channel, provenance,
+dissent, graph relationships, or shared runtime context. NCP's positioning is
+complementary: provider-native continuity serves a host workflow, while NCP serves the
+channel *between* agents. The README's own "3+ agents, 10+ turns" threshold is already
+the right dividing line.
 
-The README now states that host-native memory can provide local continuity but does not
-replace NCP's cross-agent trust and handoff channel. That keeps the product boundary
-honest: NCP is not an orchestrator, model router, or replacement for a host's own memory.
+The README now states that host-native memory's scope varies by provider and that NCP
+complements provider-native continuity with an explicit shared agent-to-agent channel.
+That keeps the product boundary honest: NCP is not an orchestrator, model router, or
+replacement for a host's own memory.
 
 ---
 
@@ -201,9 +202,9 @@ keep it in the always-loaded artifact rather than deferring it to a skill.
 
 Completed compatibility work:
 
-1. **Done — native-memory positioning.** The README distinguishes host-local continuity
-   from NCP's cross-agent context and handoff channel without broadening NCP into an
-   orchestrator.
+1. **Done — native-memory positioning.** The README distinguishes provider-native
+   continuity—machine-local or more broadly synchronized—from NCP's cross-agent context
+   and handoff channel without broadening NCP into an orchestrator.
 2. **Done — structured whisper objects.** Typed structured-v1 payloads are validated and
    canonicalized; legacy strings remain intentionally supported for this major version.
 3. **Done — memo gating and `core`/`full` profiles.** Disabled memo tools are hidden and
@@ -211,6 +212,11 @@ Completed compatibility work:
 4. **Done — remove roadmap IDs from tool descriptions.**
 5. **Done — executable-aware provider readiness and observed model/CLI metadata.** Only
    complete metadata-bearing live attempts can be archived as passing evidence.
+6. **Done — wrapper-owned handoff lifecycle.** `ncp handoff` prepares bounded context
+   in-process, executes the provider in the bound repository, then persists a
+   bounded/redacted completion record before acknowledging the source whispers. An
+   optional follow-up is emitted only after completion succeeds. This is wrapper
+   behavior; it does not claim that a provider model itself calls NCP tools.
 
 Open work:
 
@@ -221,9 +227,6 @@ Open work:
 2. **Pending — redesign the provider evaluator before retrying cleanup.** The next attempt
    needs an evaluation architecture that separates the static contract from the prompt
    interaction and produces complete, observed-metadata evidence for each provider.
-3. **Pending — make the subagent lifecycle contract mechanical.** `ncp handoff` should
-   compose the required lifecycle calls rather than relying solely on instruction text.
-
 The remaining work is deliberately provider- and evidence-bound. NCP can continue to
 reduce its own context surface without pretending that a failed provider experiment has
 validated a template change.

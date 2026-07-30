@@ -6,12 +6,16 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ### Added
 
-- **Verified, repo-bound handoff control** (`ncp handoff`, `[handoff]`): the
-  Claude and OpenCode handoff consumers remain bound to the resolved NCP project
-  workspace. `[handoff].require_verified` is available with a **default of
-  `false`** (and `NCP_HANDOFF_REQUIRE_VERIFIED` override). When enabled—or when
+- **Verified, repo-bound handoff lifecycle** (`ncp handoff`, `[handoff]`): the
+  Claude and OpenCode wrappers resolve and bind provider execution to the NCP
+  project workspace. The wrapper, not the provider model, loads bounded context
+  in-process, supplies it separately from untrusted handoff data, persists a
+  bounded/redacted completion record, and only then acknowledges source
+  whispers. An optional follow-up is emitted only after completion succeeds.
+  `[handoff].require_verified` is available with a **default of `false`** (and
+  `NCP_HANDOFF_REQUIRE_VERIFIED` override). When enabled—or when
   `[identity].require_signatures` is enabled—only verified pending whispers are
-  admitted as handoffs; filtered whispers are not acknowledged.
+  admitted as handoffs; filtered whispers remain unacknowledged.
 - **Configuration-aware MCP catalog** (`[tools].profile`): `"full"` (the
   **default**) advertises the generally available NCP tools, while `"core"`
   exposes only the bounded per-turn lifecycle: `ncp_get_context`,
