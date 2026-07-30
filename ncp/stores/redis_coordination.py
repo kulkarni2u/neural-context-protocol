@@ -130,7 +130,11 @@ class RedisCoordination:
             payload = client.hgetall(self._payload_key(whisper_id))
             if payload:
                 target = payload.get("target", "")
-                if target == "*" and agent_id is not None:
+                if target == "*":
+                    if agent_id is None:
+                        # Cannot attribute a broadcast acknowledgement to a specific
+                        # recipient; skip rather than deleting it for every recipient.
+                        continue
                     client.hset(self._delivery_key(whisper_id), mapping={agent_id: str(time.time())})
                     deleted += 1
                     continue

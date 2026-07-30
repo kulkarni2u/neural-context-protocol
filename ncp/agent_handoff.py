@@ -122,6 +122,9 @@ class PreparedHandoff:
     workspace: Path
 
 
+_MAX_VERIFIED_FETCH_LIMIT = 1000
+
+
 def resolve_handoff_workspace(cwd: Path, config: NCPConfig) -> Path:
     """Bind a handoff to the initialized NCP project containing ``cwd``."""
 
@@ -163,7 +166,9 @@ def load_handoffs(
             ][:max_items]
             if len(handoffs) >= max_items or len(candidates) < fetch_limit:
                 break
-            fetch_limit *= 2
+            if fetch_limit >= _MAX_VERIFIED_FETCH_LIMIT:
+                break
+            fetch_limit = min(fetch_limit * 2, _MAX_VERIFIED_FETCH_LIMIT)
         if not handoffs:
             raise ValueError(f"No verified NCP handoffs for {agent_id}.")
     else:
@@ -527,8 +532,6 @@ def acknowledge_handoffs(
     """Delete handoffs after a successful consumer run."""
 
     whisper_ids = [whisper.whisper_id for whisper in handoffs]
-    if agent_id is None:
-        return store.acknowledge_whispers(whisper_ids)
     return store.acknowledge_whispers(whisper_ids, agent_id=agent_id)
 
 

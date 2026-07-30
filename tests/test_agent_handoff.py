@@ -276,8 +276,8 @@ def test_load_handoffs_can_use_non_sqlite_store(monkeypatch: pytest.MonkeyPatch,
         def peek_whispers(self, **kwargs: object) -> list[Whisper]:
             return store.peek_whispers(**kwargs)
 
-        def acknowledge_whispers(self, whisper_ids: list[str]) -> int:
-            return store.acknowledge_whispers(whisper_ids)
+        def acknowledge_whispers(self, whisper_ids: list[str], *, agent_id: str | None = None) -> int:
+            return store.acknowledge_whispers(whisper_ids, agent_id=agent_id)
 
         def emit_whisper(self, whisper: Whisper) -> None:
             store.emit_whisper(whisper)

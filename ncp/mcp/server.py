@@ -639,7 +639,7 @@ MEMO_TOOL_NAMES = frozenset({"ncp_lookup_memo", "ncp_record_memo"})
 def tools_for_config(config: NCPConfig | None) -> list[dict[str, object]]:
     """Return the MCP tools enabled by a normalized server configuration."""
     if config is None:
-        return list(MCP_TOOLS)
+        return [tool for tool in MCP_TOOLS if str(tool["name"]) in CORE_TOOL_NAMES]
 
     enabled_names = CORE_TOOL_NAMES if config.tool_profile == "core" else {
         str(tool["name"]) for tool in MCP_TOOLS

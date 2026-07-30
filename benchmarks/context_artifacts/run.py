@@ -605,7 +605,13 @@ def run_live_context_artifact_matrix(
                     response = exc.response
                 session_id = exc.session_id
             else:
-                session_id = None
+                observed_metadata_on_error = getattr(adapter, "last_call_metadata", None)
+                raw_session_id = (
+                    observed_metadata_on_error.get("session_id")
+                    if isinstance(observed_metadata_on_error, dict)
+                    else None
+                )
+                session_id = raw_session_id.strip() if isinstance(raw_session_id, str) and raw_session_id.strip() else None
             attempt.update(
                 {
                     "status": "metadata_error",
