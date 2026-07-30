@@ -58,6 +58,52 @@ def test_inventory_counts_only_model_facing_hook_text() -> None:
         assert item.trust_boundary_present is True
 
 
+@pytest.mark.parametrize(
+    "source",
+    [
+        (
+            "function contextFor(result) {\n"
+            "return `"
+            + (r"\_" * 50)
+            + "\n}\n\nexport const plugin = {}"
+        ),
+        (
+            "function contextFor(result) {\n"
+            "const prefix = result ? `"
+            + (r"\_" * 50)
+            + "\nreturn `${prefix} body`;\n"
+            "}\n\nexport const plugin = {}"
+        ),
+    ],
+    ids=["unterminated-return-template", "unterminated-prefix-template"],
+)
+def test_javascript_context_rejects_malformed_templates_without_backtracking(
+    source: str,
+) -> None:
+    script = (
+        "import sys\n"
+        "from benchmarks.context_artifacts.inventory import "
+        "_extract_javascript_context\n"
+        "try:\n"
+        "    _extract_javascript_context(sys.stdin.read(), 'fixture.js')\n"
+        "except ValueError:\n"
+        "    raise SystemExit(0)\n"
+        "raise SystemExit('malformed template was accepted')\n"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=REPO_ROOT,
+        input=source,
+        capture_output=True,
+        text=True,
+        timeout=2.0,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
 def test_live_conditions_use_equivalent_canonical_provider_surfaces() -> None:
     expected_surfaces = {
         "claude-cli": {

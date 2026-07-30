@@ -125,7 +125,7 @@ def _extract_javascript_context(source: str, path: str) -> str:
         raise ValueError(f"No contextFor function found in {path}")
     function_source = source[function_start:function_end]
     returned_templates = re.findall(
-        r"return\s+`(?P<message>(?:\\.|[^`])*)`",
+        r"return\s+`(?P<message>(?:\\.|[^\\`])*)`",
         function_source,
         flags=re.DOTALL,
     )
@@ -134,8 +134,8 @@ def _extract_javascript_context(source: str, path: str) -> str:
 
     candidates: list[str] = []
     prefix_match = re.search(
-        r"const\s+prefix\s*=.*?\?\s*`(?P<up>(?:\\.|[^`])*)`"
-        r"\s*:\s*`(?P<down>(?:\\.|[^`])*)`",
+        r"const\s+prefix\s*=.*?\?\s*`(?P<up>(?:\\.|[^\\`])*)`"
+        r"\s*:\s*`(?P<down>(?:\\.|[^\\`])*)`",
         function_source,
         flags=re.DOTALL,
     )
