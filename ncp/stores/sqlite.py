@@ -565,162 +565,162 @@ class SQLiteStore(BaseStore):
                 zone=zone,
                 as_of=as_of,
             )
-        if not rows:
-            return []
+            if not rows:
+                return []
 
-        policy = self.retrieval_policy
-        now = time.time()
-
-        # CAP-T4: reputation-weighted retrieval blending
-        blended_trust: dict[str, float] | None = None
-        if self.config is not None and self.config.reputation_weight > 0.0:
-            authors = {str(r["written_by"]) for r in rows}
-            with self._connect() as connection:
-                rep_data = self._load_reputation(connection, authors)
-            rw = self.config.reputation_weight
-            blended_trust = {
-                str(row["chunk_id"]): blend_trust(
-                    float(row["base_trust"]),
-                    rep_data.get(str(row["written_by"])),
-                    rw,
-                )
-                for row in rows
-            }
-
-        def _bt(row: object) -> float:
-            if blended_trust is not None:
-                return blended_trust.get(str(row["chunk_id"]), float(row["base_trust"]))
-            return float(row["base_trust"])
-
-        if retrieval_mode == "vector":
-            return self._query_vector(
-                rows, embedding=embedding, k=k, min_score=min_score,
-                policy=policy, now=now, diversity_limit=diversity_limit,
-                blended_trust=blended_trust,
-            )
-
-        candidates: list[SubconsciousChunk] = []
-
-        if retrieval_mode == "trust_recency":
-            for row in rows:
-                age_seconds = max(0.0, now - float(row["created_at"]))
-                score = policy.score_no_bm25(
-                    age_seconds=age_seconds,
-                    base_trust=_bt(row),
-                    generation=int(row["generation"]),
-                    written_at_drift=float(row["written_at_drift"]) if row["written_at_drift"] is not None else 0.0,
-                )
-                if score < min_score:
-                    continue
-                chunk = self._row_to_chunk(row)
-                chunk.relevance = max(0.0, min(1.0, score))
-                candidates.append(chunk)
-        elif embedding is not None:
-            lexical_candidates = build_lexical_candidates(
-                text,
-                [str(row["content"]) for row in rows],
-            )
-            for row, lexical_candidate in zip(rows, lexical_candidates, strict=True):
-                row_embedding = self._decode_embedding(
-                    row["embedding"] if "embedding" in row.keys() else None
-                )
-                vector_normalized: float | None = None
-                if row_embedding is not None:
-                    sim = self._cosine_similarity(embedding, row_embedding)
-                    vector_normalized = max(0.0, min(1.0, sim))
-                if lexical_candidate.lexical_signal is None and vector_normalized is None:
-                    continue
-                age_seconds = max(0.0, now - float(row["created_at"]))
-                hybrid_score = policy.score_with_vector(
-                    bm25_normalized=lexical_candidate.lexical_signal or 0.0,
-                    vector_normalized=vector_normalized,
-                    age_seconds=age_seconds,
-                    base_trust=_bt(row),
-                    generation=int(row["generation"]),
-                    written_at_drift=float(row["written_at_drift"]) if row["written_at_drift"] is not None else 0.0,
-                )
-                if hybrid_score < min_score:
-                    continue
-                chunk = self._row_to_chunk(row)
-                chunk.relevance = max(0.0, min(1.0, hybrid_score))
-                candidates.append(chunk)
-        else:
-            for row, lexical_signal in self._fts_lexical_candidates(
-                connection_rows=rows,
-                text=text,
-                layer=layer,
-                pipeline_id=pipeline_id,
-                scope=scope,
-                zone=zone,
-                as_of=as_of,
-            ):
-                age_seconds = max(0.0, now - float(row["created_at"]))
-                hybrid_score = policy.score(
-                    bm25_normalized=lexical_signal,
-                    age_seconds=age_seconds,
-                    base_trust=_bt(row),
-                    generation=int(row["generation"]),
-                    written_at_drift=float(row["written_at_drift"]) if row["written_at_drift"] is not None else 0.0,
-                )
-                if hybrid_score < min_score:
-                    continue
-                chunk = self._row_to_chunk(row)
-                chunk.relevance = max(0.0, min(1.0, hybrid_score))
-                candidates.append(chunk)
-
-        ranked = sorted(candidates, key=lambda c: c.relevance, reverse=True)
-        result_limit = normalize_result_limit(k)
-
-        # Two-pass fallback: when explicitly requested and the primary hybrid pass
-        # returns nothing, fall back to trust/recency-only scoring so callers get
-        # the highest-trust context rather than a silent empty result.
-        # Off by default to preserve the hybrid filtering contract.
-        if fallback_to_trust_recency and retrieval_mode == "hybrid" and len(candidates) == 0:
-            already_included = {c.chunk_id for c in candidates}
-            fallback_candidates: list[SubconsciousChunk] = []
-            for row in rows:
-                if str(row["chunk_id"]) in already_included:
-                    continue
-                age_seconds = max(0.0, now - float(row["created_at"]))
-                score = policy.score_no_bm25(
-                    age_seconds=age_seconds,
-                    base_trust=float(row["base_trust"]),
-                    generation=int(row["generation"]),
-                    written_at_drift=float(row["written_at_drift"]) if row["written_at_drift"] is not None else 0.0,
-                )
-                if score < min_score:
-                    continue
-                chunk = self._row_to_chunk(row)
-                chunk.relevance = max(0.0, min(1.0, score * 0.5))
-                fallback_candidates.append(chunk)
-            fallback_candidates.sort(key=lambda c: c.relevance, reverse=True)
-            ranked = ranked + fallback_candidates
-
-        if self.reranker is not None and self.reranker.enabled:
-            candidates_to_rerank = ranked[:result_limit * 4]
-            ranked = self.reranker.rerank(text, candidates_to_rerank)
-
-        results = apply_diversity_limit(
-            ranked,
-            k=result_limit,
-            diversity_limit=diversity_limit,
-            author_getter=lambda chunk: str(chunk.written_by),
-        )
-
-        if results:
+            policy = self.retrieval_policy
             now = time.time()
-            placeholders = ",".join("?" * len(results))
-            with self._connect() as connection:
+
+            # CAP-T4: reputation-weighted retrieval blending
+            blended_trust: dict[str, float] | None = None
+            if self.config is not None and self.config.reputation_weight > 0.0:
+                authors = {str(r["written_by"]) for r in rows}
+                rep_data = self._load_reputation(connection, authors)
+                rw = self.config.reputation_weight
+                blended_trust = {
+                    str(row["chunk_id"]): blend_trust(
+                        float(row["base_trust"]),
+                        rep_data.get(str(row["written_by"])),
+                        rw,
+                    )
+                    for row in rows
+                }
+
+            def _bt(row: object) -> float:
+                if blended_trust is not None:
+                    return blended_trust.get(str(row["chunk_id"]), float(row["base_trust"]))
+                return float(row["base_trust"])
+
+            if retrieval_mode == "vector":
+                return self._query_vector(
+                    connection,
+                    rows, embedding=embedding, k=k, min_score=min_score,
+                    policy=policy, now=now, diversity_limit=diversity_limit,
+                    blended_trust=blended_trust,
+                )
+
+            candidates: list[SubconsciousChunk] = []
+
+            if retrieval_mode == "trust_recency":
+                for row in rows:
+                    age_seconds = max(0.0, now - float(row["created_at"]))
+                    score = policy.score_no_bm25(
+                        age_seconds=age_seconds,
+                        base_trust=_bt(row),
+                        generation=int(row["generation"]),
+                        written_at_drift=float(row["written_at_drift"]) if row["written_at_drift"] is not None else 0.0,
+                    )
+                    if score < min_score:
+                        continue
+                    chunk = self._row_to_chunk(row)
+                    chunk.relevance = max(0.0, min(1.0, score))
+                    candidates.append(chunk)
+            elif embedding is not None:
+                lexical_candidates = build_lexical_candidates(
+                    text,
+                    [str(row["content"]) for row in rows],
+                )
+                for row, lexical_candidate in zip(rows, lexical_candidates, strict=True):
+                    row_embedding = self._decode_embedding(
+                        row["embedding"] if "embedding" in row.keys() else None
+                    )
+                    vector_normalized: float | None = None
+                    if row_embedding is not None:
+                        sim = self._cosine_similarity(embedding, row_embedding)
+                        vector_normalized = max(0.0, min(1.0, sim))
+                    if lexical_candidate.lexical_signal is None and vector_normalized is None:
+                        continue
+                    age_seconds = max(0.0, now - float(row["created_at"]))
+                    hybrid_score = policy.score_with_vector(
+                        bm25_normalized=lexical_candidate.lexical_signal or 0.0,
+                        vector_normalized=vector_normalized,
+                        age_seconds=age_seconds,
+                        base_trust=_bt(row),
+                        generation=int(row["generation"]),
+                        written_at_drift=float(row["written_at_drift"]) if row["written_at_drift"] is not None else 0.0,
+                    )
+                    if hybrid_score < min_score:
+                        continue
+                    chunk = self._row_to_chunk(row)
+                    chunk.relevance = max(0.0, min(1.0, hybrid_score))
+                    candidates.append(chunk)
+            else:
+                for row, lexical_signal in self._fts_lexical_candidates(
+                    connection,
+                    connection_rows=rows,
+                    text=text,
+                    layer=layer,
+                    pipeline_id=pipeline_id,
+                    scope=scope,
+                    zone=zone,
+                    as_of=as_of,
+                ):
+                    age_seconds = max(0.0, now - float(row["created_at"]))
+                    hybrid_score = policy.score(
+                        bm25_normalized=lexical_signal,
+                        age_seconds=age_seconds,
+                        base_trust=_bt(row),
+                        generation=int(row["generation"]),
+                        written_at_drift=float(row["written_at_drift"]) if row["written_at_drift"] is not None else 0.0,
+                    )
+                    if hybrid_score < min_score:
+                        continue
+                    chunk = self._row_to_chunk(row)
+                    chunk.relevance = max(0.0, min(1.0, hybrid_score))
+                    candidates.append(chunk)
+
+            ranked = sorted(candidates, key=lambda c: c.relevance, reverse=True)
+            result_limit = normalize_result_limit(k)
+
+            # Two-pass fallback: when explicitly requested and the primary hybrid pass
+            # returns nothing, fall back to trust/recency-only scoring so callers get
+            # the highest-trust context rather than a silent empty result.
+            # Off by default to preserve the hybrid filtering contract.
+            if fallback_to_trust_recency and retrieval_mode == "hybrid" and len(candidates) == 0:
+                already_included = {c.chunk_id for c in candidates}
+                fallback_candidates: list[SubconsciousChunk] = []
+                for row in rows:
+                    if str(row["chunk_id"]) in already_included:
+                        continue
+                    age_seconds = max(0.0, now - float(row["created_at"]))
+                    score = policy.score_no_bm25(
+                        age_seconds=age_seconds,
+                        base_trust=float(row["base_trust"]),
+                        generation=int(row["generation"]),
+                        written_at_drift=float(row["written_at_drift"]) if row["written_at_drift"] is not None else 0.0,
+                    )
+                    if score < min_score:
+                        continue
+                    chunk = self._row_to_chunk(row)
+                    chunk.relevance = max(0.0, min(1.0, score * 0.5))
+                    fallback_candidates.append(chunk)
+                fallback_candidates.sort(key=lambda c: c.relevance, reverse=True)
+                ranked = ranked + fallback_candidates
+
+            if self.reranker is not None and self.reranker.enabled:
+                candidates_to_rerank = ranked[:result_limit * 4]
+                ranked = self.reranker.rerank(text, candidates_to_rerank)
+
+            results = apply_diversity_limit(
+                ranked,
+                k=result_limit,
+                diversity_limit=diversity_limit,
+                author_getter=lambda chunk: str(chunk.written_by),
+            )
+
+            if results:
+                now = time.time()
+                placeholders = ",".join("?" * len(results))
                 connection.execute(
                     f"UPDATE chunks SET retrieval_count = retrieval_count + 1,"
                     f" last_retrieved_at = ? WHERE chunk_id IN ({placeholders})",
                     [now] + [c.chunk_id for c in results],
                 )
-            for chunk in results:
-                chunk.retrieval_count += 1
-                chunk.last_retrieved_at = now
+                for chunk in results:
+                    chunk.retrieval_count += 1
+                    chunk.last_retrieved_at = now
 
-        return results
+            return results
 
     @staticmethod
     def _decode_embedding(value: object) -> list[float] | None:
@@ -742,6 +742,7 @@ class SQLiteStore(BaseStore):
 
     def _query_vector(
         self,
+        connection: sqlite3.Connection,
         rows: list[sqlite3.Row],
         *,
         embedding: list[float] | None,
@@ -792,12 +793,11 @@ class SQLiteStore(BaseStore):
         if results:
             now_val = time.time()
             placeholders = ",".join("?" * len(results))
-            with self._connect() as connection:
-                connection.execute(
-                    f"UPDATE chunks SET retrieval_count = retrieval_count + 1,"
-                    f" last_retrieved_at = ? WHERE chunk_id IN ({placeholders})",
-                    [now_val] + [c.chunk_id for c in results],
-                )
+            connection.execute(
+                f"UPDATE chunks SET retrieval_count = retrieval_count + 1,"
+                f" last_retrieved_at = ? WHERE chunk_id IN ({placeholders})",
+                [now_val] + [c.chunk_id for c in results],
+            )
             for chunk in results:
                 chunk.retrieval_count += 1
                 chunk.last_retrieved_at = now_val
@@ -2886,6 +2886,7 @@ class SQLiteStore(BaseStore):
 
     def _fts_lexical_candidates(
         self,
+        connection: sqlite3.Connection,
         *,
         connection_rows: list[sqlite3.Row],
         text: str,
@@ -2926,18 +2927,17 @@ class SQLiteStore(BaseStore):
         params.extend(bitemporal_params)
 
         try:
-            with self._connect() as connection:
-                fts_rows = connection.execute(
-                    f"""
-                    SELECT chunks.*, bm25(chunks_fts) AS fts_rank
-                    FROM chunks_fts
-                    JOIN chunks ON chunks_fts.rowid = chunks.rowid
-                    WHERE {' AND '.join(clauses)}
-                    ORDER BY fts_rank ASC
-                    """,
-                    params,
-                ).fetchall()
-        except NCPStoreUnavailableError:
+            fts_rows = connection.execute(
+                f"""
+                SELECT chunks.*, bm25(chunks_fts) AS fts_rank
+                FROM chunks_fts
+                JOIN chunks ON chunks_fts.rowid = chunks.rowid
+                WHERE {' AND '.join(clauses)}
+                ORDER BY fts_rank ASC
+                """,
+                params,
+            ).fetchall()
+        except sqlite3.Error:
             lexical_candidates = build_lexical_candidates(
                 text,
                 [str(row["content"]) for row in connection_rows],

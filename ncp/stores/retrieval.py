@@ -357,24 +357,32 @@ def apply_mmr_selection(
     selected: list[SubconsciousChunk] = [sorted_chunks[0]]
     remaining: list[SubconsciousChunk] = sorted_chunks[1:]
 
+    # Each remaining candidate's max similarity to the selected set only
+    # ever needs the newest selection scored against it: similarities are
+    # independent of round number, so max(running_max, new_sim) equals
+    # recomputing similarity against every selected chunk from scratch.
+    # This avoids O(chunk_cap) redundant bm25_similarity/BM25Okapi builds
+    # per candidate per round.
+    max_similarities: list[float] = [0.0] * len(remaining)
+
     while len(selected) < chunk_cap and remaining:
+        newest_selected = selected[-1]
         best_idx = 0
         best_mmr = -1.0
         for i, candidate in enumerate(remaining):
             relevance = float(candidate.relevance)
-            similarities = []
-            for selected_chunk in selected:
-                embedding_sim = _embedding_similarity(candidate, selected_chunk)
-                similarities.append(
-                    embedding_sim
-                    if embedding_sim is not None
-                    else bm25_similarity(candidate.content, selected_chunk.content, corpus_sz)
-                )
-            max_sim = max(similarities)
-            mmr = mix * relevance - (1.0 - mix) * max_sim
+            embedding_sim = _embedding_similarity(candidate, newest_selected)
+            sim_to_newest = (
+                embedding_sim
+                if embedding_sim is not None
+                else bm25_similarity(candidate.content, newest_selected.content, corpus_sz)
+            )
+            max_similarities[i] = max(max_similarities[i], sim_to_newest)
+            mmr = mix * relevance - (1.0 - mix) * max_similarities[i]
             if mmr > best_mmr:
                 best_mmr = mmr
                 best_idx = i
         selected.append(remaining.pop(best_idx))
+        max_similarities.pop(best_idx)
 
     return selected

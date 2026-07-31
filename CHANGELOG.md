@@ -40,6 +40,40 @@ All notable changes to Neural Context Protocol will be documented in this file.
   failed, timed-out, or metadata-incomplete attempts are marked non-archivable
   rather than treated as successful evidence.
 
+### Performance
+
+- **`SqliteStore.query()` now uses a single connection per call**
+  (`ncp/stores/sqlite.py`): the hybrid/vector/trust_recency retrieval path
+  previously opened up to three separate SQLite connections per call (row
+  load, reputation blending, retrieval-count update), each paying PRAGMA
+  setup cost; `_query_vector` and `_fts_lexical_candidates` now take the
+  caller's connection instead of opening their own. The FTS-unavailable
+  fallback now catches `sqlite3.Error` directly (equivalent to the prior
+  `NCPStoreUnavailableError` wrapping) so fallback behavior is unchanged.
+- **Cross-encoder/Cohere client reuse in `Reranker`** (`ncp/stores/rerank.py`):
+  `_rerank_local`'s `sentence-transformers` `CrossEncoder` and
+  `_rerank_cohere`'s `cohere.Client` are now built once and cached on the
+  instance instead of being reconstructed on every `rerank()` call. Local
+  cross-encoder loads can take hundreds of ms to seconds; with reranking
+  enabled this previously repeated on every single retrieval.
+- **O(n²) re-encoding removed from token-budget fitting**
+  (`ncp/assembler.py`, `ncp/encoder.py`): `_fit_token_budget` and
+  `_fit_whispers_to_budget` previously re-encoded the entire assembled
+  context from scratch (conscious + all already-fitted chunks/whispers +
+  budget) for every remaining candidate chunk/whisper. `PidginEncoder` gains
+  `assemble_from_parts()` plus per-item `_encode_chunk_entry()` /
+  `_encode_whisper_entry()` helpers so already-fitted entries and the
+  invariant conscious/budget text are encoded once and reused; output is
+  byte-for-byte identical. Runs on every `ncp_get_context` call.
+- **Incremental MMR selection** (`ncp/stores/retrieval.py`):
+  `apply_mmr_selection`'s greedy loop previously rescored every remaining
+  candidate against *every* already-selected chunk on every round,
+  rebuilding a `BM25Okapi` index per pairwise BM25 fallback comparison. Since
+  MMR only needs the max similarity to the selected set, and
+  `max(running_max, new_sim)` is identical to recomputing from scratch, each
+  round now only scores candidates against the newest selection. Produces
+  identical selections with far fewer similarity computations.
+
 ### Changed
 
 - **Provider-template right-sizing remains unshipped.** The proposed Claude
