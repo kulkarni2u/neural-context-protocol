@@ -18,6 +18,12 @@ class Reranker:
         self.enabled = config.rerank_enabled
         self.provider = config.rerank_provider.strip().lower() if config.rerank_provider else "local"
         self.model = config.rerank_model
+        # Lazily built and cached on first use so repeated rerank() calls
+        # reuse the loaded cross-encoder/client instead of reloading it
+        # (a cross-encoder load can take hundreds of ms to seconds).
+        self._local_encoder: object | None = None
+        self._local_encoder_unavailable = False
+        self._cohere_client: object | None = None
 
     def rerank(self, query: str, chunks: Sequence[SubconsciousChunk]) -> list[SubconsciousChunk]:
         """Rerank candidates based on semantic cross-encoder scores."""
@@ -29,22 +35,34 @@ class Reranker:
             return self._rerank_cohere(query, chunk_list)
         return self._rerank_local(query, chunk_list)
 
-    def _rerank_local(self, query: str, chunks: list[SubconsciousChunk]) -> list[SubconsciousChunk]:
-        """Local reranker utilizing sentence-transformers if available, falling back to Jaccard."""
+    def _get_local_encoder(self) -> object | None:
+        if self._local_encoder is not None:
+            return self._local_encoder
+        if self._local_encoder_unavailable:
+            return None
         try:
             from sentence_transformers import CrossEncoder
-            encoder = CrossEncoder(self.model or "cross-encoder/ms-marco-MiniLM-L-6-v2")
-            pairs = [(query, chunk.content) for chunk in chunks]
-            scores = encoder.predict(pairs)
-            for chunk, score in zip(chunks, scores):
-                sigmoid = 1.0 / (1.0 + math.exp(-float(score)))
-                chunk.relevance = max(0.0, min(1.0, sigmoid))
+            self._local_encoder = CrossEncoder(self.model or "cross-encoder/ms-marco-MiniLM-L-6-v2")
         except ImportError:
+            self._local_encoder_unavailable = True
             warnings.warn(
                 "sentence-transformers not installed. Local rerank falling back to Jaccard similarity. "
                 "Install via: pip install sentence-transformers",
                 ImportWarning,
             )
+            return None
+        return self._local_encoder
+
+    def _rerank_local(self, query: str, chunks: list[SubconsciousChunk]) -> list[SubconsciousChunk]:
+        """Local reranker utilizing sentence-transformers if available, falling back to Jaccard."""
+        encoder = self._get_local_encoder()
+        if encoder is not None:
+            pairs = [(query, chunk.content) for chunk in chunks]
+            scores = encoder.predict(pairs)  # type: ignore[attr-defined]
+            for chunk, score in zip(chunks, scores):
+                sigmoid = 1.0 / (1.0 + math.exp(-float(score)))
+                chunk.relevance = max(0.0, min(1.0, sigmoid))
+        else:
             query_set = set(query.lower().split())
             for chunk in chunks:
                 doc_set = set(chunk.content.lower().split())
@@ -66,9 +84,11 @@ class Reranker:
             return self._rerank_local(query, chunks)
 
         try:
-            import cohere
-            client = cohere.Client(api_key=api_key)
-            resp = client.rerank(
+            if self._cohere_client is None:
+                import cohere
+                self._cohere_client = cohere.Client(api_key=api_key)
+            client = self._cohere_client
+            resp = client.rerank(  # type: ignore[attr-defined]
                 model=self.model or "rerank-english-v3.0",
                 query=query,
                 documents=[chunk.content for chunk in chunks],

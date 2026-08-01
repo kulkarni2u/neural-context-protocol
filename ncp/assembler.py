@@ -713,38 +713,49 @@ class Assembler:
             whispers=whispers,
             max_tokens=max_tokens,
         )
+        # Conscious/budget/whisper text is invariant across the chunk-fitting
+        # loop below, and each already-fitted chunk's entry doesn't change
+        # once encoded — so both are encoded once and reused instead of
+        # re-encoding the whole growing context on every candidate chunk.
+        conscious_text = self.encoder._encode_conscious(conscious)
+        budget_text = self.encoder._encode_budget(budget)
+        whispers_text = self.encoder._encode_whispers(fitted_whispers, now=None) if fitted_whispers else None
+
         fitted_chunks: list[SubconsciousChunk] = []
+        fitted_entries: list[str] = []
         for chunk in chunks:
-            candidate_chunks = [*fitted_chunks, chunk]
-            candidate = self.encoder.assemble(
-                conscious=conscious,
-                chunks=candidate_chunks,
-                whispers=fitted_whispers,
-                budget=budget,
+            entry = self.encoder._encode_chunk_entry(chunk)
+            candidate = self.encoder.assemble_from_parts(
+                conscious_text=conscious_text,
+                chunk_entries=[*fitted_entries, entry],
+                whispers_text=whispers_text,
+                budget_text=budget_text,
             )
             if estimate_tokens(candidate) <= max_tokens:
                 fitted_chunks.append(chunk)
+                fitted_entries.append(entry)
                 continue
             distilled = self._distill_for_budget(
-                conscious=conscious,
-                budget=budget,
-                fitted_chunks=fitted_chunks,
-                fitted_whispers=fitted_whispers,
+                conscious_text=conscious_text,
+                budget_text=budget_text,
+                whispers_text=whispers_text,
+                fitted_entries=fitted_entries,
                 chunk=chunk,
                 max_tokens=max_tokens,
                 query_text=query_text,
             )
             if distilled is not None:
                 fitted_chunks.append(distilled)
+                fitted_entries.append(self.encoder._encode_chunk_entry(distilled))
         return fitted_chunks, fitted_whispers
 
     def _distill_for_budget(
         self,
         *,
-        conscious: ConsciousBlock,
-        budget: BudgetContext,
-        fitted_chunks: list[SubconsciousChunk],
-        fitted_whispers: list[Whisper],
+        conscious_text: str,
+        budget_text: str,
+        whispers_text: str | None,
+        fitted_entries: list[str],
         chunk: SubconsciousChunk,
         max_tokens: int,
         query_text: str,
@@ -753,11 +764,11 @@ class Assembler:
             return None
         if estimate_tokens(chunk.content) < self._distillation_min_chunk_tokens:
             return None
-        base_context = self.encoder.assemble(
-            conscious=conscious,
-            chunks=fitted_chunks,
-            whispers=fitted_whispers,
-            budget=budget,
+        base_context = self.encoder.assemble_from_parts(
+            conscious_text=conscious_text,
+            chunk_entries=fitted_entries,
+            whispers_text=whispers_text,
+            budget_text=budget_text,
         )
         remaining = max_tokens - estimate_tokens(base_context)
         if remaining <= 0:
@@ -770,11 +781,11 @@ class Assembler:
         if not distilled_content or distilled_content == chunk.content:
             return None
         distilled = chunk.model_copy(update={"content": distilled_content, "distilled": True})
-        candidate = self.encoder.assemble(
-            conscious=conscious,
-            chunks=[*fitted_chunks, distilled],
-            whispers=fitted_whispers,
-            budget=budget,
+        candidate = self.encoder.assemble_from_parts(
+            conscious_text=conscious_text,
+            chunk_entries=[*fitted_entries, self.encoder._encode_chunk_entry(distilled)],
+            whispers_text=whispers_text,
+            budget_text=budget_text,
         )
         if estimate_tokens(candidate) <= max_tokens:
             return distilled
@@ -790,19 +801,25 @@ class Assembler:
     ) -> list[Whisper]:
         if not whispers:
             return []
+        conscious_text = self.encoder._encode_conscious(conscious)
+        budget_text = self.encoder._encode_budget(budget)
+        now = time.time()
         fitted: list[Whisper] = []
+        fitted_entries: list[str] = []
         reserve = max(1, max_tokens // 4)
         for whisper in whispers:
-            candidate = [*fitted, whisper]
-            whisper_text = self.encoder._encode_whispers(candidate, now=None)
-            full_context = self.encoder.assemble(
-                conscious=conscious,
-                chunks=[],
-                whispers=candidate,
-                budget=budget,
+            entry = self.encoder._encode_whisper_entry(whisper, now=now)
+            candidate_entries = [*fitted_entries, entry]
+            whisper_text = "\n".join(["[NCP:WHISPERS]", *candidate_entries])
+            full_context = self.encoder.assemble_from_parts(
+                conscious_text=conscious_text,
+                chunk_entries=[],
+                whispers_text=whisper_text,
+                budget_text=budget_text,
             )
             if estimate_tokens(whisper_text) <= reserve and estimate_tokens(full_context) <= max_tokens:
                 fitted.append(whisper)
+                fitted_entries.append(entry)
         return fitted
 
     def _assembly_caps(

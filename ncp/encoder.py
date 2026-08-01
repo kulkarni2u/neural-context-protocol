@@ -75,14 +75,35 @@ class PidginEncoder:
     ) -> str:
         """Assemble the wire-format block ordering for one provider turn."""
 
-        blocks = [self._encode_conscious(conscious)]
+        return self.assemble_from_parts(
+            conscious_text=self._encode_conscious(conscious),
+            chunk_entries=[self._encode_chunk_entry(chunk) for chunk in chunks],
+            whispers_text=self._encode_whispers(whispers, now=now) if whispers else None,
+            budget_text=self._encode_budget(budget),
+        )
 
-        if chunks:
-            blocks.append(self._encode_subconscious(chunks))
-        if whispers:
-            blocks.append(self._encode_whispers(whispers, now=now))
-        blocks.append(self._encode_budget(budget))
+    def assemble_from_parts(
+        self,
+        *,
+        conscious_text: str,
+        chunk_entries: Sequence[str],
+        whispers_text: str | None,
+        budget_text: str,
+    ) -> str:
+        """Assemble from already-encoded blocks/entries.
 
+        Lets callers that re-check token budgets across many candidate
+        chunks (e.g. incremental fitting) reuse already-encoded conscious,
+        budget, and prior chunk-entry text instead of re-encoding the whole
+        context on every candidate.
+        """
+
+        blocks = [conscious_text]
+        if chunk_entries:
+            blocks.append("\n".join(["[NCP:SUBCONSCIOUS]", *chunk_entries]))
+        if whispers_text is not None:
+            blocks.append(whispers_text)
+        blocks.append(budget_text)
         return "\n\n".join(blocks)
 
     def _encode_budget(self, budget: BudgetContext) -> str:
@@ -128,44 +149,48 @@ class PidginEncoder:
         return "\n".join(lines)
 
     def _encode_subconscious(self, chunks: Sequence[SubconsciousChunk]) -> str:
-        lines = ["[NCP:SUBCONSCIOUS]"]
-        for chunk in chunks:
-            parts = [
-                f"chunk:{chunk.chunk_id}",
-                f"layer:{chunk.layer}",
-                f"score:{_fmt_float(chunk.effective_score)}",
-                f"src:{chunk.src}",
-                f"trust:{_fmt_float(chunk.base_trust)}",
-            ]
-            if chunk.verified:
-                parts.append("verified:1")
-            if chunk.distilled:
-                parts.append("distilled:1")
-            if chunk.raw_ref:
-                parts.append(f"raw_ref:{chunk.raw_ref}")
-            lines.append(" ".join(parts))
-            lines.append(_indent_block(chunk.content))
-        return "\n".join(lines)
+        return "\n".join(
+            ["[NCP:SUBCONSCIOUS]", *(self._encode_chunk_entry(chunk) for chunk in chunks)]
+        )
+
+    def _encode_chunk_entry(self, chunk: SubconsciousChunk) -> str:
+        parts = [
+            f"chunk:{chunk.chunk_id}",
+            f"layer:{chunk.layer}",
+            f"score:{_fmt_float(chunk.effective_score)}",
+            f"src:{chunk.src}",
+            f"trust:{_fmt_float(chunk.base_trust)}",
+        ]
+        if chunk.verified:
+            parts.append("verified:1")
+        if chunk.distilled:
+            parts.append("distilled:1")
+        if chunk.raw_ref:
+            parts.append(f"raw_ref:{chunk.raw_ref}")
+        return " ".join(parts) + "\n" + _indent_block(chunk.content)
 
     def _encode_whispers(self, whispers: Sequence[Whisper], *, now: float | None) -> str:
         effective_now = time.time() if now is None else now
-        lines = ["[NCP:WHISPERS]"]
-        for whisper in whispers:
-            age_seconds = max(0, int(round(effective_now - whisper.created_at)))
-            lines.append(
-                " ".join(
-                    [
-                        "wsp",
-                        f"from:{whisper.from_agent}",
-                        f"to:{whisper.target}",
-                        f"t:{whisper.whisper_type}",
-                        f"c:{_fmt_float(whisper.confidence)}",
-                        f"age:{_fmt_age_bucket(age_seconds)}",
-                    ]
-                )
-            )
-            lines.extend(self._encode_whisper_payload_lines(whisper.payload))
-        return "\n".join(lines)
+        return "\n".join(
+            [
+                "[NCP:WHISPERS]",
+                *(self._encode_whisper_entry(whisper, now=effective_now) for whisper in whispers),
+            ]
+        )
+
+    def _encode_whisper_entry(self, whisper: Whisper, *, now: float) -> str:
+        age_seconds = max(0, int(round(now - whisper.created_at)))
+        header = " ".join(
+            [
+                "wsp",
+                f"from:{whisper.from_agent}",
+                f"to:{whisper.target}",
+                f"t:{whisper.whisper_type}",
+                f"c:{_fmt_float(whisper.confidence)}",
+                f"age:{_fmt_age_bucket(age_seconds)}",
+            ]
+        )
+        return "\n".join([header, *self._encode_whisper_payload_lines(whisper.payload)])
 
     def _encode_whisper_payload_lines(self, payload: str) -> list[str]:
         try:
