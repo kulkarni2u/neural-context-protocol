@@ -41,10 +41,20 @@ Scoring is deterministic and mirrors `benchmarks/efficacy/run.py`:
 - **success** = the response names the task's approved-path slug **and**
   does not propose any dead-end slug outside a negation context (e.g.
   "will not use X", "X was rejected", "X is forbidden").
-- The negation-window check (`mentions_dead_end_as_retry` in
-  `benchmarks/task_success/tasks.py`) is a local reimplementation of
-  efficacy's `_mentions_dead_end_as_retry`, kept deliberately self-contained
-  so this package has no cross-benchmark import dependency.
+- The negation-window check lives in `ncp.eval.term_appears_unnegated` — a
+  public helper in the installed `ncp` package, not benchmark-internal.
+  `benchmarks/task_success/tasks.py` re-exports it as
+  `mentions_dead_end_as_retry` for backward compatibility, and
+  `benchmarks/efficacy/run.py` imports `score_response` from
+  `benchmarks.task_success.tasks` rather than reimplementing it, so there is
+  exactly one negation-scoring implementation across both benchmarks.
+- The three matched-budget conditions (`ncp`, `sliding_window`,
+  `raw_replay`) are also built from public helpers —
+  `ncp.eval.ncp_condition`, `sliding_window_condition`, and
+  `raw_replay_condition` (or `matched_budget_conditions` for all three at
+  once). An external eval harness can reuse the same matched-budget
+  construction without vendoring `benchmarks/`, which is not part of the
+  installed package.
 
 ## Modes
 

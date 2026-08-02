@@ -6,6 +6,15 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ### Added
 
+- **Public `ncp.eval` module for matched-budget evals**: the matched-budget
+  context construction (`ncp`, `sliding_window`, `raw_replay` conditions) and
+  negation-aware term scoring that `benchmarks/task_success` and
+  `benchmarks/efficacy` use internally are now importable from the installed
+  `ncp` package (`ncp.eval.matched_budget_conditions`,
+  `ncp.eval.term_appears_unnegated`) instead of living only in `benchmarks/`,
+  which does not ship with `pip install`. `benchmarks/task_success/tasks.py`
+  re-exports the prior `mentions_dead_end_as_retry`/`NEGATION_MARKERS` names
+  for backward compatibility; both benchmarks now share one implementation.
 - **Verified, repo-bound handoff lifecycle** (`ncp handoff`, `[handoff]`): the
   Claude and OpenCode wrappers resolve and bind provider execution to the NCP
   project workspace. The wrapper, not the provider model, loads bounded context

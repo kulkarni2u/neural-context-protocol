@@ -34,12 +34,12 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from ncp.api import agent as make_conscious
-from ncp.assembler import Assembler
 from ncp.dogfood import get_live_provider_readiness, load_dogfood_adapter
-from ncp.stores.sqlite import SQLiteStore
-from ncp.tokens import estimate_tokens, token_unit
-from ncp.types import BudgetContext, SubconsciousChunk
+from ncp.eval import EvalTurn
+from ncp.eval import ncp_condition as _eval_ncp_condition
+from ncp.eval import raw_replay_condition as _eval_raw_replay_condition
+from ncp.eval import sliding_window_condition as _eval_sliding_window_condition
+from ncp.tokens import token_unit
 
 from benchmarks.task_success.tasks import Task, get_tasks, score_response
 
@@ -53,66 +53,50 @@ _LIVE_PREAMBLE = (
 # Context construction per condition
 # ---------------------------------------------------------------------------
 
+def _to_eval_turns(task: Task) -> list[EvalTurn]:
+    return [
+        EvalTurn(
+            content=turn.content,
+            src=turn.src,
+            base_trust=turn.base_trust,
+            relevance=turn.relevance,
+            layer=turn.layer,
+            conditions=list(turn.conditions),
+        )
+        for turn in task.turns
+    ]
+
+
 def _ncp_context(task: Task, budget: int, pipeline_id: str, store_path: Path) -> tuple[str, int]:
     """Write scripted turns as chunks, then assemble the final-question context."""
 
-    store = SQLiteStore(store_path)
-    for index, turn in enumerate(task.turns, start=1):
-        chunk = SubconsciousChunk(
-            layer=turn.layer,  # type: ignore[arg-type]
-            src=turn.src,  # type: ignore[arg-type]
-            base_trust=turn.base_trust,
-            relevance=turn.relevance,
-            content=turn.content,
-            conditions=list(turn.conditions),
-            pipeline_id=pipeline_id,
-            written_by=f"agent_turn_{index:02d}",
-        )
-        store.write(chunk)
-
-    assembler = Assembler(store=store)
-    conscious = make_conscious(
-        id="bench_executor",
-        role="pravaha",
+    result = _eval_ncp_condition(
+        _to_eval_turns(task),
+        budget=budget,
+        query_text=task.query_text,
+        pipeline_id=pipeline_id,
+        store_path=store_path,
+        agent_id="bench_executor",
         owns=[task.domain],
         must_not=["rejected_paths"],
         task=f"{task.task_id}_question",
-        slot="build",
         intent="select_approved_path",
-        pipeline_id=pipeline_id,
     )
-    budget_ctx = BudgetContext(ctx_used=0.7, pressure="medium")
-    assembly = assembler.assemble(
-        conscious=conscious,
-        budget=budget_ctx,
-        query_text=task.query_text,
-        k=8,
-        max_tokens=budget,
-    )
-    context = assembly.context
-    return context, estimate_tokens(context)
+    return result.context, result.context_tokens
 
 
 def _sliding_window_context(task: Task, budget: int) -> tuple[str, int]:
     """Most-recent transcript entries that fit within ``budget`` tokens."""
 
-    selected: list[str] = []
-    used = 0
-    for turn in reversed(task.turns):
-        tokens = estimate_tokens(turn.content)
-        if used + tokens > budget:
-            break
-        selected.append(turn.content)
-        used += tokens
-    context = "\n".join(reversed(selected)) if selected else ""
-    return context, estimate_tokens(context)
+    result = _eval_sliding_window_condition(_to_eval_turns(task), budget=budget)
+    return result.context, result.context_tokens
 
 
 def _raw_replay_context(task: Task) -> tuple[str, int]:
     """Full unbounded transcript — reference condition, exempt from the budget."""
 
-    context = "\n".join(turn.content for turn in task.turns)
-    return context, estimate_tokens(context)
+    result = _eval_raw_replay_condition(_to_eval_turns(task))
+    return result.context, result.context_tokens
 
 
 # ---------------------------------------------------------------------------

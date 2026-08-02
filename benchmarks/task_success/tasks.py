@@ -17,42 +17,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from ncp.eval import NEGATION_MARKERS as NEGATION_MARKERS
+from ncp.eval import term_appears_unnegated
 
 # ---------------------------------------------------------------------------
 # Negation handling shared by task-success and efficacy benchmarks.
+#
+# The implementation lives in ``ncp.eval`` (the installed package) so a
+# consumer building their own matched-budget eval can reuse it without
+# vendoring this benchmark. Re-exported here under the original names for
+# backward compatibility.
 # ---------------------------------------------------------------------------
 
-NEGATION_MARKERS: tuple[str, ...] = (
-    "will not use",
-    "do not use",
-    "don't use",
-    "won't use",
-    "not use",
-    "avoid",
-    "rejected",
-    "forbidden",
-    "decommissioned",
-    "deprecated",
-    "removed from the allowed",
-    "do not propose",
-    "must not",
-)
-
-
-def mentions_dead_end_as_retry(response_lower: str, slug: str) -> bool:
-    """Return True if ``slug`` is proposed (not merely negated) in ``response_lower``."""
-
-    start = 0
-    while True:
-        idx = response_lower.find(slug, start)
-        if idx == -1:
-            return False
-        window_start = max(0, idx - 80)
-        window_end = min(len(response_lower), idx + len(slug) + 80)
-        context_window = response_lower[window_start:window_end]
-        if not any(marker in context_window for marker in NEGATION_MARKERS):
-            return True
-        start = idx + len(slug)
+mentions_dead_end_as_retry = term_appears_unnegated
 
 
 # ---------------------------------------------------------------------------
