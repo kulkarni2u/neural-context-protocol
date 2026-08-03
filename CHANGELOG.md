@@ -8,6 +8,18 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ### Added
 
+- **Read-only memory visualization web UI** (`ncp/ui/`, `ncp serve`):
+  `ncp serve` now hosts a vanilla HTML/CSS/JS UI at `/ui` — no build step, no
+  external requests — with a per-agent turn timeline showing whisper
+  traffic, a filterable chunk browser (trust badges, tombstone/supersede
+  state), a whisper inbox with TTL countdowns, store/cost stats, and an
+  interactive memory graph tab rendering `caused_by`/`supersedes`/typed
+  chunk edges as inline SVG via a deterministic, seeded force layout (no
+  external libraries). Backed by new read-only `GET /api/status|chunks|
+  turns|whispers|graph|cost` endpoints — plain JSON, gated by the same
+  bearer token as `/mcp`, not exposed as MCP tools — and three additive
+  `BaseStore` read helpers (`list_chunks`, `list_whispers`, `list_turns`).
+  Documented in `docs/NCP_HTTP_API.md` and the README's "Web UI" section.
 - **Public `ncp.eval` module for matched-budget evals**: the matched-budget
   context construction (`ncp`, `sliding_window`, `raw_replay` conditions) and
   negation-aware term scoring that `benchmarks/task_success` and
@@ -72,6 +84,33 @@ All notable changes to Neural Context Protocol will be documented in this file.
   chunk, sizing the subagent's context budget above the ~50-60 token
   `[NCP:CONSCIOUS]`/`[NCP:BUDGET]` protocol overhead floor, and closing the
   loop with `ncp_record_outcome` once the subagent's work is validated.
+
+### Fixed
+
+- **Path-injection and header-injection hardening on the new `/ui`/`/api`
+  surface** (`ncp/mcp/server.py`): addresses four CodeQL alerts (3 high
+  path-injection, 1 medium HTTP response splitting) introduced by the web
+  UI work above. `_serve_ui_asset` now reduces the request to a bare
+  filename (`PurePosixPath().name`, dropping any directory component or
+  traversal sequence) and matches it by name against the static root's own
+  directory listing, so the path actually opened always originates from the
+  filesystem, never from the request — closing the pathlib absolute-join
+  case where `root / "/etc/x.css"` resolved to `/etc/x.css`. `_cors_origin`
+  now returns the matching operator-configured allowlist entry instead of
+  echoing the request's `Origin` header back, so the emitted header value
+  can only be a configured string. The static asset directory is flat by
+  contract; nested paths now 404.
+- **Handoff/whisper/tool-gating review fixes** (`ncp/stores/sqlite.py`,
+  `ncp/stores/redis_coordination.py`, `ncp/agent_handoff.py`,
+  `ncp/mcp/server.py`): found during review of the verified-handoff work
+  above. Broadcast whispers (`target: "*"`) now always go through
+  per-recipient delivery tracking instead of an ambiguous no-`agent_id`
+  acknowledge falling through to a global delete that would consume the
+  broadcast for every recipient; the verified-fetch retry loop in
+  `load_handoffs` is capped so an unsigned-whisper flood can't force
+  unbounded growth of a single `peek_whispers` call; and `tools_for_config`
+  now returns the core tool subset (not the full unfiltered catalog) when
+  called with no config.
 
 ### Performance
 
