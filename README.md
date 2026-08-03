@@ -335,6 +335,7 @@ NCP adds bounded retrieval, provenance, optional authenticated authorship, disse
 | Cross-host handoff (Claude -> OpenCode)| window baseline| 0.0 success     | 0.8 success| **+0.8**   | Local harness with a noise-only control, not a distributed-host reliability study. |
 | Needle recall at budget 4              | sliding window | 0.00            | 0.50       | **+0.50**  | Synthetic budget-stress recall check. |
 | Task success at matched budget 400 (12 tasks, mock) | sliding window | 0.00 | 1.00 | **+1.00** | Context adequacy with a deterministic mock provider, not live model success. |
+| HotpotQA-style multi-hop QA at matched budget 300 (15 tasks) | sliding window | 0.00 | 1.00 | **+1.00** | Synthetic, HotpotQA-shaped context-adequacy check — not the official HotpotQA dataset or PlugMem's own eval harness (see [the benchmark's README](./benchmarks/hotpotqa_style/README.md)). |
 
 MACE multi-agent coordination score (40 turns): **0.8915**
 
@@ -352,6 +353,7 @@ python3 benchmarks/task_success/run.py            # mock provider, no keys neede
 python3 benchmarks/task_success/run.py --provider anthropic   # live task success
 python3 benchmarks/efficacy/run.py --provider mock --seeds 2  # context adequacy at matched budget
 python3 benchmarks/compression/run.py             # ingestion-time compression
+python3 benchmarks/hotpotqa_style/run.py          # synthetic HotpotQA-shaped multi-hop QA
 ```
 
 -----
