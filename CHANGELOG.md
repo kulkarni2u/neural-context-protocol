@@ -4,6 +4,8 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [Unreleased]
 
+## [1.4.1] - 2026-08-03
+
 ### Added
 
 - **Public `ncp.eval` module for matched-budget evals**: the matched-budget
@@ -48,6 +50,28 @@ All notable changes to Neural Context Protocol will be documented in this file.
   attempts require observed resolved model and CLI metadata; unavailable,
   failed, timed-out, or metadata-incomplete attempts are marked non-archivable
   rather than treated as successful evidence.
+- **HotpotQA-style multi-hop benchmark** (`benchmarks/hotpotqa_style/`): a
+  synthetic, HotpotQA-shaped multi-hop QA benchmark (8 "bridge" + 7
+  "comparison" questions, each needing two gold facts recovered from ~20
+  filler/distractor paragraphs), built via the public `ncp.eval` matched-budget
+  harness. Not the official HotpotQA dataset or PlugMem's own eval harness —
+  huggingface.co, arxiv.org, and cmu.edu are outside this project's reachable
+  hosts, so the benchmark reproduces the distractor-setting *shape* with
+  fictional entities instead. At the default 300-token matched budget: `ncp`
+  100% success (median 279 tokens) vs. `sliding_window` 0% (median 277 tokens)
+  vs. unbounded `raw_replay` 100% (778 tokens) — see
+  `benchmarks/hotpotqa_style/README.md` for the full scope note and budget
+  sweep. Added to the README benchmark table and reproducible-commands list.
+- **Subagent token-efficiency & accuracy checklist** (`AGENTS.md`,
+  `examples/06_claude_code/skills/ncp/SKILL.md`): documents the levers beyond
+  the mandatory `ncp_get_context`/`ncp_write_memory` dispatch template that
+  actually reduce token spend and improve retrieval accuracy for dispatched
+  subagents — a task-specific `intent`/`query_text` instead of the parent's
+  broad task, distilled write-backs instead of raw tool output, correct
+  `layer` tagging, `caused_by`/`derived_from` edges when building on a prior
+  chunk, sizing the subagent's context budget above the ~50-60 token
+  `[NCP:CONSCIOUS]`/`[NCP:BUDGET]` protocol overhead floor, and closing the
+  loop with `ncp_record_outcome` once the subagent's work is validated.
 
 ### Performance
 
