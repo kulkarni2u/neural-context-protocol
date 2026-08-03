@@ -67,3 +67,43 @@ When done call ncp_write_memory with {"content":"Implemented _async_query_vector
 - Codex implementing → `role: pravaha`
 - OpenCode reviewing → `role: nirnaya`
 - Vichara research agent → `role: vichara`
+
+## Subagent token efficiency & accuracy checklist
+
+The dispatch template above prevents a subagent from starting cold. These
+five habits are what actually convert that into fewer tokens spent and more
+relevant retrieval later — skipping them still "works," it just spends the
+budget on the wrong things.
+
+1. **Give the subagent a specific `intent`/`query_text`, not the parent's
+   broad task.** Retrieval is scored against this string (BM25 + recency +
+   trust) — `intent:"advance"` returns whatever's recent; `intent:"fix null
+   guard in PaymentProcessor retryCount"` returns the chunks that matter.
+   A vague intent doesn't just retrieve worse, it burns the same token
+   budget on irrelevant chunks.
+2. **Write back the distilled finding, not the raw tool output.** One
+   `ncp_write_memory` chunk with the specific fact/decision beats pasting a
+   full diff or stack trace — NCP's noise filter helps, but a subagent that
+   already knows the answer should write the answer, not the transcript.
+3. **Tag `layer` by what kind of knowledge it is**, not reflexively
+   `episodic`: a reusable method or fix procedure is `procedural`, a fact
+   that outlives this run is `semantic`, only "what happened this turn" is
+   `episodic`. Mistagging doesn't break anything today, but it silently
+   degrades every future `layer`-filtered retrieval (`ncp recall`, `ncp_fetch
+   layer=...`) that expects the tag to mean what it says.
+4. **Pass `caused_by`/`derived_from` edges when a subagent's output builds
+   on a prior chunk.** Without it, every subagent write looks like an
+   unrelated primary source — trust propagation and generation-decay have
+   nothing to walk, and a later consolidation pass can't tell a derived
+   finding from an independent one.
+5. **Size the subagent's context budget above the protocol floor.** The
+   `[NCP:CONSCIOUS]` + `[NCP:BUDGET]` header costs roughly 50-60 tokens
+   before any memory chunk is written. A subagent budgeted below ~150-200
+   tokens is mostly paying that fixed cost, not retrieving — budget for the
+   header plus at least 2-3x your expected chunk size, not just "small
+   because it's a subagent."
+
+Once the task is validated (tests pass, review approved), call
+`ncp_record_outcome` with the chunk/turn IDs that informed it. This is what
+closes the loop — without it, a subagent's contribution never earns or
+loses trust, and `ncp calibrate --feedback` has nothing to work from.
