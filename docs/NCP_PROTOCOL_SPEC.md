@@ -555,7 +555,7 @@ fully reconstructable from the "factors" block, not a black box.
 
 ```
 Config gate ([budget] table):
-  adaptive_budget_enabled:        bool (default false, OPT-IN) -- disabled
+  adaptive_budget_enabled:        bool (default true) -- disabled
                                    reproduces legacy behavior exactly: the
                                    effective max_tokens is always whatever
                                    the caller passed (or None, letting the
@@ -1227,7 +1227,7 @@ critical_at_ratio = 0.85
 # pipeline_budget_usd = 5.00   # CAP-E2; unset (default) disables the governor
 budget_warn_fraction = 0.8     # CAP-E2
 budget_enforcement = "warn"    # CAP-E2: off | warn | block
-adaptive_budget_enabled = false        # CAP-C6: opt-in
+adaptive_budget_enabled = true         # CAP-C6: on by default
 adaptive_budget_floor_tokens = 300     # CAP-C6
 adaptive_budget_ceiling_tokens = 2000  # CAP-C6
 

@@ -50,10 +50,11 @@ DEFAULT_CONFIG = {
         "pipeline_budget_usd": None,
         "budget_warn_fraction": 0.8,
         "budget_enforcement": "warn",
-        # CAP-C6: adaptive per-turn context token budget. Default false
-        # (opt-in) -- disabled preserves exact legacy behavior. Floor/ceiling
-        # are only consulted when enabled.
-        "adaptive_budget_enabled": False,
+        # CAP-C6: adaptive per-turn context token budget. Default true --
+        # this is a pure token-efficiency mechanism with no correctness
+        # downside for being on. Floor/ceiling are only consulted when
+        # enabled.
+        "adaptive_budget_enabled": True,
         "adaptive_budget_floor_tokens": 300,
         "adaptive_budget_ceiling_tokens": 2000,
     },
@@ -89,6 +90,7 @@ DEFAULT_CONFIG = {
         "diversity_lambda": 1.0,
         "usage_prior_weight": 1.0,
         "reputation_weight": 0.0,
+        "fallback_to_trust_recency_enabled": True,
     },
     "reputation": {
         "gain": 4.0,
@@ -101,7 +103,7 @@ DEFAULT_CONFIG = {
         "model": "BAAI/bge-small-en-v1.5",
     },
     "distillation": {
-        "enabled": False,
+        "enabled": True,
         "min_chunk_tokens": 120,
     },
     "consolidation": {
@@ -113,6 +115,13 @@ DEFAULT_CONFIG = {
     },
     "retention": {
         "max_working_chunks_per_pipeline": 0,
+        # Bound on how many same-(zone, layer, pipeline_id) rows write()'s
+        # duplicate-detection scan examines, most-recent-first. Working-zone
+        # chunk count is already capped by max_working_chunks (default 500),
+        # but "proven"/"global" zones are not -- without this bound, every
+        # write to a long-lived non-working pipeline gets slower forever as
+        # that zone/layer/pipeline combination accumulates rows.
+        "dedup_scan_limit": 200,
     },
     "server": {
         "auth_token": "",
@@ -312,6 +321,15 @@ class NCPConfig:
         return float(self.values.get("retrieval", {}).get("reputation_weight", 0.0))
 
     @property
+    def fallback_to_trust_recency_enabled(self) -> bool:
+        """Whether the assembler's hybrid retrieval falls back to a
+        trust/recency-only ranking when the primary hybrid pass finds zero
+        candidates. When disabled, a query with no lexical/vector match
+        returns an honest empty result instead of the top-trust/most-recent
+        chunks regardless of query content."""
+        return bool(self.values.get("retrieval", {}).get("fallback_to_trust_recency_enabled", True))
+
+    @property
     def reputation_gain(self) -> float:
         return float(self.values.get("reputation", {}).get("gain", 4.0))
 
@@ -374,7 +392,7 @@ class NCPConfig:
     @property
     def adaptive_budget_enabled(self) -> bool:
         """CAP-C6: whether ncp_get_context adapts the token budget to turn difficulty."""
-        return bool(self.values.get("budget", {}).get("adaptive_budget_enabled", False))
+        return bool(self.values.get("budget", {}).get("adaptive_budget_enabled", True))
 
     @property
     def adaptive_budget_floor_tokens(self) -> int:
@@ -426,7 +444,7 @@ class NCPConfig:
 
     @property
     def distillation_enabled(self) -> bool:
-        return bool(self.values.get("distillation", {}).get("enabled", False))
+        return bool(self.values.get("distillation", {}).get("enabled", True))
 
     @property
     def distillation_min_chunk_tokens(self) -> int:
@@ -440,6 +458,11 @@ class NCPConfig:
     @property
     def retention_max_working_chunks_per_pipeline(self) -> int:
         return int(self.values.get("retention", {}).get("max_working_chunks_per_pipeline", 0))
+
+    @property
+    def dedup_scan_limit(self) -> int:
+        """Bound on write()'s duplicate-detection candidate scan (see DEFAULT_CONFIG['retention'])."""
+        return max(0, int(self.values.get("retention", {}).get("dedup_scan_limit", 200)))
 
     @property
     def memoization_enabled(self) -> bool:
@@ -638,6 +661,8 @@ def _apply_env_overrides(values: dict[str, Any], env: dict[str, str]) -> None:
         values["graph"]["infer_scan_limit"] = int(env["NCP_INFER_SCAN_LIMIT"])
     if "NCP_INFER_MAX_EDGES" in env:
         values["graph"]["infer_max_edges"] = int(env["NCP_INFER_MAX_EDGES"])
+    if "NCP_DEDUP_SCAN_LIMIT" in env:
+        values["retention"]["dedup_scan_limit"] = int(env["NCP_DEDUP_SCAN_LIMIT"])
 
 
 def _deep_merge(target: dict[str, Any], updates: dict[str, Any]) -> None:

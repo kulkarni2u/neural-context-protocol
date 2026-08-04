@@ -35,6 +35,9 @@ class AssemblyResult:
     pending_whisper_ids: list[str]
     evicted_high_relevance: list[tuple[str, float]]
     evicted_whispers: list[tuple[str, float]]
+    evicted_chunk_count: int = 0
+    evicted_whisper_count: int = 0
+    retrieval_used_fallback: bool = False
 
 
 class Assembler:
@@ -79,6 +82,9 @@ class Assembler:
         self._diversity_lambda = config.diversity_lambda if config else 1.0
         self._distillation_enabled = config.distillation_enabled if config else False
         self._distillation_min_chunk_tokens = config.distillation_min_chunk_tokens if config else 120
+        self._fallback_to_trust_recency_enabled = (
+            config.fallback_to_trust_recency_enabled if config else True
+        )
 
     # ------------------------------------------------------------------
     # Step 0-5: assemble
@@ -102,6 +108,9 @@ class Assembler:
         list[Whisper],
         list[tuple[str, float]],
         list[tuple[str, float]],
+        int,
+        int,
+        bool,
     ]:
         conscious, budget = self.middleware.pre_assemble(conscious, budget)
         coherence_report = self.coherence.check(conscious)
@@ -110,6 +119,7 @@ class Assembler:
         chunk_cap, whisper_cap = self._assembly_caps(budget=budget, k=k)
         search_text = query_text or f"{hydrated.task} {hydrated.slot}"
         recent_chunks = self._resolve_recent_refs(hydrated, query_text=search_text)
+        fallback_count_before = self._retrieval_fallback_count()
         subconscious = self._retrieve_chunks(
             hydrated,
             query_text=query_text,
@@ -119,11 +129,21 @@ class Assembler:
             diversity_lambda=self._diversity_lambda,
             as_of=as_of,
         )
+        # Finding 8 (docs/NCP_SILENT_DISCONNECT_AUDIT.md): when the primary
+        # hybrid pass finds nothing and the trust/recency fallback fires, the
+        # returned chunks have no relationship to the query -- surface that
+        # so callers don't mistake "frozen" trust/recency filler for a real
+        # relevance-ranked result.
+        retrieval_used_fallback = self._retrieval_fallback_count() > fallback_count_before
         subconscious = self._cold_start_bootstrap(hydrated, subconscious)
         if self._edge_expansion:
             expanded = self._expand_edges([*recent_chunks, *subconscious], limit=chunk_cap, as_of=as_of)
             subconscious = [*subconscious, *expanded]
-            recent_chunks, subconscious = self._suppress_superseded(recent_chunks, subconscious)
+        # Superseded-fact suppression is independent of edge expansion -- it
+        # must always run against whatever the current candidate set is, or a
+        # retracted fact and its correction can both survive to the final
+        # context whenever edge_expansion is disabled.
+        recent_chunks, subconscious = self._suppress_superseded(recent_chunks, subconscious)
         deduped_chunks = self._dedupe_chunks([*recent_chunks, *subconscious])
         if self._diversity_lambda < 1.0:
             combined_chunks = self._mmr_select_chunks(
@@ -186,7 +206,22 @@ class Assembler:
                 and whisper.whisper_id not in evicted_whisper_ids
                 and float(whisper.confidence) >= 0.6
             )
-        return hydrated, budget, combined_chunks, combined_whispers, evicted_high_relevance, evicted_whispers
+        # Finding 2: unconditional eviction totals, independent of the
+        # relevance/confidence gate above -- captures cap- and budget-fit
+        # evictions even when nothing cleared the >=0.5/>=0.6 threshold.
+        evicted_chunk_count = len(deduped_chunks) - len(combined_chunks)
+        evicted_whisper_count = len(all_whispers) - len(combined_whispers)
+        return (
+            hydrated,
+            budget,
+            combined_chunks,
+            combined_whispers,
+            evicted_high_relevance,
+            evicted_whispers,
+            evicted_chunk_count,
+            evicted_whisper_count,
+            retrieval_used_fallback,
+        )
 
     def assemble(
         self,
@@ -200,7 +235,17 @@ class Assembler:
         max_tokens: int | None = None,
         as_of: float | None = None,
     ) -> AssemblyResult:
-        hydrated, budget, combined_chunks, combined_whispers, evicted_high_relevance, evicted_whispers = self._prepare_assembly(
+        (
+            hydrated,
+            budget,
+            combined_chunks,
+            combined_whispers,
+            evicted_high_relevance,
+            evicted_whispers,
+            evicted_chunk_count,
+            evicted_whisper_count,
+            retrieval_used_fallback,
+        ) = self._prepare_assembly(
             conscious=conscious,
             budget=budget,
             query_text=query_text,
@@ -229,6 +274,9 @@ class Assembler:
             ],
             evicted_high_relevance=evicted_high_relevance,
             evicted_whispers=evicted_whispers,
+            evicted_chunk_count=evicted_chunk_count,
+            evicted_whisper_count=evicted_whisper_count,
+            retrieval_used_fallback=retrieval_used_fallback,
         )
 
     def assemble_incremental(
@@ -254,7 +302,7 @@ class Assembler:
         Callers that use post_assemble middleware should apply it to the
         concatenated result: ``mw.post_assemble("\\n\\n".join(t for _, t in sections))``.
         """
-        hydrated, budget, combined_chunks, combined_whispers, _, _ = self._prepare_assembly(
+        hydrated, budget, combined_chunks, combined_whispers, _, _, _, _, _ = self._prepare_assembly(
             conscious=conscious,
             budget=budget,
             query_text=query_text,
@@ -465,9 +513,19 @@ class Assembler:
             k=store_k,
             pipeline_id=conscious.pipeline_id,
             zone="working",
-            fallback_to_trust_recency=True,
+            fallback_to_trust_recency=self._fallback_to_trust_recency_enabled,
             **extra,
         )
+
+    def _retrieval_fallback_count(self) -> int:
+        """Best-effort read of the store's trust/recency-fallback counter.
+
+        Not every store backend implements ``retrieval_fallback_count()``
+        (e.g. it's a no-op signature-only parameter on the sync pgvector
+        store today), so this degrades to 0 rather than raising.
+        """
+        getter = getattr(self.store, "retrieval_fallback_count", None)
+        return int(getter()) if callable(getter) else 0
 
     def _cold_start_bootstrap(
         self,
@@ -476,10 +534,16 @@ class Assembler:
     ) -> list[SubconsciousChunk]:
         if chunks:
             return chunks
+        content = f"pipeline_summary agent:{conscious.agent_id} task:{conscious.task} intent:{conscious.intent}"
+        if len(content) > 2000:
+            # A legitimate long task/intent must not blow the SubconsciousChunk
+            # content cap and crash the whole assemble() call -- truncate with
+            # a trailing marker instead of dropping the cold-start signal.
+            content = content[:1900] + "...[truncated]"
         cold_chunk = SubconsciousChunk(
             chunk_id=f"cold_{conscious.pipeline_id or 'init'}",
             layer="procedural",
-            content=f"pipeline_summary agent:{conscious.agent_id} task:{conscious.task} intent:{conscious.intent}",
+            content=content,
             src="synthesis",
             written_by=conscious.agent_id,
             pipeline_id=conscious.pipeline_id,
@@ -915,7 +979,11 @@ class Assembler:
                 detected_drift = float(data["detected_drift"])
                 if 0.0 <= detected_drift <= 1.0:
                     conscious = conscious.model_copy(update={"drift_score": detected_drift})
-                break
+                    break
+                # Out-of-range detected_drift is malformed input, not a
+                # terminal signal -- skip it and keep checking the rest of
+                # the drained whispers for a well-formed one.
+                continue
             except (json.JSONDecodeError, TypeError, ValueError):
                 continue
         return conscious

@@ -87,6 +87,17 @@ def test_score_bounded_in_unit_interval() -> None:
                 assert 0.0 <= s <= 1.0, f"score={s} out of [0,1] for bm25={bm25} age={age} trust={trust}"
 
 
+def test_score_clamps_bm25_normalized_above_one() -> None:
+    # bm25_normalized is meant to be pre-normalized to [0, 1], but the
+    # contract (documented, and honored for base_trust and by
+    # score_with_vector's own bm25_normalized clamp) is that score() itself
+    # never returns outside [0, 1] regardless of what it's handed.
+    p = RetrievalPolicy()
+    score = p.score(bm25_normalized=5.0, age_seconds=0.0, base_trust=1.0, generation=0)
+    assert score <= 1.0
+    assert score == pytest.approx(1.0, abs=1e-6)
+
+
 def test_lexical_only_policy_ignores_recency_and_trust() -> None:
     p = RetrievalPolicy(w_lexical=1.0, w_recency=0.0, w_trust=0.0)
     s1 = p.score(bm25_normalized=0.7, age_seconds=0.0, base_trust=1.0)

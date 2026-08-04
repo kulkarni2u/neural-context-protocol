@@ -6,12 +6,14 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
+import queue
 import re
 import shutil
 import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from typing import BinaryIO
 
@@ -27,10 +29,57 @@ def _frame_message(payload: dict[str, object]) -> bytes:
     return f"Content-Length: {len(body)}\r\n\r\n".encode("ascii") + body
 
 
-def _read_message(stream: BinaryIO) -> dict[str, object]:
+# Default deadline for a single blocking pipe read while parsing one MCP
+# frame. Without this, a truncated/malformed frame (server crash mid-write,
+# OOM-kill between header and body flush, any non-conforming server) leaves
+# stream.readline()/stream.read(n) blocked forever: the child's stdout stays
+# open, so EOF never arrives.
+_DEFAULT_MCP_READ_TIMEOUT_SECONDS = 30.0
+
+# Matches ncp/mcp/server.py's server-side _read_message Content-Length cap,
+# so a header claiming an absurd body size is rejected up front instead of
+# driving a multi-minute-or-longer stream.read(n) even within the timeout.
+_MAX_MCP_CONTENT_LENGTH = 10_485_760
+
+
+def _read_with_timeout(read_fn: object, timeout: float) -> bytes:
+    """Run one blocking ``BinaryIO`` read with a hard deadline.
+
+    Raw pipes (``subprocess.Popen(..., stdout=PIPE).stdout``) have no
+    built-in read timeout: ``readline()``/``read(n)`` block until enough
+    bytes arrive or the writer closes its end. Run the read on a daemon
+    thread so a stuck read can never block process exit (unlike
+    ``ThreadPoolExecutor``, whose worker threads are joined by an ``atexit``
+    hook even when a call never returns) and surface a timeout as a plain
+    ``RuntimeError`` instead of hanging.
+    """
+    result: "queue.Queue[tuple[str, object]]" = queue.Queue(maxsize=1)
+
+    def _worker() -> None:
+        try:
+            result.put(("ok", read_fn()))  # type: ignore[operator]
+        except BaseException as exc:  # noqa: BLE001 - relayed to the caller below
+            result.put(("error", exc))
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    thread.start()
+    try:
+        status, value = result.get(timeout=timeout)
+    except queue.Empty as exc:
+        raise RuntimeError(
+            f"Timed out after {timeout}s waiting for MCP message data"
+        ) from exc
+    if status == "error":
+        raise value  # type: ignore[misc]
+    return value  # type: ignore[return-value]
+
+
+def _read_message(
+    stream: BinaryIO, *, timeout: float = _DEFAULT_MCP_READ_TIMEOUT_SECONDS
+) -> dict[str, object]:
     headers: dict[str, str] = {}
     while True:
-        line = stream.readline()
+        line = _read_with_timeout(stream.readline, timeout)
         if not line:
             raise RuntimeError("MCP server closed the stream unexpectedly")
         if line in (b"\r\n", b"\n"):
@@ -40,11 +89,14 @@ def _read_message(stream: BinaryIO) -> dict[str, object]:
             raise RuntimeError(f"Invalid MCP response header: {line!r}")
         headers[key.strip().lower()] = value.strip()
 
-    content_length = headers.get("content-length")
-    if content_length is None:
+    content_length_raw = headers.get("content-length")
+    if content_length_raw is None:
         raise RuntimeError("Missing Content-Length header in MCP response")
-    body = stream.read(int(content_length))
-    if len(body) != int(content_length):
+    content_length = int(content_length_raw)
+    if content_length < 0 or content_length > _MAX_MCP_CONTENT_LENGTH:
+        raise RuntimeError(f"Content-Length out of allowed range: {content_length}")
+    body = _read_with_timeout(lambda: stream.read(content_length), timeout)
+    if len(body) != content_length:
         raise RuntimeError("Incomplete MCP response body")
     message = json.loads(body.decode("utf-8"))
     if not isinstance(message, dict):
@@ -534,6 +586,7 @@ class MCPStdioClient:
         store_path: str | Path,
         cwd: str | Path,
         server_cmd: list[str] | None = None,
+        read_timeout_seconds: float = _DEFAULT_MCP_READ_TIMEOUT_SECONDS,
     ) -> None:
         self.store_path = Path(store_path)
         self.cwd = Path(cwd)
@@ -547,6 +600,7 @@ class MCPStdioClient:
         ]
         self._next_id = 1
         self._process: subprocess.Popen[bytes] | None = None
+        self._read_timeout_seconds = read_timeout_seconds
 
     def __enter__(self) -> MCPStdioClient:
         self.start()
@@ -571,12 +625,15 @@ class MCPStdioClient:
             return
         process = self._process
         self._process = None
-        for pipe in (process.stdin, process.stdout, process.stderr):
-            if pipe is not None:
-                try:
-                    pipe.close()
-                except OSError:
-                    pass
+        # Terminate/kill *before* closing the pipes: if a _read_with_timeout
+        # background thread is still blocked inside stream.read() on a
+        # BufferedReader (e.g. after a read timeout on a still-alive,
+        # misbehaving child), that thread holds the reader's internal lock
+        # for the duration of the blocking read. Closing the pipe from this
+        # thread first would then block acquiring that same lock, deadlocking
+        # close() itself. Killing the process first unblocks the pending
+        # read (EOF/broken pipe), which releases the lock so the close()
+        # calls below return immediately.
         if process.poll() is None:
             process.terminate()
             try:
@@ -584,6 +641,12 @@ class MCPStdioClient:
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=5)
+        for pipe in (process.stdin, process.stdout, process.stderr):
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except OSError:
+                    pass
 
     def initialize(self) -> dict[str, object]:
         return self.request("initialize", {"protocolVersion": "2024-11-05"})
@@ -624,7 +687,7 @@ class MCPStdioClient:
         self._process.stdin.write(_frame_message(payload))
         self._process.stdin.flush()
 
-        response = _read_message(self._process.stdout)
+        response = _read_message(self._process.stdout, timeout=self._read_timeout_seconds)
         if "error" in response:
             raise RuntimeError(f"MCP {method} failed: {response['error']}")
         return response
@@ -684,7 +747,17 @@ class MCPHTTPClient:
             stderr=subprocess.PIPE,
         )
         self._client = httpx.Client(base_url=self.base_url, timeout=5.0)
-        self._wait_until_ready()
+        try:
+            self._wait_until_ready()
+        except Exception:
+            # __enter__ only calls __exit__ on success, so a readiness
+            # failure here would otherwise leak the just-spawned subprocess
+            # (still running, still holding its bound port) with nothing
+            # left referencing it to tear it down. Reuse close()'s teardown
+            # logic before re-raising so the caller's `with` block still
+            # ends with no child process left behind.
+            self.close()
+            raise
 
     def close(self) -> None:
         client = self._client
@@ -695,12 +768,8 @@ class MCPHTTPClient:
             return
         process = self._process
         self._process = None
-        for pipe in (process.stdout, process.stderr):
-            if pipe is not None:
-                try:
-                    pipe.close()
-                except OSError:
-                    pass
+        # Terminate/kill before closing the pipes -- see the matching
+        # comment in MCPStdioClient.close() for why the order matters.
         if process.poll() is None:
             process.terminate()
             try:
@@ -708,6 +777,12 @@ class MCPHTTPClient:
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=5)
+        for pipe in (process.stdout, process.stderr):
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except OSError:
+                    pass
 
     def _wait_until_ready(self, timeout_seconds: float = 5.0) -> None:
         if self._client is None:
@@ -874,6 +949,16 @@ def run_canonical_dogfood_loop(
             "continued_response": continued_response,
         }
 
+        # Finding 7 (docs/NCP_SILENT_DISCONNECT_AUDIT.md): give ncp_emit_whisper
+        # and ncp_post_turn real-subprocess coverage, the same as the three
+        # tools exercised above.
+        artifact["whisper_post_turn_pass"] = _run_whisper_and_post_turn_scenario(
+            client,
+            pipeline_id=pipeline_id,
+            from_agent="planner",
+            target_agent="critic",
+        )
+
     with MCPStdioClient(store_path=store_path, cwd=cwd, server_cmd=server_cmd) as restarted:
         restarted.initialize()
         restart_context = restarted.call_tool(
@@ -910,6 +995,8 @@ def run_canonical_dogfood_loop(
         "first_fetch_ok": seeded_content in str(artifact["first_pass"]["fetch_result"]),
         "restart_fetch_ok": artifact["restart_persistence_ok"],
         "continuation_ok": seeded_content in str(artifact["first_pass"]["continued_response"]),
+        "whisper_ok": bool(artifact["whisper_post_turn_pass"]["whisper_delivered"]),
+        "post_turn_ok": bool(artifact["whisper_post_turn_pass"]["post_turn_fetch_ok"]),
         "turn_record_count": status["turn_record_count"],
         "chunk_count": status["chunk_count"],
     }
@@ -1016,6 +1103,16 @@ def run_canonical_http_dogfood_loop(
             "continued_response": continued_response,
         }
 
+        # Finding 7 (docs/NCP_SILENT_DISCONNECT_AUDIT.md): give ncp_emit_whisper
+        # and ncp_post_turn real-subprocess coverage over the HTTP/SSE
+        # transport too, the same as the three tools exercised above.
+        artifact["whisper_post_turn_pass"] = _run_whisper_and_post_turn_scenario(
+            client,
+            pipeline_id=pipeline_id,
+            from_agent="planner",
+            target_agent="critic",
+        )
+
     with MCPHTTPClient(
         store_path=store_path,
         cwd=cwd,
@@ -1058,6 +1155,8 @@ def run_canonical_http_dogfood_loop(
         "first_fetch_ok": seeded_content in str(artifact["first_pass"]["fetch_result"]),
         "restart_fetch_ok": artifact["restart_persistence_ok"],
         "continuation_ok": seeded_content in str(artifact["first_pass"]["continued_response"]),
+        "whisper_ok": bool(artifact["whisper_post_turn_pass"]["whisper_delivered"]),
+        "post_turn_ok": bool(artifact["whisper_post_turn_pass"]["post_turn_fetch_ok"]),
         "turn_record_count": status["turn_record_count"],
         "chunk_count": status["chunk_count"],
     }
@@ -1346,6 +1445,107 @@ def _execute_fetch(
             "agent_id": agent_id,
         },
     )
+
+
+def _run_whisper_and_post_turn_scenario(
+    client: MCPStdioClient | MCPHTTPClient,
+    *,
+    pipeline_id: str,
+    from_agent: str,
+    target_agent: str,
+) -> dict[str, object]:
+    """Exercise ncp_emit_whisper and ncp_post_turn over the real MCP transport.
+
+    Finding 7 (docs/NCP_SILENT_DISCONNECT_AUDIT.md): these two tools were never
+    exercised by the real subprocess JSON-RPC harness, only by in-process unit
+    tests. This scenario emits a whisper, confirms the target agent's assembled
+    context drains it, then closes a turn via ncp_post_turn with memory_chunks
+    and confirms a follow-up ncp_fetch can retrieve one of those just-written
+    chunks -- all over the wire, not via direct handler calls.
+    """
+
+    nudge_payload = "dogfood whisper nudge: check the restart contract before finalizing"
+    emit = client.call_tool(
+        "ncp_emit_whisper",
+        {
+            "from": from_agent,
+            "target": target_agent,
+            "type": "nudge",
+            "payload": nudge_payload,
+            "confidence": 0.9,
+            "pipeline_id": pipeline_id,
+        },
+    )
+    if emit.data.get("emitted") is not True:
+        raise RuntimeError("ncp_emit_whisper did not report emitted:true")
+
+    context = client.call_tool(
+        "ncp_get_context",
+        {
+            "agent_id": target_agent,
+            "role": "review",
+            "owns": ["review"],
+            "must_not": ["implementation"],
+            "task": "prove_whisper_delivery",
+            "slot": "whisper_drain",
+            "intent": "verify_whisper_wire_format",
+            "pipeline_id": pipeline_id,
+        },
+    )
+    pending_whisper_ids = [str(item) for item in list(context.data.get("pending_whisper_ids", []))]
+    context_text = str(context.data["context"])
+    whisper_delivered = (
+        bool(pending_whisper_ids)
+        and "[NCP:WHISPERS]" in context_text
+        and nudge_payload in context_text
+    )
+    if not whisper_delivered:
+        raise RuntimeError("Emitted whisper was not delivered to the target agent's assembled context")
+
+    chunk_a_content = "dogfood post_turn memory chunk alpha over real MCP transport"
+    chunk_b_content = "dogfood post_turn memory chunk beta over real MCP transport"
+    post_turn = client.call_tool(
+        "ncp_post_turn",
+        {
+            "agent_id": target_agent,
+            "role": "review",
+            "task": "prove_whisper_delivery",
+            "slot": "whisper_drain",
+            "intent": "verify_whisper_wire_format",
+            "pipeline_id": pipeline_id,
+            "result_summary": "drained whisper and persisted memory_chunks",
+            "result_full": "drained whisper and persisted memory_chunks over real stdio/HTTP MCP",
+            "ack_whisper_ids": pending_whisper_ids,
+            "memory_chunks": [
+                {"content": chunk_a_content, "layer": "episodic", "src": "synthesis"},
+                {"content": chunk_b_content, "layer": "semantic", "src": "tool_result"},
+            ],
+        },
+    )
+    if post_turn.data.get("posted") is not True or not post_turn.data.get("turn_id"):
+        raise RuntimeError("ncp_post_turn did not report posted:true with a turn_id")
+
+    fetch = client.call_tool(
+        "ncp_fetch",
+        {
+            "query": "dogfood post_turn memory chunk alpha",
+            "session_id": str(context.data["session_id"]),
+            "pipeline_id": pipeline_id,
+            "agent_id": target_agent,
+        },
+    )
+    post_turn_fetch_ok = chunk_a_content in str(fetch.data["result"])
+    if not post_turn_fetch_ok:
+        raise RuntimeError("ncp_fetch could not retrieve a chunk just written by ncp_post_turn")
+
+    return {
+        "emit_whisper": emit.data,
+        "pending_whisper_ids": pending_whisper_ids,
+        "whisper_delivered": whisper_delivered,
+        "post_turn": post_turn.data,
+        "post_turn_fetch_result": fetch.data["result"],
+        "post_turn_fetch_ok": post_turn_fetch_ok,
+    }
 
 
 def _scripted_continue_after_fetch(*, turn: str, fetch_result: str) -> str:

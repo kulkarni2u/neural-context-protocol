@@ -58,6 +58,21 @@ def test_tool_profile_invalid_value_falls_back_to_full(tmp_path: Path) -> None:
     assert load_config(cwd=project).tool_profile == "full"
 
 
+def test_dedup_scan_limit_defaults_and_file_and_env_overrides(tmp_path: Path) -> None:
+    """docs/NCP_SILENT_DISCONNECT_AUDIT.md finding 10: write()'s duplicate-
+    detection scan must be bounded (not unbounded) for non-working zones."""
+    project = tmp_path / "repo"
+    (project / ".git").mkdir(parents=True)
+
+    assert load_config(cwd=project, env={}).dedup_scan_limit == 200
+
+    (project / ".ncp").mkdir()
+    (project / ".ncp" / "config.toml").write_text("[retention]\ndedup_scan_limit = 30\n")
+    assert load_config(cwd=project, env={}).dedup_scan_limit == 30
+
+    assert load_config(cwd=project, env={"NCP_DEDUP_SCAN_LIMIT": "7"}).dedup_scan_limit == 7
+
+
 def test_tool_profile_env_override_wins_over_toml(tmp_path: Path) -> None:
     project = tmp_path / "repo"
     (project / ".git").mkdir(parents=True)
@@ -186,7 +201,7 @@ def test_distillation_config_defaults_and_overrides(tmp_path) -> None:
     (project / ".ncp").mkdir()
 
     config = load_config(cwd=project)
-    assert config.distillation_enabled is False
+    assert config.distillation_enabled is True
     assert config.distillation_min_chunk_tokens == 120
 
     (project / ".ncp" / "config.toml").write_text(
@@ -273,7 +288,7 @@ def test_adaptive_budget_config_defaults(tmp_path: Path) -> None:
 
     config = load_config(cwd=project)
 
-    assert config.adaptive_budget_enabled is False
+    assert config.adaptive_budget_enabled is True
     assert config.adaptive_budget_floor_tokens == 300
     assert config.adaptive_budget_ceiling_tokens == 2000
 

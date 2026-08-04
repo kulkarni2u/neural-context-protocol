@@ -163,6 +163,18 @@ CREATE INDEX IF NOT EXISTS {prefix}idx_conscious_agent
 CREATE INDEX IF NOT EXISTS {prefix}idx_cost_pipeline
     ON {schema}.{prefix}cost_log(pipeline_id, logged_at);
 
+CREATE TABLE IF NOT EXISTS {schema}.{prefix}embedding_cost_log (
+    id BIGSERIAL PRIMARY KEY,
+    pipeline_id TEXT,
+    op TEXT NOT NULL,
+    char_count INTEGER NOT NULL,
+    estimated_tokens INTEGER NOT NULL,
+    logged_at DOUBLE PRECISION NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS {prefix}idx_embedding_cost_pipeline
+    ON {schema}.{prefix}embedding_cost_log(pipeline_id, logged_at);
+
 CREATE TABLE IF NOT EXISTS {schema}.{prefix}drift_history (
     session_id TEXT NOT NULL,
     turn INTEGER NOT NULL,
@@ -344,7 +356,18 @@ class PgvectorStore(BaseStore):
             self.reranker = Reranker(DummyConfig())  # type: ignore[arg-type]
 
         self._embedding_adapter = embedding_adapter
+        # WI: running estimate of tokens fed into `_embedding_adapter.embed()`
+        # calls made by this store instance (write-time + query-time). Zero
+        # when no embedding adapter is configured. In-memory only, not
+        # persisted -- consumed by benchmarks/costs accounting.
+        self._embedding_calls_tokens_est: int = 0
         self._init_db()
+
+    def embedding_tokens_estimate(self) -> int:
+        """Running estimate of tokens passed to `embedding_adapter.embed()`
+        across this store instance's lifetime (write-time + query-time).
+        Zero when no embedding adapter is configured."""
+        return self._embedding_calls_tokens_est
 
     @contextmanager
     def _connect(self) -> Iterator[Any]:
@@ -417,9 +440,11 @@ class PgvectorStore(BaseStore):
         self.last_write_inferred_edge_count = 0
         chunk = self._validate_chunk_for_write(chunk)
         if self._embedding_adapter is not None and chunk.embedding is None:
+            self._embedding_calls_tokens_est += estimate_tokens(chunk.content)
             chunk = chunk.model_copy(
                 update={"embedding": self._embedding_adapter.embed(chunk.content)}
             )
+            self.log_embedding_cost(pipeline_id=chunk.pipeline_id, op="write", text=chunk.content)
         if chunk.embedding is not None and len(chunk.embedding) != 1536:
             raise ValueError(f"embedding must have 1536 dimensions, got {len(chunk.embedding)}")
         with self._connect() as connection:
@@ -608,7 +633,9 @@ class PgvectorStore(BaseStore):
                 diversity_limit=diversity_limit, as_of=as_of,
             )
         if embedding is None and self._embedding_adapter is not None:
+            self._embedding_calls_tokens_est += estimate_tokens(text)
             embedding = self._embedding_adapter.embed(text)
+            self.log_embedding_cost(pipeline_id=pipeline_id, op="query", text=text)
         if embedding is not None and len(embedding) != 1536:
             raise ValueError(f"embedding must have 1536 dimensions, got {len(embedding)}")
 
@@ -746,7 +773,9 @@ class PgvectorStore(BaseStore):
     ) -> list[SubconsciousChunk]:
         if embedding is None:
             if self._embedding_adapter is not None:
+                self._embedding_calls_tokens_est += estimate_tokens(text)
                 embedding = self._embedding_adapter.embed(text)
+                self.log_embedding_cost(pipeline_id=pipeline_id, op="query", text=text)
             else:
                 raise ValueError("retrieval_mode='vector' requires an embedding to be provided")
         if len(embedding) != 1536:
@@ -857,11 +886,31 @@ class PgvectorStore(BaseStore):
         The old row is never deleted -- only ``superseded_by`` and
         ``valid_to`` are updated in place, so a later ``as_of`` query can
         still recover it.
+
+        Security fix (docs/NCP_SILENT_DISCONNECT_AUDIT.md finding 9): only
+        applies when both chunks share the same pipeline scope -- see the
+        matching fix/comment in ``ncp/stores/sqlite.py``.
         """
         resolved_valid_to = time.time() if valid_to is None else valid_to
         with self._connect() as connection:
             cursor = connection.cursor()
             try:
+                cursor.execute(
+                    self._sql("SELECT pipeline_id FROM {schema}.{prefix}chunks WHERE chunk_id = %s"),
+                    (old_chunk_id,),
+                )
+                old_row = self._fetchone(cursor)
+                cursor.execute(
+                    self._sql("SELECT pipeline_id FROM {schema}.{prefix}chunks WHERE chunk_id = %s"),
+                    (new_chunk_id,),
+                )
+                new_row = self._fetchone(cursor)
+                if (
+                    old_row is None
+                    or new_row is None
+                    or old_row["pipeline_id"] != new_row["pipeline_id"]
+                ):
+                    return False
                 cursor.execute(
                     self._sql(
                         "UPDATE {schema}.{prefix}chunks"
@@ -905,10 +954,44 @@ class PgvectorStore(BaseStore):
         return len(edges)
 
     def add_chunk_edges(self, edges: Sequence[ChunkEdge]) -> int:
+        """Public, caller-facing edge insertion. Security fix
+        (docs/NCP_SILENT_DISCONNECT_AUDIT.md finding 9): only inserts edges
+        whose src and dst chunks share the same pipeline scope -- see the
+        matching fix/comment in ``ncp/stores/sqlite.py``.
+        """
         if not edges:
             return 0
         with self._connect() as connection:
-            return self._upsert_chunk_edges_rows(connection, edges)
+            allowed = self._filter_edges_by_pipeline_ownership(connection, edges)
+            if not allowed:
+                return 0
+            return self._upsert_chunk_edges_rows(connection, allowed)
+
+    def _filter_edges_by_pipeline_ownership(
+        self, connection: Any, edges: Sequence[ChunkEdge]
+    ) -> list[ChunkEdge]:
+        chunk_ids = list({edge.src_chunk_id for edge in edges} | {edge.dst_chunk_id for edge in edges})
+        placeholders = ",".join(["%s"] * len(chunk_ids))
+        cursor = connection.cursor()
+        try:
+            cursor.execute(
+                self._sql(
+                    f"SELECT chunk_id, pipeline_id FROM {{schema}}.{{prefix}}chunks"
+                    f" WHERE chunk_id IN ({placeholders})"
+                ),
+                chunk_ids,
+            )
+            rows = self._fetchall(cursor)
+        finally:
+            self._close_cursor(cursor)
+        pipeline_by_id = {str(row["chunk_id"]): row["pipeline_id"] for row in rows}
+        return [
+            edge
+            for edge in edges
+            if edge.src_chunk_id in pipeline_by_id
+            and edge.dst_chunk_id in pipeline_by_id
+            and pipeline_by_id[edge.src_chunk_id] == pipeline_by_id[edge.dst_chunk_id]
+        ]
 
     def get_chunk_edges(
         self,
@@ -1532,6 +1615,109 @@ class PgvectorStore(BaseStore):
                 )
             finally:
                 self._close_cursor(cursor)
+
+    def log_embedding_cost(
+        self,
+        *,
+        pipeline_id: str | None,
+        op: str,
+        text: str,
+    ) -> None:
+        """Record one embedding-adapter call for cost visibility (Finding 3).
+
+        Best-effort only: this sits directly on the write()/query() hot path
+        next to the real ``embed()`` call, so a logging failure here must
+        never be able to break the actual write or query.
+        """
+        try:
+            char_count = len(text)
+            estimated_tokens = estimate_tokens(text)
+            with self._connect() as connection:
+                cursor = connection.cursor()
+                try:
+                    cursor.execute(
+                        self._sql(
+                            """
+                            INSERT INTO {schema}.{prefix}embedding_cost_log (
+                                pipeline_id, op, char_count, estimated_tokens, logged_at
+                            ) VALUES (%s, %s, %s, %s, %s)
+                            """
+                        ),
+                        (pipeline_id, op, char_count, estimated_tokens, time.time()),
+                    )
+                finally:
+                    self._close_cursor(cursor)
+        except Exception:
+            pass
+
+    def embedding_cost_summary(
+        self,
+        *,
+        pipeline_id: str | None = None,
+    ) -> dict[str, object]:
+        """Return aggregate embedding-adapter call stats, analogous to cost_summary()."""
+        try:
+            with self._connect() as connection:
+                cursor = connection.cursor()
+                try:
+                    statement = (
+                        "SELECT "
+                        "COUNT(*) AS entry_count, "
+                        "COALESCE(SUM(char_count), 0) AS char_count_total, "
+                        "COALESCE(SUM(estimated_tokens), 0) AS estimated_tokens_total "
+                        f"FROM {self._table_name('embedding_cost_log')}"
+                    )
+                    params: tuple[object, ...] = ()
+                    if pipeline_id is not None:
+                        statement += " WHERE pipeline_id = %s"
+                        params = (pipeline_id,)
+                    cursor.execute(statement, params)
+                    total_row = self._fetchone(cursor)
+                finally:
+                    self._close_cursor(cursor)
+
+                cursor = connection.cursor()
+                try:
+                    statement = (
+                        "SELECT op, COUNT(*) AS calls, "
+                        "COALESCE(SUM(estimated_tokens), 0) AS estimated_tokens_total "
+                        f"FROM {self._table_name('embedding_cost_log')}"
+                    )
+                    params = ()
+                    if pipeline_id is not None:
+                        statement += " WHERE pipeline_id = %s"
+                        params = (pipeline_id,)
+                    statement += " GROUP BY op ORDER BY op ASC"
+                    cursor.execute(statement, params)
+                    by_op_rows = self._fetchall(cursor)
+                finally:
+                    self._close_cursor(cursor)
+        except Exception:
+            return {
+                "summary": {"entry_count": 0, "char_count_total": 0, "estimated_tokens_total": 0},
+                "by_op": [],
+            }
+
+        if total_row is None:
+            return {
+                "summary": {"entry_count": 0, "char_count_total": 0, "estimated_tokens_total": 0},
+                "by_op": [],
+            }
+        return {
+            "summary": {
+                "entry_count": int(total_row["entry_count"]),
+                "char_count_total": int(total_row["char_count_total"]),
+                "estimated_tokens_total": int(total_row["estimated_tokens_total"]),
+            },
+            "by_op": [
+                {
+                    "op": str(row["op"]),
+                    "calls": int(row["calls"]),
+                    "estimated_tokens_total": int(row["estimated_tokens_total"]),
+                }
+                for row in by_op_rows
+            ],
+        }
 
     def log_drift_history(self, *, session_id: str, turn: int, drift_score: float) -> None:
         with self._connect() as connection:
@@ -2910,10 +3096,14 @@ class PgvectorStore(BaseStore):
         return self._with_runtime_age(validated)
 
     def _assert_src_immutable(self, connection: Any, chunk: SubconsciousChunk) -> None:
+        """Reject a write that reuses an existing ``chunk_id`` unless it
+        comes from the same author -- see the matching fix/comment in
+        ``ncp/stores/sqlite.py`` (docs/NCP_SILENT_DISCONNECT_AUDIT.md
+        finding 9)."""
         cursor = connection.cursor()
         try:
             cursor.execute(
-                self._sql("SELECT src FROM {schema}.{prefix}chunks WHERE chunk_id = %s"),
+                self._sql("SELECT src, written_by FROM {schema}.{prefix}chunks WHERE chunk_id = %s"),
                 (chunk.chunk_id,),
             )
             row = self._fetchone(cursor)
@@ -2926,8 +3116,20 @@ class PgvectorStore(BaseStore):
             raise ValueError(
                 f"src is immutable for chunk_id={chunk.chunk_id}: existing={existing_src} new={chunk.src}"
             )
+        existing_written_by = str(row["written_by"])
+        if existing_written_by != chunk.written_by:
+            raise ValueError(
+                f"written_by is immutable for chunk_id={chunk.chunk_id}: "
+                f"existing={existing_written_by} new={chunk.written_by}"
+            )
 
     def _is_duplicate(self, connection: Any, chunk: SubconsciousChunk) -> bool:
+        # Bounded, most-recent-first scan (mirrors _edge_inference_candidates):
+        # working-zone row count is already capped by max_working_chunks, but
+        # "proven"/"global" zones are not, so an unbounded scan here made every
+        # write to a long-lived non-working (zone, layer, pipeline_id) strictly
+        # slower forever as that combination accumulated rows.
+        limit = self.config.dedup_scan_limit if self.config is not None else 200
         cursor = connection.cursor()
         try:
             cursor.execute(
@@ -2936,9 +3138,11 @@ class PgvectorStore(BaseStore):
                     SELECT content FROM {schema}.{prefix}chunks
                     WHERE zone = %s AND layer = %s AND COALESCE(pipeline_id, '') = COALESCE(%s, '')
                       AND chunk_id != %s
+                    ORDER BY created_at DESC
+                    LIMIT %s
                     """
                 ),
-                (chunk.zone, chunk.layer, chunk.pipeline_id, chunk.chunk_id),
+                (chunk.zone, chunk.layer, chunk.pipeline_id, chunk.chunk_id, max(0, int(limit))),
             )
             rows = self._fetchall(cursor)
         finally:

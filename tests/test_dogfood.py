@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import subprocess
+import sys
+import time
 
 import ncp
 import pytest
@@ -9,12 +12,15 @@ from ncp.dogfood import (
     CLIProviderMetadataError,
     ClaudeCLIDogfoodAdapter,
     CodexCLIDogfoodAdapter,
+    MCPHTTPClient,
+    MCPStdioClient,
     OpenCodeCLIDogfoodAdapter,
     _build_provider_continuation_turn,
     _build_provider_fetch_contract_turn,
     _extract_claude_json_result,
     _extract_opencode_response,
     _extract_opencode_text,
+    _run_whisper_and_post_turn_scenario,
     get_live_provider_readiness,
     load_dogfood_adapter,
     run_adapter_continuation_dogfood_loop,
@@ -51,6 +57,47 @@ def test_canonical_dogfood_loop_runs_against_real_stdio_server(tmp_path: Path) -
     assert artifact["summary"]["first_fetch_ok"] is True
     assert artifact["summary"]["continuation_ok"] is True
 
+    # Finding 7 (docs/NCP_SILENT_DISCONNECT_AUDIT.md): ncp_emit_whisper and
+    # ncp_post_turn must also be exercised over the real stdio MCP transport.
+    whisper_post_turn = artifact["whisper_post_turn_pass"]
+    assert whisper_post_turn["emit_whisper"]["emitted"] is True
+    assert whisper_post_turn["pending_whisper_ids"]
+    assert whisper_post_turn["whisper_delivered"] is True
+    assert whisper_post_turn["post_turn"]["posted"] is True
+    assert whisper_post_turn["post_turn"]["turn_id"]
+    assert whisper_post_turn["post_turn_fetch_ok"] is True
+    assert artifact["summary"]["whisper_ok"] is True
+    assert artifact["summary"]["post_turn_ok"] is True
+
+
+def test_whisper_and_post_turn_scenario_runs_against_real_stdio_server(tmp_path: Path) -> None:
+    """Finding 7 (docs/NCP_SILENT_DISCONNECT_AUDIT.md): ncp_emit_whisper and
+    ncp_post_turn get real-subprocess JSON-RPC coverage, not just in-process
+    handler-dict calls."""
+
+    project = tmp_path / "repo"
+    (project / ".git").mkdir(parents=True)
+    store_path = project / ".ncp" / "store.db"
+
+    with MCPStdioClient(store_path=store_path, cwd=REPO_ROOT) as client:
+        client.initialize()
+        result = _run_whisper_and_post_turn_scenario(
+            client,
+            pipeline_id="pipe_test_whisper_post_turn",
+            from_agent="planner",
+            target_agent="critic",
+        )
+
+    assert result["emit_whisper"]["emitted"] is True
+    assert result["emit_whisper"]["payload_format"] == "legacy"
+    assert result["pending_whisper_ids"]
+    assert result["whisper_delivered"] is True
+    assert result["post_turn"]["posted"] is True
+    assert result["post_turn"]["turn_id"]
+    assert result["post_turn"]["acknowledged_whisper_ids"] == result["pending_whisper_ids"]
+    assert result["post_turn_fetch_ok"] is True
+    assert "dogfood post_turn memory chunk alpha" in str(result["post_turn_fetch_result"])
+
 
 def test_public_package_exports_dogfood_runner() -> None:
     assert callable(ncp.run_canonical_dogfood_loop)
@@ -78,6 +125,16 @@ def test_canonical_http_dogfood_loop_runs_against_real_http_server(tmp_path: Pat
     assert "/mcp" in str(artifact["sse_handshake"])
     assert "ncp_fetch:results" in str(artifact["first_pass"]["fetch_result"])
     assert artifact["summary"]["continuation_ok"] is True
+
+    # Finding 7 (docs/NCP_SILENT_DISCONNECT_AUDIT.md): ncp_emit_whisper and
+    # ncp_post_turn must also be exercised over the real HTTP/SSE MCP transport.
+    whisper_post_turn = artifact["whisper_post_turn_pass"]
+    assert whisper_post_turn["emit_whisper"]["emitted"] is True
+    assert whisper_post_turn["whisper_delivered"] is True
+    assert whisper_post_turn["post_turn"]["posted"] is True
+    assert whisper_post_turn["post_turn_fetch_ok"] is True
+    assert artifact["summary"]["whisper_ok"] is True
+    assert artifact["summary"]["post_turn_ok"] is True
 
 
 def test_adapter_continuation_loop_runs_with_local_contract_adapter(tmp_path: Path) -> None:
@@ -114,6 +171,111 @@ def test_http_adapter_continuation_loop_runs_with_local_contract_adapter(tmp_pat
     assert artifact["mode"] == "adapter_continuation"
     assert artifact["adapter"] == "DogfoodLocalAdapter"
     assert artifact["continuation_ok"] is True
+
+
+def test_stdio_client_read_message_times_out_on_truncated_frame_and_reaps_process(
+    tmp_path: Path,
+) -> None:
+    # Regression for the silent-hang bug: a server that claims a
+    # Content-Length larger than the bytes it actually writes, then never
+    # closes its stdout, used to block MCPStdioClient.request() forever
+    # (stream.read(n) has no timeout on a raw pipe, and EOF never arrives).
+    # Because that hang happened inside the request() call, __exit__ never
+    # ran and the child process leaked. It must now raise within the
+    # configured read timeout and leave no live child behind.
+    fake_server = tmp_path / "fake_server.py"
+    fake_server.write_text(
+        "import sys, time\n"
+        "sys.stdout.buffer.write(b'Content-Length: 100000\\r\\n\\r\\n')\n"
+        "sys.stdout.buffer.write(b'0123456789')\n"
+        "sys.stdout.buffer.flush()\n"
+        "time.sleep(30)\n"
+    )
+    client = MCPStdioClient(
+        store_path=tmp_path / "store.db",
+        cwd=REPO_ROOT,
+        server_cmd=[sys.executable, str(fake_server)],
+        read_timeout_seconds=1.0,
+    )
+
+    start = time.monotonic()
+    pid: int | None = None
+    with pytest.raises(RuntimeError, match="Timed out"):
+        with client as c:
+            pid = c._process.pid
+            c.initialize()
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 10.0, "read timeout did not bound the hang"
+    assert pid is not None
+    time.sleep(0.2)
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)  # process must be reaped, not leaked
+
+
+def test_stdio_client_read_message_rejects_absurd_content_length(tmp_path: Path) -> None:
+    # A Content-Length far beyond any real MCP frame must be rejected up
+    # front (matching ncp/mcp/server.py's server-side cap) instead of
+    # driving a large stream.read(n) even within the timeout budget.
+    fake_server = tmp_path / "fake_server.py"
+    fake_server.write_text(
+        "import sys\n"
+        "sys.stdout.buffer.write(b'Content-Length: 999999999\\r\\n\\r\\n')\n"
+        "sys.stdout.buffer.flush()\n"
+        "sys.stdin.buffer.read()\n"
+    )
+    client = MCPStdioClient(
+        store_path=tmp_path / "store.db",
+        cwd=REPO_ROOT,
+        server_cmd=[sys.executable, str(fake_server)],
+        read_timeout_seconds=5.0,
+    )
+
+    start = time.monotonic()
+    with pytest.raises(RuntimeError, match="Content-Length out of allowed range"):
+        with client as c:
+            c.initialize()
+    assert time.monotonic() - start < 2.0, "oversized Content-Length should be rejected immediately"
+
+
+def test_http_client_start_terminates_process_when_readiness_probe_times_out(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Regression: start() (called from __enter__) used to leave the just-
+    # spawned subprocess running if _wait_until_ready() raised, because
+    # Python only calls __exit__ when __enter__ succeeds.
+    fake_server = tmp_path / "fake_http_server.py"
+    fake_server.write_text("import time\ntime.sleep(30)\n")
+    client = MCPHTTPClient(
+        store_path=tmp_path / "store.db",
+        cwd=REPO_ROOT,
+        server_cmd=[sys.executable, str(fake_server)],
+    )
+    orig_wait_until_ready = MCPHTTPClient._wait_until_ready
+    monkeypatch.setattr(
+        MCPHTTPClient,
+        "_wait_until_ready",
+        lambda self, timeout_seconds=5.0: orig_wait_until_ready(self, timeout_seconds=1.0),
+    )
+
+    captured: dict[str, int] = {}
+    orig_popen = subprocess.Popen
+
+    def _spy_popen(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+        proc = orig_popen(*args, **kwargs)  # type: ignore[arg-type]
+        captured["pid"] = proc.pid
+        return proc
+
+    monkeypatch.setattr(subprocess, "Popen", _spy_popen)
+
+    with pytest.raises(RuntimeError, match="did not become ready"):
+        client.start()
+
+    assert "pid" in captured
+    time.sleep(0.2)
+    with pytest.raises(ProcessLookupError):
+        os.kill(captured["pid"], 0)  # process must be reaped, not leaked
 
 
 def test_live_provider_readiness_reports_missing_credentials(monkeypatch: object) -> None:

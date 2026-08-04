@@ -184,6 +184,17 @@ CREATE INDEX IF NOT EXISTS idx_conscious_agent ON conscious_log(agent_id, logged
 CREATE INDEX IF NOT EXISTS idx_conscious_pipeline_agent ON conscious_log(pipeline_id, agent_id, logged_at);
 CREATE INDEX IF NOT EXISTS idx_cost_pipeline ON cost_log(pipeline_id, logged_at);
 
+CREATE TABLE IF NOT EXISTS embedding_cost_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    pipeline_id TEXT,
+    op TEXT NOT NULL,
+    char_count INTEGER NOT NULL,
+    estimated_tokens INTEGER NOT NULL,
+    logged_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_embedding_cost_pipeline ON embedding_cost_log(pipeline_id, logged_at);
+
 CREATE TABLE IF NOT EXISTS drift_history (
     session_id TEXT NOT NULL,
     turn INTEGER NOT NULL,
@@ -284,6 +295,12 @@ class SQLiteStore(BaseStore):
         # writers on the same store instance.
         self.last_write_inferred_edge_count = 0
         self._embedding_adapter = embedding_adapter
+        # WI: running estimate of tokens fed into `_embedding_adapter.embed()`
+        # calls made by this store instance (write-time + query-time). Zero
+        # when no embedding adapter is configured. In-memory only, not
+        # persisted -- consumed by benchmarks/costs accounting.
+        self._embedding_calls_tokens_est: int = 0
+        self._retrieval_fallback_count: int = 0
 
         from ncp.stores.rerank import Reranker
         from ncp.config import load_config
@@ -371,13 +388,29 @@ class SQLiteStore(BaseStore):
                 except Exception:
                     pass  # column already exists
 
+    def embedding_tokens_estimate(self) -> int:
+        """Running estimate of tokens passed to `embedding_adapter.embed()`
+        across this store instance's lifetime (write-time + query-time).
+        Zero when no embedding adapter is configured."""
+        return self._embedding_calls_tokens_est
+
+    def retrieval_fallback_count(self) -> int:
+        """Running count of `query()` calls, across this store instance's
+        lifetime, where the primary hybrid pass found zero candidates and a
+        `fallback_to_trust_recency=True` caller received trust/recency-only
+        results instead -- i.e. results with no relationship to the query
+        text. Zero when the fallback was never requested or never fired."""
+        return self._retrieval_fallback_count
+
     def write(self, chunk: SubconsciousChunk) -> bool:
         self.last_write_inferred_edge_count = 0
         chunk = self._validate_chunk_for_write(chunk)
         if self._embedding_adapter is not None and chunk.embedding is None:
+            self._embedding_calls_tokens_est += estimate_tokens(chunk.content)
             chunk = chunk.model_copy(
                 update={"embedding": self._embedding_adapter.embed(chunk.content)}
             )
+            self.log_embedding_cost(pipeline_id=chunk.pipeline_id, op="write", text=chunk.content)
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             self._soft_gc(connection)
@@ -552,7 +585,9 @@ class SQLiteStore(BaseStore):
             and self._embedding_adapter is not None
             and retrieval_mode in {"hybrid", "vector"}
         ):
+            self._embedding_calls_tokens_est += estimate_tokens(text)
             embedding = self._embedding_adapter.embed(text)
+            self.log_embedding_cost(pipeline_id=pipeline_id, op="query", text=text)
         if retrieval_mode == "vector" and embedding is None:
             raise ValueError("retrieval_mode='vector' requires an embedding or embedding adapter")
 
@@ -696,6 +731,8 @@ class SQLiteStore(BaseStore):
                     fallback_candidates.append(chunk)
                 fallback_candidates.sort(key=lambda c: c.relevance, reverse=True)
                 ranked = ranked + fallback_candidates
+                if fallback_candidates:
+                    self._retrieval_fallback_count += 1
 
             if self.reranker is not None and self.reranker.enabled:
                 candidates_to_rerank = ranked[:result_limit * 4]
@@ -866,9 +903,25 @@ class SQLiteStore(BaseStore):
         The old row is never deleted -- only ``superseded_by`` and
         ``valid_to`` are updated in place, so a later ``as_of`` query can
         still recover it.
+
+        Security fix (docs/NCP_SILENT_DISCONNECT_AUDIT.md finding 9): only
+        applies when both chunks share the same pipeline scope. Without this,
+        any caller could pass an arbitrary ``old_chunk_id`` from a different
+        pipeline and silently retire someone else's chunk -- this was never
+        gated by authorship/signature verification, since a valid signature
+        only proves authorship of the *new* chunk's content, not any
+        relationship to the chunk it's replacing.
         """
         resolved_valid_to = time.time() if valid_to is None else valid_to
         with self._connect() as connection:
+            old_row = connection.execute(
+                "SELECT pipeline_id FROM chunks WHERE chunk_id = ?", (old_chunk_id,)
+            ).fetchone()
+            new_row = connection.execute(
+                "SELECT pipeline_id FROM chunks WHERE chunk_id = ?", (new_chunk_id,)
+            ).fetchone()
+            if old_row is None or new_row is None or old_row["pipeline_id"] != new_row["pipeline_id"]:
+                return False
             cursor = connection.execute(
                 "UPDATE chunks SET superseded_by = ?, valid_to = ? WHERE chunk_id = ?",
                 (new_chunk_id, resolved_valid_to, old_chunk_id),
@@ -1091,10 +1144,42 @@ class SQLiteStore(BaseStore):
         return len(edges)
 
     def add_chunk_edges(self, edges: Sequence[ChunkEdge]) -> int:
+        """Public, caller-facing edge insertion (e.g. ``ncp_write_memory``'s
+        ``edges`` param). Security fix (docs/NCP_SILENT_DISCONNECT_AUDIT.md
+        finding 9): only inserts edges whose src and dst chunks share the
+        same pipeline scope, so an untrusted caller can't attach a
+        contradicts/caused_by/etc. edge to an arbitrary chunk from a
+        different pipeline. Internal, trusted callers (backfill, similarity
+        inference) go through ``_upsert_chunk_edges`` directly and are
+        unaffected -- they only ever reference same-pipeline chunks by
+        construction.
+        """
         if not edges:
             return 0
         with self._connect() as connection:
-            return self._upsert_chunk_edges(connection, edges)
+            allowed = self._filter_edges_by_pipeline_ownership(connection, edges)
+            if not allowed:
+                return 0
+            return self._upsert_chunk_edges(connection, allowed)
+
+    @staticmethod
+    def _filter_edges_by_pipeline_ownership(
+        connection: sqlite3.Connection, edges: Sequence[ChunkEdge]
+    ) -> list[ChunkEdge]:
+        chunk_ids = {edge.src_chunk_id for edge in edges} | {edge.dst_chunk_id for edge in edges}
+        placeholders = ",".join("?" * len(chunk_ids))
+        rows = connection.execute(
+            f"SELECT chunk_id, pipeline_id FROM chunks WHERE chunk_id IN ({placeholders})",
+            list(chunk_ids),
+        ).fetchall()
+        pipeline_by_id = {str(row["chunk_id"]): row["pipeline_id"] for row in rows}
+        return [
+            edge
+            for edge in edges
+            if edge.src_chunk_id in pipeline_by_id
+            and edge.dst_chunk_id in pipeline_by_id
+            and pipeline_by_id[edge.src_chunk_id] == pipeline_by_id[edge.dst_chunk_id]
+        ]
 
     def get_chunk_edges(
         self,
@@ -1520,6 +1605,95 @@ class SQLiteStore(BaseStore):
                     cost_source,
                 ),
             )
+
+    def log_embedding_cost(
+        self,
+        *,
+        pipeline_id: str | None,
+        op: str,
+        text: str,
+    ) -> None:
+        """Record one embedding-adapter call for cost visibility (Finding 3).
+
+        Best-effort only: this sits directly on the write()/query() hot path
+        next to the real ``embed()`` call, so a logging failure here must
+        never be able to break the actual write or query.
+        """
+        try:
+            char_count = len(text)
+            estimated_tokens = estimate_tokens(text)
+            with self._connect() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO embedding_cost_log (
+                        pipeline_id, op, char_count, estimated_tokens, logged_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (pipeline_id, op, char_count, estimated_tokens, time.time()),
+                )
+        except Exception:
+            pass
+
+    def embedding_cost_summary(
+        self,
+        *,
+        pipeline_id: str | None = None,
+    ) -> dict[str, object]:
+        """Return aggregate embedding-adapter call stats, analogous to cost_summary()."""
+        try:
+            clauses: list[str] = []
+            params: list[object] = []
+            if pipeline_id is not None:
+                clauses.append("pipeline_id = ?")
+                params.append(pipeline_id)
+            where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+
+            with self._connect() as connection:
+                total_row = connection.execute(
+                    f"""
+                    SELECT
+                        COUNT(*) AS entry_count,
+                        COALESCE(SUM(char_count), 0) AS char_count_total,
+                        COALESCE(SUM(estimated_tokens), 0) AS estimated_tokens_total
+                    FROM embedding_cost_log
+                    {where}
+                    """,
+                    params,
+                ).fetchone()
+                by_op_rows = connection.execute(
+                    f"""
+                    SELECT
+                        op,
+                        COUNT(*) AS calls,
+                        COALESCE(SUM(estimated_tokens), 0) AS estimated_tokens_total
+                    FROM embedding_cost_log
+                    {where}
+                    GROUP BY op
+                    ORDER BY op ASC
+                    """,
+                    params,
+                ).fetchall()
+        except Exception:
+            return {
+                "summary": {"entry_count": 0, "char_count_total": 0, "estimated_tokens_total": 0},
+                "by_op": [],
+            }
+
+        return {
+            "summary": {
+                "entry_count": int(total_row["entry_count"]),
+                "char_count_total": int(total_row["char_count_total"]),
+                "estimated_tokens_total": int(total_row["estimated_tokens_total"]),
+            },
+            "by_op": [
+                {
+                    "op": str(row["op"]),
+                    "calls": int(row["calls"]),
+                    "estimated_tokens_total": int(row["estimated_tokens_total"]),
+                }
+                for row in by_op_rows
+            ],
+        }
 
     def get_pipeline_goal_versions(
         self,
@@ -3096,8 +3270,20 @@ class SQLiteStore(BaseStore):
         return self._with_runtime_age(validated)
 
     def _assert_src_immutable(self, connection: sqlite3.Connection, chunk: SubconsciousChunk) -> None:
+        """Reject a write that reuses an existing ``chunk_id`` unless it
+        comes from the same author.
+
+        Security fix (docs/NCP_SILENT_DISCONNECT_AUDIT.md finding 9): this
+        used to check only ``src``, so any caller who reused (or guessed --
+        it's returned from every write and appears in every retrieval
+        result) an existing ``chunk_id`` could silently overwrite that
+        chunk's content, ``written_by``, and ``pipeline_id`` in place while
+        keeping ``src="user_verified"``, forging trusted content under
+        someone else's identity. ``written_by`` must now match too, so only
+        the original author can update their own chunk_id in place.
+        """
         row = connection.execute(
-            "SELECT src FROM chunks WHERE chunk_id = ?",
+            "SELECT src, written_by FROM chunks WHERE chunk_id = ?",
             (chunk.chunk_id,),
         ).fetchone()
         if row is None:
@@ -3107,15 +3293,29 @@ class SQLiteStore(BaseStore):
             raise ValueError(
                 f"src is immutable for chunk_id={chunk.chunk_id}: existing={existing_src} new={chunk.src}"
             )
+        existing_written_by = str(row["written_by"])
+        if existing_written_by != chunk.written_by:
+            raise ValueError(
+                f"written_by is immutable for chunk_id={chunk.chunk_id}: "
+                f"existing={existing_written_by} new={chunk.written_by}"
+            )
 
     def _is_duplicate(self, connection: sqlite3.Connection, chunk: SubconsciousChunk) -> bool:
+        # Bounded, most-recent-first scan (mirrors _edge_inference_candidates):
+        # working-zone row count is already capped by max_working_chunks, but
+        # "proven"/"global" zones are not, so an unbounded scan here made every
+        # write to a long-lived non-working (zone, layer, pipeline_id) strictly
+        # slower forever as that combination accumulated rows.
+        limit = self.config.dedup_scan_limit if self.config is not None else 200
         rows = connection.execute(
             """
             SELECT content FROM chunks
             WHERE zone = ? AND layer = ? AND IFNULL(pipeline_id, '') = IFNULL(?, '')
               AND chunk_id != ?
+            ORDER BY created_at DESC
+            LIMIT ?
             """,
-            (chunk.zone, chunk.layer, chunk.pipeline_id, chunk.chunk_id),
+            (chunk.zone, chunk.layer, chunk.pipeline_id, chunk.chunk_id, max(0, int(limit))),
         ).fetchall()
         for row in rows:
             similarity = SequenceMatcher(None, chunk.content, str(row["content"])).ratio()

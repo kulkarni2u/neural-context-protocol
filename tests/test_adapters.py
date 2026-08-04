@@ -81,6 +81,28 @@ class TestAnthropicAdapter:
 
         assert result == ["Hel", "lo", " Paris"]
 
+    def test_stream_wraps_errors_raised_on_manager_entry(self) -> None:
+        # anthropic's Messages.stream() only builds a deferred
+        # MessageStreamManager; the real HTTP request happens on
+        # __enter__(). A provider failure there (auth, rate limit,
+        # connection, timeout) must still surface as NCPAdapterError, not
+        # a raw anthropic.* exception escaping the adapter's error contract.
+        adapter = AnthropicAdapter(api_key="test-key", model="claude-sonnet-4-20250514")
+
+        import anthropic
+
+        class _FailingStreamManager:
+            def __enter__(self) -> _FailingStreamManager:
+                raise anthropic.APIConnectionError(request=MagicMock())
+
+            def __exit__(self, *a: object) -> bool:
+                return False
+
+        with patch.object(adapter._client.messages, "stream") as mock_stream:
+            mock_stream.return_value = _FailingStreamManager()
+            with pytest.raises(NCPAdapterError, match="Anthropic call failed"):
+                list(adapter.stream(NCP_CTX, USER_TURN))
+
     def test_ctx_window(self) -> None:
         assert AnthropicAdapter(api_key="x").ctx_window == 200000
 
@@ -339,6 +361,25 @@ class TestErrorSemantics:
             mock_create.side_effect = anthropic.APITimeoutError("timed out")
             with pytest.raises(NCPAdapterTimeoutError, match="Anthropic timed out"):
                 adapter.call(NCP_CTX, USER_TURN)
+
+    def test_anthropic_stream_timeout_raises(self) -> None:
+        # Regression: stream()'s real network call happens inside the
+        # ``with`` block, not the ``.stream()`` builder call — a timeout
+        # there must still map to NCPAdapterTimeoutError like call() does.
+        adapter = AnthropicAdapter(api_key="test-key")
+        import anthropic
+
+        class _TimingOutStreamManager:
+            def __enter__(self) -> _TimingOutStreamManager:
+                raise anthropic.APITimeoutError(request=MagicMock())
+
+            def __exit__(self, *a: object) -> bool:
+                return False
+
+        with patch.object(adapter._client.messages, "stream") as mock_stream:
+            mock_stream.return_value = _TimingOutStreamManager()
+            with pytest.raises(NCPAdapterTimeoutError, match="Anthropic timed out"):
+                list(adapter.stream(NCP_CTX, USER_TURN))
 
     def test_ollama_timeout_raises(self) -> None:
         adapter = OllamaAdapter()
