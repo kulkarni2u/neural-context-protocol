@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import closing
+import hashlib
 import io
 import json
 import socket
@@ -2360,3 +2361,430 @@ class TestComputedDrift:
         result = _content(_handle_request(_call("ncp_get_context", self._args()), handlers))
 
         assert result["drift"]["method"] == "lexical"
+
+
+class TestPostTurnTrustDriftDerivation:
+    """Audit finding 1: ncp_post_turn's memory_chunks must derive base_trust/
+    written_at_drift the same way ncp_write_memory does, instead of falling
+    back to the bare SubconsciousChunk defaults."""
+
+    def test_post_turn_matches_write_memory_base_trust_for_same_src(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "test.db")
+        handlers = make_handlers(store)
+
+        via_write_memory = _content(_handle_request(
+            _call("ncp_write_memory", {
+                "content": "written via ncp_write_memory",
+                "layer": "semantic",
+                "src": "user_verified",
+                "written_by": "agentA",
+                "pipeline_id": "pipe_cmp",
+            }),
+            handlers,
+        ))
+        via_post_turn = _content(_handle_request(
+            _call("ncp_post_turn", {
+                "agent_id": "agentA",
+                "role": "worker",
+                "task": "t1",
+                "slot": "s1",
+                "intent": "i1",
+                "pipeline_id": "pipe_cmp",
+                "result_summary": "done",
+                "result_full": "done in full",
+                "memory_chunks": [{
+                    "content": "written via ncp_post_turn",
+                    "layer": "semantic",
+                    "src": "user_verified",
+                }],
+            }),
+            handlers,
+        ))
+
+        assert via_post_turn["posted"] is True
+        chunks = store.get_working_zone(pipeline_id="pipe_cmp")
+        write_memory_chunk = next(c for c in chunks if c.chunk_id == via_write_memory["chunk_id"])
+        post_turn_chunk = next(
+            c for c in chunks
+            if c.content == "written via ncp_post_turn"
+        )
+
+        assert write_memory_chunk.base_trust == 0.95
+        assert post_turn_chunk.base_trust == 0.95
+        assert post_turn_chunk.base_trust == write_memory_chunk.base_trust
+
+    def test_post_turn_written_at_drift_matches_this_turns_conscious_drift(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "test.db")
+        handlers = make_handlers(store)
+
+        _content(_handle_request(
+            _call("ncp_post_turn", {
+                "agent_id": "agentB",
+                "role": "worker",
+                "task": "t1",
+                "slot": "s1",
+                "intent": "i1",
+                "pipeline_id": "pipe_drift_pt",
+                "drift_score": 0.37,
+                "result_summary": "done",
+                "result_full": "done in full",
+                "memory_chunks": [{
+                    "content": "drift-tagged chunk",
+                    "layer": "semantic",
+                    "src": "tool_result",
+                }],
+            }),
+            handlers,
+        ))
+
+        chunks = store.get_working_zone(pipeline_id="pipe_drift_pt")
+        chunk = next(c for c in chunks if c.content == "drift-tagged chunk")
+        assert chunk.written_at_drift == 0.37
+
+    def test_post_turn_honors_explicit_base_trust_override(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "test.db")
+        handlers = make_handlers(store)
+
+        _content(_handle_request(
+            _call("ncp_post_turn", {
+                "agent_id": "agentC",
+                "role": "worker",
+                "task": "t1",
+                "slot": "s1",
+                "intent": "i1",
+                "pipeline_id": "pipe_trust_override",
+                "result_summary": "done",
+                "result_full": "done in full",
+                "memory_chunks": [{
+                    "content": "explicit trust chunk",
+                    "layer": "semantic",
+                    "src": "tool_result",
+                    "base_trust": 0.33,
+                }],
+            }),
+            handlers,
+        ))
+
+        chunks = store.get_working_zone(pipeline_id="pipe_trust_override")
+        chunk = next(c for c in chunks if c.content == "explicit trust chunk")
+        assert chunk.base_trust == 0.33
+
+
+class TestEvictionTelemetryCounts:
+    """Audit finding 2: unconditional eviction counts must be non-zero even
+    when the relevance/confidence-gated counts stay at 0."""
+
+    def test_full_budget_eviction_is_visible_even_when_high_relevance_count_is_zero(self, tmp_path: Path) -> None:
+        # Reproduces the audit's exact blind spot: write several genuinely
+        # on-topic chunks (distinct enough to survive write-time dedup),
+        # push their written_at_drift above the 0.3 discount threshold (so
+        # RetrievalPolicy.score lands under 0.5 despite a strong lexical
+        # match), then request a tiny max_tokens so the budget fit evicts
+        # them. The relevance-gated evicted_high_relevance_count stays 0 --
+        # only the new unconditional evicted_chunk_count reveals the drop.
+        store = SQLiteStore(tmp_path / "test.db")
+        handlers = make_handlers(store)
+        details = [
+            "canary_gate", "db_migration", "traffic_shift", "cred_rotation",
+            "alert_thresholds", "rollback_runbook", "comms_plan", "retro_template",
+        ]
+        for i, detail in enumerate(details):
+            writer = f"writer{i}"
+            store.log_conscious(
+                ConsciousBlock(
+                    agent_id=writer, role="x", owns=[], must_not=[],
+                    task="t", slot="s", intent="i",
+                    pipeline_id="pipe_evict", drift_score=0.9,
+                ),
+                snapshot_hash=f"hash_{i}",
+            )
+            _content(_handle_request(
+                _call("ncp_write_memory", {
+                    "content": (
+                        f"topic_alpha_deployment_review checking_release_notes "
+                        f"step {i} detail about {detail} and related considerations "
+                        f"for the release process"
+                    ),
+                    "layer": "semantic",
+                    "src": "tool_result",
+                    "written_by": writer,
+                    "pipeline_id": "pipe_evict",
+                    "base_trust": 0.3,
+                }),
+                handlers,
+            ))
+
+        result = _content(_handle_request(
+            _call("ncp_get_context", {
+                "agent_id": "reader",
+                "role": "analyst",
+                "task": "topic_alpha_deployment_review",
+                "slot": "checking_release_notes",
+                "intent": "find_relevant_facts",
+                "pipeline_id": "pipe_evict",
+                "max_tokens": 40,
+            }),
+            handlers,
+        ))
+
+        telemetry = result["telemetry"]
+        assert telemetry["evicted_high_relevance_count"] == 0
+        assert telemetry["evicted_chunk_count"] > 0
+
+    def test_evicted_chunk_count_is_zero_when_nothing_is_evicted(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "test.db")
+        handlers = make_handlers(store)
+
+        result = _content(_handle_request(
+            _call("ncp_get_context", {
+                "agent_id": "reader",
+                "role": "analyst",
+                "task": "nothing_written_yet",
+                "slot": "reviewing",
+                "intent": "find_relevant_facts",
+                "pipeline_id": "pipe_no_evict",
+            }),
+            handlers,
+        ))
+
+        telemetry = result["telemetry"]
+        assert telemetry["evicted_chunk_count"] == 0
+        assert telemetry["evicted_whisper_count"] == 0
+
+
+class TestConsciousDeadFieldsWiring:
+    """Audit finding 5: intent_anchor/escalate_to/calibration_id must be
+    derived/carried forward instead of staying permanently None."""
+
+    def _post_turn(self, handlers, **overrides: object) -> dict:
+        base = {
+            "agent_id": "fresh_agent",
+            "role": "build",
+            "task": "implement_feature",
+            "slot": "bounded_context",
+            "intent": "ship_it",
+            "pipeline_id": "pipe_anchor",
+            "result_summary": "done",
+            "result_full": "done in full",
+        }
+        base.update(overrides)
+        return _content(_handle_request(_call("ncp_post_turn", base), handlers))
+
+    def test_intent_anchor_is_derived_sha256_on_first_turn_and_carried_forward(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "test.db")
+        handlers = make_handlers(store)
+
+        # First turn for this agent/pipeline: no intent_anchor supplied, and
+        # no prior hydrated state -- must be derived as sha256(task+intent).
+        self._post_turn(handlers)
+        conscious = store.load_latest_conscious(pipeline_id="pipe_anchor", agent_id="fresh_agent")
+        assert conscious is not None
+        anchor = conscious.intent_anchor
+        assert anchor is not None
+        assert len(anchor) == 64
+        assert all(c in "0123456789abcdef" for c in anchor)
+        assert anchor == hashlib.sha256(b"implement_featureship_it").hexdigest()
+
+        # Second turn: task changes but intent_anchor is still omitted --
+        # must carry the *first* turn's anchor forward unchanged, not
+        # recompute from the new task+intent (which would differ from it).
+        self._post_turn(handlers, task="a_completely_different_task", slot="next_step")
+        second_conscious = store.load_latest_conscious(pipeline_id="pipe_anchor", agent_id="fresh_agent")
+        assert second_conscious is not None
+        assert second_conscious.intent_anchor == anchor
+
+    def test_escalate_to_and_calibration_id_carry_forward_when_omitted(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "test.db")
+        handlers = make_handlers(store)
+
+        self._post_turn(
+            handlers,
+            agent_id="escalating_agent",
+            pipeline_id="pipe_escalate",
+            escalate_to="senior_agent",
+            calibration_id="calib_001",
+        )
+        conscious = store.load_latest_conscious(pipeline_id="pipe_escalate", agent_id="escalating_agent")
+        assert conscious is not None
+        assert conscious.escalate_to == "senior_agent"
+        assert conscious.calibration_id == "calib_001"
+
+        # Next turn omits both -- must carry forward, not reset to None.
+        self._post_turn(
+            handlers,
+            agent_id="escalating_agent",
+            pipeline_id="pipe_escalate",
+            slot="next_step",
+        )
+        second_conscious = store.load_latest_conscious(pipeline_id="pipe_escalate", agent_id="escalating_agent")
+        assert second_conscious is not None
+        assert second_conscious.escalate_to == "senior_agent"
+        assert second_conscious.calibration_id == "calib_001"
+
+    def test_explicit_intent_anchor_override_is_honored(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "test.db")
+        handlers = make_handlers(store)
+
+        self._post_turn(
+            handlers,
+            agent_id="override_agent",
+            pipeline_id="pipe_anchor_override",
+            intent_anchor="custom_anchor_value",
+        )
+
+        conscious = store.load_latest_conscious(pipeline_id="pipe_anchor_override", agent_id="override_agent")
+        assert conscious is not None
+        assert conscious.intent_anchor == "custom_anchor_value"
+
+
+class TestWriteMemoryDeadFieldsWiring:
+    """Audit finding 6 + secondary notes: seven SubconsciousChunk fields
+    (plus chunk_type) must be settable through ncp_write_memory and
+    round-trip through the store, not just default/None forever."""
+
+    def test_all_seven_fields_round_trip_via_write_memory(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "test.db")
+        handlers = make_handlers(store)
+
+        result = _content(_handle_request(
+            _call("ncp_write_memory", {
+                "content": "chunk with all dead fields populated",
+                "layer": "semantic",
+                "src": "tool_result",
+                "written_by": "writer",
+                "pipeline_id": "pipe_dead_fields",
+                "owner": "team_platform",
+                "valid_while": "feature_flag_on",
+                "evidence_id": "evid_123",
+                "conditions": ["flag_a_enabled", "region_us"],
+                "result_confidence": 0.87,
+                "result_attempts": 3,
+                "caused_by": "sub_parent_chunk",
+                "chunk_type": "code",
+            }),
+            handlers,
+        ))
+
+        chunk = next(
+            c for c in store.get_working_zone(pipeline_id="pipe_dead_fields")
+            if c.chunk_id == result["chunk_id"]
+        )
+        assert chunk.owner == "team_platform"
+        assert chunk.valid_while == "feature_flag_on"
+        assert chunk.evidence_id == "evid_123"
+        assert chunk.conditions == ["flag_a_enabled", "region_us"]
+        assert chunk.result_confidence == pytest.approx(0.87)
+        assert chunk.result_attempts == 3
+        assert chunk.caused_by == "sub_parent_chunk"
+        assert chunk.chunk_type == "code"
+
+    def test_fields_default_to_none_or_empty_when_omitted(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "test.db")
+        handlers = make_handlers(store)
+
+        result = _content(_handle_request(
+            _call("ncp_write_memory", {
+                "content": "chunk with no extra fields",
+                "layer": "semantic",
+                "src": "tool_result",
+                "pipeline_id": "pipe_defaults",
+            }),
+            handlers,
+        ))
+
+        chunk = next(
+            c for c in store.get_working_zone(pipeline_id="pipe_defaults")
+            if c.chunk_id == result["chunk_id"]
+        )
+        assert chunk.owner is None
+        assert chunk.valid_while is None
+        assert chunk.evidence_id is None
+        assert chunk.conditions == []
+        assert chunk.result_confidence is None
+        assert chunk.result_attempts is None
+        assert chunk.caused_by is None
+        assert chunk.chunk_type == "prose"
+
+    def test_post_turn_memory_chunks_accept_chunk_type(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "test.db")
+        handlers = make_handlers(store)
+
+        _content(_handle_request(
+            _call("ncp_post_turn", {
+                "agent_id": "agentD",
+                "role": "worker",
+                "task": "t1",
+                "slot": "s1",
+                "intent": "i1",
+                "pipeline_id": "pipe_post_turn_chunk_type",
+                "result_summary": "done",
+                "result_full": "done in full",
+                "memory_chunks": [{
+                    "content": "json-shaped memory",
+                    "layer": "semantic",
+                    "src": "tool_result",
+                    "chunk_type": "json",
+                }],
+            }),
+            handlers,
+        ))
+
+        chunks = store.get_working_zone(pipeline_id="pipe_post_turn_chunk_type")
+        chunk = next(c for c in chunks if c.content == "json-shaped memory")
+        assert chunk.chunk_type == "json"
+
+
+class TestActiveFeaturesTelemetry:
+    """Addendum: active_features must be surfaced, and the two pure
+    token-efficiency flags must default to True."""
+
+    def test_active_features_reflects_new_defaults_with_no_config(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "test.db")
+        handlers = make_handlers(store)
+
+        result = _content(_handle_request(
+            _call("ncp_get_context", {
+                "agent_id": "reader",
+                "role": "analyst",
+                "task": "check_features",
+                "slot": "reviewing",
+                "intent": "find_relevant_facts",
+                "pipeline_id": "pipe_features_no_config",
+            }),
+            handlers,
+        ))
+
+        # make_handlers(store) with no config object falls back to the
+        # conservative "config is None -> False" path for every flag here,
+        # matching legacy behavior exactly when no NCPConfig is supplied.
+        assert result["telemetry"]["active_features"] == {
+            "distillation_enabled": False,
+            "adaptive_budget_enabled": False,
+            "memoization_enabled": False,
+            "drift_computed_enabled": False,
+            "rerank_enabled": False,
+        }
+
+    def test_active_features_reflects_loaded_config_defaults(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "test.db")
+        config = load_config(cwd=tmp_path)
+        handlers = make_handlers(store, config=config)
+
+        result = _content(_handle_request(
+            _call("ncp_get_context", {
+                "agent_id": "reader",
+                "role": "analyst",
+                "task": "check_features",
+                "slot": "reviewing",
+                "intent": "find_relevant_facts",
+                "pipeline_id": "pipe_features_with_config",
+            }),
+            handlers,
+        ))
+
+        active_features = result["telemetry"]["active_features"]
+        assert active_features["distillation_enabled"] is True
+        assert active_features["adaptive_budget_enabled"] is True
+        assert active_features["memoization_enabled"] is False
+        assert active_features["drift_computed_enabled"] is False
+        assert active_features["rerank_enabled"] is False

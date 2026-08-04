@@ -186,7 +186,7 @@ def test_distillation_config_defaults_and_overrides(tmp_path) -> None:
     (project / ".ncp").mkdir()
 
     config = load_config(cwd=project)
-    assert config.distillation_enabled is False
+    assert config.distillation_enabled is True
     assert config.distillation_min_chunk_tokens == 120
 
     (project / ".ncp" / "config.toml").write_text(
@@ -273,7 +273,7 @@ def test_adaptive_budget_config_defaults(tmp_path: Path) -> None:
 
     config = load_config(cwd=project)
 
-    assert config.adaptive_budget_enabled is False
+    assert config.adaptive_budget_enabled is True
     assert config.adaptive_budget_floor_tokens == 300
     assert config.adaptive_budget_ceiling_tokens == 2000
 
