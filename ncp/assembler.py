@@ -35,6 +35,8 @@ class AssemblyResult:
     pending_whisper_ids: list[str]
     evicted_high_relevance: list[tuple[str, float]]
     evicted_whispers: list[tuple[str, float]]
+    evicted_chunk_count: int = 0
+    evicted_whisper_count: int = 0
 
 
 class Assembler:
@@ -102,6 +104,8 @@ class Assembler:
         list[Whisper],
         list[tuple[str, float]],
         list[tuple[str, float]],
+        int,
+        int,
     ]:
         conscious, budget = self.middleware.pre_assemble(conscious, budget)
         coherence_report = self.coherence.check(conscious)
@@ -186,7 +190,21 @@ class Assembler:
                 and whisper.whisper_id not in evicted_whisper_ids
                 and float(whisper.confidence) >= 0.6
             )
-        return hydrated, budget, combined_chunks, combined_whispers, evicted_high_relevance, evicted_whispers
+        # Finding 2: unconditional eviction totals, independent of the
+        # relevance/confidence gate above -- captures cap- and budget-fit
+        # evictions even when nothing cleared the >=0.5/>=0.6 threshold.
+        evicted_chunk_count = len(deduped_chunks) - len(combined_chunks)
+        evicted_whisper_count = len(all_whispers) - len(combined_whispers)
+        return (
+            hydrated,
+            budget,
+            combined_chunks,
+            combined_whispers,
+            evicted_high_relevance,
+            evicted_whispers,
+            evicted_chunk_count,
+            evicted_whisper_count,
+        )
 
     def assemble(
         self,
@@ -200,7 +218,16 @@ class Assembler:
         max_tokens: int | None = None,
         as_of: float | None = None,
     ) -> AssemblyResult:
-        hydrated, budget, combined_chunks, combined_whispers, evicted_high_relevance, evicted_whispers = self._prepare_assembly(
+        (
+            hydrated,
+            budget,
+            combined_chunks,
+            combined_whispers,
+            evicted_high_relevance,
+            evicted_whispers,
+            evicted_chunk_count,
+            evicted_whisper_count,
+        ) = self._prepare_assembly(
             conscious=conscious,
             budget=budget,
             query_text=query_text,
@@ -229,6 +256,8 @@ class Assembler:
             ],
             evicted_high_relevance=evicted_high_relevance,
             evicted_whispers=evicted_whispers,
+            evicted_chunk_count=evicted_chunk_count,
+            evicted_whisper_count=evicted_whisper_count,
         )
 
     def assemble_incremental(
@@ -254,7 +283,7 @@ class Assembler:
         Callers that use post_assemble middleware should apply it to the
         concatenated result: ``mw.post_assemble("\\n\\n".join(t for _, t in sections))``.
         """
-        hydrated, budget, combined_chunks, combined_whispers, _, _ = self._prepare_assembly(
+        hydrated, budget, combined_chunks, combined_whispers, _, _, _, _ = self._prepare_assembly(
             conscious=conscious,
             budget=budget,
             query_text=query_text,

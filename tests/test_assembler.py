@@ -421,6 +421,66 @@ def test_token_budget_reports_high_relevance_chunks_it_drops(tmp_path: Path) -> 
 
     evicted_ids = {chunk_id for chunk_id, _ in result.evicted_high_relevance}
     assert evicted_ids
+    # The two dropped chunks are both >= 0.5, so the unconditional count
+    # must agree with the relevance-gated one here.
+    assert result.evicted_chunk_count == len(evicted_ids)
+
+
+def test_evicted_chunk_count_is_nonzero_even_when_evicted_high_relevance_is_empty(tmp_path: Path) -> None:
+    # Audit finding 2: chunks the token budget drops below the 0.5 relevance
+    # gate leave zero trace in evicted_high_relevance -- only the new
+    # unconditional evicted_chunk_count reveals that anything was dropped.
+    store = SQLiteStore(tmp_path / "token-budget-blind-spot.db")
+    chunks = [
+        SubconsciousChunk(
+            chunk_id=f"large_low_rel_{index}",
+            layer="semantic",
+            content=" ".join(["implement_store assemble_context"] + [f"term_{index}_{j}" for j in range(160)]),
+            src="tool_result",
+            pipeline_id="pipe_1",
+            relevance=0.2,
+        )
+        for index in range(2)
+    ]
+
+    def _query(*args: object, **kwargs: object) -> list[SubconsciousChunk]:
+        return chunks
+
+    store.query = _query  # type: ignore[method-assign]
+    assembler = Assembler(store=store)
+
+    result = assembler.assemble(
+        conscious=_make_conscious(),
+        budget=BudgetContext(pressure="medium"),
+        query_text="implement_store assemble_context",
+        max_tokens=200,
+    )
+
+    assert result.evicted_high_relevance == []
+    assert result.evicted_chunk_count > 0
+
+
+def test_evicted_chunk_count_is_zero_when_nothing_is_dropped(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "no-drop.db")
+    store.write(
+        SubconsciousChunk(
+            chunk_id="sub_kept",
+            layer="semantic",
+            content="implement_store assemble_context small chunk that always fits",
+            src="tool_result",
+            pipeline_id="pipe_1",
+        )
+    )
+    assembler = Assembler(store=store)
+
+    result = assembler.assemble(
+        conscious=_make_conscious(),
+        budget=BudgetContext(pressure="medium"),
+        query_text="implement_store assemble_context",
+    )
+
+    assert result.evicted_chunk_count == 0
+    assert result.evicted_whisper_count == 0
 
 
 def test_assembler_reports_evicted_whispers_without_draining_queue(tmp_path: Path) -> None:
@@ -448,6 +508,11 @@ def test_assembler_reports_evicted_whispers_without_draining_queue(tmp_path: Pat
     assert result.pending_whisper_ids == [result.whispers[1].whisper_id]
     assert result.evicted_whispers
     assert any(confidence >= 0.6 for _, confidence in result.evicted_whispers)
+    # Note: evicted_whisper_count only tracks eviction *after* the
+    # alert/whisper caps run (i.e. budget-fit drops of the already-capped
+    # set), so it does not have to equal len(evicted_whispers) here -- this
+    # eviction happened at the cap stage, before max_tokens is even applied.
+    assert result.evicted_whisper_count == 0
 
     remaining = store.drain_whispers(agent_id="executor", pipeline_id="pipe_1", max_items=5)
     assert any(whisper.payload == "follow_up_review" for whisper in remaining)

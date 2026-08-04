@@ -30,6 +30,9 @@ def _make_store_spy() -> tuple[MagicMock, list[dict]]:
     store.acknowledge_whispers = MagicMock(return_value=0)
     store.get_pipeline_goal_versions = MagicMock(return_value={})
     store.coordination = None  # prevent MCP server from treating mock attrs as coordination
+    # No prior conscious snapshot -- otherwise MagicMock auto-attributes
+    # (e.g. .escalate_to) fail ConsciousBlock's str-or-None validation.
+    store.load_latest_conscious = MagicMock(return_value=None)
     return store, call_log
 
 

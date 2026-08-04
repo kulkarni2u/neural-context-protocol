@@ -50,10 +50,11 @@ DEFAULT_CONFIG = {
         "pipeline_budget_usd": None,
         "budget_warn_fraction": 0.8,
         "budget_enforcement": "warn",
-        # CAP-C6: adaptive per-turn context token budget. Default false
-        # (opt-in) -- disabled preserves exact legacy behavior. Floor/ceiling
-        # are only consulted when enabled.
-        "adaptive_budget_enabled": False,
+        # CAP-C6: adaptive per-turn context token budget. Default true --
+        # this is a pure token-efficiency mechanism with no correctness
+        # downside for being on. Floor/ceiling are only consulted when
+        # enabled.
+        "adaptive_budget_enabled": True,
         "adaptive_budget_floor_tokens": 300,
         "adaptive_budget_ceiling_tokens": 2000,
     },
@@ -101,7 +102,7 @@ DEFAULT_CONFIG = {
         "model": "BAAI/bge-small-en-v1.5",
     },
     "distillation": {
-        "enabled": False,
+        "enabled": True,
         "min_chunk_tokens": 120,
     },
     "consolidation": {
@@ -374,7 +375,7 @@ class NCPConfig:
     @property
     def adaptive_budget_enabled(self) -> bool:
         """CAP-C6: whether ncp_get_context adapts the token budget to turn difficulty."""
-        return bool(self.values.get("budget", {}).get("adaptive_budget_enabled", False))
+        return bool(self.values.get("budget", {}).get("adaptive_budget_enabled", True))
 
     @property
     def adaptive_budget_floor_tokens(self) -> int:
@@ -426,7 +427,7 @@ class NCPConfig:
 
     @property
     def distillation_enabled(self) -> bool:
-        return bool(self.values.get("distillation", {}).get("enabled", False))
+        return bool(self.values.get("distillation", {}).get("enabled", True))
 
     @property
     def distillation_min_chunk_tokens(self) -> int:

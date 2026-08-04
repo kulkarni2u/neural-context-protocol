@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+from hashlib import sha256
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -93,6 +94,8 @@ MCP_TOOLS: list[dict[str, object]] = [
                 "ctx_used": {"type": "number", "description": "Context window usage ratio 0.0-1.0."},
                 "steps_completed": {"type": "integer", "description": "Completed plan steps for budget pressure."},
                 "steps_total": {"type": "integer", "description": "Total plan steps for budget pressure."},
+                "escalate_to": {"type": "string", "description": "Optional escalation target overriding hydrated conscious state."},
+                "calibration_id": {"type": "string", "description": "Optional calibration pass id overriding hydrated conscious state."},
                 "as_of": {
                     "type": "string",
                     "description": (
@@ -181,6 +184,22 @@ MCP_TOOLS: list[dict[str, object]] = [
                         },
                         "required": ["dst", "type"],
                     },
+                },
+                "owner": {"type": "string", "description": "Optional owning agent/identity for this chunk."},
+                "valid_while": {"type": "string", "description": "Optional human-readable condition under which this chunk remains valid."},
+                "evidence_id": {"type": "string", "description": "Optional id of the evidence backing this chunk."},
+                "conditions": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional list of conditions this chunk's content depends on.",
+                },
+                "result_confidence": {"type": "number", "description": "Optional confidence 0.0-1.0 in this chunk's result."},
+                "result_attempts": {"type": "integer", "description": "Optional number of attempts that produced this chunk's result."},
+                "caused_by": {"type": "string", "description": "Chunk ID that prompted this write (causal parent)."},
+                "chunk_type": {
+                    "type": "string",
+                    "enum": ["prose", "json", "code", "table", "auto"],
+                    "description": "Optional declared content shape. Defaults to 'prose'.",
                 },
             },
             "required": ["content", "layer", "src"],
@@ -381,6 +400,8 @@ MCP_TOOLS: list[dict[str, object]] = [
                 "cache_read_tokens": {"type": "integer"},
                 "cost_usd": {"type": "number"},
                 "latency_ms": {"type": "integer"},
+                "escalate_to": {"type": "string", "description": "Optional escalation target overriding hydrated conscious state."},
+                "calibration_id": {"type": "string", "description": "Optional calibration pass id overriding hydrated conscious state."},
                 "ack_whisper_ids": {"type": "array", "items": {"type": "string"}},
                 "memory_chunks": {
                     "type": "array",
@@ -397,6 +418,11 @@ MCP_TOOLS: list[dict[str, object]] = [
                             "src": {"type": "string", "enum": ["user_verified", "tool_result", "agent_inferred", "synthesis", "subcon_retrieved"]},
                             "chunk_id": {"type": "string", "description": "Optional chunk ID (auto-generated if omitted)"},
                             "written_by": {"type": "string", "description": "Agent writing this chunk (defaults to agent_id)"},
+                            "chunk_type": {
+                                "type": "string",
+                                "enum": ["prose", "json", "code", "table", "auto"],
+                                "description": "Optional declared content shape. Defaults to 'prose'.",
+                            },
                         },
                         "required": ["content", "layer", "src"],
                     },
@@ -763,11 +789,15 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
     budget_enforcement = config.budget_enforcement if config is not None else "warn"
     # CAP-E3: model-tiering advisory signal, on by default.
     tier_hints_enabled = config.tier_hints_enabled if config is not None else True
-    # CAP-C6: adaptive per-turn context token budget, opt-in (off by default).
+    # CAP-C6: adaptive per-turn context token budget, on by default (pure
+    # token-efficiency mechanism with no correctness downside).
     adaptive_budget_enabled = config.adaptive_budget_enabled if config is not None else False
     adaptive_budget_floor_tokens = config.adaptive_budget_floor_tokens if config is not None else 300
     adaptive_budget_ceiling_tokens = config.adaptive_budget_ceiling_tokens if config is not None else 2000
     default_context_token_budget = config.context_token_budget if config is not None else 840
+    # Token-efficiency: distillation (trim, don't drop, chunks that don't fit
+    # the budget), on by default -- same rationale as adaptive_budget above.
+    distillation_enabled = config.distillation_enabled if config is not None else False
     # CAP-T5: computed drift, opt-in (off by default -- legacy self-reported
     # drift_score is unchanged when disabled).
     drift_computed_enabled = config.drift_computed_enabled if config is not None else False
@@ -844,9 +874,21 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             "evicted_high_relevance_count": len(evicted_high_relevance),
             "evicted_whispers": evicted_whispers,
             "evicted_whispers_count": len(evicted_whispers),
+            # Finding 2: unconditional totals, independent of the
+            # relevance/confidence gate above -- non-zero here even when the
+            # filtered counts above stay 0.
+            "evicted_chunk_count": getattr(result, "evicted_chunk_count", 0),
+            "evicted_whisper_count": getattr(result, "evicted_whisper_count", 0),
             "pending_whisper_ids": pending_whisper_ids,
             "fetch_budget_remaining": fetch_budget_remaining,
             "fetch_hint": "ncp_fetch" if evicted_high_relevance and fetch_budget_remaining > 0 else None,
+            "active_features": {
+                "distillation_enabled": distillation_enabled,
+                "adaptive_budget_enabled": adaptive_budget_enabled,
+                "memoization_enabled": config.memoization_enabled if config else False,
+                "drift_computed_enabled": drift_computed_enabled,
+                "rerank_enabled": config.rerank_enabled if config else False,
+            },
         }
 
     def _tier_signal(result: object, *, budget: BudgetContext, search_text: str):
@@ -1142,6 +1184,26 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         }
         if (chunk_id := args.get("chunk_id")):
             kwargs["chunk_id"] = str(chunk_id)
+        # Finding 6: thread through the seven SubconsciousChunk fields that
+        # were previously pure DB round-trips (never settable by any of the
+        # 5 core tools). schema_version is intentionally left untouched --
+        # it's an internal version marker, not caller data.
+        if (owner := args.get("owner")) is not None:
+            kwargs["owner"] = str(owner)
+        if (valid_while := args.get("valid_while")) is not None:
+            kwargs["valid_while"] = str(valid_while)
+        if (evidence_id := args.get("evidence_id")) is not None:
+            kwargs["evidence_id"] = str(evidence_id)
+        if "conditions" in args:
+            kwargs["conditions"] = _list_arg(args, "conditions", [])
+        if "result_confidence" in args:
+            kwargs["result_confidence"] = _float_arg(args, "result_confidence", 0.0)
+        if "result_attempts" in args:
+            kwargs["result_attempts"] = _int_arg(args, "result_attempts", 0)
+        if (caused_by := args.get("caused_by")) is not None:
+            kwargs["caused_by"] = str(caused_by)
+        if (chunk_type := args.get("chunk_type")) is not None:
+            kwargs["chunk_type"] = str(chunk_type)
 
         raw_ref: str | None = None
         if fr.was_filtered and len(raw_content) <= 2000:
@@ -1269,9 +1331,16 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
                 "src": str(item["src"]),
                 "written_by": str(item.get("written_by") or conscious.agent_id),
                 "pipeline_id": conscious.pipeline_id,
+                # Finding 1: derive base_trust/written_at_drift the same way
+                # _handle_write_memory does, so a chunk written through this
+                # batch path is not silently flattened to the bare defaults.
+                "base_trust": _trust_from_args(item),
+                "written_at_drift": conscious.drift_score,
             }
             if (chunk_id := item.get("chunk_id")):
                 chunk_kwargs["chunk_id"] = str(chunk_id)
+            if (chunk_type := item.get("chunk_type")) is not None:
+                chunk_kwargs["chunk_type"] = str(chunk_type)
             memory_chunks.append(SubconsciousChunk(**chunk_kwargs))
         record = assembler.post_turn(
             conscious=conscious,
@@ -1647,14 +1716,42 @@ def _build_conscious_from_args(store: BaseStore, args: dict[str, object]) -> Con
     pipeline_id = None if pipeline_value is None else str(pipeline_value)
     agent_id = str(args["agent_id"])
     latest = store.load_latest_conscious(pipeline_id=pipeline_id, agent_id=agent_id)
+    task = str(args["task"])
+    intent = str(args["intent"])
+
+    # Finding 5: escalate_to/calibration_id are plain carry-forward fields --
+    # explicit arg wins, else the last hydrated value, else None.
+    escalate_to_raw = args.get("escalate_to")
+    if escalate_to_raw is not None:
+        escalate_to = str(escalate_to_raw)
+    else:
+        escalate_to = None if latest is None else latest.escalate_to
+
+    calibration_id_raw = args.get("calibration_id")
+    if calibration_id_raw is not None:
+        calibration_id = str(calibration_id_raw)
+    else:
+        calibration_id = None if latest is None else latest.calibration_id
+
+    # intent_anchor: explicit arg wins, else carry forward, else -- on the
+    # first turn for this agent/pipeline -- derive it as sha256(task+intent),
+    # matching the protocol spec's "sha256 of original intent at turn 0".
+    intent_anchor_raw = args.get("intent_anchor")
+    if intent_anchor_raw is not None:
+        intent_anchor = str(intent_anchor_raw)
+    elif latest is not None:
+        intent_anchor = latest.intent_anchor
+    else:
+        intent_anchor = sha256(f"{task}{intent}".encode("utf-8")).hexdigest()
+
     return ConsciousBlock(
         agent_id=agent_id,
         role=str(args["role"]),
         owns=_list_arg(args, "owns", [] if latest is None else latest.owns),
         must_not=_list_arg(args, "must_not", [] if latest is None else latest.must_not),
-        task=str(args["task"]),
+        task=task,
         slot=str(args["slot"]),
-        intent=str(args["intent"]),
+        intent=intent,
         pipeline_id=pipeline_id,
         recent=_list_arg(args, "recent", [] if latest is None else latest.recent),
         tried=_list_arg(args, "tried", [] if latest is None else latest.tried),
@@ -1666,6 +1763,9 @@ def _build_conscious_from_args(store: BaseStore, args: dict[str, object]) -> Con
         ctx_used_ratio=min(1.0, max(0.0, _float_arg(args, "ctx_used", 0.0 if latest is None else latest.ctx_used_ratio))),
         steps_completed=_int_arg(args, "steps_completed", 0 if latest is None else latest.steps_completed),
         steps_total=(None if latest is None else latest.steps_total),
+        intent_anchor=intent_anchor,
+        escalate_to=escalate_to,
+        calibration_id=calibration_id,
     )
 
 
