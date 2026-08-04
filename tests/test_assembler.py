@@ -1,6 +1,9 @@
 from pathlib import Path
 
+import pytest
+
 from ncp.assembler import Assembler
+from ncp.config import load_config
 from ncp.tokens import estimate_tokens
 from ncp.stores.sqlite import SQLiteStore
 from ncp.types import BudgetContext, ConsciousBlock, NCPResponse, SubconsciousChunk, TurnRecord, Whisper
@@ -567,3 +570,166 @@ def test_apply_post_middleware_invokes_registered_transformations(tmp_path: Path
     assembler = Assembler(store=store, middleware=pipeline)
     result = assembler.apply_post_middleware("hello ncp world")
     assert result == "hello ncp world[TAGGED]"
+
+
+# ---------------------------------------------------------------------------
+# Regression: cold-start bootstrap must truncate, not crash, on a long
+# task/intent (silent-disconnect audit finding 9)
+# ---------------------------------------------------------------------------
+
+
+def test_cold_start_bootstrap_truncates_long_task_intent_instead_of_crashing(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "store.db")
+    assembler = Assembler(store=store)
+    conscious = ConsciousBlock(
+        agent_id="agentA",
+        role="worker",
+        owns=[],
+        must_not=[],
+        task="x" * 1200,
+        slot="s",
+        intent="y" * 1200,
+        pipeline_id="pipe_empty_cold2",
+    )
+
+    # Must not raise a pydantic ValidationError even though the raw
+    # interpolated f-string would exceed SubconsciousChunk's 2000-char cap.
+    result = assembler.assemble(
+        conscious=conscious,
+        budget=BudgetContext(),
+        query_text="anything",
+        max_tokens=5000,
+    )
+
+    assert len(result.chunks) == 1
+    cold_chunk = result.chunks[0]
+    assert len(cold_chunk.content) <= 2000
+    assert cold_chunk.content.startswith("pipeline_summary agent:agentA")
+
+
+def test_cold_start_bootstrap_leaves_short_task_intent_untouched(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "store.db")
+    assembler = Assembler(store=store)
+    conscious = _make_conscious(pipeline_id="pipe_empty_cold_short")
+
+    result = assembler.assemble(
+        conscious=conscious,
+        budget=BudgetContext(),
+        query_text="anything",
+        max_tokens=5000,
+    )
+
+    assert len(result.chunks) == 1
+    assert result.chunks[0].content == (
+        f"pipeline_summary agent:{conscious.agent_id} task:{conscious.task} intent:{conscious.intent}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Regression: supersession suppression must run regardless of edge_expansion
+# (silent-disconnect audit finding 9)
+# ---------------------------------------------------------------------------
+
+
+def test_supersession_suppressed_even_when_edge_expansion_disabled(tmp_path: Path) -> None:
+    project = tmp_path / "repo"
+    (project / ".git").mkdir(parents=True)
+    config = load_config(env={"NCP_EDGE_EXPANSION": "false", "NCP_STORE_PATH": str(project / "s.db")})
+    store = SQLiteStore(project / "s.db")
+    store.write(
+        SubconsciousChunk(
+            chunk_id="fact_v1",
+            layer="episodic",
+            content="apply_guard fix_npe old fact",
+            src="agent_inferred",
+            pipeline_id="pipe_1",
+        )
+    )
+    store.write(
+        SubconsciousChunk(
+            chunk_id="fact_v2",
+            layer="episodic",
+            content="apply_guard fix_npe new fact",
+            src="agent_inferred",
+            supersedes="fact_v1",
+            pipeline_id="pipe_1",
+        )
+    )
+
+    assembler = Assembler(store=store, config=config)
+    result = assembler.assemble(
+        conscious=_make_conscious(
+            agent_id="fixer",
+            task="fix_npe",
+            slot="apply_guard",
+            intent="resolve_bug",
+            pipeline_id="pipe_1",
+        ),
+        budget=BudgetContext(ctx_used=0.2, steps_completed=1, steps_total=3, elapsed_seconds=5),
+    )
+
+    ids = {chunk.chunk_id for chunk in result.chunks}
+    assert "fact_v2" in ids
+    assert "fact_v1" not in ids
+
+
+# ---------------------------------------------------------------------------
+# Regression: an out-of-range world_check whisper must not block later,
+# well-formed world_check whispers from updating drift_score
+# (silent-disconnect audit finding 9)
+# ---------------------------------------------------------------------------
+
+
+def test_apply_drift_feedback_skips_out_of_range_signal_and_applies_next_valid(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "store.db")
+    assembler = Assembler(store=store)
+    conscious = _make_conscious(drift_score=0.0)
+
+    out_of_range = Whisper(
+        from_agent="sensorA",
+        target="executor",
+        whisper_type="world_check",
+        payload={"anchor_intent": "i", "detected_drift": 5.0},
+        confidence=0.9,
+        pipeline_id="pipe_1",
+    )
+    valid = Whisper(
+        from_agent="sensorB",
+        target="executor",
+        whisper_type="world_check",
+        payload={"anchor_intent": "i", "detected_drift": 0.85},
+        confidence=0.9,
+        pipeline_id="pipe_1",
+    )
+
+    updated = assembler._apply_drift_feedback(conscious, [out_of_range, valid])
+
+    assert updated.drift_score == pytest.approx(0.85)
+
+
+def test_apply_drift_feedback_stops_at_first_applied_valid_signal(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "store.db")
+    assembler = Assembler(store=store)
+    conscious = _make_conscious(drift_score=0.0)
+
+    first_valid = Whisper(
+        from_agent="sensorA",
+        target="executor",
+        whisper_type="world_check",
+        payload={"anchor_intent": "i", "detected_drift": 0.4},
+        confidence=0.9,
+        pipeline_id="pipe_1",
+    )
+    second_valid = Whisper(
+        from_agent="sensorB",
+        target="executor",
+        whisper_type="world_check",
+        payload={"anchor_intent": "i", "detected_drift": 0.9},
+        confidence=0.9,
+        pipeline_id="pipe_1",
+    )
+
+    updated = assembler._apply_drift_feedback(conscious, [first_valid, second_valid])
+
+    # First well-formed, in-range signal wins; loop still stops there.
+    assert updated.drift_score == pytest.approx(0.4)

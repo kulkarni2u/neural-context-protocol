@@ -27,12 +27,14 @@ Findings are ranked silent-first, most-impactful first within that bucket.
 
 Every finding and the addendum below has a corresponding fix merged on this
 branch (finding 8 was reported after the initial pass, added and fixed in a
-follow-up). Full suite after integration: **1117 passed, 32 skipped** (the skips
-are all pgvector/psycopg/redis/optional-provider-extra tests correctly
-skipping for lack of a live service in this environment), plus one
-pre-existing, unrelated failure (`tests/test_enhancements.py::
-test_reranker_cohere_mocked` — `cohere` isn't in the `dev` extras) confirmed
-present identically before any of these changes.
+follow-up). Findings 9-14 came from a full bug-bounty-style pass across the
+whole codebase (MCP protocol/security, storage, core assembly/retrieval
+logic, and adapters/CLI/SDK, hunted in parallel and fixed as they were
+confirmed). Full suite after integration: see the final commit on this
+branch for the exact pass/skip counts; the only expected failure is
+`tests/test_enhancements.py::test_reranker_cohere_mocked` (`cohere` isn't in
+the `dev` extras), confirmed present identically before any of these
+changes.
 
 | Finding | Fix |
 |---|---|
@@ -45,6 +47,12 @@ present identically before any of these changes.
 | 7 — No live-process coverage for whisper/post_turn | New shared dogfood scenario exercises `ncp_emit_whisper` + `ncp_post_turn` over both the real stdio and HTTP/SSE MCP transports |
 | Addendum — features off by default | `adaptive_budget_enabled` and `distillation_enabled` now default `true`; `ncp_get_context` telemetry gained an `active_features` block |
 | 8 — Silent trust/recency retrieval fallback ("frozen injects") | Fallback is now `retrieval.fallback_to_trust_recency_enabled`-gated (default `true`, unchanged behavior) instead of hardcoded, and firing it is surfaced as `telemetry.retrieval_used_fallback` |
+| 9 — Cross-pipeline authorization bypass via `supersedes`/`edges`/chunk_id reuse | `supersede()`/`add_chunk_edges()` now require matching `pipeline_id`; `write()`'s immutability check now covers `written_by`, not just `src` |
+| 10 — Stdio DoS + auth-token timing side channel | A malformed-shape (not malformed-JSON) message no longer kills the whole server loop; HTTP bearer-token check now uses `hmac.compare_digest` |
+| 11 — Cold-start bootstrap crashes `assemble()` on a long task/intent | `_cold_start_bootstrap` now truncates the interpolated content to fit `SubconsciousChunk`'s 2000-char cap instead of raising a `ValidationError` |
+| 12 — Superseded facts reappear when `edge_expansion` is disabled | `_suppress_superseded` now runs unconditionally in `_prepare_assembly`, no longer gated on the unrelated `edge_expansion` flag |
+| 13 — Malformed `world_check` whisper blocks later valid drift signals | `_apply_drift_feedback`'s `break` now only fires once a signal is actually applied; out-of-range `detected_drift` falls through to the next whisper |
+| 14 — `RetrievalPolicy.score()` can exceed its documented `[0, 1]` range | `bm25_normalized` is now double-clamped (`max(0.0, min(1.0, ...))`, matching `score_with_vector`'s existing clamp) |
 
 ---
 
@@ -471,6 +479,305 @@ present identically before any of these changes.
      `retrieval_used_fallback: bool` — so a caller/agent can now tell
      "this context is genuinely query-relevant" from "this is trust/recency
      filler, treat it accordingly" instead of the two being indistinguishable.
+
+---
+
+## 9. Cross-pipeline authorization bypass via `supersedes`, `edges`, and chunk_id reuse
+
+**Status: Fixed.**
+
+- **Location:** `ncp/stores/sqlite.py:894-913` (`supersede`), `:1130-1134`
+  (`add_chunk_edges`), `:3272-3283` (`_assert_src_immutable`); same pattern in
+  `ncp/stores/pgvector.py` and `ncp/stores/pgvector_async.py`; wired from
+  `ncp/mcp/server.py`'s `_handle_write_memory`
+- **Type:** adapter-gap — the write path never enforced an ownership
+  invariant the rest of the system (retrieval, bitemporal visibility,
+  trust scoring) implicitly assumes
+- **Severity:** silent — no error, and not gated by signature verification
+  even with `require_signatures=True`; a valid signature only proves
+  authorship of the *new* chunk's content, never any relationship to a
+  chunk it references
+- **Evidence:** found independently by two parallel bug-bounty passes (MCP
+  protocol/security domain and storage/persistence domain), both confirming
+  the same three-part exploit against the real `ncp_write_memory` handler:
+
+  1. **Cross-pipeline `supersedes`:** `store.supersede(old_chunk_id,
+     new_chunk_id, ...)` ran a bare `UPDATE chunks SET superseded_by=?,
+     valid_to=? WHERE chunk_id=?` with no ownership check at all. Any
+     caller could pass an arbitrary `chunk_id` from a *different pipeline*
+     via `ncp_write_memory`'s `supersedes` param and silently retire it —
+     `is_currently_valid()` excludes any chunk with `superseded_by is not
+     None` from default (non-`as_of`) queries, so this made another
+     pipeline's `user_verified` chunk vanish from normal reads.
+  2. **Cross-pipeline `edges`:** `store.add_chunk_edges()` had the identical
+     gap — any caller could attach an edge (e.g. `contradicts`, weight 5.0)
+     from their own new chunk to an arbitrary victim chunk in an unrelated
+     pipeline, with zero existence or ownership check on `dst`.
+  3. **Chunk_id reuse / content forgery:** `write()`'s only anti-tamper
+     check (`_assert_src_immutable`) verified that `src` didn't change for
+     a reused `chunk_id` — but not `written_by`. Since `chunk_id` is
+     returned from every write and appears in every retrieval result, any
+     caller who learned an existing `chunk_id` could reuse it with
+     `src="user_verified"` and overwrite that chunk's content, author, and
+     even `pipeline_id` in place, forging trusted content under another
+     identity while keeping full trust.
+
+  All three confirmed live against the real `ncp_write_memory` handler,
+  including with `require_signatures=True` and a valid registered Ed25519
+  identity for the attacker (maximum auth hardening enabled): the victim's
+  chunk was silently tombstoned/hijacked despite the attacker's write being
+  fully "verified".
+
+- **Fix:**
+  1. `supersede()` now looks up both chunks' `pipeline_id` and only applies
+     the update when they match (`None == None`, i.e. both unscoped, is
+     allowed; any other mismatch returns `False`).
+  2. `add_chunk_edges()` now resolves the `pipeline_id` of every referenced
+     `src`/`dst` chunk in one query and filters out any edge whose src and
+     dst don't share the same pipeline scope before inserting.
+  3. `write()`'s immutability check now covers `written_by` in addition to
+     `src` — reusing an existing `chunk_id` under a different author raises
+     `ValueError` instead of silently overwriting.
+
+  All three fixes applied identically across `sqlite.py`, `pgvector.py`,
+  and `pgvector_async.py`. Verified via live exploit repro before/after
+  (cross-pipeline supersede, cross-pipeline edge attachment, and
+  same-chunk_id content forgery all blocked; legitimate same-pipeline/
+  same-author operations confirmed to still work). Regression coverage:
+  `tests/test_sqlite_store.py::test_sqlite_store_written_by_is_immutable_for_existing_chunk_id`,
+  `::test_sqlite_store_supersede_rejects_cross_pipeline_target`,
+  `::test_sqlite_store_add_chunk_edges_rejects_cross_pipeline_dst`.
+
+---
+
+## 10. Malformed stdio message permanently kills the MCP server process; auth-token comparison is not constant-time
+
+**Status: Fixed.**
+
+- **Location:** `ncp/mcp/server.py:1884-1915` (`_read_message`), `:1959-1996`
+  (`serve_streams`); `:2250-2255` (`_MCPHTTPHandler._authorized`)
+- **Type:** untraced-path (DoS) / timing side-channel
+- **Severity:** silent — no error visible to the attacker beyond the
+  service going dark; the timing leak is silent by definition
+- **Evidence:**
+
+  **Stdio DoS:** `_read_message` reads exactly `Content-Length` bytes (the
+  stream stays perfectly in sync) and parses valid JSON, then raised a bare
+  `ValueError` if the parsed value wasn't a `dict` (e.g. a syntactically
+  valid `[1,2,3]` body). `serve_streams` caught this under the same
+  `except ValueError` branch used for genuine framing corruption and did
+  `break`, ending the read loop — the whole MCP session died. Confirmed
+  live: sending `[1,2,3]` followed by a completely well-formed
+  `{"jsonrpc":"2.0","id":1,"method":"ping"}` produced **zero output at
+  all** — the valid ping was never even reached. The HTTP transport already
+  handled the identical case correctly (a clean `400`), confirming this was
+  an oversight in the stdio path specifically.
+
+  **Timing side channel:** `_authorized()` compared the bearer token with
+  plain `==`, which short-circuits on the first mismatched byte — a
+  per-byte timing oracle for a network attacker trying to recover a
+  configured `auth_token`.
+
+- **Fix:**
+  1. Introduced `_MCPMessageShapeError(ValueError)`, raised specifically
+     for "fully-consumed body, valid JSON, wrong shape." `serve_streams`
+     now catches it before the generic `ValueError` branch and treats it
+     like the existing `JSONDecodeError` case (log and `continue`) instead
+     of stream desync (`break`). Verified: the malformed-then-valid repro
+     above now gets a proper response to the `ping`.
+  2. `_authorized()` now uses `hmac.compare_digest` instead of `==`.
+
+  Regression coverage:
+  `tests/test_mcp_server.py::TestInitialize::test_malformed_message_shape_does_not_kill_the_server_loop`,
+  `::TestInitialize::test_http_transport_enforces_auth_when_token_configured`
+  (extended with near-miss/short-miss cases).
+
+---
+
+## 11. Cold-start bootstrap crashes `Assembler.assemble()` on a legitimate long task/intent
+
+**Status: Fixed.**
+
+- **Location:** `ncp/assembler.py:476-495` (`_cold_start_bootstrap`), vs.
+  `ncp/types.py:265-270` (`SubconsciousChunk._content_within_limit`)
+- **Type:** untraced-path — a validator boundary two layers away from the
+  code that violates it
+- **Severity:** loud where it fires (an unhandled exception, not silent data
+  loss), but the trigger condition itself is silent: nothing signals that a
+  normal, valid `task`/`intent` pair is close to blowing up the very first
+  turn of a pipeline
+- **Evidence:**
+
+  On a pipeline's first turn (zero retrievable chunks), `_prepare_assembly`
+  calls `_cold_start_bootstrap`, which builds a synthetic filler chunk by
+  f-string-interpolating the conscious block directly into `content`:
+
+  ```python
+  content=f"pipeline_summary agent:{conscious.agent_id} task:{conscious.task} intent:{conscious.intent}"
+  ```
+
+  `SubconsciousChunk.content` has a hard `field_validator` cap of 2000
+  characters (`ncp/types.py:265-270`). `ConsciousBlock.task`/`.slot`/`.intent`
+  have no length limit at all — only a no-whitespace check
+  (`_validate_no_spaces`). Nothing prevents a caller from legitimately
+  passing a long `task` or `intent` (e.g. an orchestrator forwarding a
+  detailed multi-paragraph goal on turn 0, before any memory exists to
+  narrow it down). Once `len(agent_id) + len(task) + len(intent)` exceeds
+  roughly 1980 characters, `SubconsciousChunk(...)` raises a pydantic
+  `ValidationError` that propagates out of `assemble()` uncaught — the
+  entire `ncp_get_context` call fails instead of just omitting/truncating
+  the synthetic filler chunk that exists purely to give a cold pipeline
+  *some* signal.
+
+  Reproduced directly:
+
+  ```python
+  conscious = ConsciousBlock(agent_id="agentA", role="worker", owns=[], must_not=[],
+      task="x"*1200, slot="s", intent="y"*1200, pipeline_id="pipe_empty_cold2")
+  asm.assemble(conscious=conscious, budget=BudgetContext(), query_text="anything", max_tokens=5000)
+  # -> pydantic.ValidationError: content must be <= 2000 characters
+  ```
+
+- **Fix:** build the interpolated string first and truncate it to 1900
+  characters plus a trailing `...[truncated]` marker before constructing the
+  `SubconsciousChunk` if it would otherwise exceed the 2000-char cap, so a
+  legitimate long task/intent still yields a (truncated) cold-start signal
+  instead of an exception. Regression coverage:
+  `tests/test_assembler.py::test_cold_start_bootstrap_truncates_long_task_intent_instead_of_crashing`
+  and `::test_cold_start_bootstrap_leaves_short_task_intent_untouched` (the
+  common case must render byte-for-byte unchanged).
+
+---
+
+## 12. Superseded/retracted facts silently reappear whenever `retrieval.edge_expansion` is disabled
+
+**Status: Fixed.**
+
+- **Location:** `ncp/assembler.py:122-127` (`_prepare_assembly`)
+- **Type:** adapter-gap — a correctness mechanism gated on an unrelated
+  feature flag purely by accident of code placement
+- **Severity:** silent — no error, and a retracted fact and its correction
+  both get injected into context with identical scores and no signal which
+  one is authoritative
+- **Evidence:**
+
+  `_suppress_superseded` — the mechanism that drops a chunk once its
+  declared successor (`supersedes`) is also present in the candidate set —
+  was only ever called from inside `if self._edge_expansion:`:
+
+  ```python
+  if self._edge_expansion:
+      expanded = self._expand_edges([*recent_chunks, *subconscious], limit=chunk_cap, as_of=as_of)
+      subconscious = [*subconscious, *expanded]
+      recent_chunks, subconscious = self._suppress_superseded(recent_chunks, subconscious)
+  ```
+
+  Supersession suppression has nothing conceptually to do with multi-hop
+  edge-hop expansion — it's a distinct correctness guarantee (never surface
+  a fact alongside its own retraction) that happened to be wired inside the
+  same `if` block as an unrelated performance/recall feature. `edge_expansion`
+  is a supported, non-default-off config toggle
+  (`retrieval.edge_expansion`, `NCP_EDGE_EXPANSION` env var); any integrator
+  who disables it for cost/latency reasons silently loses fact-supersession
+  entirely as a side effect.
+
+  Confirmed live: writing `fact_v1`, then `fact_v2` with
+  `supersedes="fact_v1"`, and assembling with `retrieval.edge_expansion=False`
+  returned **both** chunks, scored identically, directly contradicting each
+  other in the same context — with no indication either was stale.
+
+- **Fix:** moved the `_suppress_superseded(recent_chunks, subconscious)` call
+  out of the `if self._edge_expansion:` block so it always runs on
+  `[*recent_chunks, *subconscious]` regardless of the edge-expansion setting;
+  when edge expansion is off, it now runs against the same list it would
+  have without the (skipped) edge-expanded append, so disabling
+  edge_expansion still disables *only* edge expansion. Regression coverage:
+  `tests/test_assembler.py::test_supersession_suppressed_even_when_edge_expansion_disabled`.
+
+---
+
+## 13. A malformed `world_check` whisper permanently blocks every subsequent valid drift signal in the same batch
+
+**Status: Fixed.**
+
+- **Location:** `ncp/assembler.py:905-926` (`_apply_drift_feedback`)
+- **Type:** untraced-path — a range check that guards the wrong thing
+- **Severity:** silent — no error, and a real drift event goes completely
+  undetected for the rest of that turn's whisper queue
+- **Evidence:**
+
+  The loop over drained whispers unconditionally `break`s after processing
+  the first well-formed `world_check` whisper (valid JSON/dict payload
+  containing a `detected_drift` key) — regardless of whether
+  `detected_drift` actually fell inside `[0.0, 1.0]`:
+
+  ```python
+  detected_drift = float(data["detected_drift"])
+  if 0.0 <= detected_drift <= 1.0:
+      conscious = conscious.model_copy(update={"drift_score": detected_drift})
+  break  # <-- fired even when the range check above was false
+  ```
+
+  `WorldCheckPayload.detected_drift` has no range validator of its own, so
+  an out-of-range value (e.g. a buggy or miscalibrated sensor emitting
+  `5.0`) is legitimate, well-formed input that reaches this code. One such
+  whisper permanently blocks every subsequent `world_check` whisper in that
+  turn's drained batch from ever updating drift, since the loop has already
+  exited.
+
+  Reproduced directly:
+
+  ```python
+  w1 = Whisper(whisper_type="world_check", payload={"anchor_intent": "i", "detected_drift": 5.0}, ...)   # out of range
+  w2 = Whisper(whisper_type="world_check", payload={"anchor_intent": "i", "detected_drift": 0.85}, ...)  # valid
+  asm._apply_drift_feedback(conscious, [w1, w2]).drift_score
+  # -> 0.0 (unchanged default), expected 0.85
+  ```
+
+- **Fix:** moved the `break` inside the `if 0.0 <= detected_drift <= 1.0:`
+  branch so it only fires once a signal was actually applied; an
+  out-of-range value now falls through to `continue` and the next whisper is
+  checked. Regression coverage:
+  `tests/test_assembler.py::test_apply_drift_feedback_skips_out_of_range_signal_and_applies_next_valid`
+  and `::test_apply_drift_feedback_stops_at_first_applied_valid_signal` (the
+  early-exit-on-success behavior is preserved, not just removed).
+
+---
+
+## 14. `RetrievalPolicy.score()` can return values outside its documented `[0, 1]` range
+
+**Status: Fixed.**
+
+- **Location:** `ncp/stores/retrieval.py:84-109` (`RetrievalPolicy.score`)
+- **Type:** contract violation in a shared primitive — not observably wrong
+  today, but load-bearing for the rest of the ranking pipeline
+- **Severity:** silent — no error, no test previously caught it; every live
+  call site happens to pass pre-normalized `bm25_normalized` today, so
+  nothing currently downstream breaks, but the guarantee itself was false
+- **Evidence:**
+
+  `score()`'s docstring states "Returns a value in `[0, 1]`." `base_trust`
+  is double-clamped (`max(0.0, min(1.0, base_trust))`), and the sibling
+  `score_with_vector()` even double-clamps `bm25_normalized` itself
+  (`max(0.0, min(1.0, bm25_normalized))`) before delegating to `score()` for
+  the no-vector case. But `score()`'s own `bm25_normalized` handling only
+  lower-clamped:
+
+  ```python
+  fused = (
+      self.w_lexical * max(0.0, bm25_normalized)  # no upper bound
+      + self.w_recency * recency
+      + self.w_trust * max(0.0, min(1.0, base_trust))
+  )
+  ```
+
+  Reproduced directly: `RetrievalPolicy().score(bm25_normalized=5.0,
+  age_seconds=0, base_trust=1.0, generation=0)` returned `3.0`, not the
+  documented `<= 1.0`.
+
+- **Fix:** clamp `bm25_normalized` the same way `score_with_vector` already
+  does: `max(0.0, min(1.0, bm25_normalized))`. Regression coverage:
+  `tests/test_retrieval_policy.py::test_score_clamps_bm25_normalized_above_one`.
 
 ---
 

@@ -139,7 +139,11 @@ class Assembler:
         if self._edge_expansion:
             expanded = self._expand_edges([*recent_chunks, *subconscious], limit=chunk_cap, as_of=as_of)
             subconscious = [*subconscious, *expanded]
-            recent_chunks, subconscious = self._suppress_superseded(recent_chunks, subconscious)
+        # Superseded-fact suppression is independent of edge expansion -- it
+        # must always run against whatever the current candidate set is, or a
+        # retracted fact and its correction can both survive to the final
+        # context whenever edge_expansion is disabled.
+        recent_chunks, subconscious = self._suppress_superseded(recent_chunks, subconscious)
         deduped_chunks = self._dedupe_chunks([*recent_chunks, *subconscious])
         if self._diversity_lambda < 1.0:
             combined_chunks = self._mmr_select_chunks(
@@ -530,10 +534,16 @@ class Assembler:
     ) -> list[SubconsciousChunk]:
         if chunks:
             return chunks
+        content = f"pipeline_summary agent:{conscious.agent_id} task:{conscious.task} intent:{conscious.intent}"
+        if len(content) > 2000:
+            # A legitimate long task/intent must not blow the SubconsciousChunk
+            # content cap and crash the whole assemble() call -- truncate with
+            # a trailing marker instead of dropping the cold-start signal.
+            content = content[:1900] + "...[truncated]"
         cold_chunk = SubconsciousChunk(
             chunk_id=f"cold_{conscious.pipeline_id or 'init'}",
             layer="procedural",
-            content=f"pipeline_summary agent:{conscious.agent_id} task:{conscious.task} intent:{conscious.intent}",
+            content=content,
             src="synthesis",
             written_by=conscious.agent_id,
             pipeline_id=conscious.pipeline_id,
@@ -969,7 +979,11 @@ class Assembler:
                 detected_drift = float(data["detected_drift"])
                 if 0.0 <= detected_drift <= 1.0:
                     conscious = conscious.model_copy(update={"drift_score": detected_drift})
-                break
+                    break
+                # Out-of-range detected_drift is malformed input, not a
+                # terminal signal -- skip it and keep checking the rest of
+                # the drained whispers for a well-formed one.
+                continue
             except (json.JSONDecodeError, TypeError, ValueError):
                 continue
         return conscious

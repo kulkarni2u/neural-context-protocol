@@ -102,7 +102,7 @@ class RetrievalPolicy:
         drift = max(0.0, min(1.0, written_at_drift))
         drift_penalty = 1.0 - drift if drift > 0.3 else 1.0
         fused = (
-            self.w_lexical * max(0.0, bm25_normalized)
+            self.w_lexical * max(0.0, min(1.0, bm25_normalized))
             + self.w_recency * recency
             + self.w_trust * max(0.0, min(1.0, base_trust))
         )
