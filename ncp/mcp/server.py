@@ -879,6 +879,12 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             # filtered counts above stay 0.
             "evicted_chunk_count": getattr(result, "evicted_chunk_count", 0),
             "evicted_whisper_count": getattr(result, "evicted_whisper_count", 0),
+            # Finding 8 (docs/NCP_SILENT_DISCONNECT_AUDIT.md): true when the
+            # primary hybrid retrieval pass found zero candidates and the
+            # returned chunks are trust/recency-only filler with no
+            # relationship to this turn's query text -- without this, that
+            # filler is indistinguishable from a real relevance-ranked result.
+            "retrieval_used_fallback": bool(getattr(result, "retrieval_used_fallback", False)),
             "pending_whisper_ids": pending_whisper_ids,
             "fetch_budget_remaining": fetch_budget_remaining,
             "fetch_hint": "ncp_fetch" if evicted_high_relevance and fetch_budget_remaining > 0 else None,

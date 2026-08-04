@@ -37,6 +37,7 @@ class AssemblyResult:
     evicted_whispers: list[tuple[str, float]]
     evicted_chunk_count: int = 0
     evicted_whisper_count: int = 0
+    retrieval_used_fallback: bool = False
 
 
 class Assembler:
@@ -81,6 +82,9 @@ class Assembler:
         self._diversity_lambda = config.diversity_lambda if config else 1.0
         self._distillation_enabled = config.distillation_enabled if config else False
         self._distillation_min_chunk_tokens = config.distillation_min_chunk_tokens if config else 120
+        self._fallback_to_trust_recency_enabled = (
+            config.fallback_to_trust_recency_enabled if config else True
+        )
 
     # ------------------------------------------------------------------
     # Step 0-5: assemble
@@ -106,6 +110,7 @@ class Assembler:
         list[tuple[str, float]],
         int,
         int,
+        bool,
     ]:
         conscious, budget = self.middleware.pre_assemble(conscious, budget)
         coherence_report = self.coherence.check(conscious)
@@ -114,6 +119,7 @@ class Assembler:
         chunk_cap, whisper_cap = self._assembly_caps(budget=budget, k=k)
         search_text = query_text or f"{hydrated.task} {hydrated.slot}"
         recent_chunks = self._resolve_recent_refs(hydrated, query_text=search_text)
+        fallback_count_before = self._retrieval_fallback_count()
         subconscious = self._retrieve_chunks(
             hydrated,
             query_text=query_text,
@@ -123,6 +129,12 @@ class Assembler:
             diversity_lambda=self._diversity_lambda,
             as_of=as_of,
         )
+        # Finding 8 (docs/NCP_SILENT_DISCONNECT_AUDIT.md): when the primary
+        # hybrid pass finds nothing and the trust/recency fallback fires, the
+        # returned chunks have no relationship to the query -- surface that
+        # so callers don't mistake "frozen" trust/recency filler for a real
+        # relevance-ranked result.
+        retrieval_used_fallback = self._retrieval_fallback_count() > fallback_count_before
         subconscious = self._cold_start_bootstrap(hydrated, subconscious)
         if self._edge_expansion:
             expanded = self._expand_edges([*recent_chunks, *subconscious], limit=chunk_cap, as_of=as_of)
@@ -204,6 +216,7 @@ class Assembler:
             evicted_whispers,
             evicted_chunk_count,
             evicted_whisper_count,
+            retrieval_used_fallback,
         )
 
     def assemble(
@@ -227,6 +240,7 @@ class Assembler:
             evicted_whispers,
             evicted_chunk_count,
             evicted_whisper_count,
+            retrieval_used_fallback,
         ) = self._prepare_assembly(
             conscious=conscious,
             budget=budget,
@@ -258,6 +272,7 @@ class Assembler:
             evicted_whispers=evicted_whispers,
             evicted_chunk_count=evicted_chunk_count,
             evicted_whisper_count=evicted_whisper_count,
+            retrieval_used_fallback=retrieval_used_fallback,
         )
 
     def assemble_incremental(
@@ -283,7 +298,7 @@ class Assembler:
         Callers that use post_assemble middleware should apply it to the
         concatenated result: ``mw.post_assemble("\\n\\n".join(t for _, t in sections))``.
         """
-        hydrated, budget, combined_chunks, combined_whispers, _, _, _, _ = self._prepare_assembly(
+        hydrated, budget, combined_chunks, combined_whispers, _, _, _, _, _ = self._prepare_assembly(
             conscious=conscious,
             budget=budget,
             query_text=query_text,
@@ -494,9 +509,19 @@ class Assembler:
             k=store_k,
             pipeline_id=conscious.pipeline_id,
             zone="working",
-            fallback_to_trust_recency=True,
+            fallback_to_trust_recency=self._fallback_to_trust_recency_enabled,
             **extra,
         )
+
+    def _retrieval_fallback_count(self) -> int:
+        """Best-effort read of the store's trust/recency-fallback counter.
+
+        Not every store backend implements ``retrieval_fallback_count()``
+        (e.g. it's a no-op signature-only parameter on the sync pgvector
+        store today), so this degrades to 0 rather than raising.
+        """
+        getter = getattr(self.store, "retrieval_fallback_count", None)
+        return int(getter()) if callable(getter) else 0
 
     def _cold_start_bootstrap(
         self,

@@ -90,6 +90,7 @@ DEFAULT_CONFIG = {
         "diversity_lambda": 1.0,
         "usage_prior_weight": 1.0,
         "reputation_weight": 0.0,
+        "fallback_to_trust_recency_enabled": True,
     },
     "reputation": {
         "gain": 4.0,
@@ -311,6 +312,15 @@ class NCPConfig:
     @property
     def reputation_weight(self) -> float:
         return float(self.values.get("retrieval", {}).get("reputation_weight", 0.0))
+
+    @property
+    def fallback_to_trust_recency_enabled(self) -> bool:
+        """Whether the assembler's hybrid retrieval falls back to a
+        trust/recency-only ranking when the primary hybrid pass finds zero
+        candidates. When disabled, a query with no lexical/vector match
+        returns an honest empty result instead of the top-trust/most-recent
+        chunks regardless of query content."""
+        return bool(self.values.get("retrieval", {}).get("fallback_to_trust_recency_enabled", True))
 
     @property
     def reputation_gain(self) -> float:

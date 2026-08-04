@@ -300,6 +300,7 @@ class SQLiteStore(BaseStore):
         # when no embedding adapter is configured. In-memory only, not
         # persisted -- consumed by benchmarks/costs accounting.
         self._embedding_calls_tokens_est: int = 0
+        self._retrieval_fallback_count: int = 0
 
         from ncp.stores.rerank import Reranker
         from ncp.config import load_config
@@ -392,6 +393,14 @@ class SQLiteStore(BaseStore):
         across this store instance's lifetime (write-time + query-time).
         Zero when no embedding adapter is configured."""
         return self._embedding_calls_tokens_est
+
+    def retrieval_fallback_count(self) -> int:
+        """Running count of `query()` calls, across this store instance's
+        lifetime, where the primary hybrid pass found zero candidates and a
+        `fallback_to_trust_recency=True` caller received trust/recency-only
+        results instead -- i.e. results with no relationship to the query
+        text. Zero when the fallback was never requested or never fired."""
+        return self._retrieval_fallback_count
 
     def write(self, chunk: SubconsciousChunk) -> bool:
         self.last_write_inferred_edge_count = 0
@@ -722,6 +731,8 @@ class SQLiteStore(BaseStore):
                     fallback_candidates.append(chunk)
                 fallback_candidates.sort(key=lambda c: c.relevance, reverse=True)
                 ranked = ranked + fallback_candidates
+                if fallback_candidates:
+                    self._retrieval_fallback_count += 1
 
             if self.reranker is not None and self.reranker.enabled:
                 candidates_to_rerank = ranked[:result_limit * 4]

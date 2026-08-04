@@ -26,7 +26,8 @@ Findings are ranked silent-first, most-impactful first within that bucket.
 ## Status: all findings fixed
 
 Every finding and the addendum below has a corresponding fix merged on this
-branch. Full suite after integration: **1113 passed, 32 skipped** (the skips
+branch (finding 8 was reported after the initial pass, added and fixed in a
+follow-up). Full suite after integration: **1117 passed, 32 skipped** (the skips
 are all pgvector/psycopg/redis/optional-provider-extra tests correctly
 skipping for lack of a live service in this environment), plus one
 pre-existing, unrelated failure (`tests/test_enhancements.py::
@@ -43,6 +44,7 @@ present identically before any of these changes.
 | 6 — Dead `SubconsciousChunk` fields | `owner`/`valid_while`/`evidence_id`/`conditions`/`result_confidence`/`result_attempts`/`caused_by`/`chunk_type` now exposed on `ncp_write_memory`'s input schema and threaded into the write path |
 | 7 — No live-process coverage for whisper/post_turn | New shared dogfood scenario exercises `ncp_emit_whisper` + `ncp_post_turn` over both the real stdio and HTTP/SSE MCP transports |
 | Addendum — features off by default | `adaptive_budget_enabled` and `distillation_enabled` now default `true`; `ncp_get_context` telemetry gained an `active_features` block |
+| 8 — Silent trust/recency retrieval fallback ("frozen injects") | Fallback is now `retrieval.fallback_to_trust_recency_enabled`-gated (default `true`, unchanged behavior) instead of hardcoded, and firing it is surfaced as `telemetry.retrieval_used_fallback` |
 
 ---
 
@@ -397,6 +399,78 @@ present identically before any of these changes.
   `ncp_emit_whisper` and closes a turn via `ncp_post_turn` over the real
   subprocess stdio transport, the same way the existing scenarios do for the
   other three tools.
+
+---
+
+## 8. Retrieval's trust/recency fallback silently produces query-blind, near-identical injects
+
+**Status: Fixed.**
+
+- **Location:** `ncp/assembler.py:500` (`_retrieve_chunks`, was a hardcoded
+  `fallback_to_trust_recency=True`); `ncp/stores/sqlite.py:710-733` (the
+  fallback path); `ncp/stores/retrieval.py:149-165` (`score_no_bm25`)
+- **Type:** adapter-gap / untraced-path
+- **Severity:** silent — no error, and the response is indistinguishable from
+  a genuine relevance-ranked result
+- **Evidence:** flagged externally by a user triaging retrieval bugs against
+  this repo (attributed to "NCP core," not their integration) and confirmed
+  here by tracing the actual code and reproducing it.
+
+  `SQLiteStore.query()`'s `fallback_to_trust_recency` parameter defaults to
+  `False` at the store layer, with an explicit comment: *"Off by default to
+  preserve the hybrid filtering contract."* But `Assembler._retrieve_chunks`
+  — the only code path any real `ncp_get_context`/`ncp_post_turn` call goes
+  through — unconditionally passed `fallback_to_trust_recency=True` on every
+  single call, silently overriding that contract for 100% of real usage.
+
+  When the primary hybrid pass (BM25 + optional vector) finds zero
+  candidates for a query — which happens whenever the query's vocabulary has
+  no lexical overlap with stored content, an easy case to hit — the fallback
+  ranks every other chunk by `score_no_bm25`: `w_recency*recency +
+  w_trust*base_trust`, gated by generation/drift penalties. This formula
+  contains **no reference to the query text at all**. So for any pipeline
+  where hybrid retrieval keeps drawing blanks (e.g. terse or vocabulary-poor
+  task/slot text), every turn injects the *same* top-trust/most-recent
+  chunks regardless of what was actually asked — "frozen injects" — and
+  nothing in the response distinguished this from a real relevance-ranked
+  result: same wire format, same-looking `score:`/`trust:` fields.
+
+  Verified against the real `ncp_get_context` handler: seeded 3 chunks about
+  unrelated topics, then queried with three different, mutually unrelated
+  strings designed to share no vocabulary with the content or each other:
+
+  ```
+  query 0: 'zzz_unrelated_topic_one'      -> [NCP:SUBCONSCIOUS] block: apple, banana
+  query 1: 'qqq_totally_different_topic'  -> [NCP:SUBCONSCIOUS] block: apple, banana  (identical)
+  query 2: 'xxx_yet_another_topic'        -> [NCP:SUBCONSCIOUS] block: apple, banana  (identical)
+  ```
+
+  All three `[NCP:SUBCONSCIOUS]` blocks were byte-for-byte identical despite
+  the queries sharing no vocabulary — and the response gave no indication
+  this had happened.
+
+  (Note: the sync `PgvectorStore.query()` accepts the same
+  `fallback_to_trust_recency` parameter in its signature but never
+  implements the fallback logic at all — so this specific "frozen injects"
+  pollution is SQLite-specific today; on pgvector the parameter is
+  currently a silent no-op instead, which is a smaller, different gap left
+  out of scope here.)
+
+- **Fix:**
+  1. Added `retrieval.fallback_to_trust_recency_enabled` to `ncp/config.py`
+     (default `True`, preserving prior behavior) and threaded it through
+     `Assembler.__init__`/`_retrieve_chunks` instead of the hardcoded
+     literal, so integrators who'd rather get an honest empty result (which
+     gracefully degrades to the pre-existing `_cold_start_bootstrap` marker,
+     not a bare empty block) can disable it.
+  2. Added a `retrieval_fallback_count()` running counter to `SQLiteStore`,
+     incremented whenever the fallback actually returns candidates; the
+     assembler diffs it around each `_retrieve_chunks` call to know whether
+     *this turn's* retrieval used it, threaded through `AssemblyResult.
+     retrieval_used_fallback` into `ncp_get_context`'s telemetry as
+     `retrieval_used_fallback: bool` — so a caller/agent can now tell
+     "this context is genuinely query-relevant" from "this is trust/recency
+     filler, treat it accordingly" instead of the two being indistinguishable.
 
 ---
 

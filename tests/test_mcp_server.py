@@ -2788,3 +2788,122 @@ class TestActiveFeaturesTelemetry:
         assert active_features["memoization_enabled"] is False
         assert active_features["drift_computed_enabled"] is False
         assert active_features["rerank_enabled"] is False
+
+
+class TestRetrievalFallbackTelemetry:
+    """Audit finding 8: the assembler's trust/recency fallback used to fire
+    silently on every query that found zero hybrid candidates, injecting the
+    same top-trust/most-recent chunks regardless of query content ("frozen
+    injects") with nothing in the response to indicate this happened."""
+
+    def _seed_chunks(self, store: SQLiteStore, pipeline_id: str) -> None:
+        handlers = make_handlers(store)
+        for i, topic in enumerate(["apple", "banana", "cherry"]):
+            _content(_handle_request(
+                _call("ncp_write_memory", {
+                    "content": f"fact about {topic} number {i}",
+                    "layer": "semantic",
+                    "src": "user_verified",
+                    "written_by": "writer",
+                    "pipeline_id": pipeline_id,
+                    "base_trust": 0.9 - i * 0.05,
+                }),
+                handlers,
+            ))
+
+    def test_unrelated_queries_get_identical_fallback_content_flagged_true(
+        self, tmp_path: Path
+    ) -> None:
+        store = SQLiteStore(tmp_path / "test.db")
+        self._seed_chunks(store, "pipe_frozen")
+        handlers = make_handlers(store)
+
+        contexts = []
+        for query in ["zzz_unrelated_topic_one", "qqq_totally_different_topic_two"]:
+            result = _content(_handle_request(
+                _call("ncp_get_context", {
+                    "agent_id": "reader",
+                    "role": "analyst",
+                    "task": query,
+                    "slot": "investigating",
+                    "intent": "find_info",
+                    "pipeline_id": "pipe_frozen",
+                }),
+                handlers,
+            ))
+            assert result["telemetry"]["retrieval_used_fallback"] is True
+            contexts.append(result["context"].split("[NCP:SUBCONSCIOUS]")[1].split("[NCP:BUDGET]")[0])
+
+        # The actual injected memory is identical across two queries with zero
+        # lexical/topical overlap -- this is the "frozen injects" symptom
+        # itself; the fix is that it's no longer silent (asserted above).
+        assert contexts[0] == contexts[1]
+
+    def test_matching_query_does_not_set_fallback_flag(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "test.db")
+        self._seed_chunks(store, "pipe_matched")
+        handlers = make_handlers(store)
+
+        result = _content(_handle_request(
+            _call("ncp_get_context", {
+                "agent_id": "reader",
+                "role": "analyst",
+                "task": "apple",
+                "slot": "investigating",
+                "intent": "find_info",
+                "pipeline_id": "pipe_matched",
+            }),
+            handlers,
+        ))
+        assert result["telemetry"]["retrieval_used_fallback"] is False
+        assert "fact about apple" in result["context"]
+
+    def test_fallback_disableable_via_config_falls_back_to_cold_start_marker(
+        self, tmp_path: Path
+    ) -> None:
+        store = SQLiteStore(tmp_path / "test.db")
+        self._seed_chunks(store, "pipe_disabled")
+
+        (tmp_path / ".ncp").mkdir(exist_ok=True)
+        (tmp_path / ".ncp" / "config.toml").write_text(
+            "[retrieval]\nfallback_to_trust_recency_enabled = false\n"
+        )
+        config = load_config(cwd=tmp_path)
+        handlers = make_handlers(store, config=config)
+
+        result = _content(_handle_request(
+            _call("ncp_get_context", {
+                "agent_id": "reader",
+                "role": "analyst",
+                "task": "zzz_unrelated_topic",
+                "slot": "investigating",
+                "intent": "find_info",
+                "pipeline_id": "pipe_disabled",
+            }),
+            handlers,
+        ))
+        assert result["telemetry"]["retrieval_used_fallback"] is False
+        # No unrelated apple/banana/cherry filler leaks through when the
+        # fallback is disabled -- the pre-existing cold-start marker (a
+        # different, query-honest mechanism) takes over instead.
+        assert "fact about apple" not in result["context"]
+        assert "fact about banana" not in result["context"]
+
+    def test_fallback_enabled_by_default_with_loaded_config(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "test.db")
+        self._seed_chunks(store, "pipe_default")
+        config = load_config(cwd=tmp_path)
+        handlers = make_handlers(store, config=config)
+
+        result = _content(_handle_request(
+            _call("ncp_get_context", {
+                "agent_id": "reader",
+                "role": "analyst",
+                "task": "zzz_unrelated_topic",
+                "slot": "investigating",
+                "intent": "find_info",
+                "pipeline_id": "pipe_default",
+            }),
+            handlers,
+        ))
+        assert result["telemetry"]["retrieval_used_fallback"] is True
