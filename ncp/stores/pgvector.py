@@ -344,7 +344,18 @@ class PgvectorStore(BaseStore):
             self.reranker = Reranker(DummyConfig())  # type: ignore[arg-type]
 
         self._embedding_adapter = embedding_adapter
+        # WI: running estimate of tokens fed into `_embedding_adapter.embed()`
+        # calls made by this store instance (write-time + query-time). Zero
+        # when no embedding adapter is configured. In-memory only, not
+        # persisted -- consumed by benchmarks/costs accounting.
+        self._embedding_calls_tokens_est: int = 0
         self._init_db()
+
+    def embedding_tokens_estimate(self) -> int:
+        """Running estimate of tokens passed to `embedding_adapter.embed()`
+        across this store instance's lifetime (write-time + query-time).
+        Zero when no embedding adapter is configured."""
+        return self._embedding_calls_tokens_est
 
     @contextmanager
     def _connect(self) -> Iterator[Any]:
@@ -417,6 +428,7 @@ class PgvectorStore(BaseStore):
         self.last_write_inferred_edge_count = 0
         chunk = self._validate_chunk_for_write(chunk)
         if self._embedding_adapter is not None and chunk.embedding is None:
+            self._embedding_calls_tokens_est += estimate_tokens(chunk.content)
             chunk = chunk.model_copy(
                 update={"embedding": self._embedding_adapter.embed(chunk.content)}
             )
@@ -608,6 +620,7 @@ class PgvectorStore(BaseStore):
                 diversity_limit=diversity_limit, as_of=as_of,
             )
         if embedding is None and self._embedding_adapter is not None:
+            self._embedding_calls_tokens_est += estimate_tokens(text)
             embedding = self._embedding_adapter.embed(text)
         if embedding is not None and len(embedding) != 1536:
             raise ValueError(f"embedding must have 1536 dimensions, got {len(embedding)}")
@@ -746,6 +759,7 @@ class PgvectorStore(BaseStore):
     ) -> list[SubconsciousChunk]:
         if embedding is None:
             if self._embedding_adapter is not None:
+                self._embedding_calls_tokens_est += estimate_tokens(text)
                 embedding = self._embedding_adapter.embed(text)
             else:
                 raise ValueError("retrieval_mode='vector' requires an embedding to be provided")

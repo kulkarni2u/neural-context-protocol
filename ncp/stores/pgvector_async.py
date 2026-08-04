@@ -109,6 +109,11 @@ class AsyncPgvectorStore(BaseStore):
         self.reputation_forget = 0.99
         self.reputation_confidence_k = 20
         self._embedding_adapter: object | None = embedding_adapter
+        # WI: running estimate of tokens fed into `_embedding_adapter.embed()`
+        # calls made by this store instance (write-time + query-time). Zero
+        # when no embedding adapter is configured. In-memory only, not
+        # persisted -- consumed by benchmarks/costs accounting.
+        self._embedding_calls_tokens_est: int = 0
         self._ivfflat_probes = ivfflat_probes
         self._apool: Any = None
         self._init_lock = anyio.Lock()
@@ -280,6 +285,12 @@ class AsyncPgvectorStore(BaseStore):
             return None
         return self._normalize_row(row, getattr(cursor, "description", None))
 
+    def embedding_tokens_estimate(self) -> int:
+        """Running estimate of tokens passed to `embedding_adapter.embed()`
+        across this store instance's lifetime (write-time + query-time).
+        Zero when no embedding adapter is configured."""
+        return self._embedding_calls_tokens_est
+
     # ------------------------------------------------------------------
     # Overridden async_* methods — native psycopg3 async I/O
     # ------------------------------------------------------------------
@@ -295,6 +306,7 @@ class AsyncPgvectorStore(BaseStore):
         if self._embedding_adapter is not None and chunk.embedding is None:
             _adapter = self._embedding_adapter
             _content = chunk.content
+            self._embedding_calls_tokens_est += estimate_tokens(_content)
             embedding_vec = await anyio.to_thread.run_sync(
                 lambda: _adapter.embed(_content)  # type: ignore[union-attr]
             )
@@ -681,6 +693,7 @@ class AsyncPgvectorStore(BaseStore):
             if self._embedding_adapter is not None:
                 _adapter = self._embedding_adapter
                 _text = text
+                self._embedding_calls_tokens_est += estimate_tokens(_text)
                 embedding = await anyio.to_thread.run_sync(
                     lambda: _adapter.embed(_text)  # type: ignore[union-attr]
                 )
@@ -802,6 +815,7 @@ class AsyncPgvectorStore(BaseStore):
         if embedding is None and self._embedding_adapter is not None:
             _adapter = self._embedding_adapter
             _text = text
+            self._embedding_calls_tokens_est += estimate_tokens(_text)
             embedding = await anyio.to_thread.run_sync(
                 lambda: _adapter.embed(_text)  # type: ignore[union-attr]
             )
