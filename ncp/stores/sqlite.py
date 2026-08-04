@@ -184,6 +184,17 @@ CREATE INDEX IF NOT EXISTS idx_conscious_agent ON conscious_log(agent_id, logged
 CREATE INDEX IF NOT EXISTS idx_conscious_pipeline_agent ON conscious_log(pipeline_id, agent_id, logged_at);
 CREATE INDEX IF NOT EXISTS idx_cost_pipeline ON cost_log(pipeline_id, logged_at);
 
+CREATE TABLE IF NOT EXISTS embedding_cost_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    pipeline_id TEXT,
+    op TEXT NOT NULL,
+    char_count INTEGER NOT NULL,
+    estimated_tokens INTEGER NOT NULL,
+    logged_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_embedding_cost_pipeline ON embedding_cost_log(pipeline_id, logged_at);
+
 CREATE TABLE IF NOT EXISTS drift_history (
     session_id TEXT NOT NULL,
     turn INTEGER NOT NULL,
@@ -378,6 +389,7 @@ class SQLiteStore(BaseStore):
             chunk = chunk.model_copy(
                 update={"embedding": self._embedding_adapter.embed(chunk.content)}
             )
+            self.log_embedding_cost(pipeline_id=chunk.pipeline_id, op="write", text=chunk.content)
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             self._soft_gc(connection)
@@ -553,6 +565,7 @@ class SQLiteStore(BaseStore):
             and retrieval_mode in {"hybrid", "vector"}
         ):
             embedding = self._embedding_adapter.embed(text)
+            self.log_embedding_cost(pipeline_id=pipeline_id, op="query", text=text)
         if retrieval_mode == "vector" and embedding is None:
             raise ValueError("retrieval_mode='vector' requires an embedding or embedding adapter")
 
@@ -1520,6 +1533,95 @@ class SQLiteStore(BaseStore):
                     cost_source,
                 ),
             )
+
+    def log_embedding_cost(
+        self,
+        *,
+        pipeline_id: str | None,
+        op: str,
+        text: str,
+    ) -> None:
+        """Record one embedding-adapter call for cost visibility (Finding 3).
+
+        Best-effort only: this sits directly on the write()/query() hot path
+        next to the real ``embed()`` call, so a logging failure here must
+        never be able to break the actual write or query.
+        """
+        try:
+            char_count = len(text)
+            estimated_tokens = estimate_tokens(text)
+            with self._connect() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO embedding_cost_log (
+                        pipeline_id, op, char_count, estimated_tokens, logged_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (pipeline_id, op, char_count, estimated_tokens, time.time()),
+                )
+        except Exception:
+            pass
+
+    def embedding_cost_summary(
+        self,
+        *,
+        pipeline_id: str | None = None,
+    ) -> dict[str, object]:
+        """Return aggregate embedding-adapter call stats, analogous to cost_summary()."""
+        try:
+            clauses: list[str] = []
+            params: list[object] = []
+            if pipeline_id is not None:
+                clauses.append("pipeline_id = ?")
+                params.append(pipeline_id)
+            where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+
+            with self._connect() as connection:
+                total_row = connection.execute(
+                    f"""
+                    SELECT
+                        COUNT(*) AS entry_count,
+                        COALESCE(SUM(char_count), 0) AS char_count_total,
+                        COALESCE(SUM(estimated_tokens), 0) AS estimated_tokens_total
+                    FROM embedding_cost_log
+                    {where}
+                    """,
+                    params,
+                ).fetchone()
+                by_op_rows = connection.execute(
+                    f"""
+                    SELECT
+                        op,
+                        COUNT(*) AS calls,
+                        COALESCE(SUM(estimated_tokens), 0) AS estimated_tokens_total
+                    FROM embedding_cost_log
+                    {where}
+                    GROUP BY op
+                    ORDER BY op ASC
+                    """,
+                    params,
+                ).fetchall()
+        except Exception:
+            return {
+                "summary": {"entry_count": 0, "char_count_total": 0, "estimated_tokens_total": 0},
+                "by_op": [],
+            }
+
+        return {
+            "summary": {
+                "entry_count": int(total_row["entry_count"]),
+                "char_count_total": int(total_row["char_count_total"]),
+                "estimated_tokens_total": int(total_row["estimated_tokens_total"]),
+            },
+            "by_op": [
+                {
+                    "op": str(row["op"]),
+                    "calls": int(row["calls"]),
+                    "estimated_tokens_total": int(row["estimated_tokens_total"]),
+                }
+                for row in by_op_rows
+            ],
+        }
 
     def get_pipeline_goal_versions(
         self,

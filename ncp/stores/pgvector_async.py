@@ -299,6 +299,7 @@ class AsyncPgvectorStore(BaseStore):
                 lambda: _adapter.embed(_content)  # type: ignore[union-attr]
             )
             chunk = chunk.model_copy(update={"embedding": embedding_vec})
+            await self.async_log_embedding_cost(pipeline_id=chunk.pipeline_id, op="write", text=chunk.content)
         if chunk.embedding is not None and len(chunk.embedding) != 1536:
             raise ValueError(f"embedding must have 1536 dimensions, got {len(chunk.embedding)}")
         embedding_val = (
@@ -684,6 +685,7 @@ class AsyncPgvectorStore(BaseStore):
                 embedding = await anyio.to_thread.run_sync(
                     lambda: _adapter.embed(_text)  # type: ignore[union-attr]
                 )
+                await self.async_log_embedding_cost(pipeline_id=pipeline_id, op="query", text=text)
             else:
                 raise ValueError("retrieval_mode='vector' requires an embedding to be provided")
         if len(embedding) != 1536:
@@ -805,6 +807,7 @@ class AsyncPgvectorStore(BaseStore):
             embedding = await anyio.to_thread.run_sync(
                 lambda: _adapter.embed(_text)  # type: ignore[union-attr]
             )
+            await self.async_log_embedding_cost(pipeline_id=pipeline_id, op="query", text=text)
         if embedding is not None and len(embedding) != 1536:
             raise ValueError(f"embedding must have 1536 dimensions, got {len(embedding)}")
         clauses = ["zone = %s"]
@@ -1124,6 +1127,101 @@ class AsyncPgvectorStore(BaseStore):
                         time.time(),
                     ),
                 )
+
+    async def async_log_embedding_cost(
+        self,
+        *,
+        pipeline_id: str | None,
+        op: str,
+        text: str,
+    ) -> None:
+        """Record one embedding-adapter call for cost visibility (Finding 3).
+
+        Best-effort only: this sits directly on the async_write()/
+        async_query() hot path next to the real ``embed()`` call, so a
+        logging failure here must never be able to break the actual write
+        or query.
+        """
+        try:
+            char_count = len(text)
+            estimated_tokens = estimate_tokens(text)
+            async with self._aconnect() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        self._sql(
+                            """
+                            INSERT INTO {schema}.{prefix}embedding_cost_log (
+                                pipeline_id, op, char_count, estimated_tokens, logged_at
+                            ) VALUES (%s, %s, %s, %s, %s)
+                            """
+                        ),
+                        (pipeline_id, op, char_count, estimated_tokens, time.time()),
+                    )
+        except Exception:
+            pass
+
+    async def async_embedding_cost_summary(
+        self,
+        *,
+        pipeline_id: str | None = None,
+    ) -> dict[str, object]:
+        """Return aggregate embedding-adapter call stats, analogous to async_cost_summary()."""
+        try:
+            async with self._aconnect() as conn:
+                async with conn.cursor() as cursor:
+                    statement = (
+                        "SELECT "
+                        "COUNT(*) AS entry_count, "
+                        "COALESCE(SUM(char_count), 0) AS char_count_total, "
+                        "COALESCE(SUM(estimated_tokens), 0) AS estimated_tokens_total "
+                        f"FROM {self._table_name('embedding_cost_log')}"
+                    )
+                    params: tuple[object, ...] = ()
+                    if pipeline_id is not None:
+                        statement += " WHERE pipeline_id = %s"
+                        params = (pipeline_id,)
+                    await cursor.execute(statement, params)
+                    total_row = await self._afetchone(cursor)
+
+                async with conn.cursor() as cursor:
+                    statement = (
+                        "SELECT op, COUNT(*) AS calls, "
+                        "COALESCE(SUM(estimated_tokens), 0) AS estimated_tokens_total "
+                        f"FROM {self._table_name('embedding_cost_log')}"
+                    )
+                    params = ()
+                    if pipeline_id is not None:
+                        statement += " WHERE pipeline_id = %s"
+                        params = (pipeline_id,)
+                    statement += " GROUP BY op ORDER BY op ASC"
+                    await cursor.execute(statement, params)
+                    by_op_rows = await self._afetchall(cursor)
+        except Exception:
+            return {
+                "summary": {"entry_count": 0, "char_count_total": 0, "estimated_tokens_total": 0},
+                "by_op": [],
+            }
+
+        if total_row is None:
+            return {
+                "summary": {"entry_count": 0, "char_count_total": 0, "estimated_tokens_total": 0},
+                "by_op": [],
+            }
+        return {
+            "summary": {
+                "entry_count": int(total_row["entry_count"]),
+                "char_count_total": int(total_row["char_count_total"]),
+                "estimated_tokens_total": int(total_row["estimated_tokens_total"]),
+            },
+            "by_op": [
+                {
+                    "op": str(row["op"]),
+                    "calls": int(row["calls"]),
+                    "estimated_tokens_total": int(row["estimated_tokens_total"]),
+                }
+                for row in by_op_rows
+            ],
+        }
 
     async def async_status_detail(self, *, pipeline_id: str | None = None) -> dict[str, object]:
         """Return store status using native async DB I/O."""
@@ -2583,6 +2681,15 @@ class AsyncPgvectorStore(BaseStore):
 
     def log_cost_raw(self, **kwargs: Any) -> None:  # type: ignore[override]
         self._not_implemented("log_cost_raw")
+
+    def log_embedding_cost(self, **kwargs: Any) -> None:
+        """Sync facade not supported; use async_log_embedding_cost() on this async-native store."""
+        self._not_implemented("log_embedding_cost")
+
+    def embedding_cost_summary(self, **kwargs: Any) -> Any:
+        """Sync facade not supported; use async_embedding_cost_summary() on this async-native store."""
+        self._not_implemented("embedding_cost_summary")
+        return {}
 
     def log_conscious(self, conscious: ConsciousBlock, *, snapshot_hash: str) -> None:
         self._not_implemented("log_conscious")
