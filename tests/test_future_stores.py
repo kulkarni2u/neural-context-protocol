@@ -48,10 +48,10 @@ class _FakeCursor:
 
         if "CREATE EXTENSION IF NOT EXISTS vector;" in sql:
             return
-        if "SELECT src FROM" in normalized and "chunks WHERE chunk_id = %s" in normalized:
+        if "SELECT src, written_by FROM" in normalized and "chunks WHERE chunk_id = %s" in normalized:
             chunk_id = str(params[0])
             row = self._db.chunks.get(chunk_id)
-            self._rows = [] if row is None else [{"src": row["src"]}]
+            self._rows = [] if row is None else [{"src": row["src"], "written_by": row["written_by"]}]
             return
         if "SELECT content FROM" in normalized and "COALESCE(pipeline_id, '') = COALESCE(%s, '')" in normalized:
             zone, layer, pipeline_id, exclude_chunk_id = params

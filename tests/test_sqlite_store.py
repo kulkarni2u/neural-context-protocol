@@ -482,6 +482,105 @@ def test_sqlite_store_src_is_immutable_for_existing_chunk_id(tmp_path: Path) -> 
         store.write(chunk.model_copy(update={"src": "synthesis"}))
 
 
+def test_sqlite_store_written_by_is_immutable_for_existing_chunk_id(tmp_path: Path) -> None:
+    """Security fix (docs/NCP_SILENT_DISCONNECT_AUDIT.md finding 9): before
+    this fix, reusing an existing chunk_id with a different written_by
+    silently overwrote that chunk's content/author in place while keeping
+    src (and therefore trust) unchanged -- a forgery vector, since chunk_id
+    is returned from every write and appears in every retrieval result."""
+    store = SQLiteStore(tmp_path / "store.db")
+    chunk = SubconsciousChunk(
+        chunk_id="sub_author_lock",
+        layer="semantic",
+        content="victim's original content",
+        src="user_verified",
+        written_by="victim_agent",
+    )
+    store.write(chunk)
+
+    with pytest.raises(ValueError, match="written_by is immutable"):
+        store.write(
+            chunk.model_copy(update={"content": "forged content", "written_by": "attacker_agent"})
+        )
+
+    # The original row must be completely untouched by the rejected write.
+    (persisted,) = store.query(text="victim's original content", k=1)
+    assert persisted.content == "victim's original content"
+    assert persisted.written_by == "victim_agent"
+
+    # A same-author update to their own chunk_id must still work.
+    ok = store.write(chunk.model_copy(update={"content": "victim's updated content"}))
+    assert ok is True
+    (updated,) = store.query(text="victim's updated content", k=1)
+    assert updated.written_by == "victim_agent"
+
+
+def test_sqlite_store_supersede_rejects_cross_pipeline_target(tmp_path: Path) -> None:
+    """Security fix (docs/NCP_SILENT_DISCONNECT_AUDIT.md finding 9): before
+    this fix, supersede() had no ownership check at all, so any caller could
+    pass an arbitrary chunk_id from a different pipeline and silently
+    retire/hide it (superseded chunks are excluded from default queries)."""
+    store = SQLiteStore(tmp_path / "store.db")
+    victim = SubconsciousChunk(
+        chunk_id="sub_victim", layer="semantic", content="victim fact",
+        src="user_verified", written_by="victim_agent", pipeline_id="pipeline_A",
+    )
+    store.write(victim)
+    attacker_new = SubconsciousChunk(
+        chunk_id="sub_attacker_new", layer="semantic", content="attacker fact",
+        src="user_verified", written_by="attacker_agent", pipeline_id="pipeline_B",
+    )
+    store.write(attacker_new)
+
+    assert store.supersede("sub_victim", "sub_attacker_new") is False
+    (still_there,) = store.query(text="victim fact", k=1, pipeline_id="pipeline_A")
+    assert still_there.superseded_by is None
+
+    # Same-pipeline supersede must still work.
+    victim_new = SubconsciousChunk(
+        chunk_id="sub_victim_correction", layer="semantic", content="corrected victim fact",
+        src="user_verified", written_by="victim_agent", pipeline_id="pipeline_A",
+    )
+    store.write(victim_new)
+    assert store.supersede("sub_victim", "sub_victim_correction") is True
+
+
+def test_sqlite_store_add_chunk_edges_rejects_cross_pipeline_dst(tmp_path: Path) -> None:
+    """Security fix (docs/NCP_SILENT_DISCONNECT_AUDIT.md finding 9): before
+    this fix, add_chunk_edges() had no ownership check, so any caller could
+    attach an edge (e.g. 'contradicts') to a chunk from a different pipeline."""
+    from ncp.types import ChunkEdge
+
+    store = SQLiteStore(tmp_path / "store.db")
+    victim = SubconsciousChunk(
+        chunk_id="sub_edge_victim", layer="semantic", content="victim fact",
+        src="user_verified", written_by="victim_agent", pipeline_id="pipeline_A",
+    )
+    store.write(victim)
+    attacker = SubconsciousChunk(
+        chunk_id="sub_edge_attacker", layer="semantic", content="attacker fact",
+        src="user_verified", written_by="attacker_agent", pipeline_id="pipeline_B",
+    )
+    store.write(attacker)
+
+    written = store.add_chunk_edges([
+        ChunkEdge(src_chunk_id="sub_edge_attacker", dst_chunk_id="sub_edge_victim", edge_type="contradicts")
+    ])
+    assert written == 0
+    assert store.get_chunk_edges(["sub_edge_victim"], direction="in") == []
+
+    # Same-pipeline edges must still work.
+    ally = SubconsciousChunk(
+        chunk_id="sub_edge_ally", layer="semantic", content="ally fact",
+        src="user_verified", written_by="victim_agent", pipeline_id="pipeline_A",
+    )
+    store.write(ally)
+    written_ok = store.add_chunk_edges([
+        ChunkEdge(src_chunk_id="sub_edge_ally", dst_chunk_id="sub_edge_victim", edge_type="supports")
+    ])
+    assert written_ok == 1
+
+
 def test_sqlite_store_revalidates_chunk_before_persisting(tmp_path: Path) -> None:
     store = SQLiteStore(tmp_path / "store.db")
     chunk = SubconsciousChunk(

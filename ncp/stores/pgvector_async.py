@@ -489,11 +489,13 @@ class AsyncPgvectorStore(BaseStore):
             )
 
     async def _async_assert_src_immutable(self, conn: Any, chunk: SubconsciousChunk) -> None:
-        """Raise ValueError if src field changes for an existing chunk_id."""
+        """Raise ValueError if src or written_by changes for an existing
+        chunk_id -- see the matching fix/comment in ``ncp/stores/sqlite.py``
+        (docs/NCP_SILENT_DISCONNECT_AUDIT.md finding 9)."""
         async with conn.cursor() as cur:
             await cur.execute(
                 self._sql(
-                    "SELECT src FROM {schema}.{prefix}chunks WHERE chunk_id = %s"
+                    "SELECT src, written_by FROM {schema}.{prefix}chunks WHERE chunk_id = %s"
                 ),
                 (chunk.chunk_id,),
             )
@@ -507,6 +509,12 @@ class AsyncPgvectorStore(BaseStore):
             raise ValueError(
                 f"src is immutable for chunk_id={chunk.chunk_id}: "
                 f"existing={existing_src} new={chunk.src}"
+            )
+        existing_written_by = str(row["written_by"])
+        if existing_written_by != chunk.written_by:
+            raise ValueError(
+                f"written_by is immutable for chunk_id={chunk.chunk_id}: "
+                f"existing={existing_written_by} new={chunk.written_by}"
             )
 
     async def _async_is_duplicate(self, conn: Any, chunk: SubconsciousChunk) -> bool:
