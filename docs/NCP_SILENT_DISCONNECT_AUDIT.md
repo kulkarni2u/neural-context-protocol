@@ -30,8 +30,10 @@ branch (finding 8 was reported after the initial pass, added and fixed in a
 follow-up). Findings 9-18 came from a full bug-bounty-style pass across the
 whole codebase (MCP protocol/security, storage, core assembly/retrieval
 logic, and adapters/CLI/SDK/dogfood harness, hunted in parallel and fixed as
-they were confirmed). Full suite after integration: see the final commit on
-this branch for the exact pass/skip counts; the only expected failure is
+they were confirmed). Full suite after full integration: **1133 passed, 32
+skipped** (the skips are all pgvector/psycopg/redis/optional-provider-extra
+tests correctly skipping for lack of a live service in this environment),
+plus one pre-existing, unrelated failure —
 `tests/test_enhancements.py::test_reranker_cohere_mocked` (`cohere` isn't in
 the `dev` extras), confirmed present identically before any of these
 changes.
