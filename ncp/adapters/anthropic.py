@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from os import environ
 
-from ncp.adapters.base import BaseAdapter, TokenUsage
+from ncp.adapters.base import BaseAdapter, NCPAdapterError, NCPAdapterTimeoutError, TokenUsage
 
 
 class AnthropicAdapter(BaseAdapter):
@@ -60,6 +60,7 @@ class AnthropicAdapter(BaseAdapter):
         )
 
     def stream(self, ncp_context: str, user_turn: str) -> Iterator[str]:
+        timeout_types = (self._anthropic.APITimeoutError, TimeoutError)
         stream_ctx = self._run_provider_call(
             lambda: self._client.messages.stream(
                 model=self._model,
@@ -68,15 +69,28 @@ class AnthropicAdapter(BaseAdapter):
                 messages=[{"role": "user", "content": user_turn}],
             ),
             provider="Anthropic",
-            timeout_types=(self._anthropic.APITimeoutError, TimeoutError),
+            timeout_types=timeout_types,
         )
-        with stream_ctx as stream:
-            for event in stream:
-                if event.type == "content_block_delta" and event.delta.type == "text_delta":
-                    yield event.delta.text
-            final = getattr(stream, "get_final_message", None)
-            if callable(final):
-                try:
-                    self.last_usage = self._usage_from_anthropic(final())
-                except Exception:
-                    self.last_usage = None
+        # ``.stream()`` above only builds a deferred MessageStreamManager; the
+        # real HTTP request happens on ``__enter__`` below, so that entry (and
+        # the iteration that follows) must be wrapped too, or real provider
+        # failures (auth, rate limit, connection, timeout) escape as raw
+        # anthropic.* exceptions instead of this adapter's NCPAdapterError
+        # contract — see call()'s equivalent wrapping via _run_provider_call.
+        try:
+            with stream_ctx as stream:
+                for event in stream:
+                    if event.type == "content_block_delta" and event.delta.type == "text_delta":
+                        yield event.delta.text
+                final = getattr(stream, "get_final_message", None)
+                if callable(final):
+                    try:
+                        self.last_usage = self._usage_from_anthropic(final())
+                    except Exception:
+                        self.last_usage = None
+        except NCPAdapterError:
+            raise
+        except timeout_types as exc:
+            raise NCPAdapterTimeoutError(f"Anthropic timed out: {exc}") from exc
+        except Exception as exc:
+            raise NCPAdapterError(f"Anthropic call failed: {exc}") from exc

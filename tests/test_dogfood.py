@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import subprocess
+import sys
+import time
 
 import ncp
 import pytest
@@ -9,6 +12,7 @@ from ncp.dogfood import (
     CLIProviderMetadataError,
     ClaudeCLIDogfoodAdapter,
     CodexCLIDogfoodAdapter,
+    MCPHTTPClient,
     MCPStdioClient,
     OpenCodeCLIDogfoodAdapter,
     _build_provider_continuation_turn,
@@ -167,6 +171,111 @@ def test_http_adapter_continuation_loop_runs_with_local_contract_adapter(tmp_pat
     assert artifact["mode"] == "adapter_continuation"
     assert artifact["adapter"] == "DogfoodLocalAdapter"
     assert artifact["continuation_ok"] is True
+
+
+def test_stdio_client_read_message_times_out_on_truncated_frame_and_reaps_process(
+    tmp_path: Path,
+) -> None:
+    # Regression for the silent-hang bug: a server that claims a
+    # Content-Length larger than the bytes it actually writes, then never
+    # closes its stdout, used to block MCPStdioClient.request() forever
+    # (stream.read(n) has no timeout on a raw pipe, and EOF never arrives).
+    # Because that hang happened inside the request() call, __exit__ never
+    # ran and the child process leaked. It must now raise within the
+    # configured read timeout and leave no live child behind.
+    fake_server = tmp_path / "fake_server.py"
+    fake_server.write_text(
+        "import sys, time\n"
+        "sys.stdout.buffer.write(b'Content-Length: 100000\\r\\n\\r\\n')\n"
+        "sys.stdout.buffer.write(b'0123456789')\n"
+        "sys.stdout.buffer.flush()\n"
+        "time.sleep(30)\n"
+    )
+    client = MCPStdioClient(
+        store_path=tmp_path / "store.db",
+        cwd=REPO_ROOT,
+        server_cmd=[sys.executable, str(fake_server)],
+        read_timeout_seconds=1.0,
+    )
+
+    start = time.monotonic()
+    pid: int | None = None
+    with pytest.raises(RuntimeError, match="Timed out"):
+        with client as c:
+            pid = c._process.pid
+            c.initialize()
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 10.0, "read timeout did not bound the hang"
+    assert pid is not None
+    time.sleep(0.2)
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)  # process must be reaped, not leaked
+
+
+def test_stdio_client_read_message_rejects_absurd_content_length(tmp_path: Path) -> None:
+    # A Content-Length far beyond any real MCP frame must be rejected up
+    # front (matching ncp/mcp/server.py's server-side cap) instead of
+    # driving a large stream.read(n) even within the timeout budget.
+    fake_server = tmp_path / "fake_server.py"
+    fake_server.write_text(
+        "import sys\n"
+        "sys.stdout.buffer.write(b'Content-Length: 999999999\\r\\n\\r\\n')\n"
+        "sys.stdout.buffer.flush()\n"
+        "sys.stdin.buffer.read()\n"
+    )
+    client = MCPStdioClient(
+        store_path=tmp_path / "store.db",
+        cwd=REPO_ROOT,
+        server_cmd=[sys.executable, str(fake_server)],
+        read_timeout_seconds=5.0,
+    )
+
+    start = time.monotonic()
+    with pytest.raises(RuntimeError, match="Content-Length out of allowed range"):
+        with client as c:
+            c.initialize()
+    assert time.monotonic() - start < 2.0, "oversized Content-Length should be rejected immediately"
+
+
+def test_http_client_start_terminates_process_when_readiness_probe_times_out(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Regression: start() (called from __enter__) used to leave the just-
+    # spawned subprocess running if _wait_until_ready() raised, because
+    # Python only calls __exit__ when __enter__ succeeds.
+    fake_server = tmp_path / "fake_http_server.py"
+    fake_server.write_text("import time\ntime.sleep(30)\n")
+    client = MCPHTTPClient(
+        store_path=tmp_path / "store.db",
+        cwd=REPO_ROOT,
+        server_cmd=[sys.executable, str(fake_server)],
+    )
+    orig_wait_until_ready = MCPHTTPClient._wait_until_ready
+    monkeypatch.setattr(
+        MCPHTTPClient,
+        "_wait_until_ready",
+        lambda self, timeout_seconds=5.0: orig_wait_until_ready(self, timeout_seconds=1.0),
+    )
+
+    captured: dict[str, int] = {}
+    orig_popen = subprocess.Popen
+
+    def _spy_popen(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+        proc = orig_popen(*args, **kwargs)  # type: ignore[arg-type]
+        captured["pid"] = proc.pid
+        return proc
+
+    monkeypatch.setattr(subprocess, "Popen", _spy_popen)
+
+    with pytest.raises(RuntimeError, match="did not become ready"):
+        client.start()
+
+    assert "pid" in captured
+    time.sleep(0.2)
+    with pytest.raises(ProcessLookupError):
+        os.kill(captured["pid"], 0)  # process must be reaped, not leaked
 
 
 def test_live_provider_readiness_reports_missing_credentials(monkeypatch: object) -> None:

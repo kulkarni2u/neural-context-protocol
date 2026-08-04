@@ -27,11 +27,11 @@ Findings are ranked silent-first, most-impactful first within that bucket.
 
 Every finding and the addendum below has a corresponding fix merged on this
 branch (finding 8 was reported after the initial pass, added and fixed in a
-follow-up). Findings 9-15 came from a full bug-bounty-style pass across the
+follow-up). Findings 9-18 came from a full bug-bounty-style pass across the
 whole codebase (MCP protocol/security, storage, core assembly/retrieval
-logic, and adapters/CLI/SDK, hunted in parallel and fixed as they were
-confirmed). Full suite after integration: see the final commit on this
-branch for the exact pass/skip counts; the only expected failure is
+logic, and adapters/CLI/SDK/dogfood harness, hunted in parallel and fixed as
+they were confirmed). Full suite after integration: see the final commit on
+this branch for the exact pass/skip counts; the only expected failure is
 `tests/test_enhancements.py::test_reranker_cohere_mocked` (`cohere` isn't in
 the `dev` extras), confirmed present identically before any of these
 changes.
@@ -54,6 +54,9 @@ changes.
 | 13 — Malformed `world_check` whisper blocks later valid drift signals | `_apply_drift_feedback`'s `break` now only fires once a signal is actually applied; out-of-range `detected_drift` falls through to the next whisper |
 | 14 — `RetrievalPolicy.score()` can exceed its documented `[0, 1]` range | `bm25_normalized` is now double-clamped (`max(0.0, min(1.0, ...))`, matching `score_with_vector`'s existing clamp) |
 | 15 — Redis fetch-slot race + unbounded dedup scan | `claim_fetch_slot` claims via atomic `HINCRBY` with a compensating revert; `_is_duplicate`/`_async_is_duplicate` bound their candidate scan via a new `retention.dedup_scan_limit` config knob (default 200) |
+| 16 — `_read_message` can hang forever on a truncated/malformed frame | Blocking pipe reads now run under a hard deadline; oversized `Content-Length` is rejected before reading; a related `close()`-ordering deadlock uncovered while fixing this was also fixed |
+| 17 — `MCPHTTPClient` leaks its subprocess on a readiness-probe timeout | `start()` now tears the just-spawned process down via `close()` before re-raising when `_wait_until_ready()` fails |
+| 18 — `AnthropicAdapter.stream()` lets raw provider errors escape | The real HTTP request (inside `with stream_ctx as stream:`) is now wrapped in the same error-mapping `call()` uses, so streaming failures raise `NCPAdapterError`/`NCPAdapterTimeoutError` too |
 
 ---
 
@@ -864,6 +867,156 @@ changes.
 
 ---
 
+## 16. `_read_message` in the dogfood harness can hang forever on a truncated/malformed JSON-RPC frame, leaking the subprocess
+
+**Status: Fixed.**
+
+- **Location:** `ncp/dogfood.py`, `_read_message` (module-level helper used
+  by `MCPStdioClient.request()`)
+- **Type:** untraced-path / resource-leak
+- **Severity:** silent — no exception, no log line; the calling process (e.g.
+  `ncp dogfood`, or a CI job invoking it) just hangs forever with a leaked
+  child process
+- **Evidence:**
+
+  `line = stream.readline()` (the header loop) and
+  `body = stream.read(int(content_length))` both block on a raw pipe with no
+  timeout. If a server process sends a `Content-Length` header larger than
+  the bytes it actually writes (crash mid-write, OOM-kill between header and
+  body flush, or any non-conforming server), `stream.read(n)` loops
+  internally until it gets `n` bytes or EOF — and since the child's stdout
+  stays open, EOF never comes. The call blocks indefinitely, and since this
+  happens inside `with MCPStdioClient(...) as client:`, `__exit__`/`close()`
+  (which would terminate the subprocess) never runs.
+
+  Confirmed live with a fake child that writes `Content-Length: 100000` plus
+  10 bytes of body, then sleeps: on the pre-fix code, `MCPStdioClient.
+  request()` was still blocked after 8+ seconds (killed by an external
+  timeout for the repro to terminate at all), and the child process was
+  still alive afterward — a genuine, unbounded hang with a leaked child.
+
+- **Fix:**
+  1. Blocking pipe reads (`readline()`/`read(n)`) now run on a background
+     daemon thread with a hard deadline (`_read_with_timeout`, default
+     `_DEFAULT_MCP_READ_TIMEOUT_SECONDS = 30.0`, threaded through
+     `MCPStdioClient(read_timeout_seconds=...)`). A daemon thread was used
+     instead of `concurrent.futures.ThreadPoolExecutor` deliberately:
+     `ThreadPoolExecutor`'s worker threads are joined by an `atexit` hook
+     even when never explicitly shut down, so a call that legitimately never
+     returns (the exact failure mode here) would reintroduce the same hang
+     at interpreter exit — confirmed by direct repro before settling on the
+     daemon-thread + `queue.Queue` approach. On timeout, a plain
+     `RuntimeError` is raised instead of hanging, so the surrounding `with`
+     block's `__exit__` now runs.
+  2. Added a `Content-Length` sanity cap (`_MAX_MCP_CONTENT_LENGTH =
+     10_485_760`, matching the existing server-side cap in
+     `ncp/mcp/server.py`'s `_read_message`) so an absurd header is rejected
+     before any read is attempted.
+  3. While verifying (1) end-to-end, found and fixed a second, related bug
+     it exposed: `MCPStdioClient.close()`/`MCPHTTPClient.close()` closed the
+     process's pipes *before* terminating the still-alive child. If a
+     `_read_with_timeout` background thread was still blocked inside
+     `stream.read()` on that pipe (holding the `BufferedReader`'s internal
+     lock for the duration of the blocking read), `pipe.close()` from the
+     main thread would then block acquiring that same lock — deadlocking
+     `close()` itself, since the process (whose termination would unblock
+     the read via EOF) was never reached. Reordered both `close()` methods
+     to terminate/kill the process first, then close the pipes, so the
+     pending read unblocks (EOF/broken pipe) before `close()` needs the
+     lock. Confirmed via repro: pre-reorder, `close()` after a read timeout
+     hung indefinitely; post-reorder, it returns in under 10ms.
+
+  Regression tests: `tests/test_dogfood.py::
+  test_stdio_client_read_message_times_out_on_truncated_frame_and_reaps_process`,
+  `::test_stdio_client_read_message_rejects_absurd_content_length`.
+
+---
+
+## 17. `MCPHTTPClient` leaks its subprocess when the readiness probe times out
+
+**Status: Fixed.**
+
+- **Location:** `ncp/dogfood.py`, `MCPHTTPClient.start()` and
+  `_wait_until_ready()`
+- **Type:** resource-leak
+- **Severity:** silent — `RuntimeError` is raised as expected, but the
+  spawned process is orphaned, still running and holding its bound port
+- **Evidence:**
+
+  `start()` (called from `__enter__`) does `self._process =
+  subprocess.Popen(...)` then `self._wait_until_ready()`. If the server
+  doesn't answer `/healthz` within `timeout_seconds` (default 5.0s) but
+  hasn't exited, `_wait_until_ready()` raises `RuntimeError`. Because this
+  happens inside `__enter__`, Python's `with` statement never calls
+  `__exit__` (it only calls `__exit__` if `__enter__` succeeds) — so
+  `close()` (which terminates/kills the child) never runs.
+
+  Confirmed live: pointing `server_cmd` at a process that never answers
+  `/healthz` raises the expected `RuntimeError` after the probe deadline,
+  but `os.kill(pid, 0)` confirms the child is still alive afterward — a real
+  leaked, port-holding process, not just a slow failure.
+
+- **Fix:** `start()` now wraps `self._wait_until_ready()` in a
+  `try/except Exception` that calls `self.close()` (reusing the same
+  terminate/kill teardown `__exit__` already uses, rather than duplicating
+  it) before re-raising the original exception. `close()` is idempotent
+  (`self._process is None` short-circuits) so this is safe to call even if
+  the process happened to exit on its own by then.
+
+  Regression test: `tests/test_dogfood.py::
+  test_http_client_start_terminates_process_when_readiness_probe_times_out`.
+
+---
+
+## 18. `AnthropicAdapter.stream()` lets real provider errors escape unwrapped, breaking the adapter's own error contract
+
+**Status: Fixed.**
+
+- **Location:** `ncp/adapters/anthropic.py`, `stream()`, contrast with
+  `call()`
+- **Type:** adapter-gap
+- **Severity:** silent-ish — not a hang, but a contract violation: any code
+  written against `except NCPAdapterError` (the documented adapter contract)
+  silently fails to catch real streaming failures
+- **Evidence:**
+
+  The `anthropic` SDK's `Messages.stream()` only builds a deferred request
+  object (`MessageStreamManager`) — the actual HTTP call happens inside
+  `MessageStreamManager.__enter__` (the `with stream_ctx as stream:` line).
+  Pre-fix, `AnthropicAdapter.stream()` only wrapped the `.stream()` call
+  itself (which just builds the manager) in `self._run_provider_call(...)` —
+  the real network request, in the `with` block, was outside that wrapper.
+  So any real failure during streaming (auth failure, rate limit, connection
+  error, timeout) raised the SDK's raw `anthropic.APIConnectionError`/
+  `APIStatusError`/`APITimeoutError` instead of this codebase's own
+  `NCPAdapterError`/`NCPAdapterTimeoutError`.
+
+  Confirmed live: pointing the adapter at an unroutable address,
+  `adapter.call(...)` correctly raised `NCPAdapterError: Anthropic call
+  failed: Connection error.`, while `list(adapter.stream(...))` raised the
+  raw, unwrapped `anthropic.APIConnectionError`. Also reproduced
+  deterministically with a mocked `MessageStreamManager` whose `__enter__`
+  raises `anthropic.APIConnectionError`/`APITimeoutError`: pre-fix, both
+  leaked as raw `anthropic.*` exceptions out of `list(adapter.stream(...))`.
+
+  (`OpenAIAdapter.stream()` does not have this bug — its SDK performs the
+  HTTP request synchronously inside the wrapped `.create(stream=True)` call,
+  so it was left untouched.)
+
+- **Fix:** the `with stream_ctx as stream:` entry and the streaming loop
+  that follows are now wrapped in the same `NCPAdapterError`/
+  `NCPAdapterTimeoutError` mapping `_run_provider_call` already applies to
+  `call()` (`except timeout_types -> NCPAdapterTimeoutError`, `except
+  Exception -> NCPAdapterError`, both with the same `"Anthropic ... "`
+  message shape), so a streaming failure now produces the same exception
+  type and message shape as the equivalent non-streaming failure.
+
+  Regression tests: `tests/test_adapters.py::TestAnthropicAdapter::
+  test_stream_wraps_errors_raised_on_manager_entry`,
+  `TestErrorSemantics::test_anthropic_stream_timeout_raises`.
+
+---
+
 ## Secondary notes (not independent findings, lower severity)
 
 - **`SubconsciousChunk.caused_by` (scalar) has no input on the two most-used
@@ -941,6 +1094,52 @@ resp = handlers["ncp_get_context"]({"agent_id": "reader", "role": "analyst",
     "max_tokens": 120})
 # resp["context"] has zero [NCP:SUBCONSCIOUS] entries (full eviction)
 # resp["telemetry"]["evicted_high_relevance_count"] == 0
+```
+
+**Finding 16 — `_read_message` hang / leaked subprocess:**
+
+```python
+# fake_server.py: writes a Content-Length header far larger than the body
+# it actually sends, then sleeps forever without closing stdout.
+#   sys.stdout.buffer.write(b"Content-Length: 100000\r\n\r\n")
+#   sys.stdout.buffer.write(b"0123456789")
+#   sys.stdout.buffer.flush()
+#   time.sleep(9999)
+
+client = MCPStdioClient(store_path=..., cwd=..., server_cmd=[sys.executable, "fake_server.py"])
+client.start()
+client.initialize()  # pre-fix: blocks forever; post-fix (read_timeout_seconds=N):
+                      #   raises RuntimeError("Timed out after Ns waiting for MCP message data")
+                      #   within N seconds, and the with-block's __exit__ reaps the child.
+```
+
+**Finding 17 — `MCPHTTPClient` leaked subprocess on readiness timeout:**
+
+```python
+# fake_http_server.py: never answers /healthz (e.g. time.sleep(9999)).
+client = MCPHTTPClient(store_path=..., cwd=..., server_cmd=[sys.executable, "fake_http_server.py"])
+try:
+    client.start()
+except RuntimeError:
+    pass
+# pre-fix: os.kill(pid, 0) succeeds -- child still alive (leaked).
+# post-fix: os.kill(pid, 0) raises ProcessLookupError -- child was reaped by close().
+```
+
+**Finding 18 — `AnthropicAdapter.stream()` unwrapped provider error:**
+
+```python
+class FakeStreamManager:
+    def __enter__(self):
+        raise anthropic.APIConnectionError(request=MagicMock())
+    def __exit__(self, *a):
+        return False
+
+with patch.object(adapter._client.messages, "stream") as mock_stream:
+    mock_stream.return_value = FakeStreamManager()
+    list(adapter.stream("ctx", "hi"))
+# pre-fix: raises raw anthropic.APIConnectionError
+# post-fix: raises NCPAdapterError("Anthropic call failed: Connection error.")
 ```
 
 ---
