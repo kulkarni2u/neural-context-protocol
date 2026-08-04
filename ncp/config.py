@@ -115,6 +115,13 @@ DEFAULT_CONFIG = {
     },
     "retention": {
         "max_working_chunks_per_pipeline": 0,
+        # Bound on how many same-(zone, layer, pipeline_id) rows write()'s
+        # duplicate-detection scan examines, most-recent-first. Working-zone
+        # chunk count is already capped by max_working_chunks (default 500),
+        # but "proven"/"global" zones are not -- without this bound, every
+        # write to a long-lived non-working pipeline gets slower forever as
+        # that zone/layer/pipeline combination accumulates rows.
+        "dedup_scan_limit": 200,
     },
     "server": {
         "auth_token": "",
@@ -453,6 +460,11 @@ class NCPConfig:
         return int(self.values.get("retention", {}).get("max_working_chunks_per_pipeline", 0))
 
     @property
+    def dedup_scan_limit(self) -> int:
+        """Bound on write()'s duplicate-detection candidate scan (see DEFAULT_CONFIG['retention'])."""
+        return max(0, int(self.values.get("retention", {}).get("dedup_scan_limit", 200)))
+
+    @property
     def memoization_enabled(self) -> bool:
         return bool(self.values.get("memoization", {}).get("enabled", False))
 
@@ -649,6 +661,8 @@ def _apply_env_overrides(values: dict[str, Any], env: dict[str, str]) -> None:
         values["graph"]["infer_scan_limit"] = int(env["NCP_INFER_SCAN_LIMIT"])
     if "NCP_INFER_MAX_EDGES" in env:
         values["graph"]["infer_max_edges"] = int(env["NCP_INFER_MAX_EDGES"])
+    if "NCP_DEDUP_SCAN_LIMIT" in env:
+        values["retention"]["dedup_scan_limit"] = int(env["NCP_DEDUP_SCAN_LIMIT"])
 
 
 def _deep_merge(target: dict[str, Any], updates: dict[str, Any]) -> None:

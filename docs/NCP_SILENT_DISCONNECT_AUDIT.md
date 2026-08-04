@@ -27,7 +27,7 @@ Findings are ranked silent-first, most-impactful first within that bucket.
 
 Every finding and the addendum below has a corresponding fix merged on this
 branch (finding 8 was reported after the initial pass, added and fixed in a
-follow-up). Findings 9-14 came from a full bug-bounty-style pass across the
+follow-up). Findings 9-15 came from a full bug-bounty-style pass across the
 whole codebase (MCP protocol/security, storage, core assembly/retrieval
 logic, and adapters/CLI/SDK, hunted in parallel and fixed as they were
 confirmed). Full suite after integration: see the final commit on this
@@ -53,6 +53,7 @@ changes.
 | 12 — Superseded facts reappear when `edge_expansion` is disabled | `_suppress_superseded` now runs unconditionally in `_prepare_assembly`, no longer gated on the unrelated `edge_expansion` flag |
 | 13 — Malformed `world_check` whisper blocks later valid drift signals | `_apply_drift_feedback`'s `break` now only fires once a signal is actually applied; out-of-range `detected_drift` falls through to the next whisper |
 | 14 — `RetrievalPolicy.score()` can exceed its documented `[0, 1]` range | `bm25_normalized` is now double-clamped (`max(0.0, min(1.0, ...))`, matching `score_with_vector`'s existing clamp) |
+| 15 — Redis fetch-slot race + unbounded dedup scan | `claim_fetch_slot` claims via atomic `HINCRBY` with a compensating revert; `_is_duplicate`/`_async_is_duplicate` bound their candidate scan via a new `retention.dedup_scan_limit` config knob (default 200) |
 
 ---
 
@@ -778,6 +779,88 @@ changes.
 - **Fix:** clamp `bm25_normalized` the same way `score_with_vector` already
   does: `max(0.0, min(1.0, bm25_normalized))`. Regression coverage:
   `tests/test_retrieval_policy.py::test_score_clamps_bm25_normalized_above_one`.
+
+---
+
+## 15. Redis fetch-slot budget race, and an unbounded per-write duplicate-detection scan
+
+**Status: Fixed.**
+
+- **Location:** `ncp/stores/redis_coordination.py` (`RedisCoordination.
+  claim_fetch_slot`); `ncp/stores/sqlite.py` (`_is_duplicate`),
+  `ncp/stores/pgvector.py` (`_is_duplicate`), `ncp/stores/pgvector_async.py`
+  (`_async_is_duplicate`)
+- **Type:** concurrency-race / unbounded-scan (DoS)
+- **Severity:** silent — no error either way; the fetch cap is silently
+  bypassable under real concurrency, and the growing write latency has no
+  alarm or log line of its own
+- **Evidence:**
+
+  **9a — fetch-slot race.** `claim_fetch_slot` did `hgetall` → compare
+  `current >= max_fetches` in Python → `hset` with `current+1`, with no
+  atomicity between the read and the write. Two concurrent `ncp_fetch`
+  calls for the same `session_id` (the distributed Redis coordination path
+  exists specifically to serialize *multiple processes/workers* sharing one
+  session, which is exactly the scenario this race requires) can both read
+  `current=2` at a limit of 3, both pass the check, and both write
+  `fetch_count=3` — the hard per-session cap enforced via
+  `ncp_fetch limit reached: max 3 per session` in `ncp/mcp/server.py`'s
+  `_handle_fetch` is bypassable by concurrent callers. (The in-process,
+  non-Redis fallback path in the same handler already used a real
+  `threading.Lock` and was not affected — this was specific to the
+  distributed Redis path.)
+
+  **9b — unbounded dedup scan.** Every `write()` call runs `_is_duplicate`,
+  which `SELECT`s **all** rows matching `(zone, layer, pipeline_id)` with no
+  `LIMIT`, then runs `difflib.SequenceMatcher` (itself O(content_len²))
+  against every one of them in a Python loop. `_hard_gc`/retention only
+  caps chunk count for `zone == "working"` (default 500 via
+  `max_working_chunks`) — `"proven"` and `"global"` zones are never capped
+  by count, so a pipeline that accumulates chunks in a non-working zone
+  makes every subsequent write to that zone/layer/pipeline combination
+  strictly slower, unbounded. Confirmed live in the original hunt: per-write
+  latency grew from ~2ms to 331ms+ (still climbing) over 2400 writes to a
+  `zone="global"` pipeline.
+
+- **Fix:**
+  1. `claim_fetch_slot` now claims atomically via `HINCRBY` — a single
+     Redis command, atomic even with concurrent callers since Redis
+     processes commands from different clients sequentially — then reverts
+     with a compensating `HINCRBY -1` and raises the same
+     `ncp_fetch limit reached` error if the increment pushed the count past
+     `max_fetches`. Return shape (`tuple[int, str | None]`), key naming/TTL,
+     and `pipeline_id` resolution/scoping are unchanged.
+  2. `_is_duplicate`/`_async_is_duplicate` now bound the candidate scan with
+     `ORDER BY created_at DESC LIMIT ?`, mirroring the existing bounded-scan
+     pattern already used for edge-inference candidates
+     (`_edge_inference_candidates`). The bound is a new
+     `retention.dedup_scan_limit` config knob (default `200`, env override
+     `NCP_DEDUP_SCAN_LIMIT`), read the same defensive way other per-store
+     `self.config`-derived values already are (`self.config.dedup_scan_limit
+     if self.config is not None else 200`). Applied identically to all three
+     backends; sqlite is exercised by a regression test, pgvector/
+     pgvector_async structurally mirror it but weren't live-tested (no
+     Postgres available in this environment).
+
+  Verified: (a) `HINCRBY`'s atomicity is a documented single-command Redis
+  guarantee, not something that needs a live server to reason about, and
+  `tests/test_future_stores.py::
+  test_redis_coordination_claim_fetch_slot_uses_atomic_hincrby_and_reverts_over_limit`
+  exercises the sequential contract (3 claims succeed, the 4th is rejected,
+  and `fetch_count` stays at exactly 3 after the rejected 4th — the
+  increment-then-revert pair is balanced, not just the raise) against the
+  same fake-Redis client the other Redis-coordination tests already use.
+  (b) `tests/test_sqlite_store.py::
+  test_sqlite_store_dedup_scan_is_bounded_for_non_working_zones` writes 12
+  mutually-dissimilar chunks to a `zone="global"` pipeline with
+  `dedup_scan_limit=5` and shows the bound actually changes behavior: a
+  near-duplicate of a chunk that's now outside the 5-row lookback window is
+  no longer flagged as a duplicate (proving the scan is genuinely bounded,
+  not just faster), while a near-duplicate still inside the window is still
+  correctly detected and suppressed (proving dedup itself still works).
+  `tests/test_config.py::
+  test_dedup_scan_limit_defaults_and_file_and_env_overrides` covers the new
+  config knob's default/file/env precedence.
 
 ---
 

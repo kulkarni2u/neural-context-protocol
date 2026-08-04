@@ -1,8 +1,10 @@
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+import time
 
 import pytest
 
+from ncp.config import NCPConfig
 from ncp.stores.base import NCPStoreUnavailableError
 from ncp.stores.sqlite import SQLiteStore
 from ncp.types import ConsciousBlock, DissentPayload, NCPResponse, SubconsciousChunk, TurnRecord, Whisper
@@ -313,6 +315,65 @@ def test_sqlite_store_duplicate_write_is_skipped(tmp_path: Path) -> None:
 
     assert store.write(chunk) is True
     assert store.write(chunk.model_copy(update={"chunk_id": "sub_duplicate"})) is False
+
+
+def test_sqlite_store_dedup_scan_is_bounded_for_non_working_zones(tmp_path: Path) -> None:
+    """docs/NCP_SILENT_DISCONNECT_AUDIT.md finding 10: _is_duplicate's scan
+    must not be unbounded for "proven"/"global" zones, which (unlike
+    "working") are never capped by _hard_gc/retention -- an unbounded scan
+    there made every write to a long-lived non-working pipeline strictly
+    slower forever. This asserts the bound is real by proving it changes
+    behavior: a near-duplicate pushed outside the (small, configured)
+    lookback window is no longer detected, while one still inside the
+    window is."""
+    config = NCPConfig(values={"retention": {"dedup_scan_limit": 5}}, project_root=Path("."))
+    store = SQLiteStore(tmp_path / "store.db", config=config)
+    far_future_expiry = time.time() + 100_000
+    # Mutually dissimilar topics (SequenceMatcher ratio well under the 0.92
+    # near-duplicate cutoff between any two) so only an exact/near-exact
+    # repeat of the *same* topic ever counts as a duplicate below.
+    topics = [
+        "mountain glacier erosion patterns over centuries",
+        "vintage jazz recording studio acoustics",
+        "coral reef bleaching ocean temperature correlation",
+        "medieval manuscript illumination pigment chemistry",
+        "high altitude cargo drone battery thermal limits",
+        "sourdough starter fermentation yeast culture",
+        "urban rail transit signal interlocking design",
+        "desert cactus root water storage adaptation",
+        "orbital debris tracking radar cross section",
+        "handmade ceramic glaze firing temperature curves",
+        "beekeeping colony winter survival strategies",
+        "volcanic ash soil fertility agricultural impact",
+    ]
+
+    def _filler(i: int) -> SubconsciousChunk:
+        return SubconsciousChunk(
+            chunk_id=f"sub_filler_{i}",
+            layer="semantic",
+            content=topics[i],
+            src="tool_result",
+            pipeline_id="pipe_dedup",
+            zone="global",
+            expiry=far_future_expiry,
+        )
+
+    first = _filler(0)
+    assert store.write(first) is True
+    # Push `first` outside the 5-row scan window with unrelated writes.
+    for i in range(1, 12):
+        assert store.write(_filler(i)) is True
+    last = _filler(11)
+
+    # A near-duplicate of the now-11-writes-old `first` chunk is outside the
+    # bounded scan window -- write succeeds (not silently treated as dup).
+    stale_near_duplicate = first.model_copy(update={"chunk_id": "sub_stale_dup"})
+    assert store.write(stale_near_duplicate) is True
+
+    # A near-duplicate of the most recent chunk is still inside the window
+    # -- dedup detection is not just disabled, it still works where it should.
+    fresh_near_duplicate = last.model_copy(update={"chunk_id": "sub_fresh_dup"})
+    assert store.write(fresh_near_duplicate) is False
 
 
 def test_sqlite_store_whisper_drain_filters_and_deletes(tmp_path: Path) -> None:

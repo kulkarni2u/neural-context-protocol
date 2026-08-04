@@ -196,12 +196,19 @@ class RedisCoordination:
     ) -> tuple[int, str | None]:
         client = self._client_or_raise()
         key = self._fetch_key(session_id)
-        payload = client.hgetall(key)
-        current = int(payload.get("fetch_count", "0") or 0)
-        if current >= max_fetches:
+        # HINCRBY is a single atomic Redis command (Redis serializes commands
+        # from concurrent clients), so this claim can't race the way a
+        # hgetall-then-hset read-modify-write could: two concurrent callers
+        # for the same session_id can no longer both observe a stale
+        # pre-increment count and both slip past the max_fetches check.
+        updated = int(client.hincrby(key, "fetch_count", 1))
+        if updated > max_fetches:
+            # Revert the over-limit claim so fetch_count doesn't keep
+            # climbing past max_fetches on repeated rejected attempts.
+            client.hincrby(key, "fetch_count", -1)
             raise ValueError("ncp_fetch limit reached: max 3 per session")
-        resolved_pipeline = pipeline_id if pipeline_id is not None else (payload.get("pipeline_id") or None)
-        updated = current + 1
+        existing_pipeline = client.hgetall(key).get("pipeline_id") or None
+        resolved_pipeline = pipeline_id if pipeline_id is not None else existing_pipeline
         client.hset(
             key,
             mapping={

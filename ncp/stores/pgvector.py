@@ -3124,6 +3124,12 @@ class PgvectorStore(BaseStore):
             )
 
     def _is_duplicate(self, connection: Any, chunk: SubconsciousChunk) -> bool:
+        # Bounded, most-recent-first scan (mirrors _edge_inference_candidates):
+        # working-zone row count is already capped by max_working_chunks, but
+        # "proven"/"global" zones are not, so an unbounded scan here made every
+        # write to a long-lived non-working (zone, layer, pipeline_id) strictly
+        # slower forever as that combination accumulated rows.
+        limit = self.config.dedup_scan_limit if self.config is not None else 200
         cursor = connection.cursor()
         try:
             cursor.execute(
@@ -3132,9 +3138,11 @@ class PgvectorStore(BaseStore):
                     SELECT content FROM {schema}.{prefix}chunks
                     WHERE zone = %s AND layer = %s AND COALESCE(pipeline_id, '') = COALESCE(%s, '')
                       AND chunk_id != %s
+                    ORDER BY created_at DESC
+                    LIMIT %s
                     """
                 ),
-                (chunk.zone, chunk.layer, chunk.pipeline_id, chunk.chunk_id),
+                (chunk.zone, chunk.layer, chunk.pipeline_id, chunk.chunk_id, max(0, int(limit))),
             )
             rows = self._fetchall(cursor)
         finally:

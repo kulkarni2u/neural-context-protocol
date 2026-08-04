@@ -54,14 +54,16 @@ class _FakeCursor:
             self._rows = [] if row is None else [{"src": row["src"], "written_by": row["written_by"]}]
             return
         if "SELECT content FROM" in normalized and "COALESCE(pipeline_id, '') = COALESCE(%s, '')" in normalized:
-            zone, layer, pipeline_id, exclude_chunk_id = params
-            self._rows = [
-                {"content": row["content"]}
+            zone, layer, pipeline_id, exclude_chunk_id, limit = params
+            matches = [
+                row
                 for row in self._db.chunks.values()
                 if row["zone"] == zone and row["layer"] == layer
                 and (row["pipeline_id"] or "") == (pipeline_id or "")
                 and row["chunk_id"] != exclude_chunk_id
             ]
+            matches.sort(key=lambda row: row["created_at"], reverse=True)
+            self._rows = [{"content": row["content"]} for row in matches[: int(limit)]]
             return
         if "INSERT INTO" in normalized and "chunks (" in normalized:
             self._insert_chunk(params)
@@ -452,6 +454,12 @@ class _FakeRedisClient:
 
     def hgetall(self, key: str) -> dict[str, str]:
         return dict(self.hashes.get(key, {}))
+
+    def hincrby(self, key: str, field: str, amount: int = 1) -> int:
+        bucket = self.hashes.setdefault(key, {})
+        updated = int(bucket.get(field, "0") or 0) + amount
+        bucket[field] = str(updated)
+        return updated
 
     def expire(self, key: str, ttl_seconds: int) -> None:
         self.expirations[key] = ttl_seconds
@@ -946,6 +954,37 @@ def test_redis_coordination_supports_peek_ack_and_fetch_sessions() -> None:
         coordination.claim_fetch_slot("session-1", pipeline_id="pipe_redis")
     with pytest.raises(ValueError, match="max 3 per session"):
         coordination.claim_fetch_slot("session-1", pipeline_id="pipe_redis")
+
+
+def test_redis_coordination_claim_fetch_slot_uses_atomic_hincrby_and_reverts_over_limit() -> None:
+    """Guards against a read-modify-write race in claim_fetch_slot: the
+    fix replaces a hgetall-then-hset check with a single atomic HINCRBY,
+    so this asserts the sequential contract still holds exactly (3 claims
+    succeed, the 4th is rejected, and the rejected claim doesn't leave
+    fetch_count above the limit)."""
+    client = _FakeRedisClient()
+    coordination = RedisCoordination(
+        "redis://127.0.0.1:6379/0",
+        client_factory=lambda _url: client,
+    )
+
+    for expected_count in (1, 2, 3):
+        claimed, pipeline_id = coordination.claim_fetch_slot("session-atomic", pipeline_id="pipe_atomic", max_fetches=3)
+        assert claimed == expected_count
+        assert pipeline_id == "pipe_atomic"
+
+    with pytest.raises(ValueError, match="max 3 per session"):
+        coordination.claim_fetch_slot("session-atomic", pipeline_id="pipe_atomic", max_fetches=3)
+
+    # The rejected 4th claim must not leave the counter above the limit -
+    # i.e. the HINCRBY+revert pair is balanced, not just the raise.
+    key = coordination._fetch_key("session-atomic")
+    assert client.hgetall(key)["fetch_count"] == "3"
+
+    # A fresh claim after the revert still works correctly (no drift).
+    coordination.reset_fetch_session("session-atomic", pipeline_id="pipe_atomic")
+    claimed, _ = coordination.claim_fetch_slot("session-atomic", pipeline_id="pipe_atomic", max_fetches=3)
+    assert claimed == 1
 
 
 def test_future_store_hints_point_to_local_scripts(tmp_path: Path) -> None:
