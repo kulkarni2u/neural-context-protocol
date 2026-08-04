@@ -6,12 +6,14 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
+import queue
 import re
 import shutil
 import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from typing import BinaryIO
 
@@ -27,10 +29,57 @@ def _frame_message(payload: dict[str, object]) -> bytes:
     return f"Content-Length: {len(body)}\r\n\r\n".encode("ascii") + body
 
 
-def _read_message(stream: BinaryIO) -> dict[str, object]:
+# Default deadline for a single blocking pipe read while parsing one MCP
+# frame. Without this, a truncated/malformed frame (server crash mid-write,
+# OOM-kill between header and body flush, any non-conforming server) leaves
+# stream.readline()/stream.read(n) blocked forever: the child's stdout stays
+# open, so EOF never arrives.
+_DEFAULT_MCP_READ_TIMEOUT_SECONDS = 30.0
+
+# Matches ncp/mcp/server.py's server-side _read_message Content-Length cap,
+# so a header claiming an absurd body size is rejected up front instead of
+# driving a multi-minute-or-longer stream.read(n) even within the timeout.
+_MAX_MCP_CONTENT_LENGTH = 10_485_760
+
+
+def _read_with_timeout(read_fn: object, timeout: float) -> bytes:
+    """Run one blocking ``BinaryIO`` read with a hard deadline.
+
+    Raw pipes (``subprocess.Popen(..., stdout=PIPE).stdout``) have no
+    built-in read timeout: ``readline()``/``read(n)`` block until enough
+    bytes arrive or the writer closes its end. Run the read on a daemon
+    thread so a stuck read can never block process exit (unlike
+    ``ThreadPoolExecutor``, whose worker threads are joined by an ``atexit``
+    hook even when a call never returns) and surface a timeout as a plain
+    ``RuntimeError`` instead of hanging.
+    """
+    result: "queue.Queue[tuple[str, object]]" = queue.Queue(maxsize=1)
+
+    def _worker() -> None:
+        try:
+            result.put(("ok", read_fn()))  # type: ignore[operator]
+        except BaseException as exc:  # noqa: BLE001 - relayed to the caller below
+            result.put(("error", exc))
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    thread.start()
+    try:
+        status, value = result.get(timeout=timeout)
+    except queue.Empty as exc:
+        raise RuntimeError(
+            f"Timed out after {timeout}s waiting for MCP message data"
+        ) from exc
+    if status == "error":
+        raise value  # type: ignore[misc]
+    return value  # type: ignore[return-value]
+
+
+def _read_message(
+    stream: BinaryIO, *, timeout: float = _DEFAULT_MCP_READ_TIMEOUT_SECONDS
+) -> dict[str, object]:
     headers: dict[str, str] = {}
     while True:
-        line = stream.readline()
+        line = _read_with_timeout(stream.readline, timeout)
         if not line:
             raise RuntimeError("MCP server closed the stream unexpectedly")
         if line in (b"\r\n", b"\n"):
@@ -40,11 +89,14 @@ def _read_message(stream: BinaryIO) -> dict[str, object]:
             raise RuntimeError(f"Invalid MCP response header: {line!r}")
         headers[key.strip().lower()] = value.strip()
 
-    content_length = headers.get("content-length")
-    if content_length is None:
+    content_length_raw = headers.get("content-length")
+    if content_length_raw is None:
         raise RuntimeError("Missing Content-Length header in MCP response")
-    body = stream.read(int(content_length))
-    if len(body) != int(content_length):
+    content_length = int(content_length_raw)
+    if content_length < 0 or content_length > _MAX_MCP_CONTENT_LENGTH:
+        raise RuntimeError(f"Content-Length out of allowed range: {content_length}")
+    body = _read_with_timeout(lambda: stream.read(content_length), timeout)
+    if len(body) != content_length:
         raise RuntimeError("Incomplete MCP response body")
     message = json.loads(body.decode("utf-8"))
     if not isinstance(message, dict):
@@ -534,6 +586,7 @@ class MCPStdioClient:
         store_path: str | Path,
         cwd: str | Path,
         server_cmd: list[str] | None = None,
+        read_timeout_seconds: float = _DEFAULT_MCP_READ_TIMEOUT_SECONDS,
     ) -> None:
         self.store_path = Path(store_path)
         self.cwd = Path(cwd)
@@ -547,6 +600,7 @@ class MCPStdioClient:
         ]
         self._next_id = 1
         self._process: subprocess.Popen[bytes] | None = None
+        self._read_timeout_seconds = read_timeout_seconds
 
     def __enter__(self) -> MCPStdioClient:
         self.start()
@@ -571,12 +625,15 @@ class MCPStdioClient:
             return
         process = self._process
         self._process = None
-        for pipe in (process.stdin, process.stdout, process.stderr):
-            if pipe is not None:
-                try:
-                    pipe.close()
-                except OSError:
-                    pass
+        # Terminate/kill *before* closing the pipes: if a _read_with_timeout
+        # background thread is still blocked inside stream.read() on a
+        # BufferedReader (e.g. after a read timeout on a still-alive,
+        # misbehaving child), that thread holds the reader's internal lock
+        # for the duration of the blocking read. Closing the pipe from this
+        # thread first would then block acquiring that same lock, deadlocking
+        # close() itself. Killing the process first unblocks the pending
+        # read (EOF/broken pipe), which releases the lock so the close()
+        # calls below return immediately.
         if process.poll() is None:
             process.terminate()
             try:
@@ -584,6 +641,12 @@ class MCPStdioClient:
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=5)
+        for pipe in (process.stdin, process.stdout, process.stderr):
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except OSError:
+                    pass
 
     def initialize(self) -> dict[str, object]:
         return self.request("initialize", {"protocolVersion": "2024-11-05"})
@@ -624,7 +687,7 @@ class MCPStdioClient:
         self._process.stdin.write(_frame_message(payload))
         self._process.stdin.flush()
 
-        response = _read_message(self._process.stdout)
+        response = _read_message(self._process.stdout, timeout=self._read_timeout_seconds)
         if "error" in response:
             raise RuntimeError(f"MCP {method} failed: {response['error']}")
         return response
@@ -684,7 +747,17 @@ class MCPHTTPClient:
             stderr=subprocess.PIPE,
         )
         self._client = httpx.Client(base_url=self.base_url, timeout=5.0)
-        self._wait_until_ready()
+        try:
+            self._wait_until_ready()
+        except Exception:
+            # __enter__ only calls __exit__ on success, so a readiness
+            # failure here would otherwise leak the just-spawned subprocess
+            # (still running, still holding its bound port) with nothing
+            # left referencing it to tear it down. Reuse close()'s teardown
+            # logic before re-raising so the caller's `with` block still
+            # ends with no child process left behind.
+            self.close()
+            raise
 
     def close(self) -> None:
         client = self._client
@@ -695,12 +768,8 @@ class MCPHTTPClient:
             return
         process = self._process
         self._process = None
-        for pipe in (process.stdout, process.stderr):
-            if pipe is not None:
-                try:
-                    pipe.close()
-                except OSError:
-                    pass
+        # Terminate/kill before closing the pipes -- see the matching
+        # comment in MCPStdioClient.close() for why the order matters.
         if process.poll() is None:
             process.terminate()
             try:
@@ -708,6 +777,12 @@ class MCPHTTPClient:
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=5)
+        for pipe in (process.stdout, process.stderr):
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except OSError:
+                    pass
 
     def _wait_until_ready(self, timeout_seconds: float = 5.0) -> None:
         if self._client is None:
