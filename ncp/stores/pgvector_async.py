@@ -518,7 +518,15 @@ class AsyncPgvectorStore(BaseStore):
             )
 
     async def _async_is_duplicate(self, conn: Any, chunk: SubconsciousChunk) -> bool:
-        """Return True if a content-similar chunk exists in the same zone/layer/pipeline."""
+        """Return True if a content-similar chunk exists in the same zone/layer/pipeline.
+
+        Bounded, most-recent-first scan (mirrors _async_edge_inference_candidates):
+        working-zone row count is already capped by max_working_chunks, but
+        "proven"/"global" zones are not, so an unbounded scan here made every
+        write to a long-lived non-working (zone, layer, pipeline_id) strictly
+        slower forever as that combination accumulated rows.
+        """
+        limit = self.config.dedup_scan_limit if self.config is not None else 200
         async with conn.cursor() as cur:
             await cur.execute(
                 self._sql(
@@ -527,9 +535,11 @@ class AsyncPgvectorStore(BaseStore):
                     WHERE zone = %s AND layer = %s
                       AND COALESCE(pipeline_id, '') = COALESCE(%s, '')
                       AND chunk_id != %s
+                    ORDER BY created_at DESC
+                    LIMIT %s
                     """
                 ),
-                (chunk.zone, chunk.layer, chunk.pipeline_id, chunk.chunk_id),
+                (chunk.zone, chunk.layer, chunk.pipeline_id, chunk.chunk_id, max(0, int(limit))),
             )
             raw_rows = await cur.fetchall()
             description = cur.description

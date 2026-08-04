@@ -27,10 +27,11 @@ Findings are ranked silent-first, most-impactful first within that bucket.
 
 Every finding and the addendum below has a corresponding fix merged on this
 branch (finding 8 was reported after the initial pass, added and fixed in a
-follow-up). Full suite after integration: **1117 passed, 32 skipped** (the skips
-are all pgvector/psycopg/redis/optional-provider-extra tests correctly
-skipping for lack of a live service in this environment), plus one
-pre-existing, unrelated failure (`tests/test_enhancements.py::
+follow-up; findings 9 and 10 likewise, in later bug-bounty passes over the
+same codebase). Full suite after finding 10's integration: **1124 passed,
+32 skipped** (the skips are all pgvector/psycopg/redis/optional-provider-extra
+tests correctly skipping for lack of a live service in this environment),
+plus one pre-existing, unrelated failure (`tests/test_enhancements.py::
 test_reranker_cohere_mocked` — `cohere` isn't in the `dev` extras) confirmed
 present identically before any of these changes.
 
@@ -45,6 +46,8 @@ present identically before any of these changes.
 | 7 — No live-process coverage for whisper/post_turn | New shared dogfood scenario exercises `ncp_emit_whisper` + `ncp_post_turn` over both the real stdio and HTTP/SSE MCP transports |
 | Addendum — features off by default | `adaptive_budget_enabled` and `distillation_enabled` now default `true`; `ncp_get_context` telemetry gained an `active_features` block |
 | 8 — Silent trust/recency retrieval fallback ("frozen injects") | Fallback is now `retrieval.fallback_to_trust_recency_enabled`-gated (default `true`, unchanged behavior) instead of hardcoded, and firing it is surfaced as `telemetry.retrieval_used_fallback` |
+| 9 — Cross-pipeline authz bypass, stdio DoS, auth-token timing side channel | `supersede`/`add_chunk_edges` now enforce same-`pipeline_id`; `write()`'s immutability check now covers `written_by`; wrong-shape JSON no longer kills the stdio read loop; bearer-token check uses `hmac.compare_digest` |
+| 10 — Redis fetch-slot race + unbounded dedup scan | `claim_fetch_slot` claims via atomic `HINCRBY` with a compensating revert; `_is_duplicate`/`_async_is_duplicate` bound their candidate scan via a new `retention.dedup_scan_limit` config knob (default 200) |
 
 ---
 
@@ -471,6 +474,142 @@ present identically before any of these changes.
      `retrieval_used_fallback: bool` — so a caller/agent can now tell
      "this context is genuinely query-relevant" from "this is trust/recency
      filler, treat it accordingly" instead of the two being indistinguishable.
+
+---
+
+## 9. Cross-pipeline authorization bypass in `supersede`/edges/`write`, plus a stdio DoS and an auth-token timing side channel
+
+**Status: Fixed.**
+
+- **Location:** `ncp/stores/sqlite.py`, `ncp/stores/pgvector.py`,
+  `ncp/stores/pgvector_async.py` (`supersede`, `add_chunk_edges`, the
+  src/`written_by` immutability check in `write`); `ncp/mcp/server.py`
+  (`_read_message`/`serve_streams` framing, HTTP bearer-token comparison)
+- **Type:** missing-authz-check / DoS / timing side channel
+- **Severity:** not silent in the "wrong-but-no-error" sense of the other
+  findings — these are direct security bugs, bundled here under the same
+  finding number because they were reported and fixed together as one
+  bug-bounty pass
+- **Evidence:**
+
+  `store.supersede()` and `store.add_chunk_edges()` had zero ownership
+  check — any caller could pass an arbitrary `chunk_id` from a *different*
+  pipeline via `ncp_write_memory`'s `supersedes`/`edges` params and silently
+  retire or attach a hostile edge to someone else's chunk, ungated by
+  signature verification even with `require_signatures` enabled (a valid
+  signature only proves authorship of the *new* chunk's content, not any
+  relationship to the chunk it references). Separately, `write()`'s only
+  anti-tamper check was that `src` couldn't change for a reused `chunk_id`
+  — `written_by` was unchecked, so anyone who learned an existing
+  `chunk_id` (trivially available: it's returned from every write and
+  appears in every retrieval result) could overwrite that chunk's content
+  and author in place while keeping `src="user_verified"` and full trust,
+  forging verified content under another identity.
+
+  Independently: `_read_message` treated "valid JSON, wrong shape" (e.g. a
+  bare array instead of an object) the same as a genuine framing/header
+  error, even though the body was fully and correctly consumed and the
+  stream stayed in sync — `serve_streams`'s except-`ValueError` branch then
+  aborted the whole read loop, permanently killing the server process over
+  one malformed message. And the HTTP bearer-token check used `==` instead
+  of a constant-time comparison, a timing side channel on the configured
+  auth token.
+
+  Confirmed via live exploit repro before/after each fix (cross-pipeline
+  supersede, cross-pipeline edge attachment, same-`chunk_id` content
+  forgery, the stdio kill, and the timing side channel all blocked;
+  legitimate same-pipeline/same-author operations and well-formed messages
+  verified to still work).
+
+- **Fix:** `supersede()` now requires `old_chunk_id`/`new_chunk_id` to share
+  the same `pipeline_id`; `add_chunk_edges()` filters out any edge whose
+  src/dst chunks don't share the same `pipeline_id`; `write()`'s
+  immutability check now covers `written_by` in addition to `src`; a
+  dedicated `_MCPMessageShapeError` treats wrong-shape-but-valid-JSON like
+  the existing `JSONDecodeError` path (log and continue) instead of stream
+  desync (abort); the bearer-token check now uses `hmac.compare_digest`.
+
+---
+
+## 10. Redis fetch-slot budget race, and an unbounded per-write duplicate-detection scan
+
+**Status: Fixed.**
+
+- **Location:** `ncp/stores/redis_coordination.py` (`RedisCoordination.
+  claim_fetch_slot`); `ncp/stores/sqlite.py` (`_is_duplicate`),
+  `ncp/stores/pgvector.py` (`_is_duplicate`), `ncp/stores/pgvector_async.py`
+  (`_async_is_duplicate`)
+- **Type:** concurrency-race / unbounded-scan (DoS)
+- **Severity:** silent — no error either way; the fetch cap is silently
+  bypassable under real concurrency, and the growing write latency has no
+  alarm or log line of its own
+- **Evidence:**
+
+  **9a — fetch-slot race.** `claim_fetch_slot` did `hgetall` → compare
+  `current >= max_fetches` in Python → `hset` with `current+1`, with no
+  atomicity between the read and the write. Two concurrent `ncp_fetch`
+  calls for the same `session_id` (the distributed Redis coordination path
+  exists specifically to serialize *multiple processes/workers* sharing one
+  session, which is exactly the scenario this race requires) can both read
+  `current=2` at a limit of 3, both pass the check, and both write
+  `fetch_count=3` — the hard per-session cap enforced via
+  `ncp_fetch limit reached: max 3 per session` in `ncp/mcp/server.py`'s
+  `_handle_fetch` is bypassable by concurrent callers. (The in-process,
+  non-Redis fallback path in the same handler already used a real
+  `threading.Lock` and was not affected — this was specific to the
+  distributed Redis path.)
+
+  **9b — unbounded dedup scan.** Every `write()` call runs `_is_duplicate`,
+  which `SELECT`s **all** rows matching `(zone, layer, pipeline_id)` with no
+  `LIMIT`, then runs `difflib.SequenceMatcher` (itself O(content_len²))
+  against every one of them in a Python loop. `_hard_gc`/retention only
+  caps chunk count for `zone == "working"` (default 500 via
+  `max_working_chunks`) — `"proven"` and `"global"` zones are never capped
+  by count, so a pipeline that accumulates chunks in a non-working zone
+  makes every subsequent write to that zone/layer/pipeline combination
+  strictly slower, unbounded. Confirmed live in the original hunt: per-write
+  latency grew from ~2ms to 331ms+ (still climbing) over 2400 writes to a
+  `zone="global"` pipeline.
+
+- **Fix:**
+  1. `claim_fetch_slot` now claims atomically via `HINCRBY` — a single
+     Redis command, atomic even with concurrent callers since Redis
+     processes commands from different clients sequentially — then reverts
+     with a compensating `HINCRBY -1` and raises the same
+     `ncp_fetch limit reached` error if the increment pushed the count past
+     `max_fetches`. Return shape (`tuple[int, str | None]`), key naming/TTL,
+     and `pipeline_id` resolution/scoping are unchanged.
+  2. `_is_duplicate`/`_async_is_duplicate` now bound the candidate scan with
+     `ORDER BY created_at DESC LIMIT ?`, mirroring the existing bounded-scan
+     pattern already used for edge-inference candidates
+     (`_edge_inference_candidates`). The bound is a new
+     `retention.dedup_scan_limit` config knob (default `200`, env override
+     `NCP_DEDUP_SCAN_LIMIT`), read the same defensive way other per-store
+     `self.config`-derived values already are (`self.config.dedup_scan_limit
+     if self.config is not None else 200`). Applied identically to all three
+     backends; sqlite is exercised by a regression test, pgvector/
+     pgvector_async structurally mirror it but weren't live-tested (no
+     Postgres available in this environment).
+
+  Verified: (a) `HINCRBY`'s atomicity is a documented single-command Redis
+  guarantee, not something that needs a live server to reason about, and
+  `tests/test_future_stores.py::
+  test_redis_coordination_claim_fetch_slot_uses_atomic_hincrby_and_reverts_over_limit`
+  exercises the sequential contract (3 claims succeed, the 4th is rejected,
+  and `fetch_count` stays at exactly 3 after the rejected 4th — the
+  increment-then-revert pair is balanced, not just the raise) against the
+  same fake-Redis client the other Redis-coordination tests already use.
+  (b) `tests/test_sqlite_store.py::
+  test_sqlite_store_dedup_scan_is_bounded_for_non_working_zones` writes 12
+  mutually-dissimilar chunks to a `zone="global"` pipeline with
+  `dedup_scan_limit=5` and shows the bound actually changes behavior: a
+  near-duplicate of a chunk that's now outside the 5-row lookback window is
+  no longer flagged as a duplicate (proving the scan is genuinely bounded,
+  not just faster), while a near-duplicate still inside the window is still
+  correctly detected and suppressed (proving dedup itself still works).
+  `tests/test_config.py::
+  test_dedup_scan_limit_defaults_and_file_and_env_overrides` covers the new
+  config knob's default/file/env precedence.
 
 ---
 
