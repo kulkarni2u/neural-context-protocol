@@ -443,3 +443,60 @@ resp = handlers["ncp_get_context"]({"agent_id": "reader", "role": "analyst",
 # resp["context"] has zero [NCP:SUBCONSCIOUS] entries (full eviction)
 # resp["telemetry"]["evicted_high_relevance_count"] == 0
 ```
+
+---
+
+## Addendum: token-efficiency features are opt-in and off by default, with no signal that they're off
+
+These aren't wrong-behavior bugs in the pipeline_id sense — nothing is
+mis-wired — but they sit in the same blind spot: a host running the default
+configuration has no way to discover, short of reading `ncp/config.py`, that
+the mechanisms most directly aimed at reducing token spend are inert.
+
+- **Every token-efficiency knob defaults to off.** Confirmed directly against
+  `ncp/config.py`'s property defaults:
+
+  | Feature | Config key | Default |
+  |---|---|---|
+  | Distillation (trim, don't drop, chunks that don't fit) | `distillation.enabled` | `False` |
+  | Adaptive budget (shrink budget on easy/low-drift turns) | `budget.adaptive_budget_enabled` | `False` |
+  | Memoization (skip re-running already-done work) | `memoization.enabled` | `False` |
+  | Computed drift (replace self-reported honor system) | `drift.drift_computed_enabled` | `False` |
+  | Rerank | `retrieval.rerank_enabled` | `False` |
+
+  `ncp_get_context`'s response telemetry never indicates that a feature which
+  would have reduced this turn's token cost is disabled — there is no
+  `distillation_would_have_saved_n_tokens` field or equivalent. A plain
+  `ncp.configure()` with no `ncp.toml` gets the least token-efficient
+  configuration NCP supports, silently.
+
+- **Token counting is a `chars/4` heuristic unless `NCP_TOKEN_UNIT=tiktoken`
+  is set** (`ncp/tokens.py:1-6`). `context_token_budget` is therefore an
+  estimate of the target model's real token count, not a measurement of it —
+  it can silently over- or under-shoot depending on how far the model's real
+  tokenizer diverges from chars/4 on the actual content, and (per finding 2
+  above) there's no telemetry that would reveal an overshoot after the fact.
+
+- **Passing an explicit `k` to `ncp_get_context` bypasses the pressure-based
+  auto-shrink tiers entirely.** `Assembler._assembly_caps`
+  (`ncp/assembler.py:825-837`) only consults `chunk_cap_high`/
+  `chunk_cap_critical` when `k is None`:
+
+  ```python
+  def _assembly_caps(self, *, budget: BudgetContext, k: int | None) -> tuple[int, int]:
+      if k is not None:
+          return max(1, k), self._whisper_cap_default
+      if budget.pressure == "critical":
+          return self._chunk_cap_critical, self._whisper_cap_critical
+      if budget.pressure == "high":
+          return self._chunk_cap_high, self._whisper_cap_high
+      return self._chunk_cap_default, self._whisper_cap_default
+  ```
+
+  An integration that always sets `k` explicitly never gets the automatic
+  tightening under budget pressure that the default path provides.
+
+**Fix:** surface the active feature-flag set (which of the five above are
+on/off) in `ncp_get_context`'s telemetry block, and default `distillation` and
+`adaptive_budget` to `True` — they're the two mechanisms whose entire purpose
+is bounding token spend, and neither has a correctness downside for being on.
