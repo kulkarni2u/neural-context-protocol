@@ -262,7 +262,8 @@ def _run_pipeline_benchmark(
     peak_naive = int(baseline_summary["raw_replay"]["peak_tokens"])
     final_naive = int(baseline_summary["raw_replay"]["final_tokens"])
     reduction_factor = round(final_naive / final_ncp, 2) if final_ncp else 0.0
-    overhead = assembly_overhead(embed_tokens=0, retrieval_ops=turns, whisper_writes=0)
+    embed_tokens = store.embedding_tokens_estimate() if hasattr(store, "embedding_tokens_estimate") else 0
+    overhead = assembly_overhead(embed_tokens=embed_tokens, retrieval_ops=turns, whisper_writes=0)
     total_token_savings_vs_raw = sum(
         int(row["raw_replay_input_tokens"]) - int(row["ncp_input_tokens"])
         for row in turn_rows

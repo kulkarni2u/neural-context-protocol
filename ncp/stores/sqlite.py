@@ -284,6 +284,11 @@ class SQLiteStore(BaseStore):
         # writers on the same store instance.
         self.last_write_inferred_edge_count = 0
         self._embedding_adapter = embedding_adapter
+        # WI: running estimate of tokens fed into `_embedding_adapter.embed()`
+        # calls made by this store instance (write-time + query-time). Zero
+        # when no embedding adapter is configured. In-memory only, not
+        # persisted -- consumed by benchmarks/costs accounting.
+        self._embedding_calls_tokens_est: int = 0
 
         from ncp.stores.rerank import Reranker
         from ncp.config import load_config
@@ -371,10 +376,17 @@ class SQLiteStore(BaseStore):
                 except Exception:
                     pass  # column already exists
 
+    def embedding_tokens_estimate(self) -> int:
+        """Running estimate of tokens passed to `embedding_adapter.embed()`
+        across this store instance's lifetime (write-time + query-time).
+        Zero when no embedding adapter is configured."""
+        return self._embedding_calls_tokens_est
+
     def write(self, chunk: SubconsciousChunk) -> bool:
         self.last_write_inferred_edge_count = 0
         chunk = self._validate_chunk_for_write(chunk)
         if self._embedding_adapter is not None and chunk.embedding is None:
+            self._embedding_calls_tokens_est += estimate_tokens(chunk.content)
             chunk = chunk.model_copy(
                 update={"embedding": self._embedding_adapter.embed(chunk.content)}
             )
@@ -552,6 +564,7 @@ class SQLiteStore(BaseStore):
             and self._embedding_adapter is not None
             and retrieval_mode in {"hybrid", "vector"}
         ):
+            self._embedding_calls_tokens_est += estimate_tokens(text)
             embedding = self._embedding_adapter.embed(text)
         if retrieval_mode == "vector" and embedding is None:
             raise ValueError("retrieval_mode='vector' requires an embedding or embedding adapter")
