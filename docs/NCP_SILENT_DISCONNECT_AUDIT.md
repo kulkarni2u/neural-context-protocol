@@ -23,9 +23,32 @@ The equivalent role in this codebase is played by `ncp/mcp/server.py`'s
 
 Findings are ranked silent-first, most-impactful first within that bucket.
 
+## Status: all findings fixed
+
+Every finding and the addendum below has a corresponding fix merged on this
+branch. Full suite after integration: **1113 passed, 32 skipped** (the skips
+are all pgvector/psycopg/redis/optional-provider-extra tests correctly
+skipping for lack of a live service in this environment), plus one
+pre-existing, unrelated failure (`tests/test_enhancements.py::
+test_reranker_cohere_mocked` — `cohere` isn't in the `dev` extras) confirmed
+present identically before any of these changes.
+
+| Finding | Fix |
+|---|---|
+| 1 — `ncp_post_turn` trust/drift gap | `_handle_post_turn` now derives `base_trust` via `_trust_from_args(item)` and sets `written_at_drift` from `conscious.drift_score`, matching `_handle_write_memory` |
+| 2 — Silent eviction | `AssemblyResult` gained unconditional `evicted_chunk_count`/`evicted_whisper_count`, surfaced in `ncp_get_context`'s telemetry alongside the existing relevance/confidence-filtered lists |
+| 3 — Embedding spend invisible | New `embedding_cost_log` table + `log_embedding_cost()`/`embedding_cost_summary()` on all three stores (sqlite, pgvector, pgvector_async), wired into `/api/cost` |
+| 4 — Benchmark cost accounting | `assembly_overhead()`'s `embed_tokens` is now measured via a per-store running counter (`embedding_tokens_estimate()`) instead of hardcoded `0` |
+| 5 — Dead `ConsciousBlock` fields | `escalate_to`/`calibration_id`/`intent_anchor` now threaded through `_build_conscious_from_args` the same way `recent`/`tried`/`failed` etc. are; `intent_anchor` derives `sha256(task+intent)` on turn 0 |
+| 6 — Dead `SubconsciousChunk` fields | `owner`/`valid_while`/`evidence_id`/`conditions`/`result_confidence`/`result_attempts`/`caused_by`/`chunk_type` now exposed on `ncp_write_memory`'s input schema and threaded into the write path |
+| 7 — No live-process coverage for whisper/post_turn | New shared dogfood scenario exercises `ncp_emit_whisper` + `ncp_post_turn` over both the real stdio and HTTP/SSE MCP transports |
+| Addendum — features off by default | `adaptive_budget_enabled` and `distillation_enabled` now default `true`; `ncp_get_context` telemetry gained an `active_features` block |
+
 ---
 
 ## 1. `ncp_post_turn`'s batch chunk-write path drops trust/drift enrichment
+
+**Status: Fixed.**
 
 - **Location:** `ncp/mcp/server.py:1266-1275` (`_handle_post_turn`), vs.
   `ncp/mcp/server.py:1131-1162` (`_handle_write_memory`) and
@@ -76,6 +99,8 @@ Findings are ranked silent-first, most-impactful first within that bucket.
 
 ## 2. Token-budget eviction can be 100% silent even in the response telemetry
 
+**Status: Fixed.**
+
 - **Location:** `ncp/assembler.py:143-147`, `:700-750` (`_fit_token_budget`);
   `ncp/mcp/server.py:831-850` (`_context_telemetry`)
 - **Type:** untraced-path
@@ -124,6 +149,8 @@ Findings are ranked silent-first, most-impactful first within that bucket.
 
 ## 3. Production embedding spend is invisible to NCP's own cost accounting
 
+**Status: Fixed.**
+
 - **Location:** `ncp/stores/pgvector.py:419-421,610-611,748-749`;
   `ncp/stores/pgvector_async.py:295-299,681-685,802-806`;
   `ncp/stores/sqlite.py:162-174` (`cost_log` schema)
@@ -169,6 +196,8 @@ Findings are ranked silent-first, most-impactful first within that bucket.
 ---
 
 ## 4. The headline compression-ratio figures are a pure read-side count; the one write-side netting mechanism is neutered by a hardcoded zero
+
+**Status: Fixed.**
 
 - **Location:** `ncp/benchmarks.py:264-270`; `ncp/costs.py:74-98`
   (`assembly_overhead`)
@@ -227,6 +256,8 @@ Findings are ranked silent-first, most-impactful first within that bucket.
 
 ## 5. `ConsciousBlock.calibration_id` / `intent_anchor` / `escalate_to` are fully dead — contradicting the protocol spec's own claim
 
+**Status: Fixed.**
+
 - **Location:** `ncp/types.py:82` (`intent_anchor`), `:88` (`escalate_to`),
   `:96` (`calibration_id`); `docs/NCP_PROTOCOL_SPEC.md:96,105,115`
 - **Type:** dead-write / dead-read
@@ -271,6 +302,8 @@ Findings are ranked silent-first, most-impactful first within that bucket.
 ---
 
 ## 6. Seven `SubconsciousChunk` fields are pure DB round-trips — never set by any producer, never read by any consumer
+
+**Status: Fixed.**
 
 - **Location:** `ncp/types.py:191,197-203,210` (`evidence_id`,
   `result_confidence`, `result_attempts`, `conditions`, `valid_while`,
@@ -318,6 +351,8 @@ Findings are ranked silent-first, most-impactful first within that bucket.
 ---
 
 ## 7. `ncp_emit_whisper` and `ncp_post_turn` are never exercised by the repo's own live-process integration harness
+
+**Status: Fixed.**
 
 - **Location:** `ncp/dogfood.py` (real subprocess JSON-RPC client, run via
   `ncp dogfood` / `ncp/cli.py:1068-1149`)
@@ -447,6 +482,8 @@ resp = handlers["ncp_get_context"]({"agent_id": "reader", "role": "analyst",
 ---
 
 ## Addendum: token-efficiency features are opt-in and off by default, with no signal that they're off
+
+**Status: Fixed.**
 
 These aren't wrong-behavior bugs in the pipeline_id sense — nothing is
 mis-wired — but they sit in the same blind spot: a host running the default
