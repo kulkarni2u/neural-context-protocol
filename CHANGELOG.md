@@ -4,6 +4,178 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [Unreleased]
 
+## [1.4.2] - 2026-08-04
+
+Silent-disconnect audit and a follow-up bug-bounty pass across the whole
+codebase (MCP protocol/security, storage, core assembly/retrieval logic, and
+adapters/CLI/SDK/dogfood harness). Eighteen findings total, all fixed and
+verified with a live repro before/after; full details, evidence, and repro
+scripts for each are in `docs/NCP_SILENT_DISCONNECT_AUDIT.md`.
+
+### Security
+
+- **Cross-pipeline authorization bypass via `supersedes`, `edges`, and
+  chunk_id reuse** (`ncp/stores/sqlite.py`, `ncp/stores/pgvector.py`,
+  `ncp/stores/pgvector_async.py`): `supersede()` and `add_chunk_edges()` had
+  no ownership check at all — any caller could pass an arbitrary `chunk_id`
+  from a *different pipeline* via `ncp_write_memory`'s `supersedes`/`edges`
+  params and silently retire or attach a hostile edge to someone else's
+  chunk, ungated by signature verification even with
+  `[identity].require_signatures` enabled. Separately, `write()`'s only
+  anti-tamper check was that `src` couldn't change for a reused `chunk_id`
+  — `written_by` was unchecked, so reusing a known `chunk_id` (returned
+  from every write, visible in every retrieval result) could overwrite
+  another chunk's content and author in place while keeping full trust.
+  `supersede()`/`add_chunk_edges()` now require matching `pipeline_id`;
+  `write()`'s immutability check now covers `written_by`. (finding 9)
+- **Stdio DoS and an auth-token timing side channel**
+  (`ncp/mcp/server.py`): one syntactically valid but non-object JSON
+  message (e.g. a bare array) used to be treated the same as a genuine
+  framing/header error and permanently killed the whole MCP server
+  process, even though the stream stayed perfectly in sync — every
+  subsequent message, including well-formed ones, went unanswered. The
+  HTTP bearer-token check also used `==` instead of a constant-time
+  comparison. Fixed via a dedicated `_MCPMessageShapeError` (treated like
+  a recoverable parse error, not stream desync) and
+  `hmac.compare_digest`. (finding 10)
+- **Redis-backed `ncp_fetch` budget was bypassable under concurrency**
+  (`ncp/stores/redis_coordination.py`): `claim_fetch_slot` did a
+  read-then-write with no atomicity, so concurrent callers sharing a
+  session could both pass the `max 3 per session` check. Now claims via a
+  single atomic `HINCRBY` with a compensating revert on overflow.
+  (finding 15)
+
+### Fixed
+
+- **`ncp_post_turn`'s batch memory-write path silently corrupted trust
+  scores** (`ncp/mcp/server.py`): chunks written via `memory_chunks`
+  always got the bare Pydantic default `base_trust=0.7` regardless of
+  `src`, instead of the `src`-derived score `ncp_write_memory` computes —
+  flattening/mis-ranking a large share of real memory in retrieval.
+  (finding 1)
+- **Token-budget eviction could report zero evictions while dropping
+  everything** (`ncp/assembler.py`, `ncp/mcp/server.py`): the existing
+  `evicted_high_relevance`/`evicted_whispers` telemetry is filtered to
+  `relevance >= 0.5`/`confidence >= 0.6`; a response with *all* relevant
+  content evicted could be indistinguishable from one where nothing
+  relevant ever existed. Added unconditional `evicted_chunk_count`/
+  `evicted_whisper_count` telemetry fields. (finding 2)
+- **Silent, query-blind "frozen injects" from the retrieval fallback**
+  (`ncp/assembler.py`, `ncp/stores/sqlite.py`): `Assembler._retrieve_chunks`
+  hardcoded `fallback_to_trust_recency=True` on every call, silently
+  overriding the store's own off-by-default contract; when hybrid
+  retrieval found nothing, the fallback ranked purely by
+  trust/recency/generation/drift with zero reference to the query text, so
+  any pipeline that drew hybrid blanks got the same top-trust chunks
+  injected every turn regardless of what was asked, with no signal this
+  had happened. Now gated by `retrieval.fallback_to_trust_recency_enabled`
+  (default `true`, unchanged behavior; disabling it degrades to the
+  existing cold-start marker, not a bare empty block) and surfaced as
+  `telemetry.retrieval_used_fallback`. (finding 8)
+- **`ConsciousBlock.calibration_id`/`intent_anchor`/`escalate_to` were
+  fully dead** (`ncp/mcp/server.py`), contradicting the protocol spec's
+  claim that `calibration_id`'s "logic shipped in 0.4.0" — zero references
+  anywhere outside `types.py`. Now threaded through
+  `_build_conscious_from_args` the same way `recent`/`tried`/`failed` are;
+  `intent_anchor` derives `sha256(task+intent)` on turn 0. (finding 5)
+- **Seven `SubconsciousChunk` fields were pure DB round-trips**
+  (`ncp/mcp/server.py`): `owner`/`valid_while`/`evidence_id`/`conditions`/
+  `result_confidence`/`result_attempts` (plus `caused_by`/`chunk_type` from
+  the secondary notes) were validated, persisted, and reconstructed on
+  every read but never settable by any of the 5 core tools. Now exposed on
+  `ncp_write_memory`'s input schema and threaded into the write path.
+  (finding 6)
+- **Cold-start bootstrap crashed `Assembler.assemble()` on a legitimate
+  long task/intent** (`ncp/assembler.py`): `_cold_start_bootstrap`
+  f-string-interpolated `task`/`intent` directly into a chunk with a hard
+  2000-char cap; a long-but-valid task/intent on a pipeline's first turn
+  raised an unhandled `ValidationError` instead of yielding a truncated
+  cold-start signal. (finding 11)
+- **Superseded/retracted facts silently reappeared whenever
+  `retrieval.edge_expansion` was disabled** (`ncp/assembler.py`):
+  supersession suppression was only called from inside the
+  edge-expansion branch by accident of code placement, so disabling that
+  unrelated feature flag silently disabled fact-supersession too — a
+  retracted fact and its correction could both surface in the same
+  context with no signal which was authoritative. (finding 12)
+- **A malformed `world_check` whisper permanently blocked every
+  subsequent valid drift signal in the same batch** (`ncp/assembler.py`):
+  `_apply_drift_feedback` unconditionally broke out of the whisper loop
+  after the first well-formed `world_check` whisper, regardless of
+  whether its `detected_drift` was actually in range — one out-of-range
+  signal (e.g. a miscalibrated sensor) silently discarded every real
+  drift event queued behind it. (finding 13)
+- **`RetrievalPolicy.score()` could exceed its documented `[0, 1]` range**
+  (`ncp/stores/retrieval.py`): `bm25_normalized` was only lower-clamped,
+  unlike every other input and unlike the sibling `score_with_vector()`.
+  Not observably wrong today (every live call site passes pre-normalized
+  values) but a real contract violation in a shared, load-bearing
+  primitive. Now double-clamped to match. (finding 14)
+- **Unbounded per-write duplicate-detection scan** (`ncp/stores/sqlite.py`,
+  `ncp/stores/pgvector.py`, `ncp/stores/pgvector_async.py`): every
+  `write()` scanned *all* same-`(zone, layer, pipeline_id)` rows with no
+  limit; `proven`/`global` zones are never count-capped the way `working`
+  is, so a long-lived non-working-zone pipeline made every subsequent
+  write strictly slower without bound (confirmed live: ~2ms → 330ms+ over
+  2400 writes). Now bounded via a new `retention.dedup_scan_limit` config
+  knob (default `200`), mirroring the existing bounded scan already used
+  for edge inference. (finding 15)
+- **Dogfood harness's JSON-RPC reader could hang forever with a leaked
+  subprocess** (`ncp/dogfood.py`): `_read_message`'s blocking pipe reads
+  had no timeout, so a `Content-Length` header larger than the bytes
+  actually sent (crash mid-write, non-conforming server) blocked
+  indefinitely with no way for the surrounding `with` block to reap the
+  child. Now runs under a hard deadline via a background daemon thread. A
+  related `close()`-ordering deadlock (pipes closed before the process was
+  terminated, blocking against a still-reading background thread) found
+  while verifying this fix was fixed in the same pass. (finding 16)
+- **`MCPHTTPClient` leaked its subprocess when the readiness probe timed
+  out** (`ncp/dogfood.py`): the failure happened inside `__enter__`, so
+  Python's `with` statement never called `__exit__`/`close()` and the
+  spawned process was orphaned, still holding its bound port. `start()`
+  now tears the process down before re-raising. (finding 17)
+- **`AnthropicAdapter.stream()` let raw provider errors escape unwrapped**
+  (`ncp/adapters/anthropic.py`): the actual HTTP request happens inside
+  the SDK's `with stream_ctx as stream:` entry, which was outside the
+  error-wrapping `_run_provider_call` used, so streaming failures raised
+  raw `anthropic.*` exceptions instead of this codebase's
+  `NCPAdapterError`/`NCPAdapterTimeoutError` — silently breaking any
+  caller written against `except NCPAdapterError`. Now wrapped the same
+  way `call()` already is. (finding 18)
+
+### Added
+
+- **Embedding-call cost logging** (`ncp/stores/sqlite.py`,
+  `ncp/stores/pgvector.py`, `ncp/stores/pgvector_async.py`): a new
+  `embedding_cost_log` table plus `log_embedding_cost()`/
+  `embedding_cost_summary()` on all three stores, logged at every
+  embedding-adapter call site and wired into `/api/cost` — this spend was
+  previously invisible to NCP's own cost accounting entirely. (finding 3)
+- **`ncp_get_context` telemetry gains `active_features`**
+  (`ncp/mcp/server.py`): surfaces whether `distillation_enabled`,
+  `adaptive_budget_enabled`, `memoization_enabled`,
+  `drift_computed_enabled`, and `rerank_enabled` are currently on, so a
+  caller can tell why a token-efficiency mechanism isn't kicking in
+  instead of guessing.
+- **Real-subprocess dogfood coverage for `ncp_emit_whisper`/
+  `ncp_post_turn`** (`ncp/dogfood.py`): these two tools previously had no
+  coverage from the repo's own live-process JSON-RPC harness, only
+  in-process unit tests; a new shared scenario exercises both over the
+  real stdio and HTTP/SSE transports. (finding 7)
+
+### Changed
+
+- **`distillation.enabled` and `budget.adaptive_budget_enabled` now
+  default to `true`** (`ncp/config.py`): both are pure token-efficiency
+  mechanisms with no correctness downside for being on, but previously
+  required explicit opt-in with no signal they were off by default.
+- **Benchmark cost accounting no longer hardcodes embedding spend to
+  zero** (`ncp/benchmarks.py`, `ncp/stores/*.py`): `assembly_overhead()`'s
+  `embed_tokens` is now a real per-store measurement
+  (`embedding_tokens_estimate()`) instead of a literal `0`, so the
+  reported "net token-equivalent savings" figure can reflect real
+  embedding cost when a benchmark run uses one. (finding 4)
+
 ## [1.4.1] - 2026-08-03
 
 ### Added
