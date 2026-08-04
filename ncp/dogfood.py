@@ -874,6 +874,16 @@ def run_canonical_dogfood_loop(
             "continued_response": continued_response,
         }
 
+        # Finding 7 (docs/NCP_SILENT_DISCONNECT_AUDIT.md): give ncp_emit_whisper
+        # and ncp_post_turn real-subprocess coverage, the same as the three
+        # tools exercised above.
+        artifact["whisper_post_turn_pass"] = _run_whisper_and_post_turn_scenario(
+            client,
+            pipeline_id=pipeline_id,
+            from_agent="planner",
+            target_agent="critic",
+        )
+
     with MCPStdioClient(store_path=store_path, cwd=cwd, server_cmd=server_cmd) as restarted:
         restarted.initialize()
         restart_context = restarted.call_tool(
@@ -910,6 +920,8 @@ def run_canonical_dogfood_loop(
         "first_fetch_ok": seeded_content in str(artifact["first_pass"]["fetch_result"]),
         "restart_fetch_ok": artifact["restart_persistence_ok"],
         "continuation_ok": seeded_content in str(artifact["first_pass"]["continued_response"]),
+        "whisper_ok": bool(artifact["whisper_post_turn_pass"]["whisper_delivered"]),
+        "post_turn_ok": bool(artifact["whisper_post_turn_pass"]["post_turn_fetch_ok"]),
         "turn_record_count": status["turn_record_count"],
         "chunk_count": status["chunk_count"],
     }
@@ -1016,6 +1028,16 @@ def run_canonical_http_dogfood_loop(
             "continued_response": continued_response,
         }
 
+        # Finding 7 (docs/NCP_SILENT_DISCONNECT_AUDIT.md): give ncp_emit_whisper
+        # and ncp_post_turn real-subprocess coverage over the HTTP/SSE
+        # transport too, the same as the three tools exercised above.
+        artifact["whisper_post_turn_pass"] = _run_whisper_and_post_turn_scenario(
+            client,
+            pipeline_id=pipeline_id,
+            from_agent="planner",
+            target_agent="critic",
+        )
+
     with MCPHTTPClient(
         store_path=store_path,
         cwd=cwd,
@@ -1058,6 +1080,8 @@ def run_canonical_http_dogfood_loop(
         "first_fetch_ok": seeded_content in str(artifact["first_pass"]["fetch_result"]),
         "restart_fetch_ok": artifact["restart_persistence_ok"],
         "continuation_ok": seeded_content in str(artifact["first_pass"]["continued_response"]),
+        "whisper_ok": bool(artifact["whisper_post_turn_pass"]["whisper_delivered"]),
+        "post_turn_ok": bool(artifact["whisper_post_turn_pass"]["post_turn_fetch_ok"]),
         "turn_record_count": status["turn_record_count"],
         "chunk_count": status["chunk_count"],
     }
@@ -1346,6 +1370,107 @@ def _execute_fetch(
             "agent_id": agent_id,
         },
     )
+
+
+def _run_whisper_and_post_turn_scenario(
+    client: MCPStdioClient | MCPHTTPClient,
+    *,
+    pipeline_id: str,
+    from_agent: str,
+    target_agent: str,
+) -> dict[str, object]:
+    """Exercise ncp_emit_whisper and ncp_post_turn over the real MCP transport.
+
+    Finding 7 (docs/NCP_SILENT_DISCONNECT_AUDIT.md): these two tools were never
+    exercised by the real subprocess JSON-RPC harness, only by in-process unit
+    tests. This scenario emits a whisper, confirms the target agent's assembled
+    context drains it, then closes a turn via ncp_post_turn with memory_chunks
+    and confirms a follow-up ncp_fetch can retrieve one of those just-written
+    chunks -- all over the wire, not via direct handler calls.
+    """
+
+    nudge_payload = "dogfood whisper nudge: check the restart contract before finalizing"
+    emit = client.call_tool(
+        "ncp_emit_whisper",
+        {
+            "from": from_agent,
+            "target": target_agent,
+            "type": "nudge",
+            "payload": nudge_payload,
+            "confidence": 0.9,
+            "pipeline_id": pipeline_id,
+        },
+    )
+    if emit.data.get("emitted") is not True:
+        raise RuntimeError("ncp_emit_whisper did not report emitted:true")
+
+    context = client.call_tool(
+        "ncp_get_context",
+        {
+            "agent_id": target_agent,
+            "role": "review",
+            "owns": ["review"],
+            "must_not": ["implementation"],
+            "task": "prove_whisper_delivery",
+            "slot": "whisper_drain",
+            "intent": "verify_whisper_wire_format",
+            "pipeline_id": pipeline_id,
+        },
+    )
+    pending_whisper_ids = [str(item) for item in list(context.data.get("pending_whisper_ids", []))]
+    context_text = str(context.data["context"])
+    whisper_delivered = (
+        bool(pending_whisper_ids)
+        and "[NCP:WHISPERS]" in context_text
+        and nudge_payload in context_text
+    )
+    if not whisper_delivered:
+        raise RuntimeError("Emitted whisper was not delivered to the target agent's assembled context")
+
+    chunk_a_content = "dogfood post_turn memory chunk alpha over real MCP transport"
+    chunk_b_content = "dogfood post_turn memory chunk beta over real MCP transport"
+    post_turn = client.call_tool(
+        "ncp_post_turn",
+        {
+            "agent_id": target_agent,
+            "role": "review",
+            "task": "prove_whisper_delivery",
+            "slot": "whisper_drain",
+            "intent": "verify_whisper_wire_format",
+            "pipeline_id": pipeline_id,
+            "result_summary": "drained whisper and persisted memory_chunks",
+            "result_full": "drained whisper and persisted memory_chunks over real stdio/HTTP MCP",
+            "ack_whisper_ids": pending_whisper_ids,
+            "memory_chunks": [
+                {"content": chunk_a_content, "layer": "episodic", "src": "synthesis"},
+                {"content": chunk_b_content, "layer": "semantic", "src": "tool_result"},
+            ],
+        },
+    )
+    if post_turn.data.get("posted") is not True or not post_turn.data.get("turn_id"):
+        raise RuntimeError("ncp_post_turn did not report posted:true with a turn_id")
+
+    fetch = client.call_tool(
+        "ncp_fetch",
+        {
+            "query": "dogfood post_turn memory chunk alpha",
+            "session_id": str(context.data["session_id"]),
+            "pipeline_id": pipeline_id,
+            "agent_id": target_agent,
+        },
+    )
+    post_turn_fetch_ok = chunk_a_content in str(fetch.data["result"])
+    if not post_turn_fetch_ok:
+        raise RuntimeError("ncp_fetch could not retrieve a chunk just written by ncp_post_turn")
+
+    return {
+        "emit_whisper": emit.data,
+        "pending_whisper_ids": pending_whisper_ids,
+        "whisper_delivered": whisper_delivered,
+        "post_turn": post_turn.data,
+        "post_turn_fetch_result": fetch.data["result"],
+        "post_turn_fetch_ok": post_turn_fetch_ok,
+    }
 
 
 def _scripted_continue_after_fetch(*, turn: str, fetch_result: str) -> str:

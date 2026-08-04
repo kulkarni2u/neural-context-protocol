@@ -9,12 +9,14 @@ from ncp.dogfood import (
     CLIProviderMetadataError,
     ClaudeCLIDogfoodAdapter,
     CodexCLIDogfoodAdapter,
+    MCPStdioClient,
     OpenCodeCLIDogfoodAdapter,
     _build_provider_continuation_turn,
     _build_provider_fetch_contract_turn,
     _extract_claude_json_result,
     _extract_opencode_response,
     _extract_opencode_text,
+    _run_whisper_and_post_turn_scenario,
     get_live_provider_readiness,
     load_dogfood_adapter,
     run_adapter_continuation_dogfood_loop,
@@ -51,6 +53,47 @@ def test_canonical_dogfood_loop_runs_against_real_stdio_server(tmp_path: Path) -
     assert artifact["summary"]["first_fetch_ok"] is True
     assert artifact["summary"]["continuation_ok"] is True
 
+    # Finding 7 (docs/NCP_SILENT_DISCONNECT_AUDIT.md): ncp_emit_whisper and
+    # ncp_post_turn must also be exercised over the real stdio MCP transport.
+    whisper_post_turn = artifact["whisper_post_turn_pass"]
+    assert whisper_post_turn["emit_whisper"]["emitted"] is True
+    assert whisper_post_turn["pending_whisper_ids"]
+    assert whisper_post_turn["whisper_delivered"] is True
+    assert whisper_post_turn["post_turn"]["posted"] is True
+    assert whisper_post_turn["post_turn"]["turn_id"]
+    assert whisper_post_turn["post_turn_fetch_ok"] is True
+    assert artifact["summary"]["whisper_ok"] is True
+    assert artifact["summary"]["post_turn_ok"] is True
+
+
+def test_whisper_and_post_turn_scenario_runs_against_real_stdio_server(tmp_path: Path) -> None:
+    """Finding 7 (docs/NCP_SILENT_DISCONNECT_AUDIT.md): ncp_emit_whisper and
+    ncp_post_turn get real-subprocess JSON-RPC coverage, not just in-process
+    handler-dict calls."""
+
+    project = tmp_path / "repo"
+    (project / ".git").mkdir(parents=True)
+    store_path = project / ".ncp" / "store.db"
+
+    with MCPStdioClient(store_path=store_path, cwd=REPO_ROOT) as client:
+        client.initialize()
+        result = _run_whisper_and_post_turn_scenario(
+            client,
+            pipeline_id="pipe_test_whisper_post_turn",
+            from_agent="planner",
+            target_agent="critic",
+        )
+
+    assert result["emit_whisper"]["emitted"] is True
+    assert result["emit_whisper"]["payload_format"] == "legacy"
+    assert result["pending_whisper_ids"]
+    assert result["whisper_delivered"] is True
+    assert result["post_turn"]["posted"] is True
+    assert result["post_turn"]["turn_id"]
+    assert result["post_turn"]["acknowledged_whisper_ids"] == result["pending_whisper_ids"]
+    assert result["post_turn_fetch_ok"] is True
+    assert "dogfood post_turn memory chunk alpha" in str(result["post_turn_fetch_result"])
+
 
 def test_public_package_exports_dogfood_runner() -> None:
     assert callable(ncp.run_canonical_dogfood_loop)
@@ -78,6 +121,16 @@ def test_canonical_http_dogfood_loop_runs_against_real_http_server(tmp_path: Pat
     assert "/mcp" in str(artifact["sse_handshake"])
     assert "ncp_fetch:results" in str(artifact["first_pass"]["fetch_result"])
     assert artifact["summary"]["continuation_ok"] is True
+
+    # Finding 7 (docs/NCP_SILENT_DISCONNECT_AUDIT.md): ncp_emit_whisper and
+    # ncp_post_turn must also be exercised over the real HTTP/SSE MCP transport.
+    whisper_post_turn = artifact["whisper_post_turn_pass"]
+    assert whisper_post_turn["emit_whisper"]["emitted"] is True
+    assert whisper_post_turn["whisper_delivered"] is True
+    assert whisper_post_turn["post_turn"]["posted"] is True
+    assert whisper_post_turn["post_turn_fetch_ok"] is True
+    assert artifact["summary"]["whisper_ok"] is True
+    assert artifact["summary"]["post_turn_ok"] is True
 
 
 def test_adapter_continuation_loop_runs_with_local_contract_adapter(tmp_path: Path) -> None:
