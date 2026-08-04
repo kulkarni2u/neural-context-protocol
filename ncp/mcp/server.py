@@ -7,6 +7,7 @@ from datetime import datetime
 from hashlib import sha256
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import hmac
 import json
 import sys
 import threading
@@ -1881,6 +1882,17 @@ def _handle_request(
     return _err_response(req_id, -32601, f"Method not found: {method}")
 
 
+class _MCPMessageShapeError(ValueError):
+    """A fully-consumed MCP message whose JSON shape is invalid.
+
+    Distinct from a genuine framing/header ``ValueError`` (missing/invalid
+    Content-Length, unreadable header, truncated body) where the stream's
+    position is no longer trustworthy and the read loop must stop. This
+    error means the stream is still perfectly in sync -- the caller should
+    report it and keep reading, not abort the session.
+    """
+
+
 def _read_message(input_stream: BinaryIO) -> dict[str, object] | None:
     headers: dict[str, str] = {}
     while True:
@@ -1911,7 +1923,15 @@ def _read_message(input_stream: BinaryIO) -> dict[str, object] | None:
         raise ValueError("Incomplete MCP message body")
     payload = json.loads(body.decode("utf-8"))
     if not isinstance(payload, dict):
-        raise ValueError("MCP request body must be a JSON object")
+        # Bug bounty finding (docs/NCP_SILENT_DISCONNECT_AUDIT.md finding 9):
+        # the body was fully and correctly consumed (cl_int bytes, valid
+        # JSON) -- the stream stays in sync, unlike a genuine framing/header
+        # error. This must NOT be treated the same as stream desync (which
+        # forces the read loop to stop): one client sending a syntactically
+        # valid non-object JSON value used to permanently kill the whole
+        # server process (every subsequent message, including well-formed
+        # ones, went unanswered).
+        raise _MCPMessageShapeError("MCP request body must be a JSON object")
     return payload
 
 
@@ -1957,6 +1977,15 @@ def serve_streams(
         except json.JSONDecodeError as exc:
             # Body was fully consumed but JSON was invalid — stream still in sync
             _err(f"Invalid MCP JSON: {exc}")
+            continue
+        except _MCPMessageShapeError as exc:
+            # Body was fully consumed and was valid JSON, just the wrong
+            # shape (e.g. a bare array/number instead of an object) — stream
+            # still in sync, same as the JSONDecodeError case above. Bug
+            # bounty finding (docs/NCP_SILENT_DISCONNECT_AUDIT.md finding 9):
+            # this used to fall into the generic ValueError branch below and
+            # kill the whole server session over one malformed message.
+            _err(f"Invalid MCP message shape: {exc}")
             continue
         except ValueError as exc:
             # Header/framing error — stream position is unknown, must stop
@@ -2224,7 +2253,10 @@ class _MCPHTTPHandler(BaseHTTPRequestHandler):
         if not token:
             return True
         auth = self.headers.get("Authorization", "")
-        return auth == f"Bearer {token}"
+        # Bug bounty finding (docs/NCP_SILENT_DISCONNECT_AUDIT.md finding 9):
+        # plain == short-circuits on the first mismatched byte, giving a
+        # network attacker a per-byte timing oracle on the configured token.
+        return hmac.compare_digest(auth, f"Bearer {token}")
 
     def _send_json(self, status: HTTPStatus, payload: object) -> None:
         body = _json_bytes(payload)

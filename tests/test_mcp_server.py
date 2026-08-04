@@ -106,6 +106,26 @@ class TestInitialize:
         assert framed_response is not None
         assert [tool["name"] for tool in framed_response["result"]["tools"]] == FULL_NON_MEMO_TOOL_NAMES
 
+    def test_malformed_message_shape_does_not_kill_the_server_loop(self, tmp_path: Path) -> None:
+        """Bug bounty finding (docs/NCP_SILENT_DISCONNECT_AUDIT.md finding 9):
+        a syntactically valid but non-object JSON body (e.g. a bare array)
+        used to be treated the same as a genuine framing/header error and
+        permanently stopped the read loop -- every subsequent message,
+        including well-formed ones, went unanswered."""
+        project = tmp_path / "repo"
+        (project / ".git").mkdir(parents=True)
+
+        malformed_body = json.dumps([1, 2, 3]).encode("utf-8")
+        malformed_frame = f"Content-Length: {len(malformed_body)}\r\n\r\n".encode("ascii") + malformed_body
+        input_stream = io.BytesIO(malformed_frame + _frame(_req("tools/list")))
+        output_stream = io.BytesIO()
+
+        serve_streams(input_stream, output_stream, cwd=project)
+
+        framed_response = _read_message(io.BytesIO(output_stream.getvalue()))
+        assert framed_response is not None
+        assert [tool["name"] for tool in framed_response["result"]["tools"]] == FULL_NON_MEMO_TOOL_NAMES
+
     def test_http_transport_handles_initialize_and_tools_list(self, tmp_path: Path) -> None:
         port = _free_port()
         server = create_http_server(host="127.0.0.1", port=port, cwd=tmp_path)
@@ -159,6 +179,21 @@ class TestInitialize:
                 )
                 assert allowed.status_code == 200
                 assert allowed.json()["result"]["tools"]
+
+                # Bug bounty finding (docs/NCP_SILENT_DISCONNECT_AUDIT.md
+                # finding 9): the comparison now uses hmac.compare_digest
+                # instead of ==, which used to short-circuit on the first
+                # mismatched byte (a timing side channel). Functionally,
+                # near-miss tokens of the same and different length must
+                # still both be rejected.
+                near_miss = client.post(
+                    "/mcp", json=_req("tools/list"), headers={"Authorization": "Bearer secre1"}
+                )
+                assert near_miss.status_code == 401
+                short_miss = client.post(
+                    "/mcp", json=_req("tools/list"), headers={"Authorization": "Bearer s"}
+                )
+                assert short_miss.status_code == 401
         finally:
             server._shutdown_event.set()
             server.shutdown()
