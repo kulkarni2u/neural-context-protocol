@@ -163,6 +163,18 @@ CREATE INDEX IF NOT EXISTS {prefix}idx_conscious_agent
 CREATE INDEX IF NOT EXISTS {prefix}idx_cost_pipeline
     ON {schema}.{prefix}cost_log(pipeline_id, logged_at);
 
+CREATE TABLE IF NOT EXISTS {schema}.{prefix}embedding_cost_log (
+    id BIGSERIAL PRIMARY KEY,
+    pipeline_id TEXT,
+    op TEXT NOT NULL,
+    char_count INTEGER NOT NULL,
+    estimated_tokens INTEGER NOT NULL,
+    logged_at DOUBLE PRECISION NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS {prefix}idx_embedding_cost_pipeline
+    ON {schema}.{prefix}embedding_cost_log(pipeline_id, logged_at);
+
 CREATE TABLE IF NOT EXISTS {schema}.{prefix}drift_history (
     session_id TEXT NOT NULL,
     turn INTEGER NOT NULL,
@@ -432,6 +444,7 @@ class PgvectorStore(BaseStore):
             chunk = chunk.model_copy(
                 update={"embedding": self._embedding_adapter.embed(chunk.content)}
             )
+            self.log_embedding_cost(pipeline_id=chunk.pipeline_id, op="write", text=chunk.content)
         if chunk.embedding is not None and len(chunk.embedding) != 1536:
             raise ValueError(f"embedding must have 1536 dimensions, got {len(chunk.embedding)}")
         with self._connect() as connection:
@@ -622,6 +635,7 @@ class PgvectorStore(BaseStore):
         if embedding is None and self._embedding_adapter is not None:
             self._embedding_calls_tokens_est += estimate_tokens(text)
             embedding = self._embedding_adapter.embed(text)
+            self.log_embedding_cost(pipeline_id=pipeline_id, op="query", text=text)
         if embedding is not None and len(embedding) != 1536:
             raise ValueError(f"embedding must have 1536 dimensions, got {len(embedding)}")
 
@@ -761,6 +775,7 @@ class PgvectorStore(BaseStore):
             if self._embedding_adapter is not None:
                 self._embedding_calls_tokens_est += estimate_tokens(text)
                 embedding = self._embedding_adapter.embed(text)
+                self.log_embedding_cost(pipeline_id=pipeline_id, op="query", text=text)
             else:
                 raise ValueError("retrieval_mode='vector' requires an embedding to be provided")
         if len(embedding) != 1536:
@@ -1546,6 +1561,109 @@ class PgvectorStore(BaseStore):
                 )
             finally:
                 self._close_cursor(cursor)
+
+    def log_embedding_cost(
+        self,
+        *,
+        pipeline_id: str | None,
+        op: str,
+        text: str,
+    ) -> None:
+        """Record one embedding-adapter call for cost visibility (Finding 3).
+
+        Best-effort only: this sits directly on the write()/query() hot path
+        next to the real ``embed()`` call, so a logging failure here must
+        never be able to break the actual write or query.
+        """
+        try:
+            char_count = len(text)
+            estimated_tokens = estimate_tokens(text)
+            with self._connect() as connection:
+                cursor = connection.cursor()
+                try:
+                    cursor.execute(
+                        self._sql(
+                            """
+                            INSERT INTO {schema}.{prefix}embedding_cost_log (
+                                pipeline_id, op, char_count, estimated_tokens, logged_at
+                            ) VALUES (%s, %s, %s, %s, %s)
+                            """
+                        ),
+                        (pipeline_id, op, char_count, estimated_tokens, time.time()),
+                    )
+                finally:
+                    self._close_cursor(cursor)
+        except Exception:
+            pass
+
+    def embedding_cost_summary(
+        self,
+        *,
+        pipeline_id: str | None = None,
+    ) -> dict[str, object]:
+        """Return aggregate embedding-adapter call stats, analogous to cost_summary()."""
+        try:
+            with self._connect() as connection:
+                cursor = connection.cursor()
+                try:
+                    statement = (
+                        "SELECT "
+                        "COUNT(*) AS entry_count, "
+                        "COALESCE(SUM(char_count), 0) AS char_count_total, "
+                        "COALESCE(SUM(estimated_tokens), 0) AS estimated_tokens_total "
+                        f"FROM {self._table_name('embedding_cost_log')}"
+                    )
+                    params: tuple[object, ...] = ()
+                    if pipeline_id is not None:
+                        statement += " WHERE pipeline_id = %s"
+                        params = (pipeline_id,)
+                    cursor.execute(statement, params)
+                    total_row = self._fetchone(cursor)
+                finally:
+                    self._close_cursor(cursor)
+
+                cursor = connection.cursor()
+                try:
+                    statement = (
+                        "SELECT op, COUNT(*) AS calls, "
+                        "COALESCE(SUM(estimated_tokens), 0) AS estimated_tokens_total "
+                        f"FROM {self._table_name('embedding_cost_log')}"
+                    )
+                    params = ()
+                    if pipeline_id is not None:
+                        statement += " WHERE pipeline_id = %s"
+                        params = (pipeline_id,)
+                    statement += " GROUP BY op ORDER BY op ASC"
+                    cursor.execute(statement, params)
+                    by_op_rows = self._fetchall(cursor)
+                finally:
+                    self._close_cursor(cursor)
+        except Exception:
+            return {
+                "summary": {"entry_count": 0, "char_count_total": 0, "estimated_tokens_total": 0},
+                "by_op": [],
+            }
+
+        if total_row is None:
+            return {
+                "summary": {"entry_count": 0, "char_count_total": 0, "estimated_tokens_total": 0},
+                "by_op": [],
+            }
+        return {
+            "summary": {
+                "entry_count": int(total_row["entry_count"]),
+                "char_count_total": int(total_row["char_count_total"]),
+                "estimated_tokens_total": int(total_row["estimated_tokens_total"]),
+            },
+            "by_op": [
+                {
+                    "op": str(row["op"]),
+                    "calls": int(row["calls"]),
+                    "estimated_tokens_total": int(row["estimated_tokens_total"]),
+                }
+                for row in by_op_rows
+            ],
+        }
 
     def log_drift_history(self, *, session_id: str, turn: int, drift_score: float) -> None:
         with self._connect() as connection:

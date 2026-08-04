@@ -2026,7 +2026,22 @@ def _api_graph_payload(store: BaseStore, params: dict[str, str]) -> dict[str, ob
 
 def _api_cost_payload(store: BaseStore, params: dict[str, str]) -> dict[str, object]:
     limit = _parse_int_param(params, "limit", 10, minimum=1)
-    return store.cost_summary(pipeline_id=params.get("pipeline_id") or None, limit=limit)
+    pipeline_id = params.get("pipeline_id") or None
+    payload = store.cost_summary(pipeline_id=pipeline_id, limit=limit)
+    # Finding 3 (NCP_SILENT_DISCONNECT_AUDIT.md): surface embedding-adapter
+    # spend alongside LLM-turn cost, where the store tracks it. Best-effort
+    # only -- older/alternate BaseStore implementations may not define this
+    # method, and it must never break the read-only cost view.
+    embedding_cost_summary = getattr(store, "embedding_cost_summary", None)
+    if callable(embedding_cost_summary):
+        try:
+            payload = {
+                **payload,
+                "embedding_cost": embedding_cost_summary(pipeline_id=pipeline_id),
+            }
+        except Exception:
+            pass
+    return payload
 
 
 _API_ROUTES: dict[str, Callable[[BaseStore, dict[str, str]], object]] = {
