@@ -140,6 +140,36 @@ bus already knows.
   economics benchmark.
 - **Deps:** CAP-E1, real drift (WI-016).
 
+### CAP-C8 · Procedural self-refinement — impact: HIGH, effort: L — **implemented, `ncp/refine.py`**
+- **Why:** `ncp calibrate --feedback` reweights trust on *stored memory* — it
+  never touches the instructions an agent operates under (turn contracts,
+  skill files). That's a real gap next to harnesses whose self-improvement
+  loop rewrites its own operating instructions from evidence (e.g. Prime
+  Intellect's Prime Agent `/refine`, which evidence-updates supplemental
+  prompts/skill/subagent specs with rollback snapshots).
+- **Best-in-class:** a single named, evidence-backed instruction ("procedure")
+  can accumulate outcome evidence and evolve through an explicit,
+  human-gated propose → apply pipeline, with rollback that never loses
+  history.
+- **Approach:** a procedure is one chunk-sized block of instructions (content
+  is capped at 2000 chars protocol-wide, so a whole multi-KB contract file
+  isn't the refinable unit — this also keeps every version a small,
+  evidence-cited diff instead of an opaque full-document rewrite).
+  `ncp refine propose` deterministically folds recurring `ncp_record_outcome`
+  failure notes into an additive proposal (no model call, never edits or
+  removes existing text) and writes a low-trust candidate linked via
+  `supersedes` — writing it does **not** adopt it. `ncp refine apply` is the
+  human-gated adoption step, reusing the existing CAP-C5 `supersede()`
+  machinery and `calibrate` manual-trust-override rather than duplicating
+  either. `ncp refine rollback` reverts by writing a *new* generation with
+  the prior content — nothing is ever deleted or rewritten in place, matching
+  the same bi-temporal honesty CAP-C5 already applies to ordinary memory.
+- **Impact:** closes the one gap where NCP's "self-improving" claim was
+  previously scoped to trust scores only, not to the actual instructions
+  agents follow.
+- **Deps:** none hard; sharper with CAP-T1 (authenticated authorship) once
+  proposals are signed.
+
 ---
 
 ## Pillar T — Trust: make it real, then make it weigh

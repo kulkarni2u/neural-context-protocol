@@ -132,6 +132,11 @@ class TestApiChunks:
                     "chunk_id", "pipeline_id", "scope", "zone", "layer", "chunk_type",
                     "content", "src", "written_by", "caused_by", "supersedes",
                     "superseded_by", "version", "base_trust", "created_at", "tombstoned",
+                    # CAP-C8 (ncp/refine.py): list_chunks needed generation and
+                    # source_refs to locate a procedure's chain once a version
+                    # has been superseded and dropped out of the bitemporal
+                    # "current" view get_chunks_by_ids applies.
+                    "generation", "source_refs",
                 }
                 assert set(by_id["c_live"].keys()) == expected_keys
 

@@ -175,6 +175,15 @@ DEFAULT_CONFIG = {
         "infer_scan_limit": 50,
         "infer_max_edges": 3,
     },
+    "refine": {
+        # CAP-C8: evidence-backed procedural self-refinement (ncp/refine.py).
+        # Purely explicit/CLI-invoked -- nothing in the write/retrieval path
+        # calls this automatically, so there is no enabled/disabled switch,
+        # only tuning for the `ncp refine propose`/`apply` commands.
+        "min_failed_outcomes": 3,
+        "max_bullets": 5,
+        "promote_trust": 0.80,
+    },
     "providers": {
         "pricing": {
             "claude-sonnet-4-20250514": {"input": 3.00, "output": 15.00, "cache_read": 0.30},
@@ -513,6 +522,18 @@ class NCPConfig:
     @property
     def infer_max_edges(self) -> int:
         return max(0, int(self.values.get("graph", {}).get("infer_max_edges", 3)))
+
+    @property
+    def refine_min_failed_outcomes(self) -> int:
+        return max(1, int(self.values.get("refine", {}).get("min_failed_outcomes", 3)))
+
+    @property
+    def refine_max_bullets(self) -> int:
+        return max(1, int(self.values.get("refine", {}).get("max_bullets", 5)))
+
+    @property
+    def refine_promote_trust(self) -> float:
+        return float(self.values.get("refine", {}).get("promote_trust", 0.80))
 
 
 def load_config(

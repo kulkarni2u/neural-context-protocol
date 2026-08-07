@@ -436,7 +436,7 @@ class PgvectorStore(BaseStore):
             finally:
                 self._close_cursor(cursor)
 
-    def write(self, chunk: SubconsciousChunk) -> bool:
+    def write(self, chunk: SubconsciousChunk, *, allow_duplicate: bool = False) -> bool:
         self.last_write_inferred_edge_count = 0
         chunk = self._validate_chunk_for_write(chunk)
         if self._embedding_adapter is not None and chunk.embedding is None:
@@ -450,7 +450,7 @@ class PgvectorStore(BaseStore):
         with self._connect() as connection:
             self._soft_gc(connection)
             self._assert_src_immutable(connection, chunk)
-            if self._is_duplicate(connection, chunk):
+            if not allow_duplicate and self._is_duplicate(connection, chunk):
                 return False
             cursor = connection.cursor()
             try:

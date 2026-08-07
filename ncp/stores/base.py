@@ -40,8 +40,17 @@ class BaseStore(ABC):
     # Chunk persistence
 
     @abstractmethod
-    def write(self, chunk: SubconsciousChunk) -> bool:
-        """Persist a chunk and return whether a new row was written."""
+    def write(self, chunk: SubconsciousChunk, *, allow_duplicate: bool = False) -> bool:
+        """Persist a chunk and return whether a new row was written.
+
+        ``allow_duplicate`` (default False, preserving existing behavior)
+        skips the content-similarity dedup guard. That guard exists to
+        suppress noise (repeated tool spam), not to block a write whose
+        caller already knows the near-identical content is intentional --
+        e.g. CAP-C8's ``rollback_refinement`` (``ncp/refine.py``), which
+        must be able to restore a procedure's exact prior content even
+        though an older row with that same content still exists.
+        """
 
     @abstractmethod
     def query(
@@ -160,6 +169,34 @@ class BaseStore(ABC):
     async def async_record_outcome(self, outcome: OutcomeRecord) -> bool:
         """Asynchronously record a task outcome."""
         return await anyio.to_thread.run_sync(self.record_outcome, outcome)
+
+    def list_outcomes(
+        self,
+        *,
+        chunk_ids: Sequence[str] | None = None,
+        consumed: bool | None = None,
+        limit: int = 200,
+    ) -> list[OutcomeRecord]:
+        """Return outcome records for read-only inspection (CAP-C8).
+
+        Unlike the internal feedback-calibration loader, this never marks
+        rows consumed. ``chunk_ids`` filters to outcomes whose
+        ``OutcomeRecord.chunk_ids`` intersects the given set; ``None``
+        (default) returns outcomes regardless of chunk linkage. Backends
+        that do not implement this return an empty list.
+        """
+        return []
+
+    async def async_list_outcomes(
+        self,
+        *,
+        chunk_ids: Sequence[str] | None = None,
+        consumed: bool | None = None,
+        limit: int = 200,
+    ) -> list[OutcomeRecord]:
+        """Asynchronously list outcome records using thread pool."""
+        fn = partial(self.list_outcomes, chunk_ids=chunk_ids, consumed=consumed, limit=limit)
+        return await anyio.to_thread.run_sync(fn)
 
     # ------------------------------------------------------------------
     # Graph engineering: typed chunk_edges substrate
@@ -538,7 +575,12 @@ class BaseStore(ABC):
     ) -> dict[str, object]:
         """Return ``{"chunks": [dict, ...], "total": int}`` for UI inspection.
 
-        Backends that do not implement this return an empty page.
+        Each chunk dict includes (among others) ``generation`` and
+        ``source_refs`` -- CAP-C8's procedure-chain walk (``ncp/refine.py``)
+        relies on both being present to locate a procedure's chain when the
+        bitemporal-filtered ``get_chunks_by_ids`` view has already hidden a
+        superseded link. Backends that do not implement this return an empty
+        page.
         """
         return {"chunks": [], "total": 0}
 
@@ -598,9 +640,9 @@ class BaseStore(ABC):
     # ------------------------------------------------------------------
     # Async Counterpart Surface
 
-    async def async_write(self, chunk: SubconsciousChunk) -> bool:
+    async def async_write(self, chunk: SubconsciousChunk, *, allow_duplicate: bool = False) -> bool:
         """Asynchronously persist a chunk using thread pool."""
-        return await anyio.to_thread.run_sync(self.write, chunk)
+        return await anyio.to_thread.run_sync(partial(self.write, chunk, allow_duplicate=allow_duplicate))
 
     async def async_query(
         self,

@@ -402,7 +402,7 @@ class SQLiteStore(BaseStore):
         text. Zero when the fallback was never requested or never fired."""
         return self._retrieval_fallback_count
 
-    def write(self, chunk: SubconsciousChunk) -> bool:
+    def write(self, chunk: SubconsciousChunk, *, allow_duplicate: bool = False) -> bool:
         self.last_write_inferred_edge_count = 0
         chunk = self._validate_chunk_for_write(chunk)
         if self._embedding_adapter is not None and chunk.embedding is None:
@@ -415,7 +415,7 @@ class SQLiteStore(BaseStore):
             connection.execute("BEGIN IMMEDIATE")
             self._soft_gc(connection)
             self._assert_src_immutable(connection, chunk)
-            if self._is_duplicate(connection, chunk):
+            if not allow_duplicate and self._is_duplicate(connection, chunk):
                 return False
             connection.execute(
                 """
@@ -964,6 +964,54 @@ class SQLiteStore(BaseStore):
                 ),
             )
             return True
+
+    def list_outcomes(
+        self,
+        *,
+        chunk_ids: Sequence[str] | None = None,
+        consumed: bool | None = None,
+        limit: int = 200,
+    ) -> list[OutcomeRecord]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if consumed is not None:
+            clauses.append("consumed = ?")
+            params.append(1 if consumed else 0)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+
+        # chunk_ids membership isn't indexable as stored (a JSON array
+        # column), so this scans up to a bounded window ordered newest-first
+        # and filters in Python -- the same tradeoff _load_unconsumed_outcomes
+        # already makes for calibration, just read-only and optionally
+        # chunk-scoped.
+        scan_limit = max(1, min(2000, int(limit) * 10 if chunk_ids is not None else int(limit)))
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM outcomes {where} ORDER BY created_at DESC LIMIT ?",
+                [*params, scan_limit],
+            ).fetchall()
+
+        wanted = set(chunk_ids) if chunk_ids is not None else None
+        results: list[OutcomeRecord] = []
+        for row in rows:
+            row_chunk_ids = json.loads(row["chunk_ids"]) if row["chunk_ids"] else []
+            if wanted is not None and wanted.isdisjoint(row_chunk_ids):
+                continue
+            results.append(
+                OutcomeRecord(
+                    outcome_id=str(row["outcome_id"]),
+                    turn_id=row["turn_id"],
+                    chunk_ids=row_chunk_ids,
+                    success=bool(row["success"]),
+                    weight=float(row["weight"]),
+                    note=row["note"],
+                    created_at=float(row["created_at"]),
+                    consumed=bool(row["consumed"]),
+                )
+            )
+            if len(results) >= limit:
+                break
+        return results
 
     def record_memo(
         self,
@@ -2528,6 +2576,7 @@ class SQLiteStore(BaseStore):
                     c.chunk_id, c.pipeline_id, c.scope, c.zone, c.layer, c.chunk_type,
                     c.content, c.src, c.written_by, c.caused_by, c.supersedes,
                     c.superseded_by, c.version, c.base_trust, c.created_at,
+                    c.generation, c.source_refs,
                     t.chunk_id AS tombstone_chunk_id
                 FROM chunks c
                 LEFT JOIN tombstones t ON t.chunk_id = c.chunk_id
@@ -2555,6 +2604,8 @@ class SQLiteStore(BaseStore):
                 "version": int(row["version"]),
                 "base_trust": float(row["base_trust"]),
                 "created_at": float(row["created_at"]),
+                "generation": int(row["generation"]),
+                "source_refs": json.loads(row["source_refs"]) if row["source_refs"] else [],
                 "tombstoned": row["tombstone_chunk_id"] is not None,
             }
             for row in rows

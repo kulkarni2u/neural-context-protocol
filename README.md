@@ -260,6 +260,22 @@ The self-improving loop closes through `ncp calibrate --feedback` (`ncp/stores/c
 
 -----
 
+## Procedural self-refinement
+
+`ncp calibrate --feedback` reweights trust on *stored memory* — it never touches the instructions an agent operates under. Procedural self-refinement (`ncp/refine.py`) closes that gap for a narrow, deliberately bounded case: a single named **procedure** — one chunk-sized block of operating instructions, not a whole multi-KB contract file — can accumulate outcome evidence and evolve through an explicit, human-gated pipeline.
+
+```bash
+ncp refine ingest null-guard-rule --content "Always null-check retryCount before calling intValue()."
+ncp refine propose null-guard-rule        # evidence-backed candidate, not yet adopted
+ncp refine apply <candidate_chunk_id>     # adopt it (promotes trust, optional --write-to file)
+ncp refine rollback null-guard-rule       # revert to the prior version (new generation, nothing deleted)
+ncp refine show null-guard-rule --history # walk every version
+```
+
+`ncp refine propose` is deterministic and additive-only: it never edits or removes existing instruction text, only appends deduplicated, frequency-ranked notes drawn from `ncp_record_outcome` failures (no model call). Writing a candidate does not adopt it — it's a new, low-trust chunk linked to its predecessor via `supersedes`. `ncp refine apply` is the human-gated adoption step, reusing the existing CAP-C5 `supersede()` machinery and `calibrate` manual-trust-override rather than duplicating either. `ncp refine rollback` never deletes or rewrites history: reverting writes a *new* generation whose content matches the prior version. Config under `[refine]`: `min_failed_outcomes` (default `3`), `max_bullets` (default `5`), `promote_trust` (default `0.80`).
+
+-----
+
 ## Graph engineering
 
 Relationships between memories are first-class graph structure. Chunks are linked via typed directional edges (`caused_by`, `supersedes`, `supports`, `contradicts`, `refines`, `derived_from`), so retrieval and trust propagation can traverse relationships instead of treating memory as a flat scored pool.
@@ -451,6 +467,7 @@ ncp trust-drift # trust-drift observability: rising, falling, and feedback summa
 ncp precedents  # query past decisions: 'show me decisions like this one'
 ncp consolidate # merge and compact memory
 ncp calibrate   # recalibrate trust (add --feedback for the self-improvement pass)
+ncp refine      # evidence-backed procedural self-refinement: ingest/show/propose/apply/rollback
 ncp handoff     # cross-agent handoff coordination
 ncp batch       # process a JSONL file of NCP operations
 ncp identity    # create / list / revoke Ed25519 agent identities
