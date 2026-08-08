@@ -2671,7 +2671,7 @@ class AsyncPgvectorStore(BaseStore):
             "Use async_* methods or PgvectorStore for sync access."
         )
 
-    def write(self, chunk: SubconsciousChunk) -> bool:  # type: ignore[override]
+    def write(self, chunk: SubconsciousChunk, *, allow_duplicate: bool = False) -> bool:  # type: ignore[override]
         self._not_implemented("write")
         return False  # unreachable
 

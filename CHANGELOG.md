@@ -4,6 +4,33 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **CAP-C8: evidence-backed procedural self-refinement** (`ncp/refine.py`,
+  `ncp refine ingest|show|propose|apply|rollback`): NCP's calibration loop
+  reweights trust on stored memory but never touches the instructions an
+  agent operates under. This closes that gap for a single named "procedure"
+  (one chunk-sized block of operating instructions — content is capped at
+  2000 chars protocol-wide, so a whole multi-KB contract file isn't the
+  refinable unit). `ncp refine propose` deterministically folds recurring
+  `ncp_record_outcome` failure notes into an additive, evidence-cited
+  proposal (no model call, never edits or removes existing text) and writes
+  it as a new low-trust candidate chunk linked to its predecessor via
+  `supersedes` — writing a candidate never adopts it. `ncp refine apply`
+  is the explicit human-gated adoption step: it promotes the candidate via
+  the existing CAP-C5 `supersede()` machinery and existing `calibrate`
+  manual-override trust promotion, optionally writing the adopted content to
+  a file. `ncp refine rollback` reverts to the prior version by writing a
+  *new* generation with the old content — nothing is ever deleted or
+  rewritten in place. New additive `BaseStore.list_outcomes` (SQLite) backs
+  evidence gathering; `list_chunks` now also returns `generation` and
+  `source_refs` so a procedure's version chain can be read even after
+  `get_chunks_by_ids`'s bitemporal "current" view has hidden a superseded
+  link; `write()` gained an opt-in `allow_duplicate` flag (default `false`)
+  so an intentional byte-faithful rollback isn't rejected by the
+  noise-suppression dedup guard. Config: `[refine]`
+  (`min_failed_outcomes`, `max_bullets`, `promote_trust`).
+
 ## [1.4.2] - 2026-08-04
 
 Silent-disconnect audit and a follow-up bug-bounty pass across the whole

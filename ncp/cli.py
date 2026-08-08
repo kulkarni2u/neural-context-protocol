@@ -1785,6 +1785,225 @@ def calibrate_command(
         console.print(f"[green]Calibrated {total_changed} chunk(s){suffix}.[/green]")
 
 
+@main.group("refine")
+def refine_group() -> None:
+    """CAP-C8: evidence-backed procedural self-refinement (propose/apply/rollback)."""
+
+
+@refine_group.command("ingest")
+@click.argument("key")
+@click.option("--content", default=None, help="Procedure text (must fit in 2000 chars).")
+@click.option("--file", "file_path", default=None, type=click.Path(exists=True, dir_okay=False, path_type=Path), help="Read content from this file instead of --content.")
+@click.option("--cwd", default=None, type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("--pipeline-id", default=None, help="Pipeline scope for this procedure.")
+@click.option("--written-by", default="operator", help="Author recorded on the initial version.")
+def refine_ingest_command(
+    key: str,
+    content: str | None,
+    file_path: Path | None,
+    cwd: Path | None,
+    pipeline_id: str | None,
+    written_by: str,
+) -> None:
+    """Store the initial version of a refinable procedure under KEY."""
+    from ncp.config import load_config
+    from ncp.refine import ingest_procedure
+
+    if file_path is not None:
+        content = file_path.read_text()
+    if not content or not content.strip():
+        raise click.UsageError("Provide --content or --file.")
+
+    config = load_config(cwd=cwd or Path.cwd())
+    try:
+        store = create_store(config)
+    except NCPStoreUnavailableError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    try:
+        chunk = ingest_procedure(
+            store, key=key, content=content, pipeline_id=pipeline_id, written_by=written_by
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    console.print(f"[green]Ingested procedure '{key}' as {chunk.chunk_id}[/green] (generation 0)")
+
+
+@refine_group.command("show")
+@click.argument("key")
+@click.option("--cwd", default=None, type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("--pipeline-id", default=None, help="Pipeline scope for this procedure.")
+@click.option("--history", is_flag=True, default=False, help="Show every version, not just the head.")
+def refine_show_command(key: str, cwd: Path | None, pipeline_id: str | None, history: bool) -> None:
+    """Show the current (or full version history of a) refinable procedure."""
+    from ncp.config import load_config
+    from ncp.refine import find_procedure_head, procedure_chain
+
+    config = load_config(cwd=cwd or Path.cwd())
+    try:
+        store = create_store(config)
+    except NCPStoreUnavailableError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    if history:
+        chain = procedure_chain(store, key=key, pipeline_id=pipeline_id)
+        if not chain:
+            raise click.ClickException(f"no procedure ingested for key '{key}'")
+        table = Table(title=f"Procedure '{key}' history", box=box.SIMPLE_HEAVY)
+        table.add_column("Gen", justify="right")
+        table.add_column("Chunk ID")
+        table.add_column("Trust", justify="right")
+        table.add_column("Written by")
+        table.add_column("Content")
+        for c in chain:
+            table.add_row(str(c.generation), c.chunk_id, f"{c.base_trust:.2f}", c.written_by, c.content[:80])
+        console.print(table)
+        return
+
+    head = find_procedure_head(store, key=key, pipeline_id=pipeline_id)
+    if head is None:
+        raise click.ClickException(f"no procedure ingested for key '{key}'")
+    table = Table(title=f"Procedure '{key}'", box=box.SIMPLE)
+    table.add_column("Field", style="cyan")
+    table.add_column("Value")
+    table.add_row("Chunk ID", head.chunk_id)
+    table.add_row("Generation", str(head.generation))
+    table.add_row("Trust", f"{head.base_trust:.2f}")
+    table.add_row("Written by", head.written_by)
+    console.print(table)
+    console.print(head.content)
+
+
+@refine_group.command("propose")
+@click.argument("key")
+@click.option("--cwd", default=None, type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("--pipeline-id", default=None, help="Pipeline scope for this procedure.")
+@click.option("--min-failed-outcomes", default=None, type=int, help="Override config minimum failure count.")
+@click.option("--max-bullets", default=None, type=int, help="Override config max proposed bullets.")
+@click.option("--dry-run", is_flag=True, default=False, help="Preview the proposal without writing a candidate chunk.")
+def refine_propose_command(
+    key: str,
+    cwd: Path | None,
+    pipeline_id: str | None,
+    min_failed_outcomes: int | None,
+    max_bullets: int | None,
+    dry_run: bool,
+) -> None:
+    """Propose a next version of KEY from recorded outcome evidence."""
+    from ncp.config import load_config
+    from ncp.refine import propose_refinement
+
+    config = load_config(cwd=cwd or Path.cwd())
+    try:
+        store = create_store(config)
+    except NCPStoreUnavailableError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    try:
+        result = propose_refinement(
+            store,
+            key=key,
+            pipeline_id=pipeline_id,
+            min_failed_outcomes=min_failed_outcomes if min_failed_outcomes is not None else config.refine_min_failed_outcomes,
+            max_bullets=max_bullets if max_bullets is not None else config.refine_max_bullets,
+            dry_run=dry_run,
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    if result.proposal is None:
+        console.print(f"[dim]Not enough failure evidence yet for '{key}' (head={result.head_chunk_id}).[/dim]")
+        return
+
+    table = Table(title=f"Refinement proposal for '{key}'", box=box.SIMPLE_HEAVY)
+    table.add_column("Metric")
+    table.add_column("Value", justify="right")
+    table.add_row("Head chunk", result.head_chunk_id)
+    table.add_row("Failures considered", str(result.proposal.failure_count))
+    table.add_row("Successes considered", str(result.proposal.success_count))
+    table.add_row("Rationale bullets", str(len(result.proposal.rationale)))
+    console.print(table)
+    for line in result.proposal.rationale:
+        console.print(f"  {line}")
+
+    if dry_run:
+        console.print("[yellow]Dry run: no candidate chunk written.[/yellow]")
+    elif result.new_chunk is not None:
+        console.print(
+            f"[green]Proposed candidate {result.new_chunk.chunk_id}[/green] "
+            f"(generation {result.new_chunk.generation}, trust {result.new_chunk.base_trust:.2f}). "
+            f"Run `ncp refine apply {result.new_chunk.chunk_id}` to adopt it."
+        )
+
+
+@refine_group.command("apply")
+@click.argument("chunk_id")
+@click.option("--cwd", default=None, type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("--promote-trust", default=None, type=float, help="Trust to promote the candidate to (default from config, 0.80).")
+@click.option("--write-to", default=None, type=click.Path(dir_okay=False, path_type=Path), help="Also write the adopted content to this file.")
+def refine_apply_command(
+    chunk_id: str,
+    cwd: Path | None,
+    promote_trust: float | None,
+    write_to: Path | None,
+) -> None:
+    """Adopt a proposed candidate chunk as the live version of its procedure."""
+    from ncp.config import load_config
+    from ncp.refine import apply_refinement
+
+    config = load_config(cwd=cwd or Path.cwd())
+    try:
+        store = create_store(config)
+    except NCPStoreUnavailableError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    try:
+        adopted = apply_refinement(
+            store,
+            chunk_id=chunk_id,
+            promote_trust=promote_trust if promote_trust is not None else config.refine_promote_trust,
+            write_to=write_to,
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    console.print(f"[green]Adopted {adopted.chunk_id}[/green] (trust {adopted.base_trust:.2f}).")
+    if write_to is not None:
+        console.print(f"Wrote content to {write_to}")
+
+
+@refine_group.command("rollback")
+@click.argument("key")
+@click.option("--cwd", default=None, type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("--pipeline-id", default=None, help="Pipeline scope for this procedure.")
+@click.option("--write-to", default=None, type=click.Path(dir_okay=False, path_type=Path), help="Also write the reverted content to this file.")
+def refine_rollback_command(
+    key: str,
+    cwd: Path | None,
+    pipeline_id: str | None,
+    write_to: Path | None,
+) -> None:
+    """Revert KEY to its previous version (recorded as a new generation, nothing is deleted)."""
+    from ncp.config import load_config
+    from ncp.refine import rollback_refinement
+
+    config = load_config(cwd=cwd or Path.cwd())
+    try:
+        store = create_store(config)
+    except NCPStoreUnavailableError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    try:
+        reverted = rollback_refinement(store, key=key, pipeline_id=pipeline_id, write_to=write_to)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    console.print(f"[green]Rolled back '{key}' to {reverted.chunk_id}[/green] (generation {reverted.generation}).")
+    if write_to is not None:
+        console.print(f"Wrote content to {write_to}")
+
+
 @main.group("identity")
 def identity_group() -> None:
     """Manage local agent identities."""
