@@ -6,6 +6,36 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ### Added
 
+- **WI-P3: deterministic fan-in reduction for high-fanout bursts**
+  (`ncp/stores/consolidation.py::reduce_candidates`, `[retrieval].reduce_fanin_enabled`,
+  off by default): when many parallel workers write overlapping findings
+  into one pipeline, the existing bounded chunk-cap retrieval could fill
+  its budget with several near-duplicate restatements of the same claim
+  instead of that many distinct ones. When enabled, retrieval overfetches
+  past the normal cap, then within any high-fanout `(layer, zone,
+  pipeline_id)` cluster: merges near-duplicate claims to the highest-trust
+  version (reusing the same clustering `ncp consolidate` already uses),
+  drops malformed (empty) candidates, and flags surviving same-topic claims
+  that diverge as contradictions — gated on a reversal-cue check (`"already
+  fixed"`, `"no longer reproduces"`, ...), not similarity alone, since
+  paraphrase variance and genuine contradictions score similarly close on
+  short technical claims. Contradictions are surfaced as an additive
+  `note:contradicts` line in the assembled context (`PidginEncoder.assemble`'s
+  new `contradiction_notes` parameter) for the reading agent to reason
+  about; NCP never resolves one itself. `AssemblyResult` gained
+  `fanin_merged_count`, `fanin_contradictions`, and
+  `fanin_dropped_malformed_count`; `ncp_get_context`'s telemetry and
+  `active_features` surface the same, additively. New benchmark
+  (`benchmarks/fanin_reduce/`, `ncp.benchmarks.run_fanin_reduce_benchmark`):
+  on a deterministic 40-worker/4-topic corpus, 25% of NCP's own bounded
+  top-k retrieval slots are near-duplicates of another slot in the same
+  result with the reducer off; enabling it merges those away and cuts
+  tokens 13% against an unbounded raw dump of all 40 workers (see
+  `docs/NCP_BENCHMARK_FANIN_REDUCE.md`). Config: `[retrieval]`
+  (`reduce_fanin_enabled`, `reduce_fanin_min_cluster`,
+  `reduce_fanin_similarity_threshold`, `reduce_fanin_contradict_floor`,
+  `reduce_fanin_overfetch`).
+
 - **CAP-C8: evidence-backed procedural self-refinement** (`ncp/refine.py`,
   `ncp refine ingest|show|propose|apply|rollback`): NCP's calibration loop
   reweights trust on stored memory but never touches the instructions an

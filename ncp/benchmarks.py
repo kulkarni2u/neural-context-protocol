@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 
 from ncp.bench.baselines import (
@@ -13,7 +14,9 @@ from ncp.bench.baselines import (
 
 from ncp.assembler import Assembler
 from ncp.api import agent
-from ncp.costs import assembly_overhead
+from ncp.config import NCPConfig
+from ncp.costs import assembly_overhead, calculate_cost
+from ncp.stores.consolidation import reduce_candidates
 from ncp.stores.sqlite import SQLiteStore
 from ncp.tokens import estimate_tokens, token_unit
 from ncp.types import BudgetContext, NCPResponse, SubconsciousChunk
@@ -338,3 +341,328 @@ def _make_research_result_summary(*, turn_number: int, role_name: str, topic: st
         f"{role_name} turn {turn_number:02d} resolved {topic} by comparing retrieved evidence, "
         "documenting one grounded finding, preserving source attribution, and handing off the verified thread."
     )
+
+
+# ---------------------------------------------------------------------------
+# High-fanout benchmark: N parallel workers -> one synthesizer (WI-P3)
+# ---------------------------------------------------------------------------
+#
+# Fixed, hand-authored, deterministic -- no network, no randomness. Four
+# topics a code-triage pipeline might surface, each with a pool of
+# hand-paraphrased confirming claims (the kind of wording variance real
+# parallel workers actually produce -- similar enough to be the same claim,
+# never byte-identical, so write-time near-dup suppression at >0.92
+# SequenceMatcher similarity does not collapse them before they even land in
+# the store) plus one claim that genuinely contradicts the others.
+
+
+@dataclass(slots=True, frozen=True)
+class _FaninTopic:
+    topic: str
+    claims: list[str]
+    contradiction: str
+
+
+_FANIN_TOPICS: list[_FaninTopic] = [
+    _FaninTopic(
+        topic="payment_npe",
+        claims=[
+            "NPE at PaymentProcessor.java:142: retryCount is null when payment_method=ACH and customer.tier=trial.",
+            "NullPointerException in PaymentProcessor.java line 142 -- retryCount comes back null for ACH trial customers.",
+            "PaymentProcessor.java:142 throws NPE because retryCount is unset for trial-tier ACH payments.",
+            "Root cause of the payment crash: retryCount is null at PaymentProcessor.java:142 for ACH trial accounts.",
+            "Trial-tier ACH payments hit a null retryCount at PaymentProcessor.java:142, causing an NPE.",
+            "PaymentProcessor.java line 142 NPEs on trial ACH customers because retryCount was never initialized.",
+            "The crash trace points to PaymentProcessor.java:142 -- retryCount is null for ACH trial-tier customers.",
+            "For ACH payments on trial accounts, retryCount is null and PaymentProcessor.java:142 throws an NPE.",
+        ],
+        contradiction=(
+            "PaymentProcessor.java:142 was already patched last release; retryCount now defaults to 0 "
+            "for all payment methods."
+        ),
+    ),
+    _FaninTopic(
+        topic="cache_race",
+        claims=[
+            "SessionStore has a cache invalidation race: two writers updating the same key within 50ms can leave a stale entry.",
+            "Concurrent writes to SessionStore within a 50ms window race on cache invalidation, leaving stale sessions.",
+            "SessionStore's cache invalidation is not atomic -- two near-simultaneous writers can strand a stale key.",
+            "A race in SessionStore lets two writers within 50ms of each other skip invalidating the shared cache entry.",
+            "SessionStore cache entries can go stale when two writers race on the same key inside a 50ms window.",
+            "Cache coherency bug in SessionStore: overlapping writes under 50ms apart don't reliably invalidate the old entry.",
+            "SessionStore's invalidation logic loses a race when two writers touch the same key within 50 milliseconds.",
+            "Under concurrent writes 50ms apart, SessionStore can serve a stale cached value due to a missed invalidation.",
+        ],
+        contradiction=(
+            "SessionStore's cache invalidation is already atomic per-key; the 50ms race was fixed by the "
+            "mutex added in the last sprint."
+        ),
+    ),
+    _FaninTopic(
+        topic="webhook_retry",
+        claims=[
+            "Webhook delivery exhausts its retry budget before the backoff timer completes for rate-limited endpoints.",
+            "Rate-limited webhook deliveries run out of retries before the exponential backoff finishes waiting.",
+            "The retry budget for webhooks is consumed faster than the backoff schedule allows, dropping rate-limited deliveries.",
+            "Webhook retries hit their cap before backoff completes when the target endpoint is rate-limiting us.",
+            "For rate-limited webhook targets, the retry count runs out before the backoff delay elapses.",
+            "Backoff timing for webhook retries is longer than the retry budget, so rate-limited calls give up too early.",
+            "Webhook delivery gives up on rate-limited endpoints because retries are exhausted before backoff finishes.",
+            "Rate-limited webhook targets drop deliveries: the retry budget is smaller than the backoff schedule needs.",
+        ],
+        contradiction=(
+            "Webhook retry budget was raised to cover the full backoff schedule; rate-limited endpoints no "
+            "longer drop deliveries."
+        ),
+    ),
+    _FaninTopic(
+        topic="auth_token_leak",
+        claims=[
+            "Auth tokens are not invalidated on logout, so a captured token can be replayed until its original TTL expires.",
+            "Logout does not revoke the auth token -- it stays valid and replayable for the rest of its TTL window.",
+            "A logged-out auth token remains usable until TTL expiry, since logout never invalidates it server-side.",
+            "Token replay is possible after logout because the auth token isn't revoked, only the client-side session is cleared.",
+            "Logging out clears the client session but leaves the auth token valid, replayable until it naturally expires.",
+            "Server-side auth tokens outlive logout: no revocation happens, so tokens are replayable until TTL runs out.",
+            "The logout flow forgets to blacklist the auth token, leaving a replay window open until TTL expiry.",
+            "Auth token TTL, not logout, is what actually ends a session -- logout alone doesn't revoke the token.",
+        ],
+        contradiction=(
+            "Logout now revokes the auth token server-side immediately; replay after logout is no longer possible."
+        ),
+    ),
+]
+
+
+def _fanin_worker_content(
+    *,
+    global_index: int,
+    topic_index: int,
+    worker_index_in_topic: int,
+    contradiction_every: int,
+    malformed_every: int,
+) -> str:
+    if malformed_every > 0 and global_index % malformed_every == 0:
+        return ""
+    topic = _FANIN_TOPICS[topic_index]
+    if contradiction_every > 0 and worker_index_in_topic % contradiction_every == contradiction_every - 1:
+        return topic.contradiction
+    return topic.claims[worker_index_in_topic % len(topic.claims)]
+
+
+def run_fanin_reduce_benchmark(
+    *,
+    store_path: str | Path,
+    workers: int = 40,
+    pipeline_id: str = "bench_fanin_reduce",
+    k: int = 16,
+    context_token_budget: int = 4000,
+    synthesis_model: str = "claude-sonnet-4-20250514",
+    contradiction_every: int = 7,
+    malformed_every: int = 13,
+) -> dict[str, object]:
+    """Compare a raw N-worker fan-in dump against NCP's bounded retrieval,
+    with and without the deterministic fan-in reducer (WI-P3).
+
+    Simulates ``workers`` parallel agents (e.g. Haiku triage workers)
+    writing paraphrased/duplicate findings across a fixed set of topics into
+    one pipeline, including a controlled fraction of genuine contradictions
+    and malformed (empty) outputs. A synthesis agent then reads the pool
+    three ways, same query and same ``k`` throughout:
+
+    - ``raw_dump``: every worker's raw content concatenated verbatim, no
+      bound at all -- the naive fan-in baseline.
+    - ``ncp_default``: NCP's existing bounded top-k retrieval (BM25 + trust
+      + recency), reducer off. This already beats ``raw_dump`` on tokens
+      (that's the pre-existing, separately-benchmarked win of bounded
+      retrieval) -- but bounding by count doesn't dedup content, so some of
+      those ``k`` slots can be near-duplicates of each other.
+    - ``ncp_reduced``: the same retrieval, overfetched past ``k`` so the
+      reducer has a real pool to work with, deterministically merged to the
+      highest-trust version per near-duplicate cluster (dropping malformed
+      candidates, flagging genuine contradictions) before the same top-k
+      cap is applied.
+
+    Because ``ncp_default`` and ``ncp_reduced`` return the same chunk count
+    at the same ``k``, comparing their raw token totals mostly measures
+    which *specific* chunks won the ranking, not reduction quality -- and
+    ``ncp_reduced``'s per-chunk contradiction notes add a little text on
+    top. The metric that actually isolates the reducer's effect is
+    ``wasted_duplicate_slots_in_default``: running the reducer as a
+    read-only diagnostic over ``ncp_default``'s own already-capped output
+    and counting how many of its ``k`` slots are near-duplicates of another
+    slot in that same result -- context budget spent twice on one claim
+    instead of once each on two different ones.
+
+    Cost is reported for the synthesis model's input tokens only, at a
+    fixed synthetic output-token count held constant across scenarios --
+    this isolates the cost effect of what reaches the synthesizer, not
+    worker cost (workers already ran regardless of what downstream
+    reduction does to their output).
+    """
+
+    if workers < 1:
+        raise ValueError("workers must be >= 1")
+
+    store = SQLiteStore(store_path)
+    raw_segments: list[str] = []
+    for index in range(workers):
+        topic_index = index % len(_FANIN_TOPICS)
+        worker_index_in_topic = index // len(_FANIN_TOPICS)
+        content = _fanin_worker_content(
+            global_index=index,
+            topic_index=topic_index,
+            worker_index_in_topic=worker_index_in_topic,
+            contradiction_every=contradiction_every,
+            malformed_every=malformed_every,
+        )
+        raw_segments.append(f"worker_{index:02d}: {content or '[no output]'}")
+        store.write(
+            SubconsciousChunk(
+                chunk_id=f"fanin_worker_{index:02d}",
+                layer="episodic",
+                content=content or " ",
+                src="agent_inferred",
+                pipeline_id=pipeline_id,
+                written_by=f"worker_{index:02d}",
+                base_trust=round(0.5 + 0.4 * ((index * 7) % 10) / 10, 2),
+            )
+        )
+
+    raw_dump_text = "\n".join(raw_segments)
+    query_text = " ".join(topic.topic.replace("_", " ") for topic in _FANIN_TOPICS)
+
+    conscious = agent(
+        id="synthesizer",
+        role="synthesize",
+        owns=["handoff"],
+        must_not=["speculation"],
+        task="triage_fanin_findings",
+        slot="synthesize_worker_reports",
+        intent="produce_grounded_summary",
+        pipeline_id=pipeline_id,
+    )
+    budget = BudgetContext(
+        ctx_used=0.3, steps_completed=workers, steps_total=workers, elapsed_seconds=float(workers)
+    )
+
+    default_assembler = Assembler(store=store)
+    default_result = default_assembler.assemble(
+        conscious=conscious, budget=budget, query_text=query_text, k=k, max_tokens=context_token_budget
+    )
+    default_config = NCPConfig(values={}, project_root=Path(store_path).parent)
+    # Read-only diagnostic: how much of ncp_default's own already-capped
+    # output is wasted on a near-duplicate of another slot in that same
+    # result? Uses the module defaults (same values reduce_fanin_enabled
+    # would use), just applied after the fact instead of before the cap.
+    default_self_reduced = reduce_candidates(
+        default_result.chunks,
+        similarity_threshold=default_config.reduce_fanin_similarity_threshold,
+        contradict_floor=default_config.reduce_fanin_contradict_floor,
+        min_cluster=3,
+    )
+
+    reduced_config = NCPConfig(
+        values={"retrieval": {"reduce_fanin_enabled": True, "reduce_fanin_overfetch": 8}},
+        project_root=Path(store_path).parent,
+    )
+    reduced_assembler = Assembler(store=store, config=reduced_config)
+    reduced_result = reduced_assembler.assemble(
+        conscious=conscious, budget=budget, query_text=query_text, k=k, max_tokens=context_token_budget
+    )
+
+    raw_dump_tokens = estimate_tokens(raw_dump_text)
+    default_tokens = estimate_tokens(default_result.context)
+    reduced_tokens = estimate_tokens(reduced_result.context)
+
+    synth_output_tokens = 200  # fixed across scenarios: isolates the input-token effect of reduction
+    raw_dump_cost = calculate_cost(
+        model=synthesis_model, input_tokens=raw_dump_tokens, output_tokens=synth_output_tokens
+    ).total_cost_usd
+    default_cost = calculate_cost(
+        model=synthesis_model, input_tokens=default_tokens, output_tokens=synth_output_tokens
+    ).total_cost_usd
+    reduced_cost = calculate_cost(
+        model=synthesis_model, input_tokens=reduced_tokens, output_tokens=synth_output_tokens
+    ).total_cost_usd
+
+    def _reduction_ratio(before: int, after: int) -> float:
+        return round(1 - (after / before), 4) if before else 0.0
+
+    wasted_duplicate_slots = len(default_self_reduced.merged_away)
+
+    # Ground-truth-backed precision check, possible only because this
+    # corpus's topic labels are known: what fraction of flagged
+    # contradiction pairs are actually about the same synthetic topic,
+    # versus two candidates from different topics that happened to clear
+    # the similarity floor together? Real production data has no such
+    # ground truth -- this number exists to keep the reducer's contradiction
+    # signal honestly characterized, not to claim it as a precision metric
+    # end users can expect at unknown corpora.
+    def _topic_index(chunk_id: str) -> int:
+        return int(chunk_id.rsplit("_", 1)[-1]) % len(_FANIN_TOPICS)
+
+    same_topic_pairs = sum(
+        1 for a, b in reduced_result.fanin_contradictions if _topic_index(a) == _topic_index(b)
+    )
+    contradiction_count = len(reduced_result.fanin_contradictions)
+    contradiction_same_topic_fraction = (
+        round(same_topic_pairs / contradiction_count, 4) if contradiction_count else None
+    )
+
+    return {
+        "benchmark": "fanin_reduce",
+        "pipeline_id": pipeline_id,
+        "token_unit": token_unit(),
+        "config": {
+            "workers": workers,
+            "topics": [topic.topic for topic in _FANIN_TOPICS],
+            "k": k,
+            "context_token_budget": context_token_budget,
+            "synthesis_model": synthesis_model,
+            "synth_output_tokens_fixed": synth_output_tokens,
+            "contradiction_every": contradiction_every,
+            "malformed_every": malformed_every,
+        },
+        "scenarios": {
+            "raw_dump": {
+                "description": "All worker outputs concatenated verbatim, no bound at all -- the naive fan-in baseline.",
+                "input_tokens": raw_dump_tokens,
+                "cost_usd": round(raw_dump_cost, 6),
+                "chunk_count": workers,
+            },
+            "ncp_default": {
+                "description": "NCP's existing bounded top-k retrieval (BM25+trust+recency); reduce_fanin off.",
+                "input_tokens": default_tokens,
+                "cost_usd": round(default_cost, 6),
+                "chunk_count": len(default_result.chunks),
+                "wasted_duplicate_slots_in_default": wasted_duplicate_slots,
+            },
+            "ncp_reduced": {
+                "description": "Same retrieval, overfetched and reduced before the same top-k cap; reduce_fanin on.",
+                "input_tokens": reduced_tokens,
+                "cost_usd": round(reduced_cost, 6),
+                "chunk_count": len(reduced_result.chunks),
+                "fanin_merged_count": reduced_result.fanin_merged_count,
+                "fanin_contradictions_count": contradiction_count,
+                "fanin_dropped_malformed_count": reduced_result.fanin_dropped_malformed_count,
+            },
+        },
+        "summary": {
+            "token_reduction_vs_raw_dump": _reduction_ratio(raw_dump_tokens, reduced_tokens),
+            "cost_reduction_usd_vs_raw_dump": round(raw_dump_cost - reduced_cost, 6),
+            "wasted_duplicate_slots_in_default": wasted_duplicate_slots,
+            "wasted_duplicate_slot_fraction_in_default": (
+                round(wasted_duplicate_slots / len(default_result.chunks), 4) if default_result.chunks else 0.0
+            ),
+            "contradictions_surfaced": contradiction_count,
+            "contradiction_same_topic_fraction": contradiction_same_topic_fraction,
+            "merged_near_duplicates": reduced_result.fanin_merged_count,
+            "malformed_dropped": reduced_result.fanin_dropped_malformed_count,
+            "pass": (
+                reduced_tokens < raw_dump_tokens
+                and reduced_result.fanin_merged_count > 0
+                and wasted_duplicate_slots > 0
+            ),
+        },
+    }

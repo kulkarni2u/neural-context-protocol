@@ -91,6 +91,29 @@ DEFAULT_CONFIG = {
         "usage_prior_weight": 1.0,
         "reputation_weight": 0.0,
         "fallback_to_trust_recency_enabled": True,
+        # Fan-in reduction (WI-P3): deterministic dedup/grouping over the
+        # subconscious candidate pool before chunk-cap/MMR truncation, for
+        # the many-workers-write-to-one-pipeline case. Default false --
+        # disabled preserves exact legacy retrieval behavior, no clustering
+        # pass, no merged or contradiction-flagged chunks.
+        "reduce_fanin_enabled": False,
+        "reduce_fanin_min_cluster": 3,
+        # Calibrated against benchmarks/fanin_reduce, not guessed: at
+        # realistic fan-in pool sizes (>=_BM25_CLUSTER_MIN), BM25 scores for
+        # genuine same-topic paraphrases of short technical claims cluster
+        # around 0.15-0.4, well below the 0.6+ that near-byte-identical text
+        # scores. A higher threshold here silently stops merging almost
+        # everything.
+        "reduce_fanin_similarity_threshold": 0.4,
+        "reduce_fanin_contradict_floor": 0.15,
+        # Retrieval already caps at chunk_cap before any dedup runs, so a
+        # high-fanout burst (many workers writing near-duplicate claims)
+        # would fill that cap with near-duplicates before the reducer ever
+        # saw them. When reduce_fanin_enabled, retrieval overfetches
+        # chunk_cap * reduce_fanin_overfetch candidates; the reducer runs on
+        # that wider pool and the existing chunk_cap/MMR/budget-fit steps
+        # still trim the *reduced* result down to budget, same as always.
+        "reduce_fanin_overfetch": 8,
     },
     "reputation": {
         "gain": 4.0,
@@ -337,6 +360,37 @@ class NCPConfig:
         returns an honest empty result instead of the top-trust/most-recent
         chunks regardless of query content."""
         return bool(self.values.get("retrieval", {}).get("fallback_to_trust_recency_enabled", True))
+
+    @property
+    def reduce_fanin_enabled(self) -> bool:
+        """WI-P3: deterministic fan-in reduction (cluster/merge/flag-contradictions)
+        over the subconscious candidate pool before chunk-cap/MMR truncation. Off
+        by default -- disabled preserves exact legacy retrieval behavior."""
+        return bool(self.values.get("retrieval", {}).get("reduce_fanin_enabled", False))
+
+    @property
+    def reduce_fanin_min_cluster(self) -> int:
+        """Minimum same-(layer,zone,pipeline_id) cluster size before the fan-in
+        reducer acts; smaller clusters pass through unchanged."""
+        return max(2, int(self.values.get("retrieval", {}).get("reduce_fanin_min_cluster", 3)))
+
+    @property
+    def reduce_fanin_similarity_threshold(self) -> float:
+        """Calibrated against benchmarks/fanin_reduce: at realistic fan-in pool
+        sizes, BM25 scores for genuine same-topic paraphrases of short technical
+        claims cluster well below the 0.6+ that near-byte-identical text scores."""
+        return float(self.values.get("retrieval", {}).get("reduce_fanin_similarity_threshold", 0.4))
+
+    @property
+    def reduce_fanin_contradict_floor(self) -> float:
+        return float(self.values.get("retrieval", {}).get("reduce_fanin_contradict_floor", 0.15))
+
+    @property
+    def reduce_fanin_overfetch(self) -> int:
+        """Multiplier applied to chunk_cap when reduce_fanin_enabled, so the
+        reducer sees a wide-enough pool to actually dedup a high-fanout burst
+        before the normal chunk_cap/MMR/budget-fit trim runs on its output."""
+        return max(1, int(self.values.get("retrieval", {}).get("reduce_fanin_overfetch", 8)))
 
     @property
     def reputation_gain(self) -> float:
@@ -640,6 +694,19 @@ def _apply_env_overrides(values: dict[str, Any], env: dict[str, str]) -> None:
         values["retrieval"]["dissent_weight"] = float(env["NCP_DISSENT_WEIGHT"])
     if "NCP_DIVERSITY_LAMBDA" in env:
         values["retrieval"]["diversity_lambda"] = float(env["NCP_DIVERSITY_LAMBDA"])
+    if "NCP_REDUCE_FANIN_ENABLED" in env:
+        val = env["NCP_REDUCE_FANIN_ENABLED"].lower()
+        values["retrieval"]["reduce_fanin_enabled"] = val in {"true", "1", "yes"}
+    if "NCP_REDUCE_FANIN_MIN_CLUSTER" in env:
+        values["retrieval"]["reduce_fanin_min_cluster"] = int(env["NCP_REDUCE_FANIN_MIN_CLUSTER"])
+    if "NCP_REDUCE_FANIN_SIMILARITY_THRESHOLD" in env:
+        values["retrieval"]["reduce_fanin_similarity_threshold"] = float(
+            env["NCP_REDUCE_FANIN_SIMILARITY_THRESHOLD"]
+        )
+    if "NCP_REDUCE_FANIN_CONTRADICT_FLOOR" in env:
+        values["retrieval"]["reduce_fanin_contradict_floor"] = float(env["NCP_REDUCE_FANIN_CONTRADICT_FLOOR"])
+    if "NCP_REDUCE_FANIN_OVERFETCH" in env:
+        values["retrieval"]["reduce_fanin_overfetch"] = int(env["NCP_REDUCE_FANIN_OVERFETCH"])
     if "NCP_REPUTATION_GAIN" in env:
         values["reputation"]["gain"] = float(env["NCP_REPUTATION_GAIN"])
     if "NCP_REPUTATION_FORGET" in env:

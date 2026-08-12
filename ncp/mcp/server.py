@@ -68,7 +68,14 @@ DEFAULT_FETCH_SESSION_ID = "__default__"
 MCP_TOOLS: list[dict[str, object]] = [
     {
         "name": "ncp_get_context",
-        "description": "Assemble the NCP context block for the current agent turn. Call at the start of each turn before any provider call.",
+        "description": (
+            "Assemble the NCP context block for the current agent turn. Call at the "
+            "start of each turn before any provider call. When [retrieval]."
+            "reduce_fanin_enabled is on, the response also includes fanin_merged_count "
+            "(near-duplicate claims merged to their highest-trust version) and "
+            "fanin_contradictions (surviving same-topic claims that diverge -- surfaced "
+            "for you to reason about, not resolved by NCP)."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -889,12 +896,22 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             "pending_whisper_ids": pending_whisper_ids,
             "fetch_budget_remaining": fetch_budget_remaining,
             "fetch_hint": "ncp_fetch" if evicted_high_relevance and fetch_budget_remaining > 0 else None,
+            # WI-P3: fan-in reduction stats -- non-zero only when
+            # [retrieval].reduce_fanin_enabled is on and this turn's
+            # candidate pool actually had a cluster to reduce.
+            "fanin_merged_count": getattr(result, "fanin_merged_count", 0),
+            "fanin_contradictions": [
+                {"chunk_a": a, "chunk_b": b}
+                for a, b in getattr(result, "fanin_contradictions", [])
+            ],
+            "fanin_dropped_malformed_count": getattr(result, "fanin_dropped_malformed_count", 0),
             "active_features": {
                 "distillation_enabled": distillation_enabled,
                 "adaptive_budget_enabled": adaptive_budget_enabled,
                 "memoization_enabled": config.memoization_enabled if config else False,
                 "drift_computed_enabled": drift_computed_enabled,
                 "rerank_enabled": config.rerank_enabled if config else False,
+                "reduce_fanin_enabled": config.reduce_fanin_enabled if config else False,
             },
         }
 
