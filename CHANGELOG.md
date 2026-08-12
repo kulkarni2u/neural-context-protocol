@@ -35,7 +35,18 @@ All notable changes to Neural Context Protocol will be documented in this file.
   (`reduce_fanin_enabled`, `reduce_fanin_min_cluster`,
   `reduce_fanin_similarity_threshold`, `reduce_fanin_contradict_floor`,
   `reduce_fanin_overfetch`).
-
+- **Claude Code plugin package** (`claude-plugin/`, `.claude-plugin/marketplace.json`):
+  packages the existing MCP registration, `SessionStart` hook, and `/ncp`
+  skill from `examples/06_claude_code` as an installable Claude Code plugin
+  (`/plugin marketplace add kulkarni2u/neural-context-protocol` then
+  `/plugin install ncp@neural-context-protocol`), so zero-touch setup no
+  longer requires copying files by hand. The manual `examples/06_claude_code`
+  path still works unchanged.
+- **GitHub Copilot example** (`examples/11_copilot/`): `.vscode/mcp.json`
+  registration and a `.github/copilot-instructions.md` turn contract for
+  Copilot Chat's agent mode, matching the pattern of the Codex CLI/OpenCode
+  examples. Copilot has no hook/autostart mechanism, so `ncp serve` must
+  already be running.
 - **CAP-C8: evidence-backed procedural self-refinement** (`ncp/refine.py`,
   `ncp refine ingest|show|propose|apply|rollback`): NCP's calibration loop
   reweights trust on stored memory but never touches the instructions an

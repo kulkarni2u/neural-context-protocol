@@ -1,0 +1,16 @@
+{
+  "name": "ncp",
+  "version": "1.4.2",
+  "description": "Connect Claude Code to the NCP memory bus: MCP tools for bounded context, durable memory, and agent-to-agent whispers, wired up automatically at session start.",
+  "author": {
+    "name": "Neural Context Protocol"
+  },
+  "homepage": "https://github.com/kulkarni2u/neural-context-protocol",
+  "license": "MIT",
+  "keywords": [
+    "mcp",
+    "memory",
+    "multi-agent",
+    "context"
+  ]
+}

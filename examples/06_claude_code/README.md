@@ -1,10 +1,19 @@
 # Claude Code Example
 
-This folder shows two setups for running NCP inside Claude Code:
+This folder shows two manual setups for running NCP inside Claude Code:
 
 - **Minimal** — register the MCP server and keep the turn contract visible.
 - **Zero-touch** — add a SessionStart hook that starts the bus and tells the
   agent (and its subagents) to use NCP for all agent-to-agent communication.
+
+Prefer not to copy files by hand? [`../../claude-plugin`](../../claude-plugin)
+packages the zero-touch setup (MCP registration + hook + skill) as an
+installable Claude Code plugin:
+
+```
+/plugin marketplace add kulkarni2u/neural-context-protocol
+/plugin install ncp@neural-context-protocol
+```
 
 ## Files
 

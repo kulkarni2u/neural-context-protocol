@@ -167,7 +167,7 @@ What they tell you:
 Each coding tool connects to the same NCP server:
 
 ```text
-Claude / Codex / OpenCode / other MCP host
+Claude / Codex / OpenCode / Copilot / other MCP host
   -> ncp serve (HTTP/SSE)
   -> shared NCP runtime
   -> SQLite or pgvector + Redis
@@ -191,7 +191,14 @@ That is the point of the runtime. Shared working memory stays bounded even when 
 
 1. Initialize with `ncp init`. If `claude` is installed and the command is
    running interactively, setup asks whether to add the Claude NCP hook files.
-2. Copy the example MCP config:
+2. Register the MCP server — either install the packaged plugin:
+
+```
+/plugin marketplace add kulkarni2u/neural-context-protocol
+/plugin install ncp@neural-context-protocol
+```
+
+   or copy the example config by hand:
 
 ```bash
 cp examples/06_claude_code/mcp_servers.json .mcp.json
@@ -244,6 +251,26 @@ ncp serve --host 127.0.0.1 --port 4242 --cwd /path/to/project
 
 OpenCode loads the project plugin through `opencode.json`; the plugin injects
 the NCP turn/subagent contract via `experimental.chat.system.transform`.
+
+### GitHub Copilot
+
+1. Copy the MCP config and turn contract from `examples/11_copilot/`:
+
+```bash
+mkdir -p .vscode .github
+cp examples/11_copilot/mcp.json               .vscode/mcp.json
+cp examples/11_copilot/copilot-instructions.md .github/copilot-instructions.md
+```
+
+2. Start the server:
+
+```bash
+ncp serve --host 127.0.0.1 --port 4242 --cwd /path/to/project
+```
+
+Copilot Chat (VS Code agent mode) picks up `.vscode/mcp.json` and
+`.github/copilot-instructions.md` automatically — there is no hook/autostart
+mechanism, so the bus must already be running before you open a chat.
 
 ## Optional Whisper Handoff Loop
 

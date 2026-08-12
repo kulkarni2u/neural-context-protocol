@@ -8,7 +8,7 @@ __pycache__/
 dist/
 build/
 *.egg-info/
-.mcp.json
+/.mcp.json
 CLAUDE.md
 .ncp/*.db
 .ncp/*.db-*

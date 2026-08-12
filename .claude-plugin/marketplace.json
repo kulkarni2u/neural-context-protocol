@@ -1,0 +1,18 @@
+{
+  "name": "neural-context-protocol",
+  "owner": {
+    "name": "Neural Context Protocol"
+  },
+  "metadata": {
+    "description": "NCP — agent-to-agent memory bus over MCP.",
+    "url": "https://github.com/kulkarni2u/neural-context-protocol"
+  },
+  "plugins": [
+    {
+      "name": "ncp",
+      "source": "./claude-plugin",
+      "description": "Connect Claude Code to the NCP memory bus: MCP tools for bounded context, durable memory, and agent-to-agent whispers, wired up automatically at session start.",
+      "version": "1.4.2"
+    }
+  ]
+}
