@@ -6,7 +6,7 @@ Implements the normative 7-step assembly sequence from NCP spec §6.1.
 from __future__ import annotations
 
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from hashlib import sha256
 import json
 import time
@@ -19,6 +19,7 @@ from ncp.distill import distill_chunk
 from ncp.encoder import PidginEncoder
 from ncp.middleware.base import MiddlewarePipeline
 from ncp.stores.base import BaseStore
+from ncp.stores.consolidation import reduce_candidates
 from ncp.stores.retrieval import DEFAULT_RETRIEVAL_POLICY, apply_mmr_selection, build_lexical_candidates, normalize_query_terms
 from ncp.tokens import estimate_tokens
 from ncp.types import BudgetContext, ConsciousBlock, NCPResponse, SubconsciousChunk, TurnRecord, Whisper
@@ -38,6 +39,9 @@ class AssemblyResult:
     evicted_chunk_count: int = 0
     evicted_whisper_count: int = 0
     retrieval_used_fallback: bool = False
+    fanin_merged_count: int = 0
+    fanin_contradictions: list[tuple[str, str]] = field(default_factory=list)
+    fanin_dropped_malformed_count: int = 0
 
 
 class Assembler:
@@ -85,6 +89,13 @@ class Assembler:
         self._fallback_to_trust_recency_enabled = (
             config.fallback_to_trust_recency_enabled if config else True
         )
+        self._reduce_fanin_enabled = config.reduce_fanin_enabled if config else False
+        self._reduce_fanin_min_cluster = config.reduce_fanin_min_cluster if config else 3
+        self._reduce_fanin_similarity_threshold = (
+            config.reduce_fanin_similarity_threshold if config else 0.6
+        )
+        self._reduce_fanin_contradict_floor = config.reduce_fanin_contradict_floor if config else 0.35
+        self._reduce_fanin_overfetch = config.reduce_fanin_overfetch if config else 8
 
     # ------------------------------------------------------------------
     # Step 0-5: assemble
@@ -111,6 +122,9 @@ class Assembler:
         int,
         int,
         bool,
+        int,
+        list[tuple[str, str]],
+        int,
     ]:
         conscious, budget = self.middleware.pre_assemble(conscious, budget)
         coherence_report = self.coherence.check(conscious)
@@ -144,6 +158,28 @@ class Assembler:
         # retracted fact and its correction can both survive to the final
         # context whenever edge_expansion is disabled.
         recent_chunks, subconscious = self._suppress_superseded(recent_chunks, subconscious)
+        # Fan-in reduction (WI-P3): when many candidates land in the same
+        # (layer, zone, pipeline_id) cluster -- the many-parallel-workers
+        # case -- merge near-duplicate claims to their highest-trust version
+        # and flag surviving divergent claims as contradictions, before the
+        # chunk-cap/MMR/budget truncation below ever sees them. Off by
+        # default; applies only to the retrieved pool, not conscious-recent
+        # continuity refs.
+        fanin_merged_count = 0
+        fanin_contradictions: list[tuple[str, str]] = []
+        fanin_dropped_malformed_count = 0
+        if self._reduce_fanin_enabled and subconscious:
+            reduced = reduce_candidates(
+                subconscious,
+                similarity_threshold=self._reduce_fanin_similarity_threshold,
+                contradict_floor=self._reduce_fanin_contradict_floor,
+                min_cluster=self._reduce_fanin_min_cluster,
+            )
+            original_order = {chunk.chunk_id: index for index, chunk in enumerate(subconscious)}
+            subconscious = sorted(reduced.kept, key=lambda chunk: original_order[chunk.chunk_id])
+            fanin_merged_count = len(reduced.merged_away)
+            fanin_contradictions = reduced.contradictions
+            fanin_dropped_malformed_count = len(reduced.dropped_malformed)
         deduped_chunks = self._dedupe_chunks([*recent_chunks, *subconscious])
         if self._diversity_lambda < 1.0:
             combined_chunks = self._mmr_select_chunks(
@@ -211,6 +247,10 @@ class Assembler:
         # evictions even when nothing cleared the >=0.5/>=0.6 threshold.
         evicted_chunk_count = len(deduped_chunks) - len(combined_chunks)
         evicted_whisper_count = len(all_whispers) - len(combined_whispers)
+        final_combined_ids = {chunk.chunk_id for chunk in combined_chunks}
+        surfaced_contradictions = [
+            (a, b) for a, b in fanin_contradictions if a in final_combined_ids and b in final_combined_ids
+        ]
         return (
             hydrated,
             budget,
@@ -221,6 +261,9 @@ class Assembler:
             evicted_chunk_count,
             evicted_whisper_count,
             retrieval_used_fallback,
+            fanin_merged_count,
+            surfaced_contradictions,
+            fanin_dropped_malformed_count,
         )
 
     def assemble(
@@ -245,6 +288,9 @@ class Assembler:
             evicted_chunk_count,
             evicted_whisper_count,
             retrieval_used_fallback,
+            fanin_merged_count,
+            fanin_contradictions,
+            fanin_dropped_malformed_count,
         ) = self._prepare_assembly(
             conscious=conscious,
             budget=budget,
@@ -260,6 +306,7 @@ class Assembler:
             chunks=combined_chunks,
             whispers=combined_whispers,
             budget=budget,
+            contradiction_notes=fanin_contradictions or None,
         )
         context = self.middleware.post_assemble(context)
         return AssemblyResult(
@@ -277,6 +324,9 @@ class Assembler:
             evicted_chunk_count=evicted_chunk_count,
             evicted_whisper_count=evicted_whisper_count,
             retrieval_used_fallback=retrieval_used_fallback,
+            fanin_merged_count=fanin_merged_count,
+            fanin_contradictions=fanin_contradictions,
+            fanin_dropped_malformed_count=fanin_dropped_malformed_count,
         )
 
     def assemble_incremental(
@@ -302,7 +352,7 @@ class Assembler:
         Callers that use post_assemble middleware should apply it to the
         concatenated result: ``mw.post_assemble("\\n\\n".join(t for _, t in sections))``.
         """
-        hydrated, budget, combined_chunks, combined_whispers, _, _, _, _, _ = self._prepare_assembly(
+        hydrated, budget, combined_chunks, combined_whispers, _, _, _, _, _, _, _, _ = self._prepare_assembly(
             conscious=conscious,
             budget=budget,
             query_text=query_text,
@@ -501,7 +551,11 @@ class Assembler:
     ) -> list[SubconsciousChunk]:
         if k is None:
             k = 2 if (budget is not None and budget.pressure == "critical") else 4
-        store_k = k * 3 if (diversity_lambda is not None and diversity_lambda < 1.0) else k
+        store_k = k
+        if diversity_lambda is not None and diversity_lambda < 1.0:
+            store_k = max(store_k, k * 3)
+        if self._reduce_fanin_enabled:
+            store_k = max(store_k, k * self._reduce_fanin_overfetch)
         search_text = query_text or f"{conscious.task} {conscious.slot}"
         extra: dict = {}
         if diversity_limit is not None:

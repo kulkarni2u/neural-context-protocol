@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from ncp.assembler import Assembler
-from ncp.config import load_config
+from ncp.config import NCPConfig, load_config
 from ncp.tokens import estimate_tokens
 from ncp.stores.sqlite import SQLiteStore
 from ncp.types import BudgetContext, ConsciousBlock, NCPResponse, SubconsciousChunk, TurnRecord, Whisper
@@ -733,3 +733,132 @@ def test_apply_drift_feedback_stops_at_first_applied_valid_signal(tmp_path: Path
 
     # First well-formed, in-range signal wins; loop still stops there.
     assert updated.drift_score == pytest.approx(0.4)
+
+
+# ---------------------------------------------------------------------------
+# Fan-in reduction (WI-P3): high-fanout many-workers-to-one-reader dedup
+# ---------------------------------------------------------------------------
+
+
+def _fanin_worker_chunk(chunk_id: str, content: str, *, base_trust: float = 0.5) -> SubconsciousChunk:
+    # Distinct written_by per call: each parallel worker is its own agent
+    # identity, so this doesn't trip the store's pre-existing per-author
+    # diversity_limit (unrelated to fan-in reduction, but easy to
+    # accidentally collide with with a shared "worker" identity).
+    return SubconsciousChunk(
+        chunk_id=chunk_id,
+        layer="episodic",
+        content=content,
+        src="agent_inferred",
+        pipeline_id="pipe_fanin",
+        written_by=chunk_id,
+        base_trust=base_trust,
+    )
+
+
+_FANIN_NEAR_DUPLICATE_CLAIMS = [
+    "NPE at PaymentProcessor.java:142, retryCount is null for ACH trial customers",
+    "NullPointerException PaymentProcessor.java line 142 -- retryCount null, ACH trial",
+    "NPE PaymentProcessor.java:142 retryCount is null, payment_method ACH, tier trial",
+    "PaymentProcessor.java:142 NPE, retryCount null for ACH trial payments",
+    "retryCount null causes NPE at PaymentProcessor.java:142 for ACH trial customers",
+]
+
+
+def _reduce_fanin_config(tmp_path: Path, **retrieval_overrides: object) -> NCPConfig:
+    values = {
+        "reduce_fanin_enabled": True,
+        "reduce_fanin_min_cluster": 3,
+        "reduce_fanin_similarity_threshold": 0.5,
+        "reduce_fanin_contradict_floor": 0.2,
+        "reduce_fanin_overfetch": 8,
+    }
+    values.update(retrieval_overrides)
+    return NCPConfig(values={"retrieval": values}, project_root=tmp_path)
+
+
+def test_reduce_fanin_disabled_by_default_leaves_worker_burst_unreduced(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "store.db")
+    for index, claim in enumerate(_FANIN_NEAR_DUPLICATE_CLAIMS):
+        store.write(_fanin_worker_chunk(f"worker_{index}", claim, base_trust=0.4 + index * 0.1))
+
+    assembler = Assembler(store=store)
+    result = assembler.assemble(
+        conscious=_make_conscious(pipeline_id="pipe_fanin"),
+        budget=BudgetContext(ctx_used=0.2, steps_completed=1, steps_total=3, elapsed_seconds=10),
+        query_text="PaymentProcessor NPE retryCount ACH trial",
+    )
+
+    assert result.fanin_merged_count == 0
+    assert result.fanin_contradictions == []
+    assert "note:contradicts" not in result.context
+
+
+def test_reduce_fanin_enabled_merges_high_fanout_near_duplicates(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "store.db")
+    for index, claim in enumerate(_FANIN_NEAR_DUPLICATE_CLAIMS):
+        store.write(_fanin_worker_chunk(f"worker_{index}", claim, base_trust=0.4 + index * 0.1))
+
+    assembler = Assembler(store=store, config=_reduce_fanin_config(tmp_path))
+    result = assembler.assemble(
+        conscious=_make_conscious(pipeline_id="pipe_fanin"),
+        budget=BudgetContext(ctx_used=0.2, steps_completed=1, steps_total=3, elapsed_seconds=10),
+        query_text="PaymentProcessor NPE retryCount ACH trial",
+    )
+
+    # The reducer must actually see the whole burst (overfetch), not just
+    # the chunk_cap-sized slice retrieval would otherwise return.
+    assert result.fanin_merged_count > 0
+    assert result.fanin_dropped_malformed_count == 0
+
+
+def test_reduce_fanin_disabled_does_not_overfetch_beyond_chunk_cap(tmp_path: Path) -> None:
+    """Sanity check that the overfetch widening is gated on the flag, so
+    legacy retrieval-cap behavior is unchanged when the feature is off."""
+    store = SQLiteStore(tmp_path / "store.db")
+    for index, claim in enumerate(_FANIN_NEAR_DUPLICATE_CLAIMS):
+        store.write(_fanin_worker_chunk(f"worker_{index}", claim, base_trust=0.4 + index * 0.1))
+
+    assembler = Assembler(store=store)
+    candidates = assembler._retrieve_chunks(
+        _make_conscious(pipeline_id="pipe_fanin"),
+        query_text="PaymentProcessor NPE retryCount ACH trial",
+        budget=BudgetContext(ctx_used=0.2, steps_completed=1, steps_total=3, elapsed_seconds=10),
+        k=4,
+    )
+    assert len(candidates) <= 4
+
+
+def test_reduce_fanin_surfaces_contradiction_without_dropping_either_claim(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "store.db")
+    store.write(
+        _fanin_worker_chunk(
+            "guard1", "Null guard applied at PaymentProcessor.java:142, tests pass", base_trust=0.8
+        )
+    )
+    store.write(
+        _fanin_worker_chunk(
+            "guard2", "Null guard applied at PaymentProcessor.java:142, tests now pass cleanly", base_trust=0.6
+        )
+    )
+    store.write(
+        _fanin_worker_chunk(
+            "nofix", "PaymentProcessor.java:142 still throws NPE, guard did not resolve it", base_trust=0.7
+        )
+    )
+
+    config = _reduce_fanin_config(tmp_path, reduce_fanin_similarity_threshold=0.75, reduce_fanin_contradict_floor=0.1)
+    assembler = Assembler(store=store, config=config)
+    result = assembler.assemble(
+        conscious=_make_conscious(pipeline_id="pipe_fanin"),
+        budget=BudgetContext(ctx_used=0.2, steps_completed=1, steps_total=3, elapsed_seconds=10),
+        query_text="PaymentProcessor null guard fix status",
+    )
+
+    assert result.fanin_contradictions != []
+    assert "note:contradicts" in result.context
+    kept_ids = {chunk.chunk_id for chunk in result.chunks}
+    contradicting_ids = {chunk_id for pair in result.fanin_contradictions for chunk_id in pair}
+    # Contradictions are surfaced, never silently resolved -- both sides of
+    # any reported pair must still be present in the assembled context.
+    assert contradicting_ids <= kept_ids

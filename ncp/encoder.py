@@ -72,6 +72,7 @@ class PidginEncoder:
         budget: BudgetContext,
         *,
         now: float | None = None,
+        contradiction_notes: Sequence[tuple[str, str]] | None = None,
     ) -> str:
         """Assemble the wire-format block ordering for one provider turn."""
 
@@ -80,6 +81,7 @@ class PidginEncoder:
             chunk_entries=[self._encode_chunk_entry(chunk) for chunk in chunks],
             whispers_text=self._encode_whispers(whispers, now=now) if whispers else None,
             budget_text=self._encode_budget(budget),
+            contradiction_notes=contradiction_notes,
         )
 
     def assemble_from_parts(
@@ -89,6 +91,7 @@ class PidginEncoder:
         chunk_entries: Sequence[str],
         whispers_text: str | None,
         budget_text: str,
+        contradiction_notes: Sequence[tuple[str, str]] | None = None,
     ) -> str:
         """Assemble from already-encoded blocks/entries.
 
@@ -96,11 +99,19 @@ class PidginEncoder:
         chunks (e.g. incremental fitting) reuse already-encoded conscious,
         budget, and prior chunk-entry text instead of re-encoding the whole
         context on every candidate.
+
+        ``contradiction_notes`` is additive: pairs of chunk ids that the
+        fan-in reducer found related but divergent (see
+        ``ncp.stores.consolidation.reduce_candidates``). NCP groups and
+        drops duplicates itself, but a contradiction is a call for the
+        reading model, not the bus -- so it's surfaced as a plain note
+        appended to the subconscious block rather than resolved here.
         """
 
         blocks = [conscious_text]
         if chunk_entries:
-            blocks.append("\n".join(["[NCP:SUBCONSCIOUS]", *chunk_entries]))
+            note_lines = [f"note:contradicts {a}<->{b}" for a, b in contradiction_notes or []]
+            blocks.append("\n".join(["[NCP:SUBCONSCIOUS]", *chunk_entries, *note_lines]))
         if whispers_text is not None:
             blocks.append(whispers_text)
         blocks.append(budget_text)

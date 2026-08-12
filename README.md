@@ -324,6 +324,21 @@ This is deterministic signal filtering, not a model-quality change. See [the com
 
 -----
 
+## Fan-in reduction
+
+Write-time filtering strips boilerplate from one chunk at a time. It doesn't dedup *across* chunks — and a high-fanout burst (many parallel workers writing overlapping findings into one pipeline) is exactly the case where that matters: without dedup, a synthesis agent's bounded context can end up with several near-duplicate restatements of the same claim instead of that many distinct ones.
+
+`[retrieval].reduce_fanin_enabled` (off by default) adds a deterministic reduction pass to context assembly for this case. When enabled, retrieval overfetches beyond the normal chunk cap, then — within any high-fanout cluster — merges near-duplicate claims down to the highest-trust version (reusing the same clustering `ncp consolidate` uses), drops malformed (empty) candidates, and flags surviving same-topic claims that diverge as contradictions. Contradictions are surfaced as a `note:contradicts` line in the assembled context for the reading agent to reason about; NCP groups and drops duplicates deterministically, but it never resolves a contradiction itself.
+
+```toml
+[retrieval]
+reduce_fanin_enabled = true
+```
+
+On a deterministic 40-worker benchmark, 25% of NCP's own bounded top-k retrieval slots are near-duplicates of another slot in the same result with this off; enabling it merges those away and cuts tokens 13% against an unbounded raw dump of all 40 workers. See [the fan-in reduction benchmark doc](./docs/NCP_BENCHMARK_FANIN_REDUCE.md), including an honest account of the contradiction-flagging heuristic's false-positive rate.
+
+-----
+
 ## What NCP is (and isn't)
 
 **NCP is the agent-to-agent memory bus and context protocol, not the orchestrator.**
@@ -360,6 +375,8 @@ These are deterministic token-accounting benchmarks. The task-success row measur
 
 A separate, complementary compression benchmark measures ingestion-time noise reduction on a fixed noisy-payload corpus: **33% aggregate token reduction** (537 → 360, `chars_div4`, pass gate aggregate >= 0.20), ranging from **68%** on duplicate-heavy logs down to **2%** on already-dense stack traces (see [the compression benchmark doc](./docs/NCP_BENCHMARK_COMPRESSION.md)).
 
+A third, complementary benchmark targets the many-parallel-workers-to-one-synthesizer fan-in case: with `[retrieval].reduce_fanin_enabled` off (today's default), **25% of NCP's own bounded top-k retrieval slots are near-duplicates of another slot in the same result** on a deterministic 40-worker/4-topic corpus; enabling it merges the near-duplicates, drops malformed candidates, and flags likely contradictions for the reading model, at a **13% token reduction** against an unbounded raw dump of all 40 workers (see [the fan-in reduction benchmark doc](./docs/NCP_BENCHMARK_FANIN_REDUCE.md) for the full methodology and an honest account of the contradiction-flagging heuristic's false-positive rate).
+
 Benchmarks are reproducible:
 
 ```bash
@@ -369,6 +386,7 @@ python3 benchmarks/task_success/run.py            # mock provider, no keys neede
 python3 benchmarks/task_success/run.py --provider anthropic   # live task success
 python3 benchmarks/efficacy/run.py --provider mock --seeds 2  # context adequacy at matched budget
 python3 benchmarks/compression/run.py             # ingestion-time compression
+python3 benchmarks/fanin_reduce/run.py            # many-workers-to-one-synthesizer fan-in reduction
 python3 benchmarks/hotpotqa_style/run.py          # synthetic HotpotQA-shaped multi-hop QA
 ```
 
@@ -531,7 +549,7 @@ ncp explain --cwd /path/to/project
 | `[budget]`       | Context token budget and per-pressure chunk/whisper caps (default → high → critical)       |
 | `[pipeline]`     | Working-set size and GC (`max_working_chunks`, `gc_threshold`, default TTL)                |
 | `[whispers]`     | Whisper TTL, max per drain, and `min_confidence` to deliver                                |
-| `[retrieval]`    | Signal weights, `generation_penalty_base`, `edge_expansion`, rerank, trust propagation     |
+| `[retrieval]`    | Signal weights, `generation_penalty_base`, `edge_expansion`, rerank, trust propagation, `reduce_fanin_enabled` |
 | `[embedding]`    | Semantic vector retrieval — off by default; provider and model                            |
 | `[reputation]`   | Beta-reputation `gain`, `forget`, `confidence_k`                                           |
 | `[consolidation]`| Similarity threshold, trust floor, and optional LLM model for memory compaction            |
@@ -621,6 +639,7 @@ NCP is the memory bus. In our workflows, Sarathi is one orchestrator that runs o
 - [Benchmark: matched-budget efficacy](./docs/NCP_BENCHMARK_MATCHED_BUDGET_EFFICACY.md)
 - [Benchmark: research pipeline](./docs/NCP_BENCHMARK_RESEARCH_PIPELINE.md)
 - [Benchmark: ingestion-time compression](./docs/NCP_BENCHMARK_COMPRESSION.md)
+- [Benchmark: fan-in reduction](./docs/NCP_BENCHMARK_FANIN_REDUCE.md)
 - [MACE multi-agent eval](./benchmarks/mace/README.md)
 - [Post-V1 roadmap](./docs/NCP_POST_V1_ROADMAP.md)
 - [Active handoff packet](./docs/NCP_ACTIVE_HANDOFF_PACKET.md)

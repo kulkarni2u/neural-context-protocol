@@ -2798,6 +2798,7 @@ class TestActiveFeaturesTelemetry:
             "memoization_enabled": False,
             "drift_computed_enabled": False,
             "rerank_enabled": False,
+            "reduce_fanin_enabled": False,
         }
 
     def test_active_features_reflects_loaded_config_defaults(self, tmp_path: Path) -> None:
@@ -2823,6 +2824,7 @@ class TestActiveFeaturesTelemetry:
         assert active_features["memoization_enabled"] is False
         assert active_features["drift_computed_enabled"] is False
         assert active_features["rerank_enabled"] is False
+        assert active_features["reduce_fanin_enabled"] is False
 
 
 class TestRetrievalFallbackTelemetry:
