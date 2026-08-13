@@ -23,12 +23,23 @@ ncp init                              # creates .ncp/config.toml
 ncp serve --host 127.0.0.1 --port 4242 --cwd /path/to/project
 ```
 
-`mcp.json` in this plugin points at `http://127.0.0.1:4242/mcp`. If the
-`ncp_*` tools aren't available to you, the bus almost certainly isn't
-running — say so plainly and give the two commands above rather than
-working around it silently. This plugin format has no session-start hook
-or autostart mechanism (see the plugin's README for why); nothing here
-starts the server for you.
+`mcp.json` in this plugin points at `http://127.0.0.1:4242/mcp`. This
+plugin format has no session-start hook or autostart mechanism (see the
+plugin's README for why); nothing here starts the server for you. If the
+`ncp_*` tools aren't available, tell the user plainly rather than working
+around it silently, and distinguish which case you're in:
+
+- **Tools missing entirely / connection refused** — the bus isn't running.
+  Give the two commands above.
+- **A `ncp_*` call fails with HTTP 401** — the bus *is* running with
+  `[server].auth_token` (or `NCP_AUTH_TOKEN`) set, but this plugin's
+  `mcp.json` intentionally ships with no `Authorization` header (see the
+  plugin README's Gaps section — there's no portable way to embed a secret
+  in a committed config file). Don't retry blindly or guess at a token:
+  tell the user the server requires a bearer token and that their client
+  needs to attach `Authorization: Bearer <token>` to the `ncp` server entry
+  through whatever client-side override mechanism they have, separate from
+  this shipped file.
 
 ## The loop, every turn
 
