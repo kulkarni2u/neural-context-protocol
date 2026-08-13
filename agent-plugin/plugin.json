@@ -1,0 +1,21 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "ncp",
+  "version": "1.4.2",
+  "description": "NCP — an agent-to-agent memory bus over MCP. Bounded, trust-weighted context assembly, durable cross-session memory, and directed whispers for multi-agent systems.",
+  "author": {
+    "name": "Neural Context Protocol",
+    "url": "https://github.com/kulkarni2u/neural-context-protocol"
+  },
+  "homepage": "https://github.com/kulkarni2u/neural-context-protocol",
+  "repository": "https://github.com/kulkarni2u/neural-context-protocol",
+  "license": "MIT",
+  "keywords": [
+    "mcp",
+    "memory",
+    "multi-agent",
+    "context",
+    "agent-to-agent",
+    "memory-bus"
+  ]
+}

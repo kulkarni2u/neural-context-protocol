@@ -47,6 +47,19 @@ All notable changes to Neural Context Protocol will be documented in this file.
   Copilot Chat's agent mode, matching the pattern of the Codex CLI/OpenCode
   examples. Copilot has no hook/autostart mechanism, so `ncp serve` must
   already be running.
+- **Portable Agent Plugin** (`agent-plugin/`): packages NCP to the
+  vendor-neutral [Agent Plugins 1.0.0](https://agent-plugins.org) standard
+  (`plugin.json` + `mcp.json` + `skills/ncp-core`, `skills/ncp-multi-agent`)
+  so the same directory works with any compliant client, not just Claude
+  Code. Validated against the published `plugin.schema.json`/
+  `mcp.schema.json`. Declares `streamable-http` only — NCP's `serve-stdio`
+  is `hidden=True` in the CLI and documented as an internal
+  tests/dogfood transport, not a stable public interface, so it's called
+  out as a gap rather than shipped as if supported. Complements, and does
+  not replace, `claude-plugin/`: the Claude Code plugin keeps its native
+  `SessionStart` hook/autostart, which the portable format has no
+  equivalent for. See `agent-plugin/README.md` for the full gap list (no
+  stdio transport, no autostart, no portable auth-header mechanism).
 - **CAP-C8: evidence-backed procedural self-refinement** (`ncp/refine.py`,
   `ncp refine ingest|show|propose|apply|rollback`): NCP's calibration loop
   reweights trust on stored memory but never touches the instructions an

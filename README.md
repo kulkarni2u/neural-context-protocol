@@ -11,7 +11,7 @@
 
 NCP is an **agent-to-agent communication protocol** for multi-agent systems — and, underneath it, a **memory bus over MCP**. It lets agents talk to each other, hand off work, and build on prior results without replaying transcripts or stuffing prompts.
 
-MCP standardized how a single agent talks to its tools. NCP standardizes how **agents talk to each other**. It exposes one MCP endpoint that every host — Claude, Codex, OpenCode, Copilot, n8n, LangGraph, or a custom orchestrator — connects to as a peer. Each agent reads bounded, trust-weighted context, writes durable memory, and sends bounded signals (whispers) to other agents, all through the same protocol.
+MCP standardized how a single agent talks to its tools. NCP standardizes how **agents talk to each other**. It exposes one MCP endpoint that every host — Claude, Codex, OpenCode, Copilot, n8n, LangGraph, any Agent Plugins-compliant client, or a custom orchestrator — connects to as a peer. Each agent reads bounded, trust-weighted context, writes durable memory, and sends bounded signals (whispers) to other agents, all through the same protocol.
 
 The protocol rides on a memory bus: durable shared state, relevance-bounded retrieval, and trust scoring are what make the conversation between agents reliable. Making token spend compound is the payoff that follows.
 
@@ -75,6 +75,35 @@ For Codex CLI and OpenCode, register the same endpoint and copy the host's `AGEN
 For GitHub Copilot (VS Code agent mode), copy [`examples/11_copilot/mcp.json`](./examples/11_copilot/mcp.json) to `.vscode/mcp.json` and [`examples/11_copilot/copilot-instructions.md`](./examples/11_copilot/copilot-instructions.md) to `.github/copilot-instructions.md` — see [`examples/11_copilot/README.md`](./examples/11_copilot/README.md).
 
 For n8n, NCP's MCP server must be reachable from your n8n instance with an auth token configured — see [`examples/08_n8n/README.md`](./examples/08_n8n/README.md).
+
+### Portable Agent Plugin (vendor-neutral)
+
+[`agent-plugin/`](./agent-plugin) packages NCP to the open
+[Agent Plugins 1.0.0](https://agent-plugins.org) standard — `plugin.json` +
+`mcp.json` + `skills/` in one directory — so the same package works with any
+compliant client (Cursor, VS Code/Copilot, or any other host implementing
+the spec), not just Claude Code:
+
+```bash
+pip install neural-context-protocol
+ncp init
+ncp serve --host 127.0.0.1 --port 4242 --cwd /path/to/project
+```
+
+Then load `agent-plugin/` with whatever mechanism your client uses to load
+an Agent Plugin directory. It declares one `streamable-http` MCP server
+(`http://127.0.0.1:4242/mcp`) and two skills: `ncp-core` (the per-turn loop
+and tool reference) and `ncp-multi-agent` (whispers, subagent dispatch,
+cross-host coordination). See [`agent-plugin/README.md`](./agent-plugin/README.md)
+for setup details and known gaps (no stdio transport, no session-start
+hook/autostart — both intentional, explained there).
+
+This is a different package from [`claude-plugin/`](./claude-plugin): the
+Claude Code plugin is native-format and installable via `/plugin install`,
+with a `SessionStart` hook that health-checks and can autostart the bus.
+`agent-plugin/` trades that lifecycle automation for portability across
+clients. Install whichever matches your client, or both — they point at the
+same running `ncp serve` instance and don't conflict.
 
 `ncp init` creates `.ncp/config.toml` and a `CLAUDE.md` turn contract in the project root.
 When run interactively, it also detects installed `claude`, `codex`, and

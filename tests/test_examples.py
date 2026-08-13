@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -212,6 +213,54 @@ def test_copilot_example_files_exist() -> None:
     assert ".vscode/mcp.json" in readme_text
     assert ".github/copilot-instructions.md" in readme_text
     assert "ncp_emit_whisper" in readme_text
+
+
+def test_agent_plugin_files_exist() -> None:
+    plugin_dir = REPO_ROOT / "agent-plugin"
+
+    manifest = json.loads((plugin_dir / "plugin.json").read_text())
+    assert manifest["$schema"] == "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json"
+    name_pattern = re.compile(r"^(?!.*(?:--|\.\.))[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$")
+    assert name_pattern.match(manifest["name"])
+    assert 1 <= len(manifest["name"]) <= 64
+    allowed_top = {
+        "$schema", "name", "version", "description", "author", "homepage",
+        "repository", "license", "keywords", "extensions",
+    }
+    assert set(manifest.keys()) <= allowed_top
+    assert set(manifest["author"].keys()) <= {"name", "email", "url"}
+    assert isinstance(manifest["repository"], str)
+    assert isinstance(manifest["keywords"], list)
+
+    mcp_config = json.loads((plugin_dir / "mcp.json").read_text())
+    assert mcp_config["$schema"] == "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json"
+    assert set(mcp_config.keys()) == {"$schema", "mcpServers"}
+    ncp_server = mcp_config["mcpServers"]["ncp"]
+    assert ncp_server["type"] == "streamable-http"
+    assert ncp_server["url"] == "http://127.0.0.1:4242/mcp"
+    assert set(ncp_server.keys()) <= {"type", "url", "headers"}
+
+    for skill_name in ("ncp-core", "ncp-multi-agent"):
+        skill_path = plugin_dir / "skills" / skill_name / "SKILL.md"
+        text = skill_path.read_text()
+        front_matter = re.match(r"^---\n(.*?)\n---\n", text, re.S)
+        assert front_matter is not None, skill_name
+        assert f"name: {skill_name}" in front_matter.group(1)
+        assert "description:" in front_matter.group(1)
+
+    core_text = (plugin_dir / "skills" / "ncp-core" / "SKILL.md").read_text()
+    assert "ncp_get_context" in core_text
+    assert "ncp_write_memory" in core_text
+    assert "ncp_record_outcome" in core_text
+    assert "memory bus, not an orchestrator" in core_text
+
+    multi_agent_text = (plugin_dir / "skills" / "ncp-multi-agent" / "SKILL.md").read_text()
+    assert "ncp_emit_whisper" in multi_agent_text
+    assert "ack_whisper_ids" in multi_agent_text
+
+    plugin_readme = (plugin_dir / "README.md").read_text()
+    assert "claude-plugin" in plugin_readme
+    assert "serve-stdio" in plugin_readme
 
 
 def test_opencode_plugin_injects_ncp_context() -> None:

@@ -167,7 +167,7 @@ What they tell you:
 Each coding tool connects to the same NCP server:
 
 ```text
-Claude / Codex / OpenCode / Copilot / other MCP host
+Claude / Codex / OpenCode / Copilot / any Agent Plugins client / other MCP host
   -> ncp serve (HTTP/SSE)
   -> shared NCP runtime
   -> SQLite or pgvector + Redis
@@ -271,6 +271,19 @@ ncp serve --host 127.0.0.1 --port 4242 --cwd /path/to/project
 Copilot Chat (VS Code agent mode) picks up `.vscode/mcp.json` and
 `.github/copilot-instructions.md` automatically — there is no hook/autostart
 mechanism, so the bus must already be running before you open a chat.
+
+### Portable Agent Plugin (any compliant client)
+
+`agent-plugin/` packages NCP to the vendor-neutral
+[Agent Plugins 1.0.0](https://agent-plugins.org) standard (`plugin.json` +
+`mcp.json` + `skills/`) instead of a client-specific format. Load the
+directory with whatever mechanism your client uses for Agent Plugins; it
+registers the same `streamable-http` endpoint
+(`http://127.0.0.1:4242/mcp`) as every other integration above. It has no
+lifecycle hook, so `ncp init` + `ncp serve` must already be done/running.
+See [`agent-plugin/README.md`](../agent-plugin/README.md) for the full
+setup and a list of known gaps (no stdio transport, no autostart, no
+portable auth-header mechanism).
 
 ## Optional Whisper Handoff Loop
 
