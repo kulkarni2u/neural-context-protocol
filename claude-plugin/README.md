@@ -13,9 +13,10 @@ hand.
 /plugin install ncp@neural-context-protocol
 ```
 
-Then, from your project:
+Then, from your project (requires Python 3.11+):
 
 ```bash
+pip install neural-context-protocol
 ncp init
 ncp serve --host 127.0.0.1 --port 4242 --cwd /path/to/your/project
 ```

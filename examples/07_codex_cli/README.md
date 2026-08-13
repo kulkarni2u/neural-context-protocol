@@ -15,7 +15,10 @@ the agent-to-agent channel for every turn and subagent.
 
 ## Setup
 
+Requires Python 3.11+.
+
 ```bash
+pip install neural-context-protocol
 ncp init
 cp examples/07_codex_cli/AGENTS.md ./AGENTS.md      # or merge into an existing one
 mkdir -p .codex/hooks

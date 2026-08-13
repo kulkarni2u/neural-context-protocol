@@ -15,7 +15,10 @@ contract in `.github/copilot-instructions.md` is the whole setup.
 
 ## Setup
 
+Requires Python 3.11+.
+
 ```bash
+pip install neural-context-protocol
 ncp init
 mkdir -p .vscode .github
 cp examples/11_copilot/mcp.json               .vscode/mcp.json

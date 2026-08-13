@@ -29,7 +29,8 @@ matches your client, or both.
 
 ## Setup
 
-NCP is not bundled — it's a separate server this directory points at:
+NCP is not bundled — it's a separate server this directory points at.
+Requires Python 3.11+:
 
 ```bash
 pip install neural-context-protocol

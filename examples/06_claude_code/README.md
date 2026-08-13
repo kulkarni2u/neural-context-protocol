@@ -24,9 +24,13 @@ installable Claude Code plugin:
   injects the "route all agent comms through NCP" instruction at session start.
 - `skills/ncp/SKILL.md` — a lite `/ncp` skill the agent can invoke on demand.
 
+Both setups below require Python 3.11+ and `pip install neural-context-protocol`
+first.
+
 ## Minimal setup
 
 ```bash
+pip install neural-context-protocol
 ncp init
 cp examples/06_claude_code/mcp_servers.json .mcp.json
 ncp serve --host 127.0.0.1 --port 4242 --cwd /path/to/your/project
@@ -39,6 +43,7 @@ Claude Code then connects to `http://127.0.0.1:4242/mcp`.
 From your project root:
 
 ```bash
+pip install neural-context-protocol
 ncp init
 cp examples/06_claude_code/mcp_servers.json .mcp.json
 mkdir -p .claude/hooks .claude/skills/ncp

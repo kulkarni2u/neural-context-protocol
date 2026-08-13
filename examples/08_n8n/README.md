@@ -12,9 +12,12 @@ This folder shows how to wire NCP into n8n workflows.
 
 n8n usually runs in its own container or host, separate from wherever you run
 `ncp serve`. Loopback-only setups (like the Claude Code and Codex CLI
-examples) won't work here — n8n can't reach `127.0.0.1` on the NCP host. So:
+examples) won't work here — n8n can't reach `127.0.0.1` on the NCP host. So,
+on the host that will run `ncp serve` (not necessarily the n8n host; requires
+Python 3.11+):
 
 ```bash
+pip install neural-context-protocol
 ncp init
 ncp serve --host 0.0.0.0 --port 4242 --cwd /path/to/your/project --auth-token <token>
 ```

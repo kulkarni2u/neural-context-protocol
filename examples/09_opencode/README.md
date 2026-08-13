@@ -16,7 +16,10 @@ agent-to-agent channel for every turn and subagent.
 
 ## Setup
 
+Requires Python 3.11+.
+
 ```bash
+pip install neural-context-protocol
 ncp init
 cp examples/09_opencode/opencode.json ./opencode.json   # or merge into an existing one
 cp examples/09_opencode/AGENTS.md     ./AGENTS.md        # or merge into an existing one
