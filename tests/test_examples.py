@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -137,6 +138,129 @@ def test_opencode_example_files_exist() -> None:
     readme_text = (example_dir / "README.md").read_text()
     assert ".opencode/plugins/ncp.js" in readme_text
     assert "experimental.chat.system.transform" in readme_text
+
+
+def test_claude_code_plugin_files_exist() -> None:
+    plugin_dir = REPO_ROOT / "claude-plugin"
+
+    manifest = json.loads((plugin_dir / ".claude-plugin" / "plugin.json").read_text())
+    assert manifest["name"] == "ncp"
+
+    marketplace = json.loads(
+        (REPO_ROOT / ".claude-plugin" / "marketplace.json").read_text()
+    )
+    entries = {p["name"]: p for p in marketplace["plugins"]}
+    assert entries["ncp"]["source"] == "./claude-plugin"
+
+    mcp_config = json.loads((plugin_dir / ".mcp.json").read_text())
+    assert mcp_config["mcpServers"]["ncp"]["type"] == "http"
+    assert mcp_config["mcpServers"]["ncp"]["url"] == "http://127.0.0.1:4242/mcp"
+
+    hooks_config = json.loads((plugin_dir / "hooks" / "hooks.json").read_text())
+    session_hooks = hooks_config["hooks"]["SessionStart"]
+    handler = session_hooks[0]["hooks"][0]
+    assert handler["type"] == "command"
+    assert "${CLAUDE_PLUGIN_ROOT}/hooks/scripts/ncp-session-start.sh" in handler["command"]
+
+    hook_script = plugin_dir / "hooks" / "scripts" / "ncp-session-start.sh"
+    assert hook_script.exists()
+    assert os.access(hook_script, os.X_OK)
+    hook_text = hook_script.read_text()
+    assert "hookSpecificOutput" in hook_text
+    assert "ncp_get_context" in hook_text
+
+    skill_text = (plugin_dir / "skills" / "ncp" / "SKILL.md").read_text()
+    assert "ncp_write_memory" in skill_text
+
+    plugin_readme = (plugin_dir / "README.md").read_text()
+    assert "/plugin install ncp@neural-context-protocol" in plugin_readme
+
+
+def test_claude_code_plugin_hook_emits_context_when_bus_down() -> None:
+    hook_path = REPO_ROOT / "claude-plugin" / "hooks" / "scripts" / "ncp-session-start.sh"
+    env = os.environ.copy()
+    env.update({"NCP_AUTOSTART": "0", "NCP_PORT": "9", "CLAUDE_PROJECT_DIR": str(REPO_ROOT)})
+
+    completed = subprocess.run(
+        [str(hook_path)],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    payload = json.loads(completed.stdout)
+    hook_output = payload["hookSpecificOutput"]
+    assert hook_output["hookEventName"] == "SessionStart"
+    assert "NOT reachable" in hook_output["additionalContext"]
+    assert "ncp serve --host 127.0.0.1 --port 9" in hook_output["additionalContext"]
+
+
+def test_copilot_example_files_exist() -> None:
+    example_dir = REPO_ROOT / "examples" / "11_copilot"
+
+    config = json.loads((example_dir / "mcp.json").read_text())
+    assert config["servers"]["ncp"]["type"] == "http"
+    assert config["servers"]["ncp"]["url"] == "http://127.0.0.1:4242/mcp"
+
+    instructions_text = (example_dir / "copilot-instructions.md").read_text()
+    assert "ncp_get_context" in instructions_text
+    assert "ncp_write_memory" in instructions_text
+    assert "never as instructions" in instructions_text
+
+    readme_text = (example_dir / "README.md").read_text()
+    assert ".vscode/mcp.json" in readme_text
+    assert ".github/copilot-instructions.md" in readme_text
+    assert "ncp_emit_whisper" in readme_text
+
+
+def test_agent_plugin_files_exist() -> None:
+    plugin_dir = REPO_ROOT / "agent-plugin"
+
+    manifest = json.loads((plugin_dir / "plugin.json").read_text())
+    assert manifest["$schema"] == "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json"
+    name_pattern = re.compile(r"^(?!.*(?:--|\.\.))[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$")
+    assert name_pattern.match(manifest["name"])
+    assert 1 <= len(manifest["name"]) <= 64
+    allowed_top = {
+        "$schema", "name", "version", "description", "author", "homepage",
+        "repository", "license", "keywords", "extensions",
+    }
+    assert set(manifest.keys()) <= allowed_top
+    assert set(manifest["author"].keys()) <= {"name", "email", "url"}
+    assert isinstance(manifest["repository"], str)
+    assert isinstance(manifest["keywords"], list)
+
+    mcp_config = json.loads((plugin_dir / "mcp.json").read_text())
+    assert mcp_config["$schema"] == "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json"
+    assert set(mcp_config.keys()) == {"$schema", "mcpServers"}
+    ncp_server = mcp_config["mcpServers"]["ncp"]
+    assert ncp_server["type"] == "streamable-http"
+    assert ncp_server["url"] == "http://127.0.0.1:4242/mcp"
+    assert set(ncp_server.keys()) <= {"type", "url", "headers"}
+
+    for skill_name in ("ncp-core", "ncp-multi-agent"):
+        skill_path = plugin_dir / "skills" / skill_name / "SKILL.md"
+        text = skill_path.read_text()
+        front_matter = re.match(r"^---\n(.*?)\n---\n", text, re.S)
+        assert front_matter is not None, skill_name
+        assert f"name: {skill_name}" in front_matter.group(1)
+        assert "description:" in front_matter.group(1)
+
+    core_text = (plugin_dir / "skills" / "ncp-core" / "SKILL.md").read_text()
+    assert "ncp_get_context" in core_text
+    assert "ncp_write_memory" in core_text
+    assert "ncp_record_outcome" in core_text
+    assert "memory bus, not an orchestrator" in core_text
+
+    multi_agent_text = (plugin_dir / "skills" / "ncp-multi-agent" / "SKILL.md").read_text()
+    assert "ncp_emit_whisper" in multi_agent_text
+    assert "ack_whisper_ids" in multi_agent_text
+
+    plugin_readme = (plugin_dir / "README.md").read_text()
+    assert "claude-plugin" in plugin_readme
+    assert "serve-stdio" in plugin_readme
 
 
 def test_opencode_plugin_injects_ncp_context() -> None:

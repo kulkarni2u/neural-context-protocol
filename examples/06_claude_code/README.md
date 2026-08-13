@@ -1,10 +1,19 @@
 # Claude Code Example
 
-This folder shows two setups for running NCP inside Claude Code:
+This folder shows two manual setups for running NCP inside Claude Code:
 
 - **Minimal** — register the MCP server and keep the turn contract visible.
 - **Zero-touch** — add a SessionStart hook that starts the bus and tells the
   agent (and its subagents) to use NCP for all agent-to-agent communication.
+
+Prefer not to copy files by hand? [`../../claude-plugin`](../../claude-plugin)
+packages the zero-touch setup (MCP registration + hook + skill) as an
+installable Claude Code plugin:
+
+```
+/plugin marketplace add kulkarni2u/neural-context-protocol
+/plugin install ncp@neural-context-protocol
+```
 
 ## Files
 
@@ -15,9 +24,13 @@ This folder shows two setups for running NCP inside Claude Code:
   injects the "route all agent comms through NCP" instruction at session start.
 - `skills/ncp/SKILL.md` — a lite `/ncp` skill the agent can invoke on demand.
 
+Both setups below require Python 3.11+ and `pip install neural-context-protocol`
+first.
+
 ## Minimal setup
 
 ```bash
+pip install neural-context-protocol
 ncp init
 cp examples/06_claude_code/mcp_servers.json .mcp.json
 ncp serve --host 127.0.0.1 --port 4242 --cwd /path/to/your/project
@@ -30,6 +43,7 @@ Claude Code then connects to `http://127.0.0.1:4242/mcp`.
 From your project root:
 
 ```bash
+pip install neural-context-protocol
 ncp init
 cp examples/06_claude_code/mcp_servers.json .mcp.json
 mkdir -p .claude/hooks .claude/skills/ncp

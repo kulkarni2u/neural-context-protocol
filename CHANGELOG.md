@@ -35,7 +35,31 @@ All notable changes to Neural Context Protocol will be documented in this file.
   (`reduce_fanin_enabled`, `reduce_fanin_min_cluster`,
   `reduce_fanin_similarity_threshold`, `reduce_fanin_contradict_floor`,
   `reduce_fanin_overfetch`).
-
+- **Claude Code plugin package** (`claude-plugin/`, `.claude-plugin/marketplace.json`):
+  packages the existing MCP registration, `SessionStart` hook, and `/ncp`
+  skill from `examples/06_claude_code` as an installable Claude Code plugin
+  (`/plugin marketplace add kulkarni2u/neural-context-protocol` then
+  `/plugin install ncp@neural-context-protocol`), so zero-touch setup no
+  longer requires copying files by hand. The manual `examples/06_claude_code`
+  path still works unchanged.
+- **GitHub Copilot example** (`examples/11_copilot/`): `.vscode/mcp.json`
+  registration and a `.github/copilot-instructions.md` turn contract for
+  Copilot Chat's agent mode, matching the pattern of the Codex CLI/OpenCode
+  examples. Copilot has no hook/autostart mechanism, so `ncp serve` must
+  already be running.
+- **Portable Agent Plugin** (`agent-plugin/`): packages NCP to the
+  vendor-neutral [Agent Plugins 1.0.0](https://agent-plugins.org) standard
+  (`plugin.json` + `mcp.json` + `skills/ncp-core`, `skills/ncp-multi-agent`)
+  so the same directory works with any compliant client, not just Claude
+  Code. Validated against the published `plugin.schema.json`/
+  `mcp.schema.json`. Declares `streamable-http` only — NCP's `serve-stdio`
+  is `hidden=True` in the CLI and documented as an internal
+  tests/dogfood transport, not a stable public interface, so it's called
+  out as a gap rather than shipped as if supported. Complements, and does
+  not replace, `claude-plugin/`: the Claude Code plugin keeps its native
+  `SessionStart` hook/autostart, which the portable format has no
+  equivalent for. See `agent-plugin/README.md` for the full gap list (no
+  stdio transport, no autostart, no portable auth-header mechanism).
 - **CAP-C8: evidence-backed procedural self-refinement** (`ncp/refine.py`,
   `ncp refine ingest|show|propose|apply|rollback`): NCP's calibration loop
   reweights trust on stored memory but never touches the instructions an
