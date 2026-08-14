@@ -8,6 +8,8 @@ import shutil
 import subprocess
 import sys
 
+from ncp.types import ConsciousBlock
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -261,6 +263,40 @@ def test_agent_plugin_files_exist() -> None:
     plugin_readme = (plugin_dir / "README.md").read_text()
     assert "claude-plugin" in plugin_readme
     assert "serve-stdio" in plugin_readme
+
+
+def test_ncp_instruction_intent_examples_match_protocol_contract() -> None:
+    instruction_paths = (
+        REPO_ROOT / "AGENTS.md",
+        REPO_ROOT / "agent-plugin" / "skills" / "ncp-core" / "SKILL.md",
+        REPO_ROOT / "agent-plugin" / "skills" / "ncp-multi-agent" / "SKILL.md",
+    )
+    example_patterns = (
+        re.compile(r'"intent"\s*:\s*"([^"]+)"'),
+        re.compile(r'intent:\s*"([^"]+)"'),
+        re.compile(r'specific\s+`intent`\s+\(`"([^"]+)"`\)'),
+    )
+
+    examples: list[tuple[Path, str]] = []
+    for path in instruction_paths:
+        text = path.read_text()
+        for pattern in example_patterns:
+            examples.extend((path, match) for match in pattern.findall(text))
+
+    assert examples
+    for path, intent in examples:
+        try:
+            ConsciousBlock(
+                agent_id="example_agent",
+                role="example_role",
+                owns=[],
+                must_not=[],
+                task="example_task",
+                slot="example_slot",
+                intent=intent,
+            )
+        except ValueError as exc:
+            raise AssertionError(f"{path}: invalid intent example {intent!r}") from exc
 
 
 def test_opencode_plugin_injects_ncp_context() -> None:

@@ -44,8 +44,11 @@ around it silently, and distinguish which case you're in:
 ## The loop, every turn
 
 1. **Read** bounded context first: `ncp_get_context` with at minimum
-   `agent_id`, `role`, `task`, `slot`, `intent`. This returns three
-   sections — treat them differently:
+   `agent_id`, `role`, `task`, `slot`, `intent`. These five values are
+   whitespace-free pidgin fields; use concise `snake_case` identifiers.
+   Put the specific retrieval terms in `task` and `slot`; `intent` records
+   why the turn is happening. This returns three sections — treat them
+   differently:
    - `[NCP:CONSCIOUS]` — this agent's own durable state (task, slot,
      tried/failed actions). Trustworthy; it's yours.
    - `[NCP:SUBCONSCIOUS]` — chunks retrieved by relevance from the shared
@@ -84,10 +87,11 @@ The whole point is not loading unnecessary history:
   (default 2 critical / 4 otherwise) and `max_tokens` bound retrieval on
   purpose — raising them because "more context can't hurt" defeats the
   design and re-introduces the token cost NCP exists to avoid.
-- A vague `intent` (e.g. `"advance"`) retrieves whatever's recent, not
-  what's relevant — retrieval is scored against this string. A specific
-  `intent` (`"fix null guard in PaymentProcessor retryCount"`) is what
-  makes bounded retrieval actually relevant instead of just small.
+- Make `task` and `slot` specific (for example,
+  `task:"fix_paymentprocessor_retrycount"`, `slot:"null_guard"`). MCP
+  retrieval is scored against `task + slot`; vague values retrieve weaker
+  context for the same budget. Keep `intent` descriptive but whitespace-free,
+  such as `intent:"implement_null_guard"`.
 - Prefer `recent` refs and whispers already in your context block over
   re-fetching or asking a peer agent to re-explain something already
   written to the bus.

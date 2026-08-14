@@ -51,7 +51,7 @@ treat the following as non-optional, not a nice-to-have:
 
 **Prepend to the subagent's instructions:**
 ```
-First call ncp_get_context with {"agent_id":"<role>","role":"<role>","task":"<task_slug>","slot":"build","intent":"<specific_ask>"}
+First call ncp_get_context with {"agent_id":"<role>","role":"<role>","task":"<specific_task_slug>","slot":"<specific_slot_slug>","intent":"<intent_slug>"}
 ```
 
 **Append to the subagent's instructions:**
@@ -68,9 +68,11 @@ The prepend/append above prevents a cold start; these are what convert
 that into fewer tokens and better retrieval — skipping them still
 "works," it just spends the budget on the wrong things.
 
-1. **Give the subagent a specific `intent`, not your own broad task.**
-   Retrieval is scored against this string — a vague intent burns the
-   same budget on irrelevant chunks instead of retrieving worse-but-cheap.
+1. **Give the subagent specific `task` and `slot` values.** Retrieval is
+   scored against `task + slot`, so broad values burn the same budget on
+   irrelevant chunks. All conscious pidgin fields, including `intent`, must
+   be whitespace-free; use `snake_case` and let `intent` state why the turn
+   is happening.
 2. **Have it write back the distilled finding, not raw output.** One
    `ncp_write_memory` chunk with the specific fact beats a pasted diff or
    stack trace.
