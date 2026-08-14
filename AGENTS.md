@@ -45,7 +45,7 @@ context compaction.
 
 **Prepend to every instruction:**
 ```
-First call ncp_get_context with {"agent_id":"<role>","role":"<role>","task":"<task_slug>","slot":"build","intent":"<what_to_implement>"}
+First call ncp_get_context with {"agent_id":"<role>","role":"<role>","task":"<specific_task_slug>","slot":"<specific_slot_slug>","intent":"<intent_slug>"}
 ```
 
 **Append to every instruction:**
@@ -55,7 +55,7 @@ When done call ncp_write_memory with {"content":"<one_sentence_summary_of_what_y
 
 **Filled-in example (OpenCode, async vector mode):**
 ```
-First call ncp_get_context with {"agent_id":"opencode","role":"pravaha","task":"async_vector_mode","slot":"build","intent":"implement _async_query_vector in pgvector_async.py"}
+First call ncp_get_context with {"agent_id":"opencode","role":"pravaha","task":"async_vector_mode","slot":"pgvector_async_query","intent":"implement_async_query_vector"}
 
 [... implementation task ...]
 
@@ -75,12 +75,11 @@ five habits are what actually convert that into fewer tokens spent and more
 relevant retrieval later — skipping them still "works," it just spends the
 budget on the wrong things.
 
-1. **Give the subagent a specific `intent`/`query_text`, not the parent's
-   broad task.** Retrieval is scored against this string (BM25 + recency +
-   trust) — `intent:"advance"` returns whatever's recent; `intent:"fix null
-   guard in PaymentProcessor retryCount"` returns the chunks that matter.
-   A vague intent doesn't just retrieve worse, it burns the same token
-   budget on irrelevant chunks.
+1. **Give the subagent specific `task` and `slot` values, not the parent's
+   broad task.** Retrieval is scored against `task + slot` (BM25 + recency +
+   trust), so vague values burn the same token budget on irrelevant chunks.
+   All conscious pidgin fields are whitespace-free: use `snake_case` for
+   `task`, `slot`, and `intent`; let `intent` state why the turn is happening.
 2. **Write back the distilled finding, not the raw tool output.** One
    `ncp_write_memory` chunk with the specific fact/decision beats pasting a
    full diff or stack trace — NCP's noise filter helps, but a subagent that
