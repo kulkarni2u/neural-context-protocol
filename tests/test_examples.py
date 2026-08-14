@@ -299,6 +299,25 @@ def test_ncp_instruction_intent_examples_match_protocol_contract() -> None:
             raise AssertionError(f"{path}: invalid intent example {intent!r}") from exc
 
 
+def test_ncp_instruction_guidance_does_not_make_intent_the_retrieval_query() -> None:
+    instruction_paths = (
+        REPO_ROOT / "AGENTS.md",
+        REPO_ROOT / "agent-plugin" / "skills" / "ncp-core" / "SKILL.md",
+        REPO_ROOT / "agent-plugin" / "skills" / "ncp-multi-agent" / "SKILL.md",
+        REPO_ROOT / "claude-plugin" / "skills" / "ncp" / "SKILL.md",
+        REPO_ROOT / "examples" / "06_claude_code" / "skills" / "ncp" / "SKILL.md",
+    )
+
+    misleading_guidance = {
+        path: line.strip()
+        for path in instruction_paths
+        for line in path.read_text().splitlines()
+        if "specific `intent`" in line
+    }
+
+    assert misleading_guidance == {}
+
+
 def test_opencode_plugin_injects_ncp_context() -> None:
     if shutil.which("node") is None:
         return
