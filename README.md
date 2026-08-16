@@ -57,6 +57,51 @@ The payoff compounds at the organization level as **token capital efficiency** �
 
 -----
 
+## Full feature set
+
+Bounded retrieval is the entry point, not the whole story. The mechanisms below work together to keep shared memory small, trustworthy, and self-improving instead of turning into a landfill. Each links to the deeper section further down.
+
+### Token bloat
+
+- **Bounded context assembly** — every turn gets a budget-capped slice of context (conscious + retrieved + whispers), never the full history. See [How agents talk over the bus](#how-agents-talk-over-the-bus).
+- **Write-time noise filtering** — strips ANSI codes, dedups repeated lines, and prunes boilerplate and empty fields before anything is stored. **33% aggregate token reduction** on a fixed noisy-payload benchmark. See [Signal filtering at write time](#signal-filtering-at-write-time).
+- **Fan-in reduction** — dedups near-duplicate claims across parallel workers before they reach a synthesis agent. **13% token reduction** against an unbounded raw dump. See [Fan-in reduction](#fan-in-reduction).
+- **Consolidation** — merges repeated or near-duplicate memory into fewer, stronger entries instead of leaving competing rows. See [Retrieval and self-improving memory](#retrieval-and-self-improving-memory).
+
+### Context quality
+
+- **Trust-weighted retrieval** — blends lexical relevance (BM25), recency, and trust into one score, with penalties for drift and heavily re-derived generations. See [Retrieval and self-improving memory](#retrieval-and-self-improving-memory).
+- **Layered memory** — every chunk is tagged `episodic`, `procedural`, `semantic`, `social`, or `reasoning_trace`, so retrieval can target the kind of memory a turn actually needs. See [Memory layers](#memory-layers).
+- **Graph-aware retrieval and trust propagation** — typed edges (`caused_by`, `supersedes`, `supports`, `contradicts`, `refines`, `derived_from`) let retrieval expand along relationships and let trust credit or debit a cause for what it produced. See [Graph engineering](#graph-engineering).
+
+### Memory decay and the landfill problem
+
+- **Self-improving calibration** — `ncp calibrate --feedback` boosts chunks that keep proving useful, penalizes chunks that drew dissent, and lets weak or outdated memory decay instead of sitting at full weight forever. See [Retrieval and self-improving memory](#retrieval-and-self-improving-memory).
+- **Outcome-driven trust** — `ncp_record_outcome` ties task success or failure directly to the chunks that informed it, so calibration is grounded in what actually worked, not just what got read.
+- **Procedural self-refinement** — a single named procedure can accumulate outcome evidence and evolve through an explicit, human-gated pipeline, instead of instructions going stale. See [Procedural self-refinement](#procedural-self-refinement).
+
+### Multi-agent coordination
+
+- **Whispers** — short, directed, bounded-TTL signals between specific agents (handoffs, dissent, drift notes) instead of broadcasting full state.
+- **Cross-host handoffs** — one agent hands its task to another host through the same protocol, carrying bounded context forward instead of a transcript. See [Cross-agent handoffs](#cross-agent-handoffs).
+- **Shared pipeline memory** — every host on a `pipeline_id` reads and writes the same bounded, scored context.
+
+### Trust and accountability
+
+- **Cryptographic agent identity** — Ed25519 keypairs, with optional signed authorship verified against a registered public key. See [Agent identity and reputation](#agent-identity-and-reputation).
+- **Per-agent reputation** — a Beta-distribution posterior over "produces trustworthy memory," updated from calibration's trust deltas, that can optionally weight retrieval or gate whispers.
+- **Decision traces and precedent** — `ncp_record_decision` captures structured rationale; `ncp precedents` queries past decisions.
+
+### Operability at scale
+
+- **Storage tiers** — start on SQLite with zero extra services, move to pgvector + Redis for durable, cross-machine, multi-process coordination. See [Storage tiers](#storage-tiers).
+- **Cost and drift telemetry** — `ncp cost`, `ncp trust-drift`, `ncp explain`, and a read-only web UI at `/ui` for turn timelines, chunk trust, whisper traffic, and the memory graph.
+- **In-process library API** — drive the same bus directly from an orchestrator via `ncp.api`, no server required. See [Use NCP as a library](#use-ncp-as-a-library).
+
+Scoping note: NCP is the memory bus, not the orchestrator, and not the right default for simple single-agent or very short-lived tasks. See [What NCP is (and isn't)](#what-ncp-is-and-isnt).
+
+-----
+
 ## Quickstart
 
 ```bash
