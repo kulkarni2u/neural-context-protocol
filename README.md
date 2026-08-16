@@ -102,6 +102,21 @@ Scoping note: NCP is the memory bus, not the orchestrator, and not the right def
 
 -----
 
+## Hosts and plugins
+
+NCP is MCP-native, so any host that can speak MCP can join the bus. Two packages make that concrete for the most common setups. Install whichever matches your client, or both — they point at the same running `ncp serve` instance and don't conflict.
+
+| Package | For | What it adds |
+|---------|-----|---------------|
+| [`claude-plugin/`](./claude-plugin) | Claude Code | Native plugin, installable via `/plugin install`. A `SessionStart` hook health-checks `ncp serve`, can autostart it, and injects the turn contract — including the mandatory subagent dispatch rule — automatically. |
+| [`agent-plugin/`](./agent-plugin) | Any [Agent Plugins 1.0.0](https://agent-plugins.org)-compliant client (Cursor, VS Code/Copilot, Codex CLI's plugin support, and others) | Vendor-neutral `plugin.json` + `mcp.json` + `skills/` package. Same MCP tools and skill guidance as the Claude plugin, without Claude-specific packaging. |
+
+Both declare the same `ncp` MCP server (`http://127.0.0.1:4242/mcp`) and the same tool surface. `claude-plugin/` trades portability for lifecycle automation (autostart, health-check, session-start injection); `agent-plugin/` trades that automation for working unmodified across any spec-compliant client — the Agent Plugins spec has no hook mechanism, so `ncp serve` must already be running, and setup is one step more manual. Each package's README documents its own install steps; the Portable Agent Plugin's also lists known gaps (no stdio transport, no autostart, no built-in auth-header injection) rather than presenting itself as more turnkey than it is.
+
+For Codex CLI, OpenCode, GitHub Copilot, and n8n, see [Quickstart](#quickstart) and the matching `examples/` directory.
+
+-----
+
 ## Quickstart
 
 ```bash
