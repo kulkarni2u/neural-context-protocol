@@ -5,24 +5,40 @@
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![PyPI](https://img.shields.io/pypi/v/neural-context-protocol)
 
+**Bounded, trust-weighted memory for multi-agent systems.**
+MCP-native. Agents share context without replaying full transcripts. Around 13x fewer tokens than raw replay — see [Benchmarks](#benchmarks).
+
 -----
 
-## A protocol for agent-to-agent communication over MCP
+## The problem
+
+Most agent memory systems treat context like an append-only log.
+
+Six months of stored memory can cost more tokens on the first message than a brand-new user costs all week. Everything gets re-read at the same weight — a casual remark and a hard compliance rule fight for the same slot. There's little real consolidation, almost no decay, and retrieval usually means "search everything" instead of "pick the few things that matter right now."
+
+The store turns into a landfill. Dilution starts to feel like forgetting.
+
+NCP was built to stop that.
+
+-----
+
+## What NCP is
 
 NCP is an **agent-to-agent communication protocol** for multi-agent systems — and, underneath it, a **memory bus over MCP**. It lets agents talk to each other, hand off work, and build on prior results without replaying transcripts or stuffing prompts.
 
 MCP standardized how a single agent talks to its tools. NCP standardizes how **agents talk to each other**. It exposes one MCP endpoint that every host — Claude, Codex, OpenCode, Copilot, n8n, LangGraph, any Agent Plugins-compliant client, or a custom orchestrator — connects to as a peer. Each agent reads bounded, trust-weighted context, writes durable memory, and sends bounded signals (whispers) to other agents, all through the same protocol.
 
-The protocol rides on a memory bus: durable shared state, relevance-bounded retrieval, and trust scoring are what make the conversation between agents reliable. Making token spend compound is the payoff that follows.
+NCP is a bus, not an orchestrator. The orchestrator still decides *who runs when*; the bus owns *what they know and share*.
 
-| Problem | What the bus provides |
-|---------|-------------------|
-| Agents have no shared channel between turns | One MCP memory bus every host connects to |
-| Agents replay growing transcripts | Bounded context assembly per turn |
-| Useful work disappears after a turn | Durable memory and turn records |
+| Problem | What NCP does |
+|---------|---------------|
+| No shared channel between turns | One MCP memory bus every host can join |
+| Transcripts grow and get re-read at equal weight | Bounded, scored context per turn |
+| Good work disappears after a turn | Durable memory and decision traces |
 | Multi-agent handoff is brittle | Whispers and shared pipeline memory |
 | All context looks equally credible | Trust scores, drift markers, dissent, calibration |
-| Token spend does not compound | Reusable memory, cost telemetry, reputation signals |
+| Memory becomes a landfill | Consolidation, feedback calibration, and decay |
+| Token spend does not compound | Reusable, ranked memory across runs and agents |
 | Teams want to use smaller models safely | Better engineered context for cheaper model calls |
 
 -----
@@ -31,13 +47,11 @@ The protocol rides on a memory bus: durable shared state, relevance-bounded retr
 
 In a multi-agent system, the hard problem is not any single model — it is the channel between agents. Without one, every agent is an island: it re-reads context, re-discovers prior decisions, and leaves no reusable signal behind. Handoffs degrade into pasting full transcripts forward.
 
-NCP is that channel. It is a bus, not an orchestrator: agents attach to it as peers, publish memory and signals, and subscribe to bounded, relevance-ranked context. The orchestrator still decides *who runs when*; the bus owns *what they know and share*.
-
-Three properties make it a bus and not just a store:
+NCP is that channel. It is a bus, not just a store. Three properties make it one:
 
 - **Bounded reads.** Every agent gets a budget-bounded working context, not the whole history — so the channel scales as turns and agents grow.
 - **Directed signals.** Agents emit whispers to specific peers (handoffs, dissent, drift reports) without broadcasting full state.
-- **Trust-aware transport.** Every message on the bus carries a trust score and drift marker — self-reported, advisory inputs, not runtime-verified truth — so a receiving agent knows how much to believe what it reads.
+- **Trust-aware transport.** Every message on the bus carries a trust score and drift marker — self-reported, advisory inputs, not runtime-verified truth — so a receiving agent knows how much to believe what it reads. Calibration boosts what actually got used or produced good outcomes, lowers what drew dissent, and lets weak or outdated memory fade.
 
 The payoff compounds at the organization level as **token capital efficiency** — the business value captured per dollar spent on model reasoning. Because work persists as reusable, trusted state instead of being thrown away at the end of each turn, token spend accrues into shared organizational memory rather than resetting: decisions, evidence, outcomes, trust signals, and cost records that future runs, teams, and pipelines draw on. Future agents — including cheaper or smaller models — stand on prior work without replaying the whole history. That does not make NCP a model router or eval platform; it is the context substrate those loops need. The [Benchmarks](#benchmarks) section quantifies the effect.
 
