@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "ncp",
-  "version": "1.4.2",
+  "version": "1.4.3",
   "description": "NCP — an agent-to-agent memory bus over MCP. Bounded, trust-weighted context assembly, durable cross-session memory, and directed whispers for multi-agent systems.",
   "author": {
     "name": "Neural Context Protocol",

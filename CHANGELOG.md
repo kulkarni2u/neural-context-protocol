@@ -4,6 +4,8 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [Unreleased]
 
+## [1.4.3] - 2026-08-17
+
 ### Added
 
 - **WI-P3: deterministic fan-in reduction for high-fanout bursts**
