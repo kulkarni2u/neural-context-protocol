@@ -581,10 +581,13 @@ conflating them would have undermined the stated goal (avoiding drift):
   partial retrieval — a subagent reviewing one file only needs the rule that
   applies to it. `recall_skills()` covers this case.
 
-### 6.3 Two corrections that only surfaced from building it against the real store
+### 6.3 Three corrections that only surfaced from building it against the real store
 
-Both were caught by tracing the actual write/query code paths before
-writing tests, not anticipated in the original design pass:
+Two were caught by tracing the actual write/query code paths before
+writing tests; the third was caught only by actually testing with realistic
+markdown content instead of prose sentences, after a user asked "does this
+cache the skill file as-is?" and the honest answer -- checked, not assumed --
+turned out to be no:
 
 1. **`written_by` must be deterministic per `skill_id`, not per caller.**
    `BaseStore.write()`'s `_assert_src_immutable` (a deliberate security fix —
@@ -621,6 +624,38 @@ writing tests, not anticipated in the original design pass:
    free. This is a real, load-bearing correction to §1.5's API surface, not
    a docstring fix — a v1 built on the original claim would have silently
    never surfaced cached review-skill content in production.
+3. **Windowing must not alter a single byte, and the original implementation
+   did.** §1.2 (v1) said content routes through the existing
+   `ncp.chunker.chunk_content()` dispatcher "purely to respect the 2000-char
+   ceiling," treating this as forced plumbing with no content-fidelity
+   implication. That was wrong. `chunk_content(chunk_type="prose")` calls
+   `chunk_prose()`, which splits on sentence boundaries and **rejoins with a
+   single space** — built for retrieval-chunk quality (where minor
+   whitespace normalization is harmless because the chunk is scored and
+   read, never reconstructed), not for lossless round-tripping. A skill
+   file is markdown, not prose: tested against a realistic file, a bullet
+   list —
+   ```
+   - Always set retries >= 3.
+   - Never deploy on Fridays after 3pm.
+   - Check staging first.
+   ```
+   came back from `fetch_skill()` as one run-on line — `"- Always set
+   retries >= 3. - Never deploy on Fridays after 3pm. - Check staging
+   first."` — and a `## Usage` header came back glued onto the end of the
+   preceding sentence. For a *workflow/protocol* skill specifically, this
+   directly breaks the one guarantee `fetch_skill()` exists to make: every
+   subagent sees the *identical* content, not a reconstruction that quietly
+   dropped its structure. Fixed by replacing the retrieval chunker with
+   `_split_verbatim()`, a windowing function with one job — cut ``content``
+   into ≤2000-char windows at the best available boundary (paragraph, then
+   line, then a hard character cut only as a last resort) without
+   stripping or rejoining anything, so `"".join(windows) == content`
+   exactly, for any input. `fetch_skill()`'s reconstruction changed to match
+   (plain `"".join()`, not `"\n\n".join()`) — verified against a realistic
+   markdown fixture with headers, a code fence, and a bullet list:
+   `fetch_skill()` now returns the input byte-for-byte
+   (`tests/test_skill_cache.py::test_fetch_skill_preserves_markdown_structure_exactly`).
 
 ### 6.4 `ensure_cached()`: the orchestrator-side convenience wrapper
 

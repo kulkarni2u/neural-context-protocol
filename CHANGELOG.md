@@ -37,21 +37,25 @@ All notable changes to Neural Context Protocol will be documented in this file.
   existing upsert path. `fetch_skill()` returns cached content verbatim in
   section order (for workflow/protocol skills every subagent must see
   identically); `recall_skills()` does relevance-ranked retrieval (for
-  review/checklist skills). New `skill_ref` `ChunkSource` value
-  (`ncp/types.py`) and `[skill_cache]` config block (`ncp/config.py`,
-  `default_trust`/`default_expiry_days`/`window_chars`). See
-  `docs/NCP_SKILL_CACHING_DESIGN.md` §6 for the design and two correctness
-  fixes (deterministic per-skill authorship to avoid a write-immutability
-  rejection; `recall_skills()` as an explicit call rather than automatic
-  inclusion, since cached skill content's `zone="proven"` is outside the
-  assembler's `zone="working"` per-turn retrieval). Also adds
-  `ensure_cached()`, a fetch-or-cache convenience wrapper for the
-  orchestrator side of a DAG-driven harness: checks completeness (one
-  indexed lookup) and only falls through to `cache_skill()`'s full
-  chunk-and-write on an actual miss, then returns `content_hash` for the
-  caller to thread through the DAG's task payload so every downstream
-  subagent — regardless of provider or process — fetches the identical
-  cached content via `fetch_skill(skill_id, content_hash=...)`.
+  review/checklist skills). Windowing preserves content byte-for-byte
+  (`_split_verbatim()` cuts at paragraph/line boundaries without stripping
+  or rejoining anything — deliberately not `ncp.chunker.chunk_content()`,
+  the retrieval chunker, which rejoins sentences with single spaces and
+  would silently flatten markdown structure like bullet lists and headers).
+  New `skill_ref` `ChunkSource` value (`ncp/types.py`) and `[skill_cache]`
+  config block (`ncp/config.py`, `default_trust`/`default_expiry_days`/
+  `window_chars`). See `docs/NCP_SKILL_CACHING_DESIGN.md` §6 for the design
+  and three correctness fixes (deterministic per-skill authorship to avoid a
+  write-immutability rejection; `recall_skills()` as an explicit call rather
+  than automatic inclusion, since cached skill content's `zone="proven"` is
+  outside the assembler's `zone="working"` per-turn retrieval; exact
+  byte-for-byte windowing). Also adds `ensure_cached()`, a fetch-or-cache
+  convenience wrapper for the orchestrator side of a DAG-driven harness:
+  checks completeness (one indexed lookup) and only falls through to
+  `cache_skill()`'s full chunk-and-write on an actual miss, then returns
+  `content_hash` for the caller to thread through the DAG's task payload so
+  every downstream subagent — regardless of provider or process — fetches
+  the identical cached content via `fetch_skill(skill_id, content_hash=...)`.
 
 ## [1.4.3] - 2026-08-17
 

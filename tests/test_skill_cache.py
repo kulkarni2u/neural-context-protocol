@@ -77,12 +77,36 @@ def test_fetch_skill_returns_full_content_verbatim_in_order(tmp_path: Path):
 
     fetched = fetch_skill("acme/workflow", content_hash=result.content_hash, store=store)
 
-    assert fetched is not None
-    sections = store.get_chunks_by_ids(result.chunk_ids)
-    ordered_by_index = sorted(
-        sections, key=lambda c: int(next(cond for cond in c.conditions if cond.startswith("section:")).split(":")[1])
-    )
-    assert fetched == "\n\n".join(chunk.content for chunk in ordered_by_index)
+    assert fetched == WORKFLOW_CONTENT.strip()  # exact, byte-for-byte, not a rejoin approximation
+
+
+def test_fetch_skill_preserves_markdown_structure_exactly(tmp_path: Path):
+    """Regression test: cache_skill() used to route content through the
+    retrieval chunker (ncp.chunker.chunk_content), which splits on sentence
+    boundaries and rejoins with single spaces -- silently flattening
+    markdown structure (headers glued onto prose, bullet lists collapsed
+    onto one line). A skill file is markdown, not prose; fetch_skill() must
+    return it exactly as cached, not an approximation.
+    """
+    store = _store(tmp_path)
+    markdown_skill = (
+        "# Deploy API Skill\n\n"
+        "## Rules\n\n"
+        "- Always set retries >= 3.\n"
+        "- Never deploy on Fridays after 3pm.\n"
+        "- Check staging first.\n\n"
+        "```python\n"
+        "def deploy(service, retries=3):\n"
+        "    return api.post('/deploy', json={'service': service})\n"
+        "```\n"
+    ) * 30  # force multiple windows
+
+    result = cache_skill(markdown_skill, skill_id="acme/deploy-api", store=store)
+    fetched = fetch_skill("acme/deploy-api", content_hash=result.content_hash, store=store)
+
+    assert fetched == markdown_skill.strip()
+    assert "- Always set retries >= 3.\n- Never deploy on Fridays after 3pm." in fetched
+    assert "## Rules\n\n-" in fetched
 
 
 def test_fetch_skill_misses_on_unknown_hash(tmp_path: Path):

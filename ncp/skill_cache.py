@@ -52,15 +52,13 @@ import hashlib
 import time
 from dataclasses import dataclass, field
 
-from ncp.chunker import chunk_content
 from ncp.config import NCPConfig, load_config
 from ncp.stores.base import BaseStore
 from ncp.stores.factory import create_store
 from ncp.types import ChunkLayer, SubconsciousChunk
 
-# SubconsciousChunk.content is hard-capped at 2000 chars (ncp/types.py). Keep
-# windows comfortably under that even in the rare case chunk_prose's
-# sentence/word windowing slightly overshoots max_tokens*4 chars.
+# SubconsciousChunk.content is hard-capped at 2000 chars (ncp/types.py).
+# Never let a configured window_chars exceed this, regardless of config.
 _HARD_CONTENT_CEILING = 2000
 
 # Reserved section index for the manifest chunk (real sections start at 0),
@@ -77,10 +75,49 @@ def _section_chunk_id(skill_id: str, content_hash: str, index: int) -> str:
     return f"skl_{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:12]}"
 
 
-def _hard_split(text: str, *, limit: int) -> list[str]:
-    """Defensive fallback: split on plain char boundaries if a window is still oversized."""
+def _split_verbatim(content: str, *, limit: int) -> list[str]:
+    """Split into <=``limit``-char windows that concatenate back to ``content`` exactly.
 
-    return [text[i : i + limit] for i in range(0, len(text), limit)] or [text]
+    Deliberately *not* ``ncp.chunker.chunk_content()`` -- that's the
+    retrieval chunker, built for scoring/relevance quality, not lossless
+    round-tripping: ``chunk_prose`` splits on sentence boundaries and
+    rejoins with single spaces, which silently flattens markdown structure
+    (headers glued onto the preceding sentence, bullet lists collapsed onto
+    one line). For a skill/reference file -- markdown with headers, code
+    fences, and lists, not prose -- that's not a formatting nit, it's data
+    loss a subagent reconstructing "the protocol" would never see.
+
+    This function never strips or rejoins anything: it walks ``content``
+    left to right, cutting windows at the last paragraph break (``\\n\\n``)
+    at or before ``limit`` chars, falling back to the last line break
+    (``\\n``), falling back to a hard character cut only when neither
+    exists within the window (e.g. one long unbroken line). The delimiter
+    characters stay attached to the end of the window they close, so
+    ``"".join(_split_verbatim(content, limit=N)) == content`` always, for
+    any ``limit >= 1`` -- no separator needs to be reinserted at
+    reconstruction time (see ``fetch_skill()``).
+    """
+
+    if not content:
+        return []
+    windows: list[str] = []
+    pos = 0
+    total = len(content)
+    while pos < total:
+        remaining = total - pos
+        if remaining <= limit:
+            windows.append(content[pos:])
+            break
+        window = content[pos : pos + limit]
+        idx = window.rfind("\n\n")
+        if idx != -1:
+            cut = idx + 2
+        else:
+            idx = window.rfind("\n")
+            cut = idx + 1 if idx != -1 else limit
+        windows.append(content[pos : pos + cut])
+        pos += cut
+    return windows
 
 
 @dataclass(slots=True)
@@ -152,13 +189,8 @@ def cache_skill(
     written_by = _skill_author(skill_id)
 
     content_hash = _content_hash(content)
-    windows = chunk_content(content, chunk_type="prose", max_tokens=max(1, window_chars // 4))
-    sections: list[str] = []
-    for window in windows:
-        if len(window) <= _HARD_CONTENT_CEILING:
-            sections.append(window)
-        else:
-            sections.extend(_hard_split(window, limit=_HARD_CONTENT_CEILING))
+    limit = min(max(1, window_chars), _HARD_CONTENT_CEILING)
+    sections = _split_verbatim(content.strip(), limit=limit)
 
     source_refs = [source_ref] if source_ref else []
     written = 0
@@ -341,7 +373,12 @@ def fetch_skill(
         # Report a miss rather than silently returning a truncated protocol.
         return None
 
-    return "\n\n".join(chunk.content for chunk in ordered)
+    # Plain concatenation, not "\n\n".join(): _split_verbatim() keeps each
+    # window's own trailing delimiter characters attached at write time
+    # (see cache_skill()), so no separator needs to be reinserted here --
+    # doing so would double up whatever whitespace was already at each
+    # window boundary.
+    return "".join(chunk.content for chunk in ordered)
 
 
 def recall_skills(
