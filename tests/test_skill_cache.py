@@ -1,10 +1,12 @@
 from pathlib import Path
+from unittest.mock import patch
 
 from ncp.config import load_config
 from ncp.skill_cache import (
     _MANIFEST_SECTION_INDEX,
     _section_chunk_id,
     cache_skill,
+    ensure_cached,
     fetch_skill,
     recall_skills,
 )
@@ -194,3 +196,56 @@ def test_skill_cache_config_defaults(tmp_path: Path):
     assert config.skill_cache_default_trust == 0.60
     assert config.skill_cache_default_expiry_days == 30
     assert config.skill_cache_window_chars == 1800
+
+
+def test_ensure_cached_misses_on_first_call_then_hits_on_repeat(tmp_path: Path):
+    store = _store(tmp_path)
+
+    first = ensure_cached(WORKFLOW_CONTENT, skill_id="harness/workflow", store=store)
+    assert first.cache_hit is False
+
+    second = ensure_cached(WORKFLOW_CONTENT, skill_id="harness/workflow", store=store)
+    assert second.cache_hit is True
+    assert second.content_hash == first.content_hash
+
+
+def test_ensure_cached_detects_changed_content_as_a_miss(tmp_path: Path):
+    store = _store(tmp_path)
+    first = ensure_cached(WORKFLOW_CONTENT, skill_id="harness/workflow", store=store)
+
+    second = ensure_cached(WORKFLOW_CONTENT + " New step added.", skill_id="harness/workflow", store=store)
+
+    assert second.cache_hit is False
+    assert second.content_hash != first.content_hash
+
+
+def test_ensure_cached_skips_the_write_path_on_a_hit(tmp_path: Path):
+    """The optimization ensure_cached() exists for: a hit must not re-chunk/re-write."""
+    store = _store(tmp_path)
+    ensure_cached(WORKFLOW_CONTENT, skill_id="harness/workflow", store=store)
+
+    with patch("ncp.skill_cache.cache_skill") as mock_cache_skill:
+        result = ensure_cached(WORKFLOW_CONTENT, skill_id="harness/workflow", store=store)
+
+    assert result.cache_hit is True
+    mock_cache_skill.assert_not_called()
+
+
+def test_ensure_cached_calls_cache_skill_on_a_miss(tmp_path: Path):
+    store = _store(tmp_path)
+
+    with patch("ncp.skill_cache.cache_skill", wraps=cache_skill) as mock_cache_skill:
+        result = ensure_cached(WORKFLOW_CONTENT, skill_id="harness/workflow", store=store)
+
+    assert result.cache_hit is False
+    mock_cache_skill.assert_called_once()
+
+
+def test_ensure_cached_hash_feeds_a_downstream_subagent_fetch(tmp_path: Path):
+    """The DAG-payload pattern: orchestrator caches once, subagent fetches by the pinned hash."""
+    store = _store(tmp_path)
+
+    result = ensure_cached(WORKFLOW_CONTENT, skill_id="harness/workflow", store=store)
+    fetched_by_subagent = fetch_skill("harness/workflow", content_hash=result.content_hash, store=store)
+
+    assert fetched_by_subagent is not None

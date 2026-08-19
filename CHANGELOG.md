@@ -44,7 +44,14 @@ All notable changes to Neural Context Protocol will be documented in this file.
   fixes (deterministic per-skill authorship to avoid a write-immutability
   rejection; `recall_skills()` as an explicit call rather than automatic
   inclusion, since cached skill content's `zone="proven"` is outside the
-  assembler's `zone="working"` per-turn retrieval).
+  assembler's `zone="working"` per-turn retrieval). Also adds
+  `ensure_cached()`, a fetch-or-cache convenience wrapper for the
+  orchestrator side of a DAG-driven harness: checks completeness (one
+  indexed lookup) and only falls through to `cache_skill()`'s full
+  chunk-and-write on an actual miss, then returns `content_hash` for the
+  caller to thread through the DAG's task payload so every downstream
+  subagent — regardless of provider or process — fetches the identical
+  cached content via `fetch_skill(skill_id, content_hash=...)`.
 
 ## [1.4.3] - 2026-08-17
 

@@ -35,6 +35,15 @@ path -- true cross-agent, cross-pipeline reuse with no explicit invalidation
 call needed. Staleness detection is the caller's job (see the design doc
 §1.1): the caller already has the skill file open to call ``cache_skill()``
 in the first place, so it is best placed to know when the content changed.
+
+Typical usage in an orchestrator/DAG harness: the main session calls
+``ensure_cached(content, skill_id=...)`` once per skill/reference file at
+classification time (skips the write entirely when already fully cached at
+that content hash), then threads the returned ``content_hash`` through the
+DAG payload to every subagent it spawns. Each subagent -- regardless of
+provider or process -- calls ``fetch_skill(skill_id, content_hash=...)``
+using that pinned hash, guaranteeing byte-identical content across a
+heterogeneous fleet of subagents, not just "whatever's on disk right now."
 """
 
 from __future__ import annotations
@@ -213,6 +222,91 @@ def cache_skill(
     )
 
 
+@dataclass(slots=True)
+class EnsureCachedResult:
+    """Outcome of one ``ensure_cached()`` call."""
+
+    skill_id: str
+    content_hash: str
+    cache_hit: bool  # True: already fully cached, no write happened this call.
+
+
+def ensure_cached(
+    content: str,
+    *,
+    skill_id: str,
+    store: BaseStore | None = None,
+    config: NCPConfig | None = None,
+    pipeline_id: str | None = None,
+    layer: ChunkLayer = "procedural",
+    base_trust: float | None = None,
+    source_ref: str | None = None,
+) -> EnsureCachedResult:
+    """Fetch-or-cache in one call -- the common case at every skill-load site.
+
+    The caller here always already has ``content`` in hand (it just read the
+    skill/reference file to call this), so there's nothing to *return* the
+    way ``fetch_skill()`` returns content to a caller who doesn't have it.
+    What this saves is the section-by-section re-chunk-and-write work on
+    every call where nothing changed: it checks whether ``skill_id`` is
+    already completely cached at this exact content hash (one manifest
+    lookup, one section-completeness check -- the same check ``fetch_skill()``
+    does, not a full ``cache_skill()`` write) and only calls ``cache_skill()``
+    on an actual miss (first-ever call, or the content changed).
+
+    Typical call site: the main/orchestrator session's classification step,
+    once per workflow skill or selected reference file, before any subagent
+    is spawned. Returns ``content_hash`` so the caller can thread it through
+    the DAG/task payload to every downstream subagent, which then calls
+    ``fetch_skill(skill_id, content_hash=...)`` themselves -- same hash,
+    guaranteed byte-identical content, regardless of which provider or
+    process each subagent runs in.
+    """
+
+    resolved_config = config or load_config()
+    resolved_store = store or create_store(resolved_config)
+    content_hash = _content_hash(content)
+
+    section_count = _load_manifest_section_count(skill_id, content_hash, resolved_store)
+    if section_count is not None:
+        complete = _load_complete_sections(skill_id, content_hash, section_count, resolved_store)
+        if complete is not None:
+            return EnsureCachedResult(skill_id=skill_id, content_hash=content_hash, cache_hit=True)
+
+    cache_skill(
+        content,
+        skill_id=skill_id,
+        store=resolved_store,
+        config=resolved_config,
+        pipeline_id=pipeline_id,
+        layer=layer,
+        base_trust=base_trust,
+        source_ref=source_ref,
+    )
+    return EnsureCachedResult(skill_id=skill_id, content_hash=content_hash, cache_hit=False)
+
+
+def _load_manifest_section_count(skill_id: str, content_hash: str, store: BaseStore) -> int | None:
+    manifest_id = _section_chunk_id(skill_id, content_hash, _MANIFEST_SECTION_INDEX)
+    manifest_rows = store.get_chunks_by_ids([manifest_id])
+    if not manifest_rows:
+        return None
+    return _parse_section_count(manifest_rows[0].content)
+
+
+def _load_complete_sections(
+    skill_id: str, content_hash: str, section_count: int, store: BaseStore
+) -> list[SubconsciousChunk] | None:
+    section_ids = [_section_chunk_id(skill_id, content_hash, i) for i in range(section_count)]
+    rows_by_id = {chunk.chunk_id: chunk for chunk in store.get_chunks_by_ids(section_ids)}
+    ordered = [rows_by_id[cid] for cid in section_ids if cid in rows_by_id]
+    if len(ordered) != section_count:
+        # A section chunk aged out (expiry) or was otherwise removed since the
+        # manifest was written -- the cached copy is incomplete.
+        return None
+    return ordered
+
+
 def fetch_skill(
     skill_id: str,
     *,
@@ -238,22 +332,13 @@ def fetch_skill(
     resolved_config = config or load_config()
     resolved_store = store or create_store(resolved_config)
 
-    manifest_id = _section_chunk_id(skill_id, content_hash, _MANIFEST_SECTION_INDEX)
-    manifest_rows = resolved_store.get_chunks_by_ids([manifest_id])
-    if not manifest_rows:
-        return None
-
-    section_count = _parse_section_count(manifest_rows[0].content)
+    section_count = _load_manifest_section_count(skill_id, content_hash, resolved_store)
     if section_count is None:
         return None
 
-    section_ids = [_section_chunk_id(skill_id, content_hash, i) for i in range(section_count)]
-    rows_by_id = {chunk.chunk_id: chunk for chunk in resolved_store.get_chunks_by_ids(section_ids)}
-    ordered = [rows_by_id[cid] for cid in section_ids if cid in rows_by_id]
-    if len(ordered) != section_count:
-        # A section chunk aged out (expiry) or was otherwise removed since the
-        # manifest was written -- the cached copy is incomplete. Report a
-        # miss rather than silently returning a truncated protocol.
+    ordered = _load_complete_sections(skill_id, content_hash, section_count, resolved_store)
+    if ordered is None:
+        # Report a miss rather than silently returning a truncated protocol.
         return None
 
     return "\n\n".join(chunk.content for chunk in ordered)

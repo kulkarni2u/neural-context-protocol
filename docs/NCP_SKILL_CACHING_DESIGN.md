@@ -622,15 +622,41 @@ writing tests, not anticipated in the original design pass:
    a docstring fix — a v1 built on the original claim would have silently
    never surfaced cached review-skill content in production.
 
-### 6.4 What shipped vs. what's still open
+### 6.4 `ensure_cached()`: the orchestrator-side convenience wrapper
 
-Shipped: `cache_skill()`, `fetch_skill()`, `recall_skills()` in
-`ncp/skill_cache.py`; the `skill_ref` `ChunkSource` value (`ncp/types.py`);
-the `[skill_cache]` config block (`ncp/config.py`); `skill_ref` added to the
-`ncp_write_memory`/`ncp_fetch` MCP schema enums and the `_trust_from_args`
-default-trust table (`ncp/mcp/server.py`) for cross-surface consistency,
-though the MCP path itself wasn't the motivating use case; tests in
-`tests/test_skill_cache.py`.
+The concrete deployment shape this was built for: one main/orchestrator
+session classifies a task and dynamically builds a DAG (e.g. `ncp init`-style
+harness driven by a slash-command entry point that reads a ticket, picks a
+complexity tier, loads the matching reference skills, then spawns
+implementation/review subagents per node — possibly across different
+providers or processes per node). In that shape, the orchestrator is the
+only place that ever needs to *write* the cache; every subagent only ever
+*reads* it, by a `content_hash` the orchestrator pins and threads through
+the DAG's task payload — not by re-reading and re-hashing the skill file
+itself, which would let two nodes race to different content if the file
+changed mid-run.
+
+`ensure_cached(content, skill_id=...)` collapses the "check completeness,
+write only on a miss" dance into one call for that orchestrator-side site:
+it does the same manifest + section-completeness check `fetch_skill()`
+already does (one indexed lookup, not a full `cache_skill()` write) and only
+falls through to `cache_skill()` when the check comes back incomplete —
+first-ever call for this `skill_id`, or the content changed since the last
+cache. It returns `content_hash` for the caller to put in the DAG payload;
+every subagent then calls `fetch_skill(skill_id, content_hash=...)` with
+that exact value, so a Claude-backed implementer and a different-provider
+reviewer on the same DAG run are guaranteed to see byte-identical text, not
+independently-loaded copies that could subtly diverge.
+
+### 6.5 What shipped vs. what's still open
+
+Shipped: `cache_skill()`, `fetch_skill()`, `recall_skills()`,
+`ensure_cached()` in `ncp/skill_cache.py`; the `skill_ref` `ChunkSource`
+value (`ncp/types.py`); the `[skill_cache]` config block (`ncp/config.py`);
+`skill_ref` added to the `ncp_write_memory`/`ncp_fetch` MCP schema enums and
+the `_trust_from_args` default-trust table (`ncp/mcp/server.py`) for
+cross-surface consistency, though the MCP path itself wasn't the motivating
+use case; tests in `tests/test_skill_cache.py`.
 
 Not addressed by v1, per §5's open questions: heading-aware sectioning (v2,
 §1.2), the `scope="global"` blast-radius question (§5.1 — still open;
