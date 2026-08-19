@@ -28,6 +28,35 @@ def test_calculate_cost_supports_pricing_override() -> None:
     assert breakdown.total_cost_usd == pytest.approx(0.8)
 
 
+def test_calculate_cost_prices_cache_write_tokens() -> None:
+    breakdown = calculate_cost(
+        model="claude-sonnet-4-20250514",
+        input_tokens=1_000_000,
+        output_tokens=0,
+        cache_write_tokens=1_000_000,
+    )
+
+    # 1.25x the model's base input price ($3.00) for the default 5-minute
+    # ephemeral cache TTL -- see the pricing-table comment in ncp/config.py.
+    assert breakdown.cache_write_cost_usd == pytest.approx(3.75)
+    assert breakdown.total_cost_usd == pytest.approx(3.00 + 3.75)
+
+
+def test_calculate_cost_defaults_missing_cache_write_pricing_to_zero() -> None:
+    # A pricing entry with no ``cache_write`` key (e.g. a provider with no
+    # cache-write premium, like the real gpt-4o entries) must not KeyError,
+    # and must price cache_write_tokens as 0 rather than fail.
+    breakdown = calculate_cost(
+        model="gpt-4o-mini",
+        input_tokens=0,
+        output_tokens=0,
+        cache_write_tokens=500_000,
+    )
+
+    assert breakdown.cache_write_cost_usd == pytest.approx(0.0)
+    assert breakdown.total_cost_usd == pytest.approx(0.0)
+
+
 def test_calculate_cost_requires_known_model() -> None:
     with pytest.raises(KeyError, match="No pricing configured"):
         calculate_cost(model="missing-model", input_tokens=1, output_tokens=1)

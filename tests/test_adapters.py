@@ -28,13 +28,39 @@ NCP_CTX = "You are a helpful assistant."
 USER_TURN = "What is the capital of France?"
 
 
-def _mock_anthropic_msg(text: str) -> MagicMock:
+def _mock_anthropic_msg(text: str, *, usage: MagicMock | None = None) -> MagicMock:
     content_block = MagicMock()
     content_block.type = "text"
     content_block.text = text
     msg = MagicMock()
     msg.content = [content_block]
+    if usage is not None:
+        msg.usage = usage
     return msg
+
+
+def _mock_anthropic_usage(
+    *,
+    input_tokens: int = 10,
+    output_tokens: int = 5,
+    cache_read_input_tokens: int = 0,
+    cache_creation_input_tokens: int = 0,
+) -> MagicMock:
+    usage = MagicMock()
+    usage.input_tokens = input_tokens
+    usage.output_tokens = output_tokens
+    usage.cache_read_input_tokens = cache_read_input_tokens
+    usage.cache_creation_input_tokens = cache_creation_input_tokens
+    return usage
+
+
+# Context with a stable prefix ahead of the every-turn [NCP:BUDGET] block,
+# matching ncp/encoder.py's WI-10 block ordering (CONSCIOUS/SUBCONSCIOUS/
+# WHISPERS, then BUDGET last).
+NCP_CTX_WITH_BUDGET = (
+    "[NCP:CONSCIOUS]\nid:agent-1 role:worker ncp_v:1\n\n"
+    "[NCP:BUDGET] ctx_used:0.1 steps:1/? elapsed:2s pressure:low"
+)
 
 
 class TestAnthropicAdapter:
@@ -45,12 +71,67 @@ class TestAnthropicAdapter:
             result = adapter.call(NCP_CTX, USER_TURN)
 
         assert result == "Paris"
+        # NCP_CTX has no [NCP:BUDGET] marker, so this hits the fallback
+        # path: the whole string as one cached block (see
+        # AnthropicAdapter._split_stable_prefix).
         mock_create.assert_called_once_with(
             model="claude-sonnet-4-20250514",
             max_tokens=4096,
-            system=NCP_CTX,
+            system=[{"type": "text", "text": NCP_CTX, "cache_control": {"type": "ephemeral"}}],
             messages=[{"role": "user", "content": USER_TURN}],
         )
+
+    def test_call_splits_stable_prefix_from_budget_block(self) -> None:
+        adapter = AnthropicAdapter(api_key="test-key", model="claude-sonnet-4-20250514")
+        with patch.object(adapter._client.messages, "create") as mock_create:
+            mock_create.return_value = _mock_anthropic_msg("Paris")
+            adapter.call(NCP_CTX_WITH_BUDGET, USER_TURN)
+
+        kwargs = mock_create.call_args.kwargs
+        system_blocks = kwargs["system"]
+        assert isinstance(system_blocks, list)
+        assert len(system_blocks) == 2
+
+        stable_block, budget_block = system_blocks
+        idx = NCP_CTX_WITH_BUDGET.find("[NCP:BUDGET]")
+        assert stable_block == {
+            "type": "text",
+            "text": NCP_CTX_WITH_BUDGET[:idx],
+            "cache_control": {"type": "ephemeral"},
+        }
+        # The volatile budget block must NOT carry cache_control -- caching
+        # it would defeat the point, since it changes every turn.
+        assert budget_block == {"type": "text", "text": NCP_CTX_WITH_BUDGET[idx:]}
+        assert "cache_control" not in budget_block
+
+    def test_call_disables_prompt_caching_when_configured_off(self) -> None:
+        adapter = AnthropicAdapter(
+            api_key="test-key", model="claude-sonnet-4-20250514", enable_prompt_caching=False
+        )
+        with patch.object(adapter._client.messages, "create") as mock_create:
+            mock_create.return_value = _mock_anthropic_msg("Paris")
+            adapter.call(NCP_CTX_WITH_BUDGET, USER_TURN)
+
+        kwargs = mock_create.call_args.kwargs
+        assert kwargs["system"] == NCP_CTX_WITH_BUDGET
+
+    def test_call_extracts_cache_write_and_read_usage(self) -> None:
+        adapter = AnthropicAdapter(api_key="test-key", model="claude-sonnet-4-20250514")
+        usage = _mock_anthropic_usage(
+            input_tokens=100,
+            output_tokens=20,
+            cache_read_input_tokens=50,
+            cache_creation_input_tokens=1200,
+        )
+        with patch.object(adapter._client.messages, "create") as mock_create:
+            mock_create.return_value = _mock_anthropic_msg("Paris", usage=usage)
+            adapter.call(NCP_CTX_WITH_BUDGET, USER_TURN)
+
+        assert adapter.last_usage is not None
+        assert adapter.last_usage.input_tokens == 100
+        assert adapter.last_usage.output_tokens == 20
+        assert adapter.last_usage.cache_read_tokens == 50
+        assert adapter.last_usage.cache_write_tokens == 1200
 
     def test_stream(self) -> None:
         adapter = AnthropicAdapter(api_key="test-key", model="claude-sonnet-4-20250514")
@@ -80,6 +161,38 @@ class TestAnthropicAdapter:
             result = list(adapter.stream(NCP_CTX, USER_TURN))
 
         assert result == ["Hel", "lo", " Paris"]
+
+    def test_stream_splits_stable_prefix_from_budget_block(self) -> None:
+        adapter = AnthropicAdapter(api_key="test-key", model="claude-sonnet-4-20250514")
+
+        class _FakeStream:
+            def __iter__(self) -> object:
+                return iter(())
+
+            def __enter__(self) -> _FakeStream:
+                return self
+
+            def __exit__(self, *a: object) -> None:
+                pass
+
+            def get_final_message(self) -> MagicMock:
+                return _mock_anthropic_msg("")
+
+        with patch.object(adapter._client.messages, "stream") as mock_stream:
+            mock_stream.return_value = _FakeStream()
+            list(adapter.stream(NCP_CTX_WITH_BUDGET, USER_TURN))
+
+        kwargs = mock_stream.call_args.kwargs
+        system_blocks = kwargs["system"]
+        idx = NCP_CTX_WITH_BUDGET.find("[NCP:BUDGET]")
+        assert system_blocks == [
+            {
+                "type": "text",
+                "text": NCP_CTX_WITH_BUDGET[:idx],
+                "cache_control": {"type": "ephemeral"},
+            },
+            {"type": "text", "text": NCP_CTX_WITH_BUDGET[idx:]},
+        ]
 
     def test_stream_wraps_errors_raised_on_manager_entry(self) -> None:
         # anthropic's Messages.stream() only builds a deferred

@@ -208,9 +208,29 @@ DEFAULT_CONFIG = {
         "promote_trust": 0.80,
     },
     "providers": {
+        # ``cache_write`` (Anthropic-only): the premium for tokens written
+        # into the prompt cache on a cache-miss turn (Anthropic's
+        # ``usage.cache_creation_input_tokens``), billed once per TTL
+        # window. Anthropic's published rate for the default 5-minute
+        # ephemeral TTL is 1.25x the model's base input price -- the same
+        # relationship the existing ``cache_read`` entries already encode at
+        # 0.1x input (3.00 * 0.1 = 0.30 for sonnet, 0.80 * 0.1 = 0.08 for
+        # haiku), so cache_write here is each model's input price * 1.25.
+        # OpenAI/gpt-4o* have no cache-write premium to bill, so they omit
+        # the key; calculate_cost() treats a missing key as 0.
         "pricing": {
-            "claude-sonnet-4-20250514": {"input": 3.00, "output": 15.00, "cache_read": 0.30},
-            "claude-haiku-4-5-20251001": {"input": 0.80, "output": 4.00, "cache_read": 0.08},
+            "claude-sonnet-4-20250514": {
+                "input": 3.00,
+                "output": 15.00,
+                "cache_read": 0.30,
+                "cache_write": 3.75,
+            },
+            "claude-haiku-4-5-20251001": {
+                "input": 0.80,
+                "output": 4.00,
+                "cache_read": 0.08,
+                "cache_write": 1.00,
+            },
             "gpt-4o": {"input": 2.50, "output": 10.00, "cache_read": 1.25},
             "gpt-4o-mini": {"input": 0.15, "output": 0.60, "cache_read": 0.075},
         }

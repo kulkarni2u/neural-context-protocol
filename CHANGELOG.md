@@ -4,6 +4,30 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Anthropic prompt caching wired up** (`ncp/adapters/anthropic.py`):
+  WI-10's cache-friendly block ordering (stable `[NCP:CONSCIOUS]`/
+  `[NCP:SUBCONSCIOUS]`/`[NCP:WHISPERS]` blocks, then the every-turn-volatile
+  `[NCP:BUDGET]` block last) previously had no `cache_control` anywhere, so
+  it never actually enabled Anthropic prompt caching. `AnthropicAdapter`
+  now sends `system` as structured blocks and puts a `cache_control:
+  {"type": "ephemeral"}` breakpoint on the stable prefix (everything before
+  the literal `[NCP:BUDGET]` marker), leaving the volatile budget block
+  uncached so its every-turn change never invalidates the cached prefix.
+  New `enable_prompt_caching: bool = True` constructor param opts back out
+  to a plain-string `system` when needed.
+- **Cache-write cost tracking**: `TokenUsage.cache_write_tokens` (new field,
+  `ncp/adapters/base.py`) is now populated from Anthropic's
+  `usage.cache_creation_input_tokens` (`ncp/adapters/anthropic.py`) —
+  previously untracked, so `ncp cost` could show cache-read savings but
+  never the (smaller, once-per-TTL-window) cost of writing the cache.
+  `CostBreakdown.cache_write_cost_usd` (`ncp/costs.py`) prices it via a new
+  `cache_write` pricing key (Anthropic models only, in
+  `DEFAULT_CONFIG["providers"]["pricing"]`) and rolls into
+  `total_cost_usd`; a missing `cache_write` key (e.g. OpenAI's pricing
+  entries) defaults to 0 rather than erroring.
+
 ## [1.4.3] - 2026-08-17
 
 ### Added

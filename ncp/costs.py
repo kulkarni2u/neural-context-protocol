@@ -18,10 +18,16 @@ class CostBreakdown:
     input_cost_usd: float
     output_cost_usd: float
     cache_read_cost_usd: float
+    cache_write_cost_usd: float = 0.0
 
     @property
     def total_cost_usd(self) -> float:
-        return self.input_cost_usd + self.output_cost_usd + self.cache_read_cost_usd
+        return (
+            self.input_cost_usd
+            + self.output_cost_usd
+            + self.cache_read_cost_usd
+            + self.cache_write_cost_usd
+        )
 
 
 @dataclass(slots=True)
@@ -50,6 +56,7 @@ def calculate_cost(
     input_tokens: int,
     output_tokens: int,
     cache_read_tokens: int = 0,
+    cache_write_tokens: int = 0,
     pricing: dict[str, dict[str, float]] | None = None,
 ) -> CostBreakdown:
     """Calculate token costs from the configured per-million-token pricing table."""
@@ -64,6 +71,12 @@ def calculate_cost(
         input_cost_usd=_per_million_cost(input_tokens, float(model_pricing["input"])),
         output_cost_usd=_per_million_cost(output_tokens, float(model_pricing["output"])),
         cache_read_cost_usd=_per_million_cost(cache_read_tokens, float(model_pricing["cache_read"])),
+        # Not every provider bills a separate cache-write tier (e.g. OpenAI's
+        # prompt caching has no write premium), so this key is optional in
+        # the pricing table and defaults to 0.
+        cache_write_cost_usd=_per_million_cost(
+            cache_write_tokens, float(model_pricing.get("cache_write", 0.0))
+        ),
     )
 
 
