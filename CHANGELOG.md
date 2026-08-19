@@ -27,6 +27,24 @@ All notable changes to Neural Context Protocol will be documented in this file.
   `DEFAULT_CONFIG["providers"]["pricing"]`) and rolls into
   `total_cost_usd`; a missing `cache_write` key (e.g. OpenAI's pricing
   entries) defaults to 0 rather than erroring.
+- **Skill/reference-content caching (CAP-C9 v1)** (`ncp/skill_cache.py`):
+  content-addressed caching of third-party skill/reference content for
+  library-API consumers with no host-level progressive disclosure of their
+  own (e.g. a custom subagent harness where every subagent invocation is a
+  fresh context). `cache_skill()` writes content as `src="skill_ref"`,
+  `scope="global"`, content-hash-derived chunks, so re-caching identical
+  content across subagents/processes is a free no-op via the store's
+  existing upsert path. `fetch_skill()` returns cached content verbatim in
+  section order (for workflow/protocol skills every subagent must see
+  identically); `recall_skills()` does relevance-ranked retrieval (for
+  review/checklist skills). New `skill_ref` `ChunkSource` value
+  (`ncp/types.py`) and `[skill_cache]` config block (`ncp/config.py`,
+  `default_trust`/`default_expiry_days`/`window_chars`). See
+  `docs/NCP_SKILL_CACHING_DESIGN.md` §6 for the design and two correctness
+  fixes (deterministic per-skill authorship to avoid a write-immutability
+  rejection; `recall_skills()` as an explicit call rather than automatic
+  inclusion, since cached skill content's `zone="proven"` is outside the
+  assembler's `zone="working"` per-turn retrieval).
 
 ## [1.4.3] - 2026-08-17
 

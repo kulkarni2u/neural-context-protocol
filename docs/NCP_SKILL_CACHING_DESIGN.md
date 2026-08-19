@@ -1,7 +1,20 @@
 # NCP Skill & Reference-Content Caching (CAP-C9)
 
-> **Status:** Design proposal — not implemented. Written against `main` /
+> **Status:** v1 implemented in `ncp/skill_cache.py` (this branch), scoped to
+> the library-API case that motivated it: a custom subagent harness driving
+> NCP via `ncp.api`/`ncp/stores`, with no host-level progressive disclosure
+> of its own (unlike Claude Code/Cursor/Codex, which already load skill
+> bodies once per session for free — see §6). Written against `main` /
 > `claude/ncp-token-efficiency-cache-etl57p`.
+>
+> **Decision.** For a host with its own session-scoped skill loading, this
+> is not worth building — the redundancy it would remove doesn't exist
+> there, and Anthropic prompt caching (landed alongside this on the same
+> branch) already captures the one real saving in that case for free. For a
+> library-mode harness where every subagent invocation is a fresh context
+> and nothing else de-duplicates repeated skill loads across them, it is
+> worth it — see §6 for the reasoning and the two design corrections that
+> came out of actually building it against the real store code.
 > **Relationship to the roadmap.** This extends Pillar C (Context) of the
 > [north-star roadmap](./NCP_NORTH_STAR_CAPABILITY_ROADMAP.md). `CAP-C7`
 > (deterministic edge inference) and `CAP-C8` (procedural self-refinement)
@@ -523,3 +536,105 @@ it only reuses already-shipped mechanisms.
    starting guess, not a measured value. Should it be configurable per-skill
    (e.g. read from a convention like a `cache_ttl_days` frontmatter field,
    if one is later specified) rather than one global default?
+
+---
+
+## 6. Implementation notes (v1, `ncp/skill_cache.py`)
+
+### 6.1 Why library mode changes the "worth it" answer
+
+The original framing of this doc treated skill-content redundancy as a
+narrow edge case relative to what a host harness (Claude Code, Cursor, Codex
+CLI) already does for free: those hosts load a skill's body once per session
+on invocation (progressive disclosure baked into the harness), so the
+repeated-read waste this doc set out to fix mostly doesn't exist for them —
+and the one real gap that *did* exist for them (an unchanged skill body
+sitting in the system prompt getting re-billed every turn) is now closed by
+the Anthropic prompt-caching work landed alongside this on the same branch
+(`ncp/adapters/anthropic.py`), for free, without NCP needing to know
+anything about skills specifically.
+
+A custom subagent harness driving NCP through `ncp.api`/`ncp/stores`
+directly has neither of those. There is no host-level session that persists
+skill loading across subagent invocations — each subagent is plausibly a
+fresh process/context — and if that harness's own provider calls don't route
+through `ncp/adapters/anthropic.py`, the prompt-caching work doesn't apply
+either. For a workflow where many subagents each independently load the same
+workflow/review skills specifically *to stay consistent with each other*,
+that redundancy is the dominant pattern, not the edge case, and NCP's memory
+bus is a natural place to own the fix: this is exactly the "3+ agents, real
+shared state to preserve" line from the README's own criterion for when NCP
+is the right tool.
+
+### 6.2 A design fork the original proposal didn't have: full vs. ranked retrieval
+
+Skill content splits into two shapes with different retrieval needs, and
+conflating them would have undermined the stated goal (avoiding drift):
+
+- **Workflow/protocol skills** define a procedure every subagent must follow
+  *identically*. Relevance-ranked, top-k, partial retrieval is actively
+  wrong here: two subagents could retrieve different slices of the same
+  protocol and disagree about it — a drift source in its own right, not a
+  mitigation of one. `fetch_skill()` returns the full cached content
+  verbatim, in section order, bypassing scored retrieval entirely.
+- **Review/checklist skills** are fine, even better, with relevance-ranked
+  partial retrieval — a subagent reviewing one file only needs the rule that
+  applies to it. `recall_skills()` covers this case.
+
+### 6.3 Two corrections that only surfaced from building it against the real store
+
+Both were caught by tracing the actual write/query code paths before
+writing tests, not anticipated in the original design pass:
+
+1. **`written_by` must be deterministic per `skill_id`, not per caller.**
+   `BaseStore.write()`'s `_assert_src_immutable` (a deliberate security fix —
+   see its docstring in `ncp/stores/sqlite.py`) rejects re-using an existing
+   `chunk_id` with a different `written_by`, to stop one caller from
+   silently overwriting another's content in place. Since `cache_skill()`
+   gives identical content the same content-derived `chunk_id` regardless of
+   which subagent calls it — the entire point, for cross-agent reuse — a
+   naive API that let each caller pass its own agent identity as
+   `written_by` would make the *second* subagent's cache attempt raise
+   instead of reusing the cache. Fixed by not exposing `written_by` as a
+   parameter at all: every write for a given `skill_id` uses a synthetic,
+   caller-independent author, `ncp:skill_cache:{skill_id}` — the same
+   convention `ncp/refine.py` already uses (`ncp:refine`,
+   `ncp:refine:rollback`) for machine-authored bus content that doesn't
+   belong to any one agent.
+2. **`zone="proven"` (needed for persistence) is invisible to ordinary
+   retrieval (needed for automatic inclusion) — you cannot have both for
+   free.** §1.3 proposed `zone="proven"` so cached skill content survives
+   working-set GC, and separately assumed review-skill chunks would be
+   "already surfaced by normal `ncp.get_context()` retrieval" purely from
+   `scope="global"`. Both halves are individually correct but don't compose:
+   the assembler's per-turn retrieval hardcodes `zone="working"`
+   (`ncp/assembler.py`), and so does `ncp_fetch`'s handler
+   (`ncp/mcp/server.py`) — neither ever queries `zone="proven"`, MCP or
+   library mode alike. A chunk written to `zone="working"` would be visible
+   to ordinary retrieval automatically but re-subject to the working-set
+   eviction `zone="proven"` exists to avoid — persistence and
+   automatic-every-turn-inclusion are in tension for this content, not
+   simultaneously free. Resolved by keeping `zone="proven"` (the
+   persistence guarantee is the actual value here) and adding
+   `recall_skills()` as one explicit extra call the harness makes alongside
+   its normal `get_context()` call, rather than claiming it happens for
+   free. This is a real, load-bearing correction to §1.5's API surface, not
+   a docstring fix — a v1 built on the original claim would have silently
+   never surfaced cached review-skill content in production.
+
+### 6.4 What shipped vs. what's still open
+
+Shipped: `cache_skill()`, `fetch_skill()`, `recall_skills()` in
+`ncp/skill_cache.py`; the `skill_ref` `ChunkSource` value (`ncp/types.py`);
+the `[skill_cache]` config block (`ncp/config.py`); `skill_ref` added to the
+`ncp_write_memory`/`ncp_fetch` MCP schema enums and the `_trust_from_args`
+default-trust table (`ncp/mcp/server.py`) for cross-surface consistency,
+though the MCP path itself wasn't the motivating use case; tests in
+`tests/test_skill_cache.py`.
+
+Not addressed by v1, per §5's open questions: heading-aware sectioning (v2,
+§1.2), the `scope="global"` blast-radius question (§5.1 — still open;
+reasonable for a single trusted harness's own skills, less so if this ever
+runs on a multi-tenant bus with arbitrary third-party MCP hosts), and
+`skill_id` namespacing enforcement (§5.3 — documented as the caller's
+responsibility, not validated).

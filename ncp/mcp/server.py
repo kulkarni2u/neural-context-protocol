@@ -134,7 +134,7 @@ MCP_TOOLS: list[dict[str, object]] = [
             "properties": {
                 "content": {"type": "string", "description": "Content (max 2000 chars)"},
                 "layer": {"type": "string", "enum": ["episodic", "procedural", "semantic", "social", "reasoning_trace"]},
-                "src": {"type": "string", "enum": ["user_verified", "tool_result", "agent_inferred", "synthesis", "subcon_retrieved"]},
+                "src": {"type": "string", "enum": ["user_verified", "tool_result", "agent_inferred", "synthesis", "subcon_retrieved", "skill_ref"]},
                 "written_by": {"type": "string", "description": "Agent writing this chunk"},
                 "chunk_id": {"type": "string", "description": "Optional chunk ID (auto-generated if omitted)"},
                 "pipeline_id": {"type": "string"},
@@ -423,7 +423,7 @@ MCP_TOOLS: list[dict[str, object]] = [
                         "properties": {
                             "content": {"type": "string", "description": "Content (max 2000 chars)"},
                             "layer": {"type": "string", "enum": ["episodic", "procedural", "semantic", "social", "reasoning_trace"]},
-                            "src": {"type": "string", "enum": ["user_verified", "tool_result", "agent_inferred", "synthesis", "subcon_retrieved"]},
+                            "src": {"type": "string", "enum": ["user_verified", "tool_result", "agent_inferred", "synthesis", "subcon_retrieved", "skill_ref"]},
                             "chunk_id": {"type": "string", "description": "Optional chunk ID (auto-generated if omitted)"},
                             "written_by": {"type": "string", "description": "Agent writing this chunk (defaults to agent_id)"},
                             "chunk_type": {
@@ -1821,6 +1821,7 @@ def _trust_from_args(args: dict[str, object]) -> float:
         "synthesis": 0.70,
         "agent_inferred": 0.60,
         "subcon_retrieved": 0.55,
+        "skill_ref": 0.60,
     }.get(str(args.get("src", "")), 0.70)
 
 
