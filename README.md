@@ -8,6 +8,8 @@
 **Bounded, trust-weighted memory for multi-agent systems.**
 MCP-native. Agents share context without replaying full transcripts. Around 13x fewer tokens than raw replay — see [Benchmarks](#benchmarks).
 
+![One bus, every agent's context — how NCP moves bounded, trust-weighted memory across a multi-agent pipeline](docs/assets/ncp-bus.gif)
+
 -----
 
 ## The problem
