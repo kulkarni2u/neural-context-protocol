@@ -33,15 +33,14 @@ recent_slot_budget = 2
 # "off" (no governance), "warn" (surface status, never refuse), or "block"
 # (ncp_get_context returns {"budget_exceeded": true, ...} once exceeded).
 # budget_enforcement = "warn"
-# CAP-C6: adaptive per-turn context token budget. Default false (opt-in) --
-# disabled reproduces legacy behavior exactly (static context_token_budget,
-# no "budget_tokens" response field). When enabled, ncp_get_context scales
-# the effective token budget between the floor/ceiling below based on turn
+# CAP-C6: adaptive per-turn context token budget. Default true -- ncp_get_context
+# scales the effective token budget between the floor/ceiling below based on turn
 # difficulty (query length, drift, pressure, slot cadence) and CAP-E2 $
 # budget pressure -- see ncp/adaptive_budget.py for the formula. An explicit
 # caller max_tokens is always honored as-is; adaptation only fills in when
-# max_tokens is omitted.
-# adaptive_budget_enabled = false
+# max_tokens is omitted. Set to false to reproduce legacy behavior exactly
+# (static context_token_budget, no "budget_tokens" response field).
+adaptive_budget_enabled = true
 # adaptive_budget_floor_tokens = 300
 # adaptive_budget_ceiling_tokens = 2000
 
