@@ -318,6 +318,33 @@ def test_ncp_instruction_guidance_does_not_make_intent_the_retrieval_query() -> 
     assert misleading_guidance == {}
 
 
+def test_skill_instructions_document_structured_whisper_payloads() -> None:
+    instruction_paths = (
+        REPO_ROOT / "agent-plugin" / "skills" / "ncp-core" / "SKILL.md",
+        REPO_ROOT / "claude-plugin" / "skills" / "ncp" / "SKILL.md",
+    )
+    required_substrings = (
+        "structured-v1",
+        "ncp_emit_whisper",
+        '"slice"',
+        '"files"',
+        '"ask"',
+        '"issue"',
+        '"alternatives"',
+        "disputed chunk",
+        '"alert_code"',
+        '"description"',
+        '"anchor_intent"',
+        '"detected_drift"',
+        '"ref": "chunk_id"',
+    )
+
+    for path in instruction_paths:
+        text = path.read_text()
+        missing = [substring for substring in required_substrings if substring not in text]
+        assert missing == [], f"{path}: missing structured whisper guidance {missing}"
+
+
 def test_opencode_plugin_injects_ncp_context() -> None:
     if shutil.which("node") is None:
         return
