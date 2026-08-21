@@ -17,6 +17,10 @@ ChunkSource = Literal[
     "agent_inferred",
     "synthesis",
     "subcon_retrieved",
+    # CAP-C9: static third-party skill/reference content a host cached onto
+    # the bus (not generated, inferred, or executed by any agent). See
+    # docs/NCP_SKILL_CACHING_DESIGN.md.
+    "skill_ref",
 ]
 ChunkType = Literal["prose", "json", "code", "table", "auto"]
 ChunkScope = Literal["pipeline", "global"]

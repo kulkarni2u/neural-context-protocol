@@ -156,6 +156,23 @@ DEFAULT_CONFIG = {
         "allow_unverified": False,
         "similarity_threshold": 0.95,
     },
+    "skill_cache": {
+        # CAP-C9 v1 (docs/NCP_SKILL_CACHING_DESIGN.md): content-addressed
+        # caching of third-party skill/reference content, for library-API
+        # consumers with no host-level progressive disclosure of their own
+        # (e.g. a custom subagent harness). base_trust seeded for
+        # src="skill_ref" writes that don't pass an explicit base_trust --
+        # same posture as agent_inferred (cross-boundary, unverified
+        # content) but a separate, independently tunable key.
+        "default_trust": 0.60,
+        # Safety-net expiry (days) for the zone="proven" chunks cache_skill()
+        # writes, independent of the caller's own content-hash staleness
+        # check.
+        "default_expiry_days": 30,
+        # Character budget per window before ncp.skill_cache splits skill
+        # content -- headroom under SubconsciousChunk's 2000-char cap.
+        "window_chars": 1800,
+    },
     "tools": {
         "profile": "full",
     },
@@ -208,9 +225,29 @@ DEFAULT_CONFIG = {
         "promote_trust": 0.80,
     },
     "providers": {
+        # ``cache_write`` (Anthropic-only): the premium for tokens written
+        # into the prompt cache on a cache-miss turn (Anthropic's
+        # ``usage.cache_creation_input_tokens``), billed once per TTL
+        # window. Anthropic's published rate for the default 5-minute
+        # ephemeral TTL is 1.25x the model's base input price -- the same
+        # relationship the existing ``cache_read`` entries already encode at
+        # 0.1x input (3.00 * 0.1 = 0.30 for sonnet, 0.80 * 0.1 = 0.08 for
+        # haiku), so cache_write here is each model's input price * 1.25.
+        # OpenAI/gpt-4o* have no cache-write premium to bill, so they omit
+        # the key; calculate_cost() treats a missing key as 0.
         "pricing": {
-            "claude-sonnet-4-20250514": {"input": 3.00, "output": 15.00, "cache_read": 0.30},
-            "claude-haiku-4-5-20251001": {"input": 0.80, "output": 4.00, "cache_read": 0.08},
+            "claude-sonnet-4-20250514": {
+                "input": 3.00,
+                "output": 15.00,
+                "cache_read": 0.30,
+                "cache_write": 3.75,
+            },
+            "claude-haiku-4-5-20251001": {
+                "input": 0.80,
+                "output": 4.00,
+                "cache_read": 0.08,
+                "cache_write": 1.00,
+            },
             "gpt-4o": {"input": 2.50, "output": 10.00, "cache_read": 1.25},
             "gpt-4o-mini": {"input": 0.15, "output": 0.60, "cache_read": 0.075},
         }
@@ -546,6 +583,18 @@ class NCPConfig:
     @property
     def memoization_similarity_threshold(self) -> float:
         return float(self.values.get("memoization", {}).get("similarity_threshold", 0.95))
+
+    @property
+    def skill_cache_default_trust(self) -> float:
+        return float(self.values.get("skill_cache", {}).get("default_trust", 0.60))
+
+    @property
+    def skill_cache_default_expiry_days(self) -> int:
+        return int(self.values.get("skill_cache", {}).get("default_expiry_days", 30))
+
+    @property
+    def skill_cache_window_chars(self) -> int:
+        return int(self.values.get("skill_cache", {}).get("window_chars", 1800))
 
     @property
     def tool_profile(self) -> str:
