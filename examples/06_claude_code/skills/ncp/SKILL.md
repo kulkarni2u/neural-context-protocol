@@ -25,6 +25,15 @@ transcripts or stuffing prompts.
 - Send a bounded, directed signal with `ncp_emit_whisper` (handoff, dissent,
   drift report). Do not forward full history.
 - Acknowledge consumed whispers via `ncp_post_turn` (`pending_whisper_ids`).
+- Prefer a **structured-v1** object payload over a free-text string —
+  legacy string payloads remain compatible, but typed objects give the
+  receiving agent fields instead of a string to parse. NCP validates and
+  delivers the payload; it stays a signal bus, not an orchestrator.
+  - `share` / `request` — `{"slice": "...", "files": ["..."], "ask": "..."}`
+  - `dissent` — `{"issue": "...", "alternatives": ["..."]}`; pass the
+    disputed chunk separately as the top-level `"ref": "chunk_id"` argument.
+  - `alert` — `{"alert_code": "...", "description": "..."}`
+  - `world_check` — `{"anchor_intent": "...", "detected_drift": 0.42}`
 
 ## Subagents — required
 

@@ -322,6 +322,15 @@ def test_skill_instructions_document_structured_whisper_payloads() -> None:
     instruction_paths = (
         REPO_ROOT / "agent-plugin" / "skills" / "ncp-core" / "SKILL.md",
         REPO_ROOT / "claude-plugin" / "skills" / "ncp" / "SKILL.md",
+        REPO_ROOT / "examples" / "06_claude_code" / "skills" / "ncp" / "SKILL.md",
+        REPO_ROOT
+        / "ncp"
+        / "templates"
+        / "provider_hooks"
+        / "claude"
+        / "skills"
+        / "ncp"
+        / "SKILL.md",
     )
     required_substrings = (
         "structured-v1",
