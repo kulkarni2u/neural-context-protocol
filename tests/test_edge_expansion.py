@@ -107,6 +107,37 @@ def test_edge_expansion_disabled_by_config(tmp_path: Path) -> None:
     assert "cause_chunk" not in ids  # expansion off → cause not pulled in
 
 
+def test_edge_expansion_rejects_cross_pipeline_legacy_scalar(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "store.db")
+    # Preserve forward-reference compatibility: the scalar is written while
+    # its target is absent, then that id appears in a different pipeline.
+    store.write(
+        SubconsciousChunk(
+            chunk_id="fix_chunk",
+            layer="episodic",
+            content="apply_guard fix_npe null guard applied",
+            src="agent_inferred",
+            caused_by="future_victim",
+            pipeline_id="pipe_1",
+        )
+    )
+    store.write(
+        SubconsciousChunk(
+            chunk_id="future_victim",
+            layer="episodic",
+            content="private pipeline content unrelated to the query",
+            src="tool_result",
+            pipeline_id="pipe_2",
+        )
+    )
+
+    assembler = Assembler(store=store)
+    result = assembler.assemble(conscious=_conscious(), budget=_budget())
+
+    assert "fix_chunk" in {chunk.chunk_id for chunk in result.chunks}
+    assert "future_victim" not in {chunk.chunk_id for chunk in result.chunks}
+
+
 def test_supersession_suppresses_stale_chunk(tmp_path: Path) -> None:
     store = SQLiteStore(tmp_path / "store.db")
     # Stale chunk that matches the query lexically.

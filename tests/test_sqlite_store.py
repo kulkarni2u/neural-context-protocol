@@ -576,6 +576,30 @@ def test_sqlite_store_written_by_is_immutable_for_existing_chunk_id(tmp_path: Pa
     assert updated.written_by == "victim_agent"
 
 
+def test_sqlite_store_pipeline_id_is_immutable_for_existing_chunk_id(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "store.db")
+    chunk = SubconsciousChunk(
+        chunk_id="sub_pipeline_lock",
+        pipeline_id="pipeline_victim",
+        layer="semantic",
+        content="victim pipeline content",
+        src="tool_result",
+        written_by="shared_agent_name",
+    )
+    store.write(chunk)
+
+    with pytest.raises(ValueError, match="pipeline_id is immutable"):
+        store.write(
+            chunk.model_copy(
+                update={"pipeline_id": "pipeline_attacker", "content": "moved content"}
+            )
+        )
+
+    assert store.get_working_zone(pipeline_id="pipeline_attacker") == []
+    persisted = store.get_working_zone(pipeline_id="pipeline_victim")
+    assert [item.chunk_id for item in persisted] == ["sub_pipeline_lock"]
+
+
 def test_sqlite_store_supersede_rejects_cross_pipeline_target(tmp_path: Path) -> None:
     """Security fix (docs/NCP_SILENT_DISCONNECT_AUDIT.md finding 9): before
     this fix, supersede() had no ownership check at all, so any caller could

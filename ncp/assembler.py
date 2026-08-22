@@ -665,6 +665,7 @@ class Assembler:
             if not frontier_ids:
                 break
             frontier_relevance = {chunk.chunk_id: float(chunk.relevance) for chunk in frontier}
+            frontier_pipeline = {chunk.chunk_id: chunk.pipeline_id for chunk in frontier}
             scalar_targets: dict[str, str] = {}
             if caused_by_active:
                 for chunk in frontier:
@@ -673,6 +674,7 @@ class Assembler:
 
             edge_rows = self.store.get_chunk_edges(frontier_ids, edge_types=types, direction="out")
             hop_candidates: dict[str, float] = {}
+            hop_candidate_pipeline: dict[str, str | None] = {}
             covered_scalar_pairs: set[tuple[str, str]] = set()
             for edge in edge_rows:
                 src, dst = edge.src_chunk_id, edge.dst_chunk_id
@@ -691,6 +693,7 @@ class Assembler:
                 inherited = referrer_relevance * self._edge_expansion_decay * weight
                 if inherited > hop_candidates.get(dst, -1.0):
                     hop_candidates[dst] = inherited
+                    hop_candidate_pipeline[dst] = frontier_pipeline.get(src)
 
             if caused_by_active:
                 # Legacy fallback: chunks whose caused_by predates the edge
@@ -704,6 +707,7 @@ class Assembler:
                     inherited = referrer_relevance * self._edge_expansion_decay
                     if inherited > hop_candidates.get(dst, -1.0):
                         hop_candidates[dst] = inherited
+                        hop_candidate_pipeline[dst] = frontier_pipeline.get(src)
 
             if not hop_candidates:
                 break
@@ -713,6 +717,8 @@ class Assembler:
             next_frontier: list[SubconsciousChunk] = []
             for neighbor in fetched:
                 if neighbor.chunk_id in visited_ids:
+                    continue
+                if neighbor.pipeline_id != hop_candidate_pipeline.get(neighbor.chunk_id):
                     continue
                 visited_ids.add(neighbor.chunk_id)
                 updated = neighbor.model_copy(update={"relevance": hop_candidates[neighbor.chunk_id]})

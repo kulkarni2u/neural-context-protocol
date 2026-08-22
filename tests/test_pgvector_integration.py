@@ -3,6 +3,8 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 from uuid import uuid4
 
 import pytest
@@ -147,6 +149,69 @@ def test_pgvector_live_src_immutability_and_recent_refs() -> None:
 
     assert resolved is not None
     assert resolved.result_full == "longer result body"
+
+
+def test_pgvector_live_concurrent_chunk_ownership_is_atomic() -> None:
+    store_a = _pgvector_store()
+    store_b = PgvectorStore(
+        store_a.dsn,
+        schema=store_a.schema,
+        table_prefix=store_a.table_prefix,
+    )
+    barrier = Barrier(2)
+
+    for store in (store_a, store_b):
+        original = store._assert_src_immutable
+
+        def synchronized_check(connection, chunk, *, _original=original):
+            _original(connection, chunk)
+            barrier.wait(timeout=5)
+
+        store._assert_src_immutable = synchronized_check  # type: ignore[method-assign]
+
+    chunks = [
+        SubconsciousChunk(
+            chunk_id="sub_atomic_owner",
+            layer="semantic",
+            content="owner A content",
+            src="tool_result",
+            pipeline_id="pipeline_A",
+            written_by="owner_A",
+        ),
+        SubconsciousChunk(
+            chunk_id="sub_atomic_owner",
+            layer="semantic",
+            content="owner B content",
+            src="tool_result",
+            pipeline_id="pipeline_B",
+            written_by="owner_B",
+        ),
+    ]
+
+    def attempt(pair: tuple[PgvectorStore, SubconsciousChunk]) -> object:
+        candidate_store, chunk = pair
+        try:
+            return candidate_store.write(chunk, allow_duplicate=True)
+        except Exception as exc:  # returned for deterministic aggregate assertions
+            return exc
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(attempt, zip((store_a, store_b), chunks, strict=True)))
+
+    assert outcomes.count(True) == 1
+    errors = [outcome for outcome in outcomes if isinstance(outcome, ValueError)]
+    assert len(errors) == 1
+    assert "ownership changed concurrently" in str(errors[0])
+
+    persisted = [
+        *store_a.get_working_zone(pipeline_id="pipeline_A"),
+        *store_a.get_working_zone(pipeline_id="pipeline_B"),
+    ]
+    assert len(persisted) == 1
+    assert (persisted[0].pipeline_id, persisted[0].written_by, persisted[0].content) in {
+        ("pipeline_A", "owner_A", "owner A content"),
+        ("pipeline_B", "owner_B", "owner B content"),
+    }
 
 
 def test_pgvector_live_conscious_cost_and_goal_versions() -> None:

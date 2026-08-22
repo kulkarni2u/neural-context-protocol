@@ -25,7 +25,7 @@ import pytest
 pytest.importorskip("psycopg", reason="pgvector extra not installed")
 
 from ncp.stores.pgvector import PgvectorStore  # noqa: E402
-from ncp.types import SubconsciousChunk  # noqa: E402
+from ncp.types import ChunkEdge, SubconsciousChunk  # noqa: E402
 
 
 def _make_mock_conn(*, fetchall_return: list | None = None, rowcount: int | None = None) -> MagicMock:
@@ -66,12 +66,66 @@ def test_pgvector_write_insert_includes_bitemporal_columns() -> None:
     assert "valid_from" in insert_sql
     assert "valid_to" in insert_sql
     assert "superseded_by" in insert_sql
+    assert "src IS NOT DISTINCT FROM EXCLUDED.src" in insert_sql
+    assert "written_by IS NOT DISTINCT FROM EXCLUDED.written_by" in insert_sql
+    assert "pipeline_id IS NOT DISTINCT FROM EXCLUDED.pipeline_id" in insert_sql
     # Last 3 params are valid_from, valid_to, superseded_by (appended after embedding).
     assert insert_params[-3:] == (100.0, 200.0, None)
 
 
+def test_pgvector_write_rejects_atomic_ownership_conflict() -> None:
+    conn = _make_mock_conn(rowcount=0)
+    store = PgvectorStore("postgresql://localhost/test", connect_factory=lambda dsn: conn)
+    store._soft_gc = MagicMock()  # type: ignore[method-assign]
+    store._assert_src_immutable = MagicMock()  # type: ignore[method-assign]
+    store._is_duplicate = MagicMock(return_value=False)  # type: ignore[method-assign]
+
+    with pytest.raises(ValueError, match="ownership changed concurrently"):
+        store.write(
+            SubconsciousChunk(
+                chunk_id="atomic_conflict",
+                pipeline_id="pipeline_attacker",
+                layer="semantic",
+                content="must not overwrite",
+                src="tool_result",
+                written_by="attacker",
+            )
+        )
+
+
+def test_pgvector_write_rejects_cross_pipeline_scalar_edge() -> None:
+    conn = _make_mock_conn(
+        fetchall_return=[{"chunk_id": "victim", "pipeline_id": "pipeline_A"}]
+    )
+    store = PgvectorStore("postgresql://localhost/test", connect_factory=lambda dsn: conn)
+    store._soft_gc = MagicMock()  # type: ignore[method-assign]
+    store._assert_src_immutable = MagicMock()  # type: ignore[method-assign]
+    store._is_duplicate = MagicMock(return_value=False)  # type: ignore[method-assign]
+
+    with pytest.raises(ValueError, match="edge target pipeline mismatch"):
+        store.write(
+            SubconsciousChunk(
+                chunk_id="attacker",
+                pipeline_id="pipeline_B",
+                layer="semantic",
+                content="must not link across pipelines",
+                src="tool_result",
+                caused_by="victim",
+            )
+        )
+
+    assert not any(
+        "INSERT INTO" in str(call.args[0]) and "chunks (" in str(call.args[0])
+        for call in conn.cursor.return_value.execute.call_args_list
+    )
+
+
 def test_pgvector_supersede_updates_superseded_by_and_valid_to() -> None:
     conn = _make_mock_conn(rowcount=1)
+    conn.cursor.return_value.fetchone.side_effect = [
+        {"pipeline_id": "pipe_same"},
+        {"pipeline_id": "pipe_same"},
+    ]
     store = PgvectorStore("postgresql://localhost/test", connect_factory=lambda dsn: conn)
 
     assert store.supersede("old_chunk", "new_chunk", valid_to=555.0) is True
@@ -88,6 +142,10 @@ def test_pgvector_supersede_updates_superseded_by_and_valid_to() -> None:
 
 def test_pgvector_supersede_resolves_valid_to_to_now_when_omitted() -> None:
     conn = _make_mock_conn(rowcount=1)
+    conn.cursor.return_value.fetchone.side_effect = [
+        {"pipeline_id": "pipe_same"},
+        {"pipeline_id": "pipe_same"},
+    ]
     store = PgvectorStore("postgresql://localhost/test", connect_factory=lambda dsn: conn)
 
     before = __import__("time").time()
@@ -228,7 +286,96 @@ async def test_async_pgvector_write_insert_includes_bitemporal_columns() -> None
     assert calls, "No INSERT call found"
     insert_sql, insert_params = calls[0].args
     assert "valid_from" in insert_sql
+    assert "src IS NOT DISTINCT FROM EXCLUDED.src" in insert_sql
+    assert "written_by IS NOT DISTINCT FROM EXCLUDED.written_by" in insert_sql
+    assert "pipeline_id IS NOT DISTINCT FROM EXCLUDED.pipeline_id" in insert_sql
     assert insert_params[-3:] == (100.0, 200.0, None)
+
+
+@pytest.mark.anyio
+async def test_async_pgvector_write_rejects_atomic_ownership_conflict() -> None:
+    pytest.importorskip("psycopg_pool", reason="psycopg_pool extra not installed")
+    from ncp.stores.pgvector_async import AsyncPgvectorStore
+
+    mock_pool = _make_async_pool()
+    mock_pool._cur.rowcount = 0
+    with patch("psycopg_pool.AsyncConnectionPool", return_value=mock_pool):
+        store = AsyncPgvectorStore("postgresql://localhost/test")
+
+    store._async_soft_gc = AsyncMock()  # type: ignore[method-assign]
+    store._async_assert_src_immutable = AsyncMock()  # type: ignore[method-assign]
+    store._async_is_duplicate = AsyncMock(return_value=False)  # type: ignore[method-assign]
+
+    with pytest.raises(ValueError, match="ownership changed concurrently"):
+        await store.async_write(
+            SubconsciousChunk(
+                chunk_id="atomic_conflict",
+                pipeline_id="pipeline_attacker",
+                layer="semantic",
+                content="must not overwrite",
+                src="tool_result",
+                written_by="attacker",
+            )
+        )
+
+
+@pytest.mark.anyio
+async def test_async_pgvector_write_rejects_cross_pipeline_scalar_edge() -> None:
+    pytest.importorskip("psycopg_pool", reason="psycopg_pool extra not installed")
+    from ncp.stores.pgvector_async import AsyncPgvectorStore
+
+    mock_pool = _make_async_pool(
+        fetchall_return=[{"chunk_id": "victim", "pipeline_id": "pipeline_A"}]
+    )
+    with patch("psycopg_pool.AsyncConnectionPool", return_value=mock_pool):
+        store = AsyncPgvectorStore("postgresql://localhost/test")
+
+    store._async_soft_gc = AsyncMock()  # type: ignore[method-assign]
+    store._async_assert_src_immutable = AsyncMock()  # type: ignore[method-assign]
+    store._async_is_duplicate = AsyncMock(return_value=False)  # type: ignore[method-assign]
+
+    with pytest.raises(ValueError, match="edge target pipeline mismatch"):
+        await store.async_write(
+            SubconsciousChunk(
+                chunk_id="attacker",
+                pipeline_id="pipeline_B",
+                layer="semantic",
+                content="must not link across pipelines",
+                src="tool_result",
+                caused_by="victim",
+            )
+        )
+
+    assert not any(
+        "INSERT INTO" in str(call.args[0]) and "chunks (" in str(call.args[0])
+        for call in mock_pool._cur.execute.call_args_list
+    )
+
+
+@pytest.mark.anyio
+async def test_async_pgvector_pipeline_id_is_immutable_for_existing_chunk_id() -> None:
+    pytest.importorskip("psycopg_pool", reason="psycopg_pool extra not installed")
+    from ncp.stores.pgvector_async import AsyncPgvectorStore
+
+    mock_pool = _make_async_pool()
+    mock_pool._cur.fetchone.return_value = {
+        "src": "tool_result",
+        "written_by": "shared_agent_name",
+        "pipeline_id": "pipeline_victim",
+    }
+    with patch("psycopg_pool.AsyncConnectionPool", return_value=mock_pool):
+        store = AsyncPgvectorStore("postgresql://localhost/test")
+
+    chunk = SubconsciousChunk(
+        chunk_id="sub_pipeline_lock",
+        pipeline_id="pipeline_attacker",
+        layer="semantic",
+        content="moved content",
+        src="tool_result",
+        written_by="shared_agent_name",
+    )
+    with pytest.raises(ValueError, match="pipeline_id is immutable"):
+        await store._async_assert_src_immutable(mock_pool._conn, chunk)
 
 
 @pytest.mark.anyio
@@ -240,12 +387,62 @@ async def test_async_pgvector_supersede_updates_correct_columns() -> None:
     with patch("psycopg_pool.AsyncConnectionPool", return_value=mock_pool):
         store = AsyncPgvectorStore("postgresql://localhost/test")
 
+    mock_pool._cur.fetchone.side_effect = [
+        {"pipeline_id": "pipe_same"},
+        {"pipeline_id": "pipe_same"},
+    ]
+
     result = await store.async_supersede("old_chunk", "new_chunk", valid_to=555.0)
     assert result is True
 
     sql, params = mock_pool._cur.execute.call_args_list[-1].args
     assert "SET superseded_by = %s, valid_to = %s WHERE chunk_id = %s" in sql
     assert params == ("new_chunk", 555.0, "old_chunk")
+
+
+@pytest.mark.anyio
+async def test_async_pgvector_supersede_rejects_cross_pipeline_target() -> None:
+    pytest.importorskip("psycopg_pool", reason="psycopg_pool extra not installed")
+    from ncp.stores.pgvector_async import AsyncPgvectorStore
+
+    mock_pool = _make_async_pool()
+    mock_pool._cur.fetchone.side_effect = [
+        {"pipeline_id": "pipeline_A"},
+        {"pipeline_id": "pipeline_B"},
+    ]
+    with patch("psycopg_pool.AsyncConnectionPool", return_value=mock_pool):
+        store = AsyncPgvectorStore("postgresql://localhost/test")
+
+    assert await store.async_supersede("victim", "attacker") is False
+    assert not any(
+        "UPDATE" in str(call.args[0]) and "superseded_by" in str(call.args[0])
+        for call in mock_pool._cur.execute.call_args_list
+    )
+
+
+@pytest.mark.anyio
+async def test_async_pgvector_add_chunk_edges_rejects_cross_pipeline_dst() -> None:
+    pytest.importorskip("psycopg_pool", reason="psycopg_pool extra not installed")
+    from ncp.stores.pgvector_async import AsyncPgvectorStore
+
+    mock_pool = _make_async_pool(
+        fetchall_return=[
+            {"chunk_id": "attacker", "pipeline_id": "pipeline_B"},
+            {"chunk_id": "victim", "pipeline_id": "pipeline_A"},
+        ]
+    )
+    with patch("psycopg_pool.AsyncConnectionPool", return_value=mock_pool):
+        store = AsyncPgvectorStore("postgresql://localhost/test")
+
+    written = await store.async_add_chunk_edges(
+        [ChunkEdge(src_chunk_id="attacker", dst_chunk_id="victim", edge_type="contradicts")]
+    )
+
+    assert written == 0
+    assert not any(
+        "INSERT INTO" in str(call.args[0]) and "chunk_edges" in str(call.args[0])
+        for call in mock_pool._cur.execute.call_args_list
+    )
 
 
 @pytest.mark.anyio
@@ -258,6 +455,11 @@ async def test_async_pgvector_supersede_does_not_use_thread_shim() -> None:
     mock_pool = _make_async_pool()
     with patch("psycopg_pool.AsyncConnectionPool", return_value=mock_pool):
         store = AsyncPgvectorStore("postgresql://localhost/test")
+
+    mock_pool._cur.fetchone.side_effect = [
+        {"pipeline_id": "pipe_same"},
+        {"pipeline_id": "pipe_same"},
+    ]
 
     call_log: list[str] = []
     original = anyio.to_thread.run_sync

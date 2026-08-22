@@ -226,6 +226,18 @@ class TestWriteTimeBackfill:
         store.write(_chunk("solo"))
         assert store.get_chunk_edges(["solo"], direction="both") == []
 
+    def test_cross_pipeline_caused_by_is_rejected_without_mutation(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "test.db")
+        store.write(_chunk("victim", pipeline_id="pipeline_A"))
+
+        with pytest.raises(ValueError, match="edge target pipeline mismatch"):
+            store.write(
+                _chunk("attacker", pipeline_id="pipeline_B", caused_by="victim")
+            )
+
+        assert store.get_chunks_by_ids(["attacker"]) == []
+        assert store.get_chunk_edges(["attacker"], direction="out") == []
+
 
 # ---------------------------------------------------------------------------
 # graph_data: shape + legacy-column fallback
