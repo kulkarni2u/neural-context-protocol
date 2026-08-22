@@ -324,6 +324,8 @@ class AsyncPgvectorStore(BaseStore):
             await self._async_assert_src_immutable(conn, chunk)
             if await self._async_is_duplicate(conn, chunk):
                 return False
+            backfilled_edges = backfill_edges_for_chunk(chunk)
+            await self._async_assert_edge_targets_owned(conn, chunk, backfilled_edges)
             async with conn.cursor() as cur:
                 await cur.execute(
                     self._sql(
@@ -366,6 +368,9 @@ class AsyncPgvectorStore(BaseStore):
                             meta = EXCLUDED.meta,
                             embedding = EXCLUDED.embedding,
                             valid_from = EXCLUDED.valid_from
+                        WHERE {prefix}chunks.src IS NOT DISTINCT FROM EXCLUDED.src
+                            AND {prefix}chunks.written_by IS NOT DISTINCT FROM EXCLUDED.written_by
+                            AND {prefix}chunks.pipeline_id IS NOT DISTINCT FROM EXCLUDED.pipeline_id
                         """
                     ),
                     (
@@ -401,9 +406,17 @@ class AsyncPgvectorStore(BaseStore):
                         chunk.superseded_by,
                     ),
                 )
-            backfilled_edges = backfill_edges_for_chunk(chunk)
+                affected_rows = getattr(cur, "rowcount", None)
+            if isinstance(affected_rows, int) and affected_rows == 0:
+                raise ValueError(
+                    f"chunk ownership changed concurrently for chunk_id={chunk.chunk_id}"
+                )
             if backfilled_edges:
-                await self._async_upsert_chunk_edges_rows(conn, backfilled_edges)
+                allowed = await self._async_filter_edges_by_pipeline_ownership(
+                    conn, backfilled_edges
+                )
+                if allowed:
+                    await self._async_upsert_chunk_edges_rows(conn, allowed)
             if self.config is not None and self.config.infer_edges:
                 inferred_edges = infer_edges_for_chunk(
                     chunk,
@@ -489,13 +502,14 @@ class AsyncPgvectorStore(BaseStore):
             )
 
     async def _async_assert_src_immutable(self, conn: Any, chunk: SubconsciousChunk) -> None:
-        """Raise ValueError if src or written_by changes for an existing
+        """Raise ValueError if src, written_by, or pipeline_id changes for an existing
         chunk_id -- see the matching fix/comment in ``ncp/stores/sqlite.py``
         (docs/NCP_SILENT_DISCONNECT_AUDIT.md finding 9)."""
         async with conn.cursor() as cur:
             await cur.execute(
                 self._sql(
-                    "SELECT src, written_by FROM {schema}.{prefix}chunks WHERE chunk_id = %s"
+                    "SELECT src, written_by, pipeline_id"
+                    " FROM {schema}.{prefix}chunks WHERE chunk_id = %s"
                 ),
                 (chunk.chunk_id,),
             )
@@ -515,6 +529,12 @@ class AsyncPgvectorStore(BaseStore):
             raise ValueError(
                 f"written_by is immutable for chunk_id={chunk.chunk_id}: "
                 f"existing={existing_written_by} new={chunk.written_by}"
+            )
+        existing_pipeline_id = row["pipeline_id"]
+        if existing_pipeline_id != chunk.pipeline_id:
+            raise ValueError(
+                f"pipeline_id is immutable for chunk_id={chunk.chunk_id}: "
+                f"existing={existing_pipeline_id} new={chunk.pipeline_id}"
             )
 
     async def _async_is_duplicate(self, conn: Any, chunk: SubconsciousChunk) -> bool:
@@ -1380,11 +1400,31 @@ class AsyncPgvectorStore(BaseStore):
 
         The old row is never deleted -- only ``superseded_by`` and
         ``valid_to`` are updated in place, so a later ``as_of`` query can
-        still recover it.
+        still recover it. Both chunks must share a pipeline scope.
         """
         resolved_valid_to = time.time() if valid_to is None else valid_to
         async with self._aconnect() as conn:
             async with conn.cursor() as cur:
+                await cur.execute(
+                    self._sql(
+                        "SELECT pipeline_id FROM {schema}.{prefix}chunks WHERE chunk_id = %s"
+                    ),
+                    (old_chunk_id,),
+                )
+                old_row = await self._afetchone(cur)
+                await cur.execute(
+                    self._sql(
+                        "SELECT pipeline_id FROM {schema}.{prefix}chunks WHERE chunk_id = %s"
+                    ),
+                    (new_chunk_id,),
+                )
+                new_row = await self._afetchone(cur)
+                if (
+                    old_row is None
+                    or new_row is None
+                    or old_row["pipeline_id"] != new_row["pipeline_id"]
+                ):
+                    return False
                 await cur.execute(
                     self._sql(
                         "UPDATE {schema}.{prefix}chunks"
@@ -1426,7 +1466,60 @@ class AsyncPgvectorStore(BaseStore):
         if not edges:
             return 0
         async with self._aconnect() as conn:
-            return await self._async_upsert_chunk_edges_rows(conn, edges)
+            allowed = await self._async_filter_edges_by_pipeline_ownership(conn, edges)
+            if not allowed:
+                return 0
+            return await self._async_upsert_chunk_edges_rows(conn, allowed)
+
+    async def _async_filter_edges_by_pipeline_ownership(
+        self, connection: Any, edges: Sequence[ChunkEdge]
+    ) -> list[ChunkEdge]:
+        chunk_ids = list(
+            {edge.src_chunk_id for edge in edges}
+            | {edge.dst_chunk_id for edge in edges}
+        )
+        async with connection.cursor() as cur:
+            await cur.execute(
+                self._sql(
+                    "SELECT chunk_id, pipeline_id FROM {schema}.{prefix}chunks"
+                    " WHERE chunk_id = ANY(%s)"
+                ),
+                (chunk_ids,),
+            )
+            rows = await self._afetchall(cur)
+        pipeline_by_id = {str(row["chunk_id"]): row["pipeline_id"] for row in rows}
+        return [
+            edge
+            for edge in edges
+            if edge.src_chunk_id in pipeline_by_id
+            and edge.dst_chunk_id in pipeline_by_id
+            and pipeline_by_id[edge.src_chunk_id] == pipeline_by_id[edge.dst_chunk_id]
+        ]
+
+    async def _async_assert_edge_targets_owned(
+        self,
+        connection: Any,
+        chunk: SubconsciousChunk,
+        edges: Sequence[ChunkEdge],
+    ) -> None:
+        target_ids = list({edge.dst_chunk_id for edge in edges})
+        if not target_ids:
+            return
+        async with connection.cursor() as cur:
+            await cur.execute(
+                self._sql(
+                    "SELECT chunk_id, pipeline_id FROM {schema}.{prefix}chunks"
+                    " WHERE chunk_id = ANY(%s)"
+                ),
+                (target_ids,),
+            )
+            rows = await self._afetchall(cur)
+        for row in rows:
+            if row["pipeline_id"] != chunk.pipeline_id:
+                raise ValueError(
+                    "edge target pipeline mismatch for "
+                    f"chunk_id={chunk.chunk_id}: target={row['chunk_id']}"
+                )
 
     async def async_get_chunk_edges(  # type: ignore[override]
         self,

@@ -3,7 +3,7 @@
 ## Target
 
 - package: `neural-context-protocol`
-- current version: `1.4.3`
+- current version: `1.5.0`
 - release posture: stable public release line (see CHANGELOG.md for full history)
 
 ## Proven already
@@ -25,7 +25,7 @@
 ## Reminders for each publish
 
 - confirm the intended public version in `pyproject.toml` and `ncp/version.py`
-- review `README.md` and `docs/NCP_V1_README_POSITIONING.md` for current promise language
+- review `README.md` and the matching `CHANGELOG.md` section for current promise language
 - confirm PyPI metadata is final
   - author
   - license
@@ -42,9 +42,13 @@
 5. Confirm version in:
    - `pyproject.toml`
    - `ncp/version.py`
-6. Create git tag for the chosen release version.
-7. Upload artifacts to PyPI.
-8. Create GitHub release with benchmark and dogfood references.
+6. Create and push `v<version>` at the verified merged `origin/main` commit.
+7. Wait for `.github/workflows/release.yml` to pass; its trusted-publishing
+   job builds the artifacts and uploads them to PyPI.
+8. Verify the version-specific PyPI JSON and clean-install the published
+   package in a fresh virtual environment.
+9. Create the GitHub Release from the matching changelog section and read it
+   back to verify the public metadata.
 
 ## Suggested release notes outline
 

@@ -4,6 +4,8 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-08-21
+
 ### Added
 
 - **Anthropic prompt caching wired up** (`ncp/adapters/anthropic.py`):
@@ -56,6 +58,42 @@ All notable changes to Neural Context Protocol will be documented in this file.
   `content_hash` for the caller to thread through the DAG's task payload so
   every downstream subagent — regardless of provider or process — fetches
   the identical cached content via `fetch_skill(skill_id, content_hash=...)`.
+
+### Security
+
+- **Async pgvector supersede and edge writes now enforce pipeline ownership**
+  (`ncp/stores/pgvector_async.py`): the native async overrides now match the
+  SQLite and synchronous pgvector authorization boundary, rejecting
+  cross-pipeline supersession and typed-edge attachment before mutation.
+- **Chunk pipeline ownership is immutable across storage backends**
+  (`ncp/stores/sqlite.py`, `ncp/stores/pgvector.py`,
+  `ncp/stores/pgvector_async.py`): reusing a known `chunk_id` can no longer
+  move an existing chunk into another pipeline. PostgreSQL enforces the
+  invariant inside the atomic upsert, closing a concurrent first-write race.
+- **Scalar and typed graph relationships stay inside pipeline ownership**
+  (`ncp/stores/sqlite.py`, `ncp/stores/pgvector.py`,
+  `ncp/stores/pgvector_async.py`, `ncp/assembler.py`): caller-controlled
+  `caused_by`/`supersedes` backfill rejects existing cross-pipeline targets,
+  and retrieval refuses cross-pipeline legacy/dangling neighbors.
+
+### Fixed
+
+- **Authenticated HTTP dogfood now propagates the configured bearer token**
+  (`ncp/dogfood.py`): `MCPHTTPClient` resolves the same project configuration
+  as the spawned server and sends its bearer token for MCP and SSE requests,
+  preventing local `[server].auth_token` settings from producing `401`
+  failures in `ncp dogfood` and the release preflight.
+- **Generated config now matches the adaptive-budget runtime default**
+  (`ncp/templates/config.toml.example`): newly initialized workspaces show
+  `adaptive_budget_enabled = true` instead of documenting the old opt-in
+  behavior.
+
+### Documentation
+
+- **Plugin guidance documents structured whisper payloads**
+  (`agent-plugin/skills/ncp-core/SKILL.md`, Claude plugin/example/template
+  copies): agents now get the typed `share`/`request`, `dissent`, `alert`,
+  and `world_check` object shapes while retaining legacy-string compatibility.
 
 ## [1.4.3] - 2026-08-17
 

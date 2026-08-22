@@ -452,6 +452,8 @@ class PgvectorStore(BaseStore):
             self._assert_src_immutable(connection, chunk)
             if not allow_duplicate and self._is_duplicate(connection, chunk):
                 return False
+            backfilled_edges = backfill_edges_for_chunk(chunk)
+            self._assert_edge_targets_owned(connection, chunk, backfilled_edges)
             cursor = connection.cursor()
             try:
                 embedding_val = (
@@ -502,6 +504,9 @@ class PgvectorStore(BaseStore):
                             written_at_drift = EXCLUDED.written_at_drift,
                             verified = EXCLUDED.verified,
                             valid_from = EXCLUDED.valid_from
+                        WHERE {prefix}chunks.src IS NOT DISTINCT FROM EXCLUDED.src
+                            AND {prefix}chunks.written_by IS NOT DISTINCT FROM EXCLUDED.written_by
+                            AND {prefix}chunks.pipeline_id IS NOT DISTINCT FROM EXCLUDED.pipeline_id
                         """
                     ),
                     (
@@ -539,11 +544,17 @@ class PgvectorStore(BaseStore):
                         chunk.superseded_by,
                     ),
                 )
+                affected_rows = getattr(cursor, "rowcount", None)
             finally:
                 self._close_cursor(cursor)
-            backfilled_edges = backfill_edges_for_chunk(chunk)
+            if isinstance(affected_rows, int) and affected_rows == 0:
+                raise ValueError(
+                    f"chunk ownership changed concurrently for chunk_id={chunk.chunk_id}"
+                )
             if backfilled_edges:
-                self._upsert_chunk_edges_rows(connection, backfilled_edges)
+                allowed = self._filter_edges_by_pipeline_ownership(connection, backfilled_edges)
+                if allowed:
+                    self._upsert_chunk_edges_rows(connection, allowed)
             if self.config is not None and self.config.infer_edges:
                 inferred_edges = infer_edges_for_chunk(
                     chunk,
@@ -992,6 +1003,35 @@ class PgvectorStore(BaseStore):
             and edge.dst_chunk_id in pipeline_by_id
             and pipeline_by_id[edge.src_chunk_id] == pipeline_by_id[edge.dst_chunk_id]
         ]
+
+    def _assert_edge_targets_owned(
+        self,
+        connection: Any,
+        chunk: SubconsciousChunk,
+        edges: Sequence[ChunkEdge],
+    ) -> None:
+        target_ids = list({edge.dst_chunk_id for edge in edges})
+        if not target_ids:
+            return
+        placeholders = ",".join(["%s"] * len(target_ids))
+        cursor = connection.cursor()
+        try:
+            cursor.execute(
+                self._sql(
+                    f"SELECT chunk_id, pipeline_id FROM {{schema}}.{{prefix}}chunks"
+                    f" WHERE chunk_id IN ({placeholders})"
+                ),
+                target_ids,
+            )
+            rows = self._fetchall(cursor)
+        finally:
+            self._close_cursor(cursor)
+        for row in rows:
+            if row["pipeline_id"] != chunk.pipeline_id:
+                raise ValueError(
+                    "edge target pipeline mismatch for "
+                    f"chunk_id={chunk.chunk_id}: target={row['chunk_id']}"
+                )
 
     def get_chunk_edges(
         self,
@@ -3097,13 +3137,16 @@ class PgvectorStore(BaseStore):
 
     def _assert_src_immutable(self, connection: Any, chunk: SubconsciousChunk) -> None:
         """Reject a write that reuses an existing ``chunk_id`` unless it
-        comes from the same author -- see the matching fix/comment in
+        comes from the same author and pipeline -- see the matching fix/comment in
         ``ncp/stores/sqlite.py`` (docs/NCP_SILENT_DISCONNECT_AUDIT.md
         finding 9)."""
         cursor = connection.cursor()
         try:
             cursor.execute(
-                self._sql("SELECT src, written_by FROM {schema}.{prefix}chunks WHERE chunk_id = %s"),
+                self._sql(
+                    "SELECT src, written_by, pipeline_id"
+                    " FROM {schema}.{prefix}chunks WHERE chunk_id = %s"
+                ),
                 (chunk.chunk_id,),
             )
             row = self._fetchone(cursor)
@@ -3121,6 +3164,12 @@ class PgvectorStore(BaseStore):
             raise ValueError(
                 f"written_by is immutable for chunk_id={chunk.chunk_id}: "
                 f"existing={existing_written_by} new={chunk.written_by}"
+            )
+        existing_pipeline_id = row["pipeline_id"]
+        if existing_pipeline_id != chunk.pipeline_id:
+            raise ValueError(
+                f"pipeline_id is immutable for chunk_id={chunk.chunk_id}: "
+                f"existing={existing_pipeline_id} new={chunk.pipeline_id}"
             )
 
     def _is_duplicate(self, connection: Any, chunk: SubconsciousChunk) -> bool:

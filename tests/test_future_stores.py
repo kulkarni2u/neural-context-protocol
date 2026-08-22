@@ -48,10 +48,23 @@ class _FakeCursor:
 
         if "CREATE EXTENSION IF NOT EXISTS vector;" in sql:
             return
-        if "SELECT src, written_by FROM" in normalized and "chunks WHERE chunk_id = %s" in normalized:
+        if (
+            "SELECT src, written_by, pipeline_id FROM" in normalized
+            and "chunks WHERE chunk_id = %s" in normalized
+        ):
             chunk_id = str(params[0])
             row = self._db.chunks.get(chunk_id)
-            self._rows = [] if row is None else [{"src": row["src"], "written_by": row["written_by"]}]
+            self._rows = (
+                []
+                if row is None
+                else [
+                    {
+                        "src": row["src"],
+                        "written_by": row["written_by"],
+                        "pipeline_id": row["pipeline_id"],
+                    }
+                ]
+            )
             return
         if "SELECT content FROM" in normalized and "COALESCE(pipeline_id, '') = COALESCE(%s, '')" in normalized:
             zone, layer, pipeline_id, exclude_chunk_id, limit = params
@@ -617,6 +630,34 @@ def test_pgvector_store_src_is_immutable_for_existing_chunk_id() -> None:
 
     with pytest.raises(ValueError, match="src is immutable"):
         store.write(chunk.model_copy(update={"src": "synthesis"}))
+
+
+def test_pgvector_store_pipeline_id_is_immutable_for_existing_chunk_id() -> None:
+    db = _MemoryPgDB()
+    store = PgvectorStore(
+        "postgresql://postgres:postgres@127.0.0.1:5432/ncp",
+        connect_factory=_pg_connect_factory(db),
+    )
+    chunk = SubconsciousChunk(
+        chunk_id="sub_pipeline_lock",
+        pipeline_id="pipeline_victim",
+        layer="semantic",
+        content="victim pipeline content",
+        src="tool_result",
+        written_by="shared_agent_name",
+    )
+    store.write(chunk)
+
+    with pytest.raises(ValueError, match="pipeline_id is immutable"):
+        store.write(
+            chunk.model_copy(
+                update={"pipeline_id": "pipeline_attacker", "content": "moved content"}
+            )
+        )
+
+    assert store.get_working_zone(pipeline_id="pipeline_attacker") == []
+    persisted = store.get_working_zone(pipeline_id="pipeline_victim")
+    assert [item.chunk_id for item in persisted] == ["sub_pipeline_lock"]
 
 
 def test_pgvector_store_working_zone_turns_and_goal_versions() -> None:

@@ -417,6 +417,8 @@ class SQLiteStore(BaseStore):
             self._assert_src_immutable(connection, chunk)
             if not allow_duplicate and self._is_duplicate(connection, chunk):
                 return False
+            backfilled_edges = backfill_edges_for_chunk(chunk)
+            self._assert_edge_targets_owned(connection, chunk, backfilled_edges)
             connection.execute(
                 """
                 INSERT INTO chunks (
@@ -491,9 +493,10 @@ class SQLiteStore(BaseStore):
                     chunk.superseded_by,
                 ),
             )
-            backfilled_edges = backfill_edges_for_chunk(chunk)
             if backfilled_edges:
-                self._upsert_chunk_edges(connection, backfilled_edges)
+                allowed = self._filter_edges_by_pipeline_ownership(connection, backfilled_edges)
+                if allowed:
+                    self._upsert_chunk_edges(connection, allowed)
             if self.config is not None and self.config.infer_edges:
                 inferred_edges = infer_edges_for_chunk(
                     chunk,
@@ -1197,10 +1200,9 @@ class SQLiteStore(BaseStore):
         finding 9): only inserts edges whose src and dst chunks share the
         same pipeline scope, so an untrusted caller can't attach a
         contradicts/caused_by/etc. edge to an arbitrary chunk from a
-        different pipeline. Internal, trusted callers (backfill, similarity
-        inference) go through ``_upsert_chunk_edges`` directly and are
-        unaffected -- they only ever reference same-pipeline chunks by
-        construction.
+        different pipeline. Write-time scalar backfill is validated and
+        filtered through the same ownership boundary; deterministic similarity
+        inference still reads candidates from the current pipeline only.
         """
         if not edges:
             return 0
@@ -1228,6 +1230,34 @@ class SQLiteStore(BaseStore):
             and edge.dst_chunk_id in pipeline_by_id
             and pipeline_by_id[edge.src_chunk_id] == pipeline_by_id[edge.dst_chunk_id]
         ]
+
+    @staticmethod
+    def _assert_edge_targets_owned(
+        connection: sqlite3.Connection,
+        chunk: SubconsciousChunk,
+        edges: Sequence[ChunkEdge],
+    ) -> None:
+        """Reject scalar graph references to existing chunks in another pipeline.
+
+        Missing targets remain valid forward references. The write-time edge
+        mirror is created only once both endpoints exist in the same pipeline,
+        while the assembler independently enforces the boundary for legacy
+        dangling scalars that later resolve across pipelines.
+        """
+        target_ids = list({edge.dst_chunk_id for edge in edges})
+        if not target_ids:
+            return
+        placeholders = ",".join("?" * len(target_ids))
+        rows = connection.execute(
+            f"SELECT chunk_id, pipeline_id FROM chunks WHERE chunk_id IN ({placeholders})",
+            target_ids,
+        ).fetchall()
+        for row in rows:
+            if row["pipeline_id"] != chunk.pipeline_id:
+                raise ValueError(
+                    "edge target pipeline mismatch for "
+                    f"chunk_id={chunk.chunk_id}: target={row['chunk_id']}"
+                )
 
     def get_chunk_edges(
         self,
@@ -3322,7 +3352,7 @@ class SQLiteStore(BaseStore):
 
     def _assert_src_immutable(self, connection: sqlite3.Connection, chunk: SubconsciousChunk) -> None:
         """Reject a write that reuses an existing ``chunk_id`` unless it
-        comes from the same author.
+        comes from the same author and pipeline.
 
         Security fix (docs/NCP_SILENT_DISCONNECT_AUDIT.md finding 9): this
         used to check only ``src``, so any caller who reused (or guessed --
@@ -3330,11 +3360,12 @@ class SQLiteStore(BaseStore):
         result) an existing ``chunk_id`` could silently overwrite that
         chunk's content, ``written_by``, and ``pipeline_id`` in place while
         keeping ``src="user_verified"``, forging trusted content under
-        someone else's identity. ``written_by`` must now match too, so only
-        the original author can update their own chunk_id in place.
+        someone else's identity. ``written_by`` and ``pipeline_id`` must now
+        match too, so only the original author can update their own chunk_id
+        in its original pipeline.
         """
         row = connection.execute(
-            "SELECT src, written_by FROM chunks WHERE chunk_id = ?",
+            "SELECT src, written_by, pipeline_id FROM chunks WHERE chunk_id = ?",
             (chunk.chunk_id,),
         ).fetchone()
         if row is None:
@@ -3349,6 +3380,12 @@ class SQLiteStore(BaseStore):
             raise ValueError(
                 f"written_by is immutable for chunk_id={chunk.chunk_id}: "
                 f"existing={existing_written_by} new={chunk.written_by}"
+            )
+        existing_pipeline_id = row["pipeline_id"]
+        if existing_pipeline_id != chunk.pipeline_id:
+            raise ValueError(
+                f"pipeline_id is immutable for chunk_id={chunk.chunk_id}: "
+                f"existing={existing_pipeline_id} new={chunk.pipeline_id}"
             )
 
     def _is_duplicate(self, connection: sqlite3.Connection, chunk: SubconsciousChunk) -> bool:
