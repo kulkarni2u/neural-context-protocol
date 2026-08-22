@@ -1,8 +1,11 @@
 from pathlib import Path
+import tomllib
 
 import pytest
 
 from ncp.config import find_project_root, load_config
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_load_config_uses_project_local_default_store_path(tmp_path: Path) -> None:
@@ -373,6 +376,14 @@ def test_drift_config_file_and_env_overrides(tmp_path: Path) -> None:
     assert config.drift_computed_enabled is False
     assert config.drift_window_turns == 3
     assert config.drift_use_embeddings is False
+
+
+def test_config_template_active_adaptive_budget_enabled_matches_runtime_default() -> None:
+    template_path = REPO_ROOT / "ncp" / "templates" / "config.toml.example"
+
+    parsed = tomllib.loads(template_path.read_text())
+
+    assert parsed["budget"]["adaptive_budget_enabled"] is True
 
 
 def test_drift_window_turns_is_clamped_to_at_least_one(tmp_path: Path) -> None:
