@@ -49,6 +49,8 @@ The default `ncp dogfood` path proves these things end to end:
 4. the host triggers one `ncp_fetch` and reinjects the result into the same turn.
 5. `ncp_fetch` works in the same host session and returns the persisted chunk.
 6. Restarting the MCP server does not lose the stored memory.
+7. When the workspace config or `NCP_AUTH_TOKEN` enables bearer auth, the
+   harness starts the server and sends MCP/SSE requests with the same token.
 
 That is enough to validate the public transport path used by hosts.
 
@@ -173,6 +175,10 @@ artifact = run_canonical_http_dogfood_loop(
     store_path=Path(".ncp/store.db"),
 )
 ```
+
+The Python HTTP client also accepts `auth_token=` as an explicit override.
+For its default spawned server, the override is passed through the child
+environment rather than process arguments so it does not appear in argv.
 
 ## Output contract
 

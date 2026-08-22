@@ -754,7 +754,7 @@ NCP is the memory bus. In our workflows, Sarathi is one orchestrator that runs o
 - [Benchmark: ingestion-time compression](./docs/NCP_BENCHMARK_COMPRESSION.md)
 - [Benchmark: fan-in reduction](./docs/NCP_BENCHMARK_FANIN_REDUCE.md)
 - [MACE multi-agent eval](./benchmarks/mace/README.md)
-- [Post-V1 roadmap](./docs/NCP_POST_V1_ROADMAP.md)
+- [North-star capability roadmap](./docs/NCP_NORTH_STAR_CAPABILITY_ROADMAP.md)
 - [Active handoff packet](./docs/NCP_ACTIVE_HANDOFF_PACKET.md)
 - [CHANGELOG](./CHANGELOG.md)
 
