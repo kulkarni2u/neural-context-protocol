@@ -173,6 +173,43 @@ def test_http_adapter_continuation_loop_runs_with_local_contract_adapter(tmp_pat
     assert artifact["continuation_ok"] is True
 
 
+def test_http_client_uses_configured_auth_token(tmp_path: Path) -> None:
+    project = tmp_path / "repo"
+    (project / ".git").mkdir(parents=True)
+    config_dir = project / ".ncp"
+    config_dir.mkdir()
+    (config_dir / "config.toml").write_text(
+        '[store]\ntype = "sqlite"\npath = ".ncp/store.db"\n'
+        '[server]\nauth_token = "dogfood-test-token"\n'
+    )
+
+    with MCPHTTPClient(
+        store_path=config_dir / "store.db",
+        cwd=project,
+    ) as client:
+        assert client.request("ping")["result"] == {}
+
+
+def test_http_client_explicit_auth_token_overrides_config_for_spawned_server(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "repo"
+    (project / ".git").mkdir(parents=True)
+    config_dir = project / ".ncp"
+    config_dir.mkdir()
+    (config_dir / "config.toml").write_text(
+        '[store]\ntype = "sqlite"\npath = ".ncp/store.db"\n'
+        '[server]\nauth_token = "configured-token"\n'
+    )
+
+    with MCPHTTPClient(
+        store_path=config_dir / "store.db",
+        cwd=project,
+        auth_token="explicit-token",
+    ) as client:
+        assert client.request("ping")["result"] == {}
+
+
 def test_stdio_client_read_message_times_out_on_truncated_frame_and_reaps_process(
     tmp_path: Path,
 ) -> None:

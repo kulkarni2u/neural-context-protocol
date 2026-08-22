@@ -21,6 +21,7 @@ import httpx
 
 from ncp.adapters.base import BaseAdapter
 from ncp.adapters.local import LocalAdapter
+from ncp.config import load_config
 from ncp.stores.sqlite import SQLiteStore
 
 
@@ -704,23 +705,38 @@ class MCPHTTPClient:
         server_cmd: list[str] | None = None,
         host: str = "127.0.0.1",
         port: int | None = None,
+        auth_token: str | None = None,
     ) -> None:
         self.store_path = Path(store_path)
         self.cwd = Path(cwd)
         self.host = host
         self.port = port or _free_port()
-        self.server_cmd = server_cmd or [
-            sys.executable,
-            "-m",
-            "ncp.cli",
-            "serve",
-            "--host",
-            self.host,
-            "--port",
-            str(self.port),
-            "--store-path",
-            str(self.store_path),
-        ]
+        self.auth_token = (
+            load_config(cwd=self.cwd).server_auth_token
+            if auth_token is None and server_cmd is None
+            else auth_token or None
+        )
+        if server_cmd is None:
+            self.server_cmd = [
+                sys.executable,
+                "-m",
+                "ncp.cli",
+                "serve",
+                "--host",
+                self.host,
+                "--port",
+                str(self.port),
+                "--store-path",
+                str(self.store_path),
+            ]
+            self._server_env = os.environ.copy()
+            if self.auth_token:
+                # Keep the token out of argv/process listings while ensuring
+                # the spawned server and HTTP client use the same resolution.
+                self._server_env["NCP_AUTH_TOKEN"] = self.auth_token
+        else:
+            self.server_cmd = server_cmd
+            self._server_env = None
         self._process: subprocess.Popen[bytes] | None = None
         self._next_id = 1
         self._client: httpx.Client | None = None
@@ -742,11 +758,17 @@ class MCPHTTPClient:
         self._process = subprocess.Popen(
             self.server_cmd,
             cwd=self.cwd,
+            env=self._server_env,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
-        self._client = httpx.Client(base_url=self.base_url, timeout=5.0)
+        headers = (
+            {"Authorization": f"Bearer {self.auth_token}"}
+            if self.auth_token
+            else None
+        )
+        self._client = httpx.Client(base_url=self.base_url, timeout=5.0, headers=headers)
         try:
             self._wait_until_ready()
         except Exception:
