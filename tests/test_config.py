@@ -147,8 +147,25 @@ def test_find_project_root_walks_up_tree(tmp_path: Path) -> None:
 
 
 def test_embedding_config_defaults(tmp_path) -> None:
+    # CAP-C4: cheap local embeddings on by default. When the optional
+    # fastembed dependency is missing, create_store()/_build_embedding_adapter
+    # degrades gracefully to lexical-only rather than raising -- see
+    # test_future_stores.py for that fallback behavior.
     project = tmp_path / "repo"
     (project / ".git").mkdir(parents=True)
+    config = load_config(cwd=project)
+    assert config.embedding_enabled is True
+    assert config.embedding_provider == "local"
+    assert config.embedding_model == "BAAI/bge-small-en-v1.5"
+
+
+def test_embedding_config_toml_override_disables(tmp_path) -> None:
+    project = tmp_path / "repo"
+    (project / ".git").mkdir(parents=True)
+    (project / ".ncp").mkdir()
+    (project / ".ncp" / "config.toml").write_text(
+        "[embedding]\nenabled = false\n"
+    )
     config = load_config(cwd=project)
     assert config.embedding_enabled is False
     assert config.embedding_provider == "local"
@@ -182,6 +199,21 @@ def test_embedding_config_env_overrides(tmp_path) -> None:
     assert config.embedding_enabled is True
     assert config.embedding_provider == "openai"
     assert config.embedding_model == "text-embedding-3-small"
+
+
+def test_embedding_config_env_override_disables(tmp_path) -> None:
+    project = tmp_path / "repo"
+    (project / ".git").mkdir(parents=True)
+    config = load_config(cwd=project, env={"NCP_EMBEDDING_ENABLED": "false"})
+    assert config.embedding_enabled is False
+
+
+def test_config_template_active_embedding_enabled_matches_runtime_default() -> None:
+    template_path = REPO_ROOT / "ncp" / "templates" / "config.toml.example"
+
+    parsed = tomllib.loads(template_path.read_text())
+
+    assert parsed["embedding"]["enabled"] is True
 
 
 def test_retrieval_diversity_lambda_defaults_and_overrides(tmp_path) -> None:

@@ -98,19 +98,38 @@ bus already knows.
 - **Deps:** CAP-T3 (grounded/outcome trust so you only reuse *good* results),
   CAP-E1.
 
-### CAP-C4 · Cheap embeddings on by default — impact: MED, effort: M
+### CAP-C4 · Cheap embeddings on by default — impact: MED, effort: M — **implemented, `ncp/config.py`, `ncp/stores/factory.py`**
 - **Why:** pure BM25 misses paraphrase — agents rarely phrase the same fact the
-  same way. For agent-to-agent recall this is a real gap; embeddings are off by
-  default so the default experience is lexical-only.
+  same way. For agent-to-agent recall this was a real gap while embeddings
+  defaulted off, since the default experience was lexical-only.
 - **Best-in-class:** a small, fast, local embedding model on by default (no API
-  key), with BM25 retained in the fusion. Vector path exists only in pgvector
-  today — bring a lightweight local option to the SQLite tier.
-- **Approach:** add a local embedding provider (e.g. a small sentence model or a
-  hashing/`fastembed`-style option), wire into `RetrievalPolicy.score_with_vector`
-  for SQLite via a stored blob + brute-force cosine (fine at working-set sizes).
-  Keep it optional-but-default-on with a clean off switch.
-- **Impact:** materially better recall of paraphrased memory; enables CAP-C1/C3
-  to use semantic (not just lexical) similarity.
+  key), with BM25 retained in the fusion, on both the SQLite and pgvector
+  tiers.
+- **Implementation note:** the vector plumbing (`LocalEmbeddingAdapter`/
+  `OpenAIEmbeddingAdapter` in `ncp/adapters/embedding.py`, the SQLite
+  `embedding BLOB` column + brute-force cosine, the pgvector native
+  `vector(1536)` column, and the hybrid blend in
+  `RetrievalPolicy.score_with_vector`) already existed; the only gap was
+  `DEFAULT_CONFIG["embedding"]["enabled"]` defaulting to `False`. Flipping
+  that alone would have crashed `create_store()` for anyone without
+  the optional `fastembed` dependency installed (an `ImportError` raised
+  uncaught inside `_build_embedding_adapter`), so the fix pairs the default
+  flip with a soft-fail: `_build_embedding_adapter` now wraps adapter
+  construction in a broad `except Exception` -- missing optional package
+  (`ImportError` for `fastembed`/`openai`), missing credential
+  (`NCPAdapterConfigurationError` for `OPENAI_API_KEY`), a blocked/failed
+  model download, or any other construction-time failure -- logs one
+  warning via `logging.getLogger("ncp")` naming the fix (`pip install
+  'neural-context-protocol[local-embeddings]'`, or setting
+  `OPENAI_API_KEY`), and returns `None` so `create_store()` proceeds with
+  lexical-only retrieval exactly as it did with embeddings off. An invalid
+  `embedding_provider` value is a config/programmer error, not a
+  construction failure, and still raises `ValueError` rather than
+  degrading silently.
+- **Impact:** materially better recall of paraphrased memory by default;
+  enables CAP-C1/C3 to use semantic (not just lexical) similarity, with no
+  new hard dependency and no startup crash risk for operators who don't
+  install the optional extra.
 - **Deps:** none.
 
 ### CAP-C5 · Bi-temporal / validity-aware memory — impact: MED, effort: M
@@ -345,7 +364,7 @@ move that number, it isn't earning its complexity.
 | Bounded, non-redundant context selection | greedy top-k | MMR/submodular (CAP-C1) |
 | Query-aware compression | truncate/whole | distillation (CAP-C2) |
 | Skip redundant model work | — | memoization (CAP-C3) |
-| Semantic recall by default | lexical-only | embeddings on (CAP-C4) |
+| Semantic recall by default | embeddings on (CAP-C4, implemented) | embeddings on (CAP-C4) |
 | Temporal / validity-aware facts | expiry unenforced | bi-temporal (CAP-C5) |
 | Authenticated authorship | keys unused | signed (CAP-T1) |
 | Evidence-grounded trust | self-declared | grounded (CAP-T2) |
