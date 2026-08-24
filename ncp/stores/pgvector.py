@@ -8,6 +8,7 @@ from dataclasses import replace as dataclass_replace
 from difflib import SequenceMatcher
 import atexit
 import json
+import logging
 import math
 from pathlib import Path
 from typing import Any
@@ -42,6 +43,8 @@ from ncp.stores.retrieval import (
 )
 from ncp.tokens import estimate_tokens
 from ncp.types import CalibrationReport, ChunkEdge, ConsolidationReport, ConsciousBlock, NCPResponse, OutcomeRecord, SubconsciousChunk, TurnRecord, Whisper
+
+logger = logging.getLogger("ncp")
 
 
 PGVECTOR_SCHEMA_TEMPLATE = """
@@ -446,15 +449,46 @@ class PgvectorStore(BaseStore):
             finally:
                 self._close_cursor(cursor)
 
+    def _try_embed(self, text: str, *, pipeline_id: str | None, op: str) -> list[float] | None:
+        """Best-effort embed for opportunistic (non-explicit-vector) call sites.
+
+        `LocalEmbeddingAdapter` defers its heavy `TextEmbedding(...)` model
+        construction to its first `embed()` call, so a network/model-download
+        failure that used to surface at `create_store()` time can now surface
+        here instead, on this store's first real write or query. Since these
+        call sites treat embedding as an optional enhancement (unlike an
+        explicit `retrieval_mode="vector"` request, which must still raise),
+        a failure here is caught, logged once, and this store's embedding
+        adapter is disabled for the rest of its lifetime -- so it falls back
+        to lexical-only retrieval instead of retrying the same failing
+        network call on every subsequent write/query.
+        """
+        adapter = self._embedding_adapter
+        assert adapter is not None
+        try:
+            self._embedding_calls_tokens_est += estimate_tokens(text)
+            vector = adapter.embed(text)
+        except Exception as exc:
+            logger.warning(
+                "Embedding %s call failed (%s: %s); disabling embeddings for this "
+                "store instance and falling back to lexical-only retrieval for its "
+                "remaining lifetime.",
+                op,
+                type(exc).__name__,
+                exc,
+            )
+            self._embedding_adapter = None
+            return None
+        self.log_embedding_cost(pipeline_id=pipeline_id, op=op, text=text)
+        return vector
+
     def write(self, chunk: SubconsciousChunk, *, allow_duplicate: bool = False) -> bool:
         self.last_write_inferred_edge_count = 0
         chunk = self._validate_chunk_for_write(chunk)
         if self._embedding_adapter is not None and chunk.embedding is None:
-            self._embedding_calls_tokens_est += estimate_tokens(chunk.content)
-            chunk = chunk.model_copy(
-                update={"embedding": self._embedding_adapter.embed(chunk.content)}
-            )
-            self.log_embedding_cost(pipeline_id=chunk.pipeline_id, op="write", text=chunk.content)
+            embedding = self._try_embed(chunk.content, pipeline_id=chunk.pipeline_id, op="write")
+            if embedding is not None:
+                chunk = chunk.model_copy(update={"embedding": embedding})
         if chunk.embedding is not None and len(chunk.embedding) != 1536:
             raise ValueError(f"embedding must have 1536 dimensions, got {len(chunk.embedding)}")
         with self._connect() as connection:
@@ -654,9 +688,7 @@ class PgvectorStore(BaseStore):
                 diversity_limit=diversity_limit, as_of=as_of,
             )
         if embedding is None and self._embedding_adapter is not None:
-            self._embedding_calls_tokens_est += estimate_tokens(text)
-            embedding = self._embedding_adapter.embed(text)
-            self.log_embedding_cost(pipeline_id=pipeline_id, op="query", text=text)
+            embedding = self._try_embed(text, pipeline_id=pipeline_id, op="query")
         if embedding is not None and len(embedding) != 1536:
             raise ValueError(f"embedding must have 1536 dimensions, got {len(embedding)}")
 

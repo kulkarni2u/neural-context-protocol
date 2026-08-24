@@ -178,6 +178,83 @@ def test_sqlite_local_embeddings_retrieve_zero_lexical_overlap_paraphrase(
     assert results[0].embedding == [1.0, 0.0, 0.0]
 
 
+class _FailingEmbeddingAdapter:
+    """Adapter whose embed() always raises -- simulates a lazy
+    LocalEmbeddingAdapter model-download failure surfacing at first use."""
+
+    def __init__(self) -> None:
+        self.call_count = 0
+
+    def embed(self, text: str) -> list[float]:
+        self.call_count += 1
+        raise RuntimeError("simulated model download failure")
+
+
+def test_sqlite_write_falls_back_when_embed_fails(tmp_path: Path) -> None:
+    adapter = _FailingEmbeddingAdapter()
+    store = SQLiteStore(tmp_path / "store.db", embedding_adapter=adapter)
+
+    assert store.write(
+        SubconsciousChunk(
+            chunk_id="sub_write_fallback",
+            layer="semantic",
+            content="write should fall back to lexical only",
+            src="tool_result",
+        )
+    ) is True
+    assert adapter.call_count == 1
+    assert store._embedding_adapter is None  # disabled for this store's remaining life
+
+    # A second write must not retry the already-failing adapter.
+    store.write(
+        SubconsciousChunk(
+            chunk_id="sub_write_fallback_2",
+            layer="semantic",
+            content="second write should not retry",
+            src="tool_result",
+        )
+    )
+    assert adapter.call_count == 1
+
+
+def test_sqlite_hybrid_query_falls_back_when_embed_fails(tmp_path: Path) -> None:
+    adapter = _FailingEmbeddingAdapter()
+    store = SQLiteStore(tmp_path / "store.db", embedding_adapter=adapter)
+    store.write(
+        SubconsciousChunk(
+            chunk_id="sub_query_fallback",
+            layer="semantic",
+            content="hybrid query should fall back to lexical scoring",
+            src="tool_result",
+        )
+    )
+    # The write above already disabled the adapter (see the write test), so
+    # rebuild a fresh store over the same file with a fresh failing adapter
+    # to isolate the query-time embed failure.
+    adapter2 = _FailingEmbeddingAdapter()
+    store2 = SQLiteStore(tmp_path / "store.db", embedding_adapter=adapter2)
+
+    results = store2.query("hybrid query fallback lexical scoring", k=3, min_score=0.0)
+    assert any(chunk.chunk_id == "sub_query_fallback" for chunk in results)
+    assert adapter2.call_count == 1
+    assert store2._embedding_adapter is None  # disabled after the failure
+
+    store2.query("hybrid query fallback lexical scoring", k=3, min_score=0.0)
+    assert adapter2.call_count == 1  # not retried on the next query
+
+
+def test_sqlite_vector_mode_raises_when_embed_fails(tmp_path: Path) -> None:
+    """Unlike the opportunistic hybrid path, an explicit retrieval_mode='vector'
+    request must propagate an embed failure rather than silently falling back
+    to non-vector results."""
+    adapter = _FailingEmbeddingAdapter()
+    store = SQLiteStore(tmp_path / "store.db", embedding_adapter=adapter)
+    with pytest.raises(RuntimeError, match="simulated model download failure"):
+        store.query("explicit vector mode", retrieval_mode="vector")
+    assert adapter.call_count == 1
+    assert store._embedding_adapter is not None  # left intact -- caller sees the raw error
+
+
 def test_sqlite_store_preserves_default_behavior_when_no_embedding(tmp_path: Path) -> None:
     store = SQLiteStore(tmp_path / "store.db")
     store.write(SubconsciousChunk(

@@ -126,6 +126,28 @@ bus already knows.
   `embedding_provider` value is a config/programmer error, not a
   construction failure, and still raises `ValueError` rather than
   degrading silently.
+- **Follow-up refinement:** `_build_embedding_adapter`'s soft-fail only ever
+  covered *construction-time* failures. `LocalEmbeddingAdapter.__init__` still
+  eagerly built the underlying `fastembed.TextEmbedding(model_name=...)`,
+  whose constructor downloads the model (~130MB for the default
+  `BAAI/bge-small-en-v1.5`) from Hugging Face on first-ever use -- so with
+  embeddings on by default, that download could synchronously block every
+  default `create_store()` call, including at `ncp serve` startup, for
+  anyone on a slow, offline, or firewalled network. `LocalEmbeddingAdapter`
+  now defers that construction to its first `embed()` call instead of
+  `__init__` (`ncp/adapters/embedding.py`); `__init__` still eagerly imports
+  `fastembed` so a genuinely-missing optional dependency is still caught at
+  `create_store()` time exactly as before. Because construction can now fail
+  lazily, at the first real embed call instead of only at startup, each
+  store's opportunistic (`hybrid`/write-time) embed call sites gained a
+  `_try_embed()` helper (`ncp/stores/sqlite.py`, `ncp/stores/pgvector.py`,
+  `ncp/stores/pgvector_async.py`) that catches a first-use failure, logs one
+  warning, and disables that store's adapter for its remaining lifetime so
+  the store falls back to lexical-only retrieval instead of retrying a
+  failing network call on every subsequent write/query. An explicit
+  `retrieval_mode="vector"` request is exempt from this fallback -- the
+  caller asked for vector-mode specifically, so an embed failure there still
+  raises/propagates rather than silently returning non-vector results.
 - **Impact:** materially better recall of paraphrased memory by default;
   enables CAP-C1/C3 to use semantic (not just lexical) similarity, with no
   new hard dependency and no startup crash risk for operators who don't

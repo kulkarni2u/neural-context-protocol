@@ -19,11 +19,25 @@ def _build_embedding_adapter(cfg: NCPConfig) -> object | None:
     default `create_store()` call. Adapter construction can legitimately
     fail for reasons outside anyone's control at deploy time -- the
     optional `fastembed`/`openai` package isn't installed, OPENAI_API_KEY
-    isn't set, a model download times out or is blocked by a firewall,
-    etc. None of those are programmer errors, so none of them should ever
-    crash server startup: catch any exception construction raises, log one
-    warning naming the fix, and return None so the caller falls back to
-    exactly the lexical-only retrieval it used when embeddings were off.
+    isn't set, an unsupported provider string was configured, etc. None of
+    those are programmer errors, so none of them should ever crash server
+    startup: catch any exception construction raises, log one warning
+    naming the fix, and return None so the caller falls back to exactly the
+    lexical-only retrieval it used when embeddings were off.
+
+    Note what this does NOT cover any more: `LocalEmbeddingAdapter`
+    construction here is now cheap (import + attribute assignment only) --
+    the actual `TextEmbedding(...)` model load, which downloads ~130MB from
+    Hugging Face on first-ever use and can block or hang on a slow/offline/
+    firewalled network, is deferred to that adapter's first `embed()` call
+    (see `ncp/adapters/embedding.py::LocalEmbeddingAdapter`). A slow or
+    failing download therefore can no longer block `create_store()` /
+    server startup at all; instead it surfaces as a failure on the first
+    real write or query, which each store's `_try_embed()` helper
+    (`ncp/stores/sqlite.py`, `ncp/stores/pgvector.py`,
+    `ncp/stores/pgvector_async.py`) catches and degrades from in the same
+    lexical-only-fallback spirit as this function, except triggered lazily
+    instead of at startup.
 
     An unrecognized `embedding_provider` value, by contrast, IS a
     config/programmer error -- it can never be fixed by installing

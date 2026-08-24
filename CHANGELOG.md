@@ -74,6 +74,29 @@ All notable changes to Neural Context Protocol will be documented in this file.
   `[embedding].enabled = false` to opt back out. See
   `docs/NCP_NORTH_STAR_CAPABILITY_ROADMAP.md` (CAP-C4) for the full design
   note.
+- **CAP-C4 follow-up: lazy local-model construction** (`ncp/adapters/embedding.py`,
+  `ncp/stores/sqlite.py`, `ncp/stores/pgvector.py`,
+  `ncp/stores/pgvector_async.py`, `ncp/stores/factory.py`): with embeddings
+  on by default, `LocalEmbeddingAdapter.__init__` still eagerly constructed
+  `fastembed.TextEmbedding(model_name=...)`, which downloads the model
+  (~130MB for the default `BAAI/bge-small-en-v1.5`) from Hugging Face on
+  first-ever use — so every default `create_store()` call, including at
+  `ncp serve` startup, could block synchronously (or stall until a timeout)
+  on a slow, offline, or firewalled network. `LocalEmbeddingAdapter` now
+  defers that construction to its first `embed()` call instead of
+  `__init__`, so `__init__` stays fast and network-free (it still eagerly
+  imports `fastembed`, so a genuinely missing optional dependency is still
+  caught at `create_store()` time exactly as before). Because construction
+  can now fail lazily on first use instead of only at startup, each store's
+  opportunistic write-time and hybrid query-time embed calls are wrapped in
+  a new `_try_embed()` helper that catches a first-use failure, logs one
+  warning, and disables that store's embedding adapter for the rest of its
+  lifetime — falling back to lexical-only retrieval instead of retrying the
+  same failing network call on every subsequent write/query. An explicit
+  `retrieval_mode="vector"` request is deliberately excluded from this
+  fallback: the caller asked for vector-mode specifically, so an embed
+  failure there still raises rather than silently returning non-vector
+  results.
 
 ## [1.5.0] - 2026-08-21
 

@@ -14,6 +14,7 @@ Use PgvectorStore for synchronous callers.
 from __future__ import annotations
 
 import json
+import logging
 import math
 import time
 from collections.abc import Sequence
@@ -68,6 +69,7 @@ from ncp.types import (
 )
 
 _logger = structlog.get_logger(__name__)
+logger = logging.getLogger("ncp")
 
 
 class AsyncPgvectorStore(BaseStore):
@@ -295,6 +297,41 @@ class AsyncPgvectorStore(BaseStore):
     # Overridden async_* methods — native psycopg3 async I/O
     # ------------------------------------------------------------------
 
+    async def _try_embed(self, text: str, *, pipeline_id: str | None, op: str) -> list[float] | None:
+        """Best-effort embed for opportunistic (non-explicit-vector) call sites.
+
+        `LocalEmbeddingAdapter` defers its heavy `TextEmbedding(...)` model
+        construction to its first `embed()` call, so a network/model-download
+        failure that used to surface at `create_store()` time can now surface
+        here instead, on this store's first real write or query. Since these
+        call sites treat embedding as an optional enhancement (unlike an
+        explicit `retrieval_mode="vector"` request, which must still raise),
+        a failure here is caught, logged once, and this store's embedding
+        adapter is disabled for the rest of its lifetime -- so it falls back
+        to lexical-only retrieval instead of retrying the same failing
+        network call on every subsequent write/query.
+        """
+        adapter = self._embedding_adapter
+        assert adapter is not None
+        try:
+            self._embedding_calls_tokens_est += estimate_tokens(text)
+            vector = await anyio.to_thread.run_sync(
+                lambda: adapter.embed(text)  # type: ignore[union-attr]
+            )
+        except Exception as exc:
+            logger.warning(
+                "Embedding %s call failed (%s: %s); disabling embeddings for this "
+                "store instance and falling back to lexical-only retrieval for its "
+                "remaining lifetime.",
+                op,
+                type(exc).__name__,
+                exc,
+            )
+            self._embedding_adapter = None
+            return None
+        await self.async_log_embedding_cost(pipeline_id=pipeline_id, op=op, text=text)
+        return vector
+
     async def async_write(self, chunk: SubconsciousChunk) -> bool:
         """Persist a chunk using native async DB I/O (no thread pool).
 
@@ -304,14 +341,11 @@ class AsyncPgvectorStore(BaseStore):
         self.last_write_inferred_edge_count = 0
         chunk = self._validate_chunk_for_write(chunk)
         if self._embedding_adapter is not None and chunk.embedding is None:
-            _adapter = self._embedding_adapter
-            _content = chunk.content
-            self._embedding_calls_tokens_est += estimate_tokens(_content)
-            embedding_vec = await anyio.to_thread.run_sync(
-                lambda: _adapter.embed(_content)  # type: ignore[union-attr]
+            embedding_vec = await self._try_embed(
+                chunk.content, pipeline_id=chunk.pipeline_id, op="write"
             )
-            chunk = chunk.model_copy(update={"embedding": embedding_vec})
-            await self.async_log_embedding_cost(pipeline_id=chunk.pipeline_id, op="write", text=chunk.content)
+            if embedding_vec is not None:
+                chunk = chunk.model_copy(update={"embedding": embedding_vec})
         if chunk.embedding is not None and len(chunk.embedding) != 1536:
             raise ValueError(f"embedding must have 1536 dimensions, got {len(chunk.embedding)}")
         embedding_val = (
@@ -853,13 +887,7 @@ class AsyncPgvectorStore(BaseStore):
                 as_of=as_of,
             )
         if embedding is None and self._embedding_adapter is not None:
-            _adapter = self._embedding_adapter
-            _text = text
-            self._embedding_calls_tokens_est += estimate_tokens(_text)
-            embedding = await anyio.to_thread.run_sync(
-                lambda: _adapter.embed(_text)  # type: ignore[union-attr]
-            )
-            await self.async_log_embedding_cost(pipeline_id=pipeline_id, op="query", text=text)
+            embedding = await self._try_embed(text, pipeline_id=pipeline_id, op="query")
         if embedding is not None and len(embedding) != 1536:
             raise ValueError(f"embedding must have 1536 dimensions, got {len(embedding)}")
         clauses = ["zone = %s"]
