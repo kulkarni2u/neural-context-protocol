@@ -1244,7 +1244,7 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             kwargs["chunk_type"] = str(chunk_type)
 
         raw_ref: str | None = None
-        if fr.was_filtered and len(raw_content) <= 2000:
+        if will_produce_raw_ref:
             raw_chunk = SubconsciousChunk(
                 chunk_id=f"raw_{kwargs.get('chunk_id', '')}_{int(time.time() * 1000)}",
                 layer=str(args["layer"]),
