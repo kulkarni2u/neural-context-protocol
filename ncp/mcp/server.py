@@ -1205,6 +1205,7 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             store=store,
             require_grounded_high_trust=require_grounded_high_trust,
             will_produce_raw_ref=will_produce_raw_ref,
+            pipeline_id=None if pipeline_id is None else str(pipeline_id),
         )
 
         kwargs: dict = {
@@ -1853,7 +1854,11 @@ _GROUNDED_DEMOTION_CEILING = 0.60
 
 
 def _write_is_grounded(
-    args: dict[str, object], store: BaseStore, *, will_produce_raw_ref: bool
+    args: dict[str, object],
+    store: BaseStore,
+    *,
+    will_produce_raw_ref: bool,
+    pipeline_id: str | None,
 ) -> bool:
     """CAP-T2: has this write actually pointed at something real?
 
@@ -1861,14 +1866,36 @@ def _write_is_grounded(
     raw_ref chunk pointing at the unfiltered original (the existing mechanism
     at the raw_ref write site), or (b) the caller supplied an evidence_id that
     resolves to a real, existing chunk in the store -- not just a non-empty
-    string.
+    string -- *in the same pipeline as this write*.
+
+    The pipeline check matters because ``get_chunks_by_ids`` (see
+    ``ncp/stores/sqlite.py``) matches by chunk_id alone, with no pipeline
+    filter: it will happily resolve a chunk_id that belongs to a totally
+    unrelated pipeline. Without this check, an agent in pipeline A could
+    "ground" a tool_result/user_verified claim by passing the evidence_id of
+    any chunk that happens to exist anywhere in the store, in any pipeline --
+    the same cross-pipeline hole the 1.5.0 security hardening closed for
+    supersede() and typed-edge writes (see CHANGELOG.md's 1.5.0 "Security"
+    section), and that retrieval already refuses for legacy/dangling
+    neighbors. Grounding must follow the same pipeline-ownership boundary.
+
+    pipeline_id is compared with the same None-normalization used at the
+    ncp_write_memory call site (``None if pipeline_id is None else
+    str(pipeline_id)``), and matches the equality-based ownership check
+    ``supersede()``/edge writes already use in the store layer: two None
+    pipeline_ids are treated as equal (an unscoped/global write may ground
+    against unscoped/global evidence), but a None on one side and a real
+    pipeline_id on the other never match -- that asymmetry is exactly the
+    cross-pipeline hole this check exists to close, so it isn't given a free
+    pass just because one side is unscoped.
     """
     if will_produce_raw_ref:
         return True
     evidence_id = args.get("evidence_id")
     if not evidence_id:
         return False
-    return len(store.get_chunks_by_ids([str(evidence_id)])) > 0
+    chunks = store.get_chunks_by_ids([str(evidence_id)])
+    return any(chunk.pipeline_id == pipeline_id for chunk in chunks)
 
 
 def _grounded_trust_from_args(
@@ -1877,6 +1904,7 @@ def _grounded_trust_from_args(
     store: BaseStore,
     require_grounded_high_trust: bool,
     will_produce_raw_ref: bool,
+    pipeline_id: str | None,
 ) -> tuple[float, bool, str | None]:
     """CAP-T2: _trust_from_args, but demoting ungrounded high-trust claims.
 
@@ -1889,12 +1917,19 @@ def _grounded_trust_from_args(
     of relying on the src table. We demote rather than reject the write: a
     less disruptive way to make ungrounded claims stop paying off, matching
     the roadmap's "rejected or demoted" language.
+
+    pipeline_id is this write's own (already-normalized) pipeline scope, and
+    is threaded through to _write_is_grounded so a resolvable evidence_id
+    only counts as grounding when it resolves to a chunk in the *same*
+    pipeline -- see _write_is_grounded's docstring for why.
     """
     trust = _trust_from_args(args)
     src = str(args.get("src", ""))
     if not require_grounded_high_trust or src not in _GROUNDING_REQUIRED_SRCS:
         return trust, False, None
-    if _write_is_grounded(args, store, will_produce_raw_ref=will_produce_raw_ref):
+    if _write_is_grounded(
+        args, store, will_produce_raw_ref=will_produce_raw_ref, pipeline_id=pipeline_id
+    ):
         return trust, False, None
     demoted = min(trust, _GROUNDED_DEMOTION_CEILING)
     reason = (

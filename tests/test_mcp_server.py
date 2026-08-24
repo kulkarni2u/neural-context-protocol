@@ -1012,6 +1012,41 @@ class TestGroundedClaims:
         chunk = next(c for c in store.get_working_zone(pipeline_id=None) if c.chunk_id == result["chunk_id"])
         assert chunk.base_trust == 0.60
 
+    def test_evidence_id_pointing_at_cross_pipeline_chunk_still_demotes(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "test.db")
+        handlers = make_handlers(store, config=_grounding_config(tmp_path, enabled=True))
+        # A real, resolvable chunk -- but it lives in a different pipeline than
+        # the write below. get_chunks_by_ids() matches by chunk_id alone with
+        # no pipeline filter, so this exists specifically to prove that a
+        # cross-pipeline evidence_id does NOT count as grounding (the same
+        # pipeline-ownership boundary the 1.5.0 security hardening enforces
+        # for supersede() and typed-edge writes).
+        store.write(SubconsciousChunk(
+            chunk_id="proof_other_pipeline",
+            layer="semantic",
+            content="a chunk that belongs to an unrelated pipeline",
+            src="agent_inferred",
+            base_trust=0.5,
+            pipeline_id="other_pipeline",
+        ))
+
+        result = _content(_handle_request(
+            _call("ncp_write_memory", {
+                "content": "a claim citing someone else's pipeline as evidence",
+                "layer": "semantic",
+                "src": "tool_result",
+                "pipeline_id": "my_pipeline",
+                "evidence_id": "proof_other_pipeline",
+            }),
+            handlers,
+        ))
+
+        assert result["trust_demoted"] is True
+        chunk = next(
+            c for c in store.get_working_zone(pipeline_id="my_pipeline") if c.chunk_id == result["chunk_id"]
+        )
+        assert chunk.base_trust == 0.60
+
     def test_grounded_via_auto_raw_ref_is_not_demoted(self, tmp_path: Path) -> None:
         store = SQLiteStore(tmp_path / "test.db")
         handlers = make_handlers(store, config=_grounding_config(tmp_path, enabled=True))
