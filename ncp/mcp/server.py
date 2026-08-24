@@ -791,6 +791,8 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
     coordination = getattr(store, "coordination", None)
     default_whisper_ttl = config.whisper_ttl_default if config is not None else 1800
     require_signatures = config.require_signatures if config is not None else False
+    # CAP-T2: grounded claims, opt-in and off by default -- see _grounded_trust_from_args.
+    require_grounded_high_trust = config.require_grounded_high_trust if config is not None else False
     # CAP-E2: per-pipeline budget governance settings.
     pipeline_budget_usd = config.pipeline_budget_usd if config is not None else None
     budget_warn_fraction = config.budget_warn_fraction if config is not None else 0.8
@@ -1194,13 +1196,25 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         valid_to = None if valid_to_raw is None else _parse_iso_timestamp(valid_to_raw, field="valid_to")
         supersedes = args.get("supersedes")
 
+        # CAP-T2: grounded claims. Whether this write's own noise-filtering will
+        # auto-create a raw_ref chunk (real, existing evidence) is already known
+        # here -- fr.was_filtered was computed above, before any of this.
+        will_produce_raw_ref = fr.was_filtered and len(raw_content) <= 2000
+        trust, trust_demoted, trust_demoted_reason = _grounded_trust_from_args(
+            args,
+            store=store,
+            require_grounded_high_trust=require_grounded_high_trust,
+            will_produce_raw_ref=will_produce_raw_ref,
+            pipeline_id=None if pipeline_id is None else str(pipeline_id),
+        )
+
         kwargs: dict = {
             "content": content,
             "layer": str(args["layer"]),
             "src": str(args["src"]),
             "written_by": written_by,
             "pipeline_id": pipeline_id,
-            "base_trust": _trust_from_args(args),
+            "base_trust": trust,
             "written_at_drift": 0.0 if latest is None else latest.drift_score,
             "verified": verified,
             "valid_from": valid_from,
@@ -1230,7 +1244,7 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             kwargs["chunk_type"] = str(chunk_type)
 
         raw_ref: str | None = None
-        if fr.was_filtered and len(raw_content) <= 2000:
+        if will_produce_raw_ref:
             raw_chunk = SubconsciousChunk(
                 chunk_id=f"raw_{kwargs.get('chunk_id', '')}_{int(time.time() * 1000)}",
                 layer=str(args["layer"]),
@@ -1271,6 +1285,9 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             result["reduction_ratio"] = round(fr.reduction_ratio, 3)
             if raw_ref is not None:
                 result["raw_ref"] = raw_ref
+        if trust_demoted:
+            result["trust_demoted"] = True
+            result["trust_demoted_reason"] = trust_demoted_reason
         if supersedes is not None:
             # Honest supersedence: the old chunk is never deleted, only marked.
             # Its valid_to becomes this chunk's valid_from (or "now" if unset).
@@ -1327,7 +1344,9 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         if signature is not None:
             result["verified"] = verified
         if whisper_type == "dissent" and ref:
-            result["dissent_recorded"] = store.record_dissent(str(ref))
+            # CAP-T5: identity_id enables per-identity dedup + reputation
+            # gating in the store (see BaseStore.record_dissent).
+            result["dissent_recorded"] = store.record_dissent(str(ref), identity_id=from_agent)
         return result
 
     def _handle_post_turn(args: dict[str, object]) -> object:
@@ -1823,6 +1842,103 @@ def _trust_from_args(args: dict[str, object]) -> float:
         "subcon_retrieved": 0.55,
         "skill_ref": 0.60,
     }.get(str(args.get("src", "")), 0.70)
+
+
+# CAP-T2: the two highest static-trust tiers in _trust_from_args -- the ones
+# that assert the strongest claim ("a tool actually produced this" / "a human
+# verified this") purely from a self-declared `src` string.
+_GROUNDING_REQUIRED_SRCS = frozenset({"tool_result", "user_verified"})
+# Demotion ceiling: same value _trust_from_args gives "agent_inferred", i.e.
+# an ungrounded high-trust claim is worth no more than an ordinary inference.
+_GROUNDED_DEMOTION_CEILING = 0.60
+
+
+def _write_is_grounded(
+    args: dict[str, object],
+    store: BaseStore,
+    *,
+    will_produce_raw_ref: bool,
+    pipeline_id: str | None,
+) -> bool:
+    """CAP-T2: has this write actually pointed at something real?
+
+    Grounded means either (a) this write's own noise-filtering auto-created a
+    raw_ref chunk pointing at the unfiltered original (the existing mechanism
+    at the raw_ref write site), or (b) the caller supplied an evidence_id that
+    resolves to a real, existing chunk in the store -- not just a non-empty
+    string -- *in the same pipeline as this write*.
+
+    The pipeline check matters because ``get_chunks_by_ids`` (see
+    ``ncp/stores/sqlite.py``) matches by chunk_id alone, with no pipeline
+    filter: it will happily resolve a chunk_id that belongs to a totally
+    unrelated pipeline. Without this check, an agent in pipeline A could
+    "ground" a tool_result/user_verified claim by passing the evidence_id of
+    any chunk that happens to exist anywhere in the store, in any pipeline --
+    the same cross-pipeline hole the 1.5.0 security hardening closed for
+    supersede() and typed-edge writes (see CHANGELOG.md's 1.5.0 "Security"
+    section), and that retrieval already refuses for legacy/dangling
+    neighbors. Grounding must follow the same pipeline-ownership boundary.
+
+    pipeline_id is compared with the same None-normalization used at the
+    ncp_write_memory call site (``None if pipeline_id is None else
+    str(pipeline_id)``), and matches the equality-based ownership check
+    ``supersede()``/edge writes already use in the store layer: two None
+    pipeline_ids are treated as equal (an unscoped/global write may ground
+    against unscoped/global evidence), but a None on one side and a real
+    pipeline_id on the other never match -- that asymmetry is exactly the
+    cross-pipeline hole this check exists to close, so it isn't given a free
+    pass just because one side is unscoped.
+    """
+    if will_produce_raw_ref:
+        return True
+    evidence_id = args.get("evidence_id")
+    if not evidence_id:
+        return False
+    chunks = store.get_chunks_by_ids([str(evidence_id)])
+    return any(chunk.pipeline_id == pipeline_id for chunk in chunks)
+
+
+def _grounded_trust_from_args(
+    args: dict[str, object],
+    *,
+    store: BaseStore,
+    require_grounded_high_trust: bool,
+    will_produce_raw_ref: bool,
+    pipeline_id: str | None,
+) -> tuple[float, bool, str | None]:
+    """CAP-T2: _trust_from_args, but demoting ungrounded high-trust claims.
+
+    When require_grounded_high_trust is off (default), this is exactly
+    _trust_from_args -- no behavior change. When on and src is tool_result or
+    user_verified, the write must be grounded (see _write_is_grounded); if it
+    isn't, trust is clamped to the agent_inferred ceiling. This clamp applies
+    even to an explicit caller-supplied base_trust -- otherwise the toggle
+    would be trivially bypassed by passing base_trust: 0.95 directly instead
+    of relying on the src table. We demote rather than reject the write: a
+    less disruptive way to make ungrounded claims stop paying off, matching
+    the roadmap's "rejected or demoted" language.
+
+    pipeline_id is this write's own (already-normalized) pipeline scope, and
+    is threaded through to _write_is_grounded so a resolvable evidence_id
+    only counts as grounding when it resolves to a chunk in the *same*
+    pipeline -- see _write_is_grounded's docstring for why.
+    """
+    trust = _trust_from_args(args)
+    src = str(args.get("src", ""))
+    if not require_grounded_high_trust or src not in _GROUNDING_REQUIRED_SRCS:
+        return trust, False, None
+    if _write_is_grounded(
+        args, store, will_produce_raw_ref=will_produce_raw_ref, pipeline_id=pipeline_id
+    ):
+        return trust, False, None
+    demoted = min(trust, _GROUNDED_DEMOTION_CEILING)
+    reason = (
+        f"src={src!r} requires grounding under [identity].require_grounded_high_trust "
+        "(a resolvable evidence_id, or write-time noise filtering that produced an "
+        f"auto raw_ref); neither was present, so base_trust was demoted to the "
+        f"agent_inferred ceiling ({_GROUNDED_DEMOTION_CEILING})."
+    )
+    return demoted, True, reason
 
 
 _SUPPORTED_VERSIONS = {"2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"}

@@ -67,6 +67,12 @@ DEFAULT_CONFIG = {
         "max_per_drain": 3,
         "min_confidence": 0.60,
         "min_author_reputation": 0.0,
+        # CAP-T5 (dissent integrity): OPT-IN reputation gating on dissent
+        # whispers specifically, reusing the same Beta-posterior-mean pattern
+        # as min_author_reputation above but scoped to record_dissent() so a
+        # low-reputation identity's dissent doesn't debit a chunk's trust.
+        # Default 0.0 (off) -- every dissent counts, same as before.
+        "dissent_min_author_reputation": 0.0,
     },
     "observability": {
         "log_level": "info",
@@ -192,6 +198,16 @@ DEFAULT_CONFIG = {
         # authorship cannot be verified (missing/bad signature or revoked identity)
         # is rejected.
         "require_signatures": False,
+        # CAP-T2: OPT-IN grounded claims. When false (default) a chunk's
+        # base_trust is derived purely from the self-declared `src` string (or
+        # a caller-supplied base_trust), exactly as before. When true, a write
+        # with src="tool_result" or "user_verified" -- the two highest static
+        # -trust tiers -- must be grounded (a resolvable evidence_id, or the
+        # write's own noise-filtering auto-producing a raw_ref); ungrounded
+        # writes are demoted (not rejected) to the agent_inferred trust
+        # ceiling. Orthogonal to require_signatures -- grounding is about
+        # evidence, not authorship.
+        "require_grounded_high_trust": False,
     },
     "handoff": {
         "require_verified": False,
@@ -540,6 +556,12 @@ class NCPConfig:
         return float(self.values.get("whispers", {}).get("min_author_reputation", 0.0))
 
     @property
+    def dissent_min_author_reputation(self) -> float:
+        """CAP-T5: reputation floor (Beta posterior mean) below which record_dissent()
+        dedup-records the attempt but does not increment dissent_count. 0.0 (default) = off."""
+        return float(self.values.get("whispers", {}).get("dissent_min_author_reputation", 0.0))
+
+    @property
     def embedding_enabled(self) -> bool:
         return bool(self.values.get("embedding", {}).get("enabled", False))
 
@@ -613,6 +635,11 @@ class NCPConfig:
     @property
     def require_signatures(self) -> bool:
         return bool(self.values.get("identity", {}).get("require_signatures", False))
+
+    @property
+    def require_grounded_high_trust(self) -> bool:
+        """CAP-T2: whether ncp_write_memory demotes ungrounded tool_result/user_verified claims."""
+        return bool(self.values.get("identity", {}).get("require_grounded_high_trust", False))
 
     @property
     def handoff_require_verified(self) -> bool:

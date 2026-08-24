@@ -406,3 +406,37 @@ def test_pgvector_live_redis_coordination_for_whispers_and_fetch_sessions() -> N
     assert [json.loads(whisper.payload) for whisper in peeked] == [expected_payload]
     assert [json.loads(whisper.payload) for whisper in drained] == [expected_payload]
     assert _error(err)["message"] == "Tool error: ncp_fetch limit reached: max 3 per session"
+
+
+def test_pgvector_live_record_dissent_dedups_per_identity() -> None:
+    """CAP-T5: backend parity with SQLiteStore -- same identity dissenting
+    against the same chunk repeatedly only debits dissent_count once."""
+    store = _pgvector_store()
+    store.write(
+        SubconsciousChunk(
+            chunk_id="sub_live_dissent",
+            layer="semantic",
+            content="a disputed claim on the live pgvector store",
+            src="tool_result",
+            pipeline_id="pipe_live_dissent",
+            written_by="executor",
+        )
+    )
+
+    assert store.record_dissent("sub_live_dissent", identity_id="reviewer_a") is True
+    assert store.record_dissent("sub_live_dissent", identity_id="reviewer_a") is True
+    assert store.record_dissent("sub_live_dissent", identity_id="reviewer_b") is True
+
+    chunk = next(
+        c for c in store.get_working_zone(pipeline_id="pipe_live_dissent")
+        if c.chunk_id == "sub_live_dissent"
+    )
+    assert chunk.dissent_count == 2  # reviewer_a counted once, reviewer_b once
+
+    # Backward compat: identity_id=None still always increments, no dedup.
+    assert store.record_dissent("sub_live_dissent") is True
+    chunk = next(
+        c for c in store.get_working_zone(pipeline_id="pipe_live_dissent")
+        if c.chunk_id == "sub_live_dissent"
+    )
+    assert chunk.dissent_count == 3

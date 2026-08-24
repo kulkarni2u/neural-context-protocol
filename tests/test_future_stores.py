@@ -548,6 +548,97 @@ def test_pgvector_store_write_query_and_restart_with_fake_connection() -> None:
     assert results[0].pipeline_id == "pipe_1"
 
 
+class _FailingEmbeddingAdapter:
+    """Adapter whose embed() always raises -- simulates a lazy
+    LocalEmbeddingAdapter model-download failure surfacing at first use."""
+
+    def __init__(self) -> None:
+        self.call_count = 0
+
+    def embed(self, text: str) -> list[float]:
+        self.call_count += 1
+        raise RuntimeError("simulated model download failure")
+
+
+def test_pgvector_store_write_falls_back_when_embed_fails() -> None:
+    db = _MemoryPgDB()
+    adapter = _FailingEmbeddingAdapter()
+    store = PgvectorStore(
+        "postgresql://postgres:postgres@127.0.0.1:5432/ncp",
+        connect_factory=_pg_connect_factory(db),
+        embedding_adapter=adapter,
+    )
+
+    assert store.write(
+        SubconsciousChunk(
+            chunk_id="sub_write_fallback",
+            layer="semantic",
+            content="write should fall back to lexical only",
+            src="tool_result",
+        )
+    ) is True
+    assert adapter.call_count == 1
+    assert store._embedding_adapter is None  # disabled for this store's remaining life
+
+    # A second write must not retry the already-failing adapter.
+    store.write(
+        SubconsciousChunk(
+            chunk_id="sub_write_fallback_2",
+            layer="semantic",
+            content="second write should not retry",
+            src="tool_result",
+        )
+    )
+    assert adapter.call_count == 1
+
+
+def test_pgvector_store_hybrid_query_falls_back_when_embed_fails() -> None:
+    db = _MemoryPgDB()
+    # Write without an adapter first, so the row exists with no embedding.
+    PgvectorStore(
+        "postgresql://postgres:postgres@127.0.0.1:5432/ncp",
+        connect_factory=_pg_connect_factory(db),
+    ).write(
+        SubconsciousChunk(
+            chunk_id="sub_query_fallback",
+            layer="semantic",
+            content="hybrid query should fall back to lexical scoring",
+            src="tool_result",
+        )
+    )
+
+    adapter = _FailingEmbeddingAdapter()
+    store = PgvectorStore(
+        "postgresql://postgres:postgres@127.0.0.1:5432/ncp",
+        connect_factory=_pg_connect_factory(db),
+        embedding_adapter=adapter,
+    )
+    results = store.query("hybrid query fallback lexical scoring", k=3, min_score=0.0)
+    assert any(chunk.chunk_id == "sub_query_fallback" for chunk in results)
+    assert adapter.call_count == 1
+    assert store._embedding_adapter is None  # disabled after the failure
+
+    store.query("hybrid query fallback lexical scoring", k=3, min_score=0.0)
+    assert adapter.call_count == 1  # not retried on the next query
+
+
+def test_pgvector_store_vector_mode_raises_when_embed_fails() -> None:
+    """Unlike the opportunistic hybrid path, an explicit retrieval_mode='vector'
+    request must propagate an embed failure rather than silently falling back
+    to non-vector results."""
+    db = _MemoryPgDB()
+    adapter = _FailingEmbeddingAdapter()
+    store = PgvectorStore(
+        "postgresql://postgres:postgres@127.0.0.1:5432/ncp",
+        connect_factory=_pg_connect_factory(db),
+        embedding_adapter=adapter,
+    )
+    with pytest.raises(RuntimeError, match="simulated model download failure"):
+        store.query("explicit vector mode", retrieval_mode="vector")
+    assert adapter.call_count == 1
+    assert store._embedding_adapter is not None  # left intact -- caller sees the raw error
+
+
 def test_pgvector_store_query_filters_zero_score_noise_and_uses_effective_score() -> None:
     db = _MemoryPgDB()
     store = PgvectorStore(
@@ -1089,6 +1180,72 @@ def test_create_store_local_embeddings_enabled_without_fastembed_falls_back_to_l
     )
     results = store.query("lexical only retrieval", k=3, min_score=0.0)
     assert any(chunk.chunk_id == "sub_fallback" for chunk in results)
+
+
+def test_create_store_local_embeddings_lazy_construction_does_not_block_startup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """LocalEmbeddingAdapter defers TextEmbedding(model_name=...) -- the call
+    that downloads the model and can block/hang on a slow or offline network
+    -- to the first real embed() call, not adapter construction. So
+    create_store() must return instantly even when that eventual model
+    construction is slow or fails; the fallback happens lazily, at the
+    first write/query that actually calls embed(), not at create_store()
+    time."""
+    import sys
+    import types
+
+    construct_calls: list[str] = []
+
+    class _SlowFailingTextEmbedding:
+        def __init__(self, model_name: str) -> None:
+            construct_calls.append(model_name)
+            raise RuntimeError("simulated network timeout downloading model")
+
+    fake_fastembed = types.ModuleType("fastembed")
+    fake_fastembed.TextEmbedding = _SlowFailingTextEmbedding
+    monkeypatch.setitem(sys.modules, "fastembed", fake_fastembed)
+
+    project = tmp_path / "repo"
+    project.mkdir()
+    config = NCPConfig(
+        values={
+            "store": {"type": "sqlite", "path": str(project / ".ncp" / "store.db")},
+            "embedding": {"enabled": True, "provider": "local", "model": "BAAI/bge-small-en-v1.5"},
+            "providers": {"pricing": {}},
+        },
+        project_root=project,
+    )
+
+    # create_store() itself must not construct the model or raise.
+    store = create_store(config)
+    assert construct_calls == []
+    assert store._embedding_adapter is not None
+
+    # The first write triggers the lazy (failing) construction; the store
+    # must fall back gracefully rather than raising.
+    ok = store.write(
+        SubconsciousChunk(
+            chunk_id="sub_lazy_fail",
+            layer="semantic",
+            content="first write triggers lazy model construction",
+            src="tool_result",
+        )
+    )
+    assert ok is True
+    assert construct_calls == ["BAAI/bge-small-en-v1.5"]
+    assert store._embedding_adapter is None  # disabled for the rest of this store's life
+
+    # A second write must not retry the already-failing construction.
+    store.write(
+        SubconsciousChunk(
+            chunk_id="sub_lazy_fail_2",
+            layer="semantic",
+            content="second write should not retry the failing embed",
+            src="tool_result",
+        )
+    )
+    assert construct_calls == ["BAAI/bge-small-en-v1.5"]
 
 
 def test_build_embedding_adapter_invalid_provider_still_raises(tmp_path: Path) -> None:

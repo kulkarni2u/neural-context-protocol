@@ -8,6 +8,7 @@ from dataclasses import replace as dataclass_replace
 from difflib import SequenceMatcher
 import atexit
 import json
+import logging
 import math
 from pathlib import Path
 from typing import Any
@@ -42,6 +43,8 @@ from ncp.stores.retrieval import (
 )
 from ncp.tokens import estimate_tokens
 from ncp.types import CalibrationReport, ChunkEdge, ConsolidationReport, ConsciousBlock, NCPResponse, OutcomeRecord, SubconsciousChunk, TurnRecord, Whisper
+
+logger = logging.getLogger("ncp")
 
 
 PGVECTOR_SCHEMA_TEMPLATE = """
@@ -252,6 +255,16 @@ CREATE INDEX IF NOT EXISTS {prefix}idx_chunk_edges_src
     ON {schema}.{prefix}chunk_edges(src_chunk_id);
 CREATE INDEX IF NOT EXISTS {prefix}idx_chunk_edges_dst
     ON {schema}.{prefix}chunk_edges(dst_chunk_id);
+
+-- CAP-T5 (dissent integrity): per-(chunk_id, identity_id) dedup so one
+-- identity can't call ncp_emit_whisper(type=dissent) against the same chunk
+-- unlimited times to inflate its dissent_count.
+CREATE TABLE IF NOT EXISTS {schema}.{prefix}dissent_log (
+    chunk_id TEXT NOT NULL,
+    identity_id TEXT NOT NULL,
+    created_at DOUBLE PRECISION NOT NULL,
+    PRIMARY KEY (chunk_id, identity_id)
+);
 """
 
 
@@ -436,15 +449,46 @@ class PgvectorStore(BaseStore):
             finally:
                 self._close_cursor(cursor)
 
+    def _try_embed(self, text: str, *, pipeline_id: str | None, op: str) -> list[float] | None:
+        """Best-effort embed for opportunistic (non-explicit-vector) call sites.
+
+        `LocalEmbeddingAdapter` defers its heavy `TextEmbedding(...)` model
+        construction to its first `embed()` call, so a network/model-download
+        failure that used to surface at `create_store()` time can now surface
+        here instead, on this store's first real write or query. Since these
+        call sites treat embedding as an optional enhancement (unlike an
+        explicit `retrieval_mode="vector"` request, which must still raise),
+        a failure here is caught, logged once, and this store's embedding
+        adapter is disabled for the rest of its lifetime -- so it falls back
+        to lexical-only retrieval instead of retrying the same failing
+        network call on every subsequent write/query.
+        """
+        adapter = self._embedding_adapter
+        assert adapter is not None
+        try:
+            self._embedding_calls_tokens_est += estimate_tokens(text)
+            vector = adapter.embed(text)
+        except Exception as exc:
+            logger.warning(
+                "Embedding %s call failed (%s: %s); disabling embeddings for this "
+                "store instance and falling back to lexical-only retrieval for its "
+                "remaining lifetime.",
+                op,
+                type(exc).__name__,
+                exc,
+            )
+            self._embedding_adapter = None
+            return None
+        self.log_embedding_cost(pipeline_id=pipeline_id, op=op, text=text)
+        return vector
+
     def write(self, chunk: SubconsciousChunk, *, allow_duplicate: bool = False) -> bool:
         self.last_write_inferred_edge_count = 0
         chunk = self._validate_chunk_for_write(chunk)
         if self._embedding_adapter is not None and chunk.embedding is None:
-            self._embedding_calls_tokens_est += estimate_tokens(chunk.content)
-            chunk = chunk.model_copy(
-                update={"embedding": self._embedding_adapter.embed(chunk.content)}
-            )
-            self.log_embedding_cost(pipeline_id=chunk.pipeline_id, op="write", text=chunk.content)
+            embedding = self._try_embed(chunk.content, pipeline_id=chunk.pipeline_id, op="write")
+            if embedding is not None:
+                chunk = chunk.model_copy(update={"embedding": embedding})
         if chunk.embedding is not None and len(chunk.embedding) != 1536:
             raise ValueError(f"embedding must have 1536 dimensions, got {len(chunk.embedding)}")
         with self._connect() as connection:
@@ -644,9 +688,7 @@ class PgvectorStore(BaseStore):
                 diversity_limit=diversity_limit, as_of=as_of,
             )
         if embedding is None and self._embedding_adapter is not None:
-            self._embedding_calls_tokens_est += estimate_tokens(text)
-            embedding = self._embedding_adapter.embed(text)
-            self.log_embedding_cost(pipeline_id=pipeline_id, op="query", text=text)
+            embedding = self._try_embed(text, pipeline_id=pipeline_id, op="query")
         if embedding is not None and len(embedding) != 1536:
             raise ValueError(f"embedding must have 1536 dimensions, got {len(embedding)}")
 
@@ -1202,9 +1244,66 @@ class PgvectorStore(BaseStore):
 
         return {"nodes": nodes, "edges": edges}
 
-    def record_dissent(self, chunk_id: str) -> bool:
+    def record_dissent(self, chunk_id: str, *, identity_id: str | None = None) -> bool:
+        """See ``BaseStore.record_dissent`` for the identity_id/dedup/reputation-gating contract."""
         normalized = chunk_id.removeprefix("ctx://sub/")
         with self._connect() as connection:
+            if identity_id is None:
+                cursor = connection.cursor()
+                try:
+                    cursor.execute(
+                        self._sql(
+                            "UPDATE {schema}.{prefix}chunks"
+                            " SET dissent_count = dissent_count + 1 WHERE chunk_id = %s"
+                        ),
+                        (normalized,),
+                    )
+                    connection.commit()
+                    return cursor.rowcount > 0
+                finally:
+                    self._close_cursor(cursor)
+
+            cursor = connection.cursor()
+            try:
+                cursor.execute(
+                    self._sql("SELECT 1 FROM {schema}.{prefix}chunks WHERE chunk_id = %s"),
+                    (normalized,),
+                )
+                exists = self._fetchall(cursor)
+            finally:
+                self._close_cursor(cursor)
+            if not exists:
+                connection.commit()
+                return False
+
+            cursor = connection.cursor()
+            try:
+                cursor.execute(
+                    self._sql(
+                        "INSERT INTO {schema}.{prefix}dissent_log (chunk_id, identity_id, created_at)"
+                        " VALUES (%s, %s, %s) ON CONFLICT DO NOTHING"
+                    ),
+                    (normalized, identity_id, time.time()),
+                )
+                inserted = cursor.rowcount > 0
+            finally:
+                self._close_cursor(cursor)
+            if not inserted:
+                # Already dissented against this chunk -- no-op, not a fresh penalty.
+                connection.commit()
+                return True
+
+            threshold = self.config.dissent_min_author_reputation if self.config is not None else 0.0
+            if threshold > 0.0:
+                rep_data = self._load_reputation(connection, {identity_id})
+                result = rep_data.get(identity_id)
+                score = (result[0] / (result[0] + result[1])) if result is not None else 0.5
+                if score < threshold:
+                    # Below the reputation floor: dedup-recorded above, but no
+                    # trust penalty from this dissenter.
+                    connection.commit()
+                    return True
+
             cursor = connection.cursor()
             try:
                 cursor.execute(
@@ -1215,7 +1314,7 @@ class PgvectorStore(BaseStore):
                     (normalized,),
                 )
                 connection.commit()
-                return cursor.rowcount > 0
+                return True
             finally:
                 self._close_cursor(cursor)
 

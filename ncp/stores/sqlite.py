@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from dataclasses import replace as dataclass_replace
 from difflib import SequenceMatcher
 import json
+import logging
 from pathlib import Path
 import sqlite3
 import time
@@ -48,6 +49,8 @@ from ncp.types import (
     TurnRecord,
     Whisper,
 )
+
+logger = logging.getLogger("ncp")
 
 
 SCHEMA = """
@@ -265,6 +268,16 @@ CREATE TABLE IF NOT EXISTS chunk_edges (
 
 CREATE INDEX IF NOT EXISTS idx_chunk_edges_src ON chunk_edges(src_chunk_id);
 CREATE INDEX IF NOT EXISTS idx_chunk_edges_dst ON chunk_edges(dst_chunk_id);
+
+-- CAP-T5 (dissent integrity): per-(chunk_id, identity_id) dedup so one
+-- identity can't call ncp_emit_whisper(type=dissent) against the same chunk
+-- unlimited times to inflate its dissent_count.
+CREATE TABLE IF NOT EXISTS dissent_log (
+    chunk_id TEXT NOT NULL,
+    identity_id TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    PRIMARY KEY (chunk_id, identity_id)
+);
 """
 
 
@@ -381,6 +394,7 @@ class SQLiteStore(BaseStore):
                 "CREATE TABLE IF NOT EXISTS identities (identity_id TEXT PRIMARY KEY, public_key TEXT NOT NULL, alg TEXT NOT NULL DEFAULT 'ed25519', label TEXT, created_at REAL NOT NULL, revoked_at REAL)",
                 "CREATE TABLE IF NOT EXISTS reputation (identity_id TEXT PRIMARY KEY, alpha REAL NOT NULL DEFAULT 1.0, beta REAL NOT NULL DEFAULT 1.0, obs_count INTEGER NOT NULL DEFAULT 0, last_updated REAL NOT NULL DEFAULT 0.0)",
                 "CREATE INDEX IF NOT EXISTS idx_reputation_updated ON reputation(last_updated)",
+                "CREATE TABLE IF NOT EXISTS dissent_log (chunk_id TEXT NOT NULL, identity_id TEXT NOT NULL, created_at REAL NOT NULL, PRIMARY KEY (chunk_id, identity_id))",  # CAP-T5
                 "INSERT INTO chunks_fts(chunks_fts) VALUES ('rebuild')",
             ):
                 try:
@@ -402,15 +416,46 @@ class SQLiteStore(BaseStore):
         text. Zero when the fallback was never requested or never fired."""
         return self._retrieval_fallback_count
 
+    def _try_embed(self, text: str, *, pipeline_id: str | None, op: str) -> list[float] | None:
+        """Best-effort embed for opportunistic (non-explicit-vector) call sites.
+
+        `LocalEmbeddingAdapter` defers its heavy `TextEmbedding(...)` model
+        construction to its first `embed()` call, so a network/model-download
+        failure that used to surface at `create_store()` time can now surface
+        here instead, on this store's first real write or query. Since these
+        call sites treat embedding as an optional enhancement (unlike an
+        explicit `retrieval_mode="vector"` request, which must still raise),
+        a failure here is caught, logged once, and this store's embedding
+        adapter is disabled for the rest of its lifetime -- so it falls back
+        to lexical-only retrieval instead of retrying the same failing
+        network call on every subsequent write/query.
+        """
+        adapter = self._embedding_adapter
+        assert adapter is not None
+        try:
+            self._embedding_calls_tokens_est += estimate_tokens(text)
+            vector = adapter.embed(text)
+        except Exception as exc:
+            logger.warning(
+                "Embedding %s call failed (%s: %s); disabling embeddings for this "
+                "store instance and falling back to lexical-only retrieval for its "
+                "remaining lifetime.",
+                op,
+                type(exc).__name__,
+                exc,
+            )
+            self._embedding_adapter = None
+            return None
+        self.log_embedding_cost(pipeline_id=pipeline_id, op=op, text=text)
+        return vector
+
     def write(self, chunk: SubconsciousChunk, *, allow_duplicate: bool = False) -> bool:
         self.last_write_inferred_edge_count = 0
         chunk = self._validate_chunk_for_write(chunk)
         if self._embedding_adapter is not None and chunk.embedding is None:
-            self._embedding_calls_tokens_est += estimate_tokens(chunk.content)
-            chunk = chunk.model_copy(
-                update={"embedding": self._embedding_adapter.embed(chunk.content)}
-            )
-            self.log_embedding_cost(pipeline_id=chunk.pipeline_id, op="write", text=chunk.content)
+            embedding = self._try_embed(chunk.content, pipeline_id=chunk.pipeline_id, op="write")
+            if embedding is not None:
+                chunk = chunk.model_copy(update={"embedding": embedding})
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             self._soft_gc(connection)
@@ -588,9 +633,15 @@ class SQLiteStore(BaseStore):
             and self._embedding_adapter is not None
             and retrieval_mode in {"hybrid", "vector"}
         ):
-            self._embedding_calls_tokens_est += estimate_tokens(text)
-            embedding = self._embedding_adapter.embed(text)
-            self.log_embedding_cost(pipeline_id=pipeline_id, op="query", text=text)
+            if retrieval_mode == "vector":
+                # Explicit vector-mode request: let an embed failure raise
+                # naturally rather than silently falling back to non-vector
+                # results, which would be worse than a clear failure.
+                self._embedding_calls_tokens_est += estimate_tokens(text)
+                embedding = self._embedding_adapter.embed(text)
+                self.log_embedding_cost(pipeline_id=pipeline_id, op="query", text=text)
+            else:
+                embedding = self._try_embed(text, pipeline_id=pipeline_id, op="query")
         if retrieval_mode == "vector" and embedding is None:
             raise ValueError("retrieval_mode='vector' requires an embedding or embedding adapter")
 
@@ -931,14 +982,59 @@ class SQLiteStore(BaseStore):
             )
             return cursor.rowcount > 0
 
-    def record_dissent(self, chunk_id: str) -> bool:
+    def record_dissent(self, chunk_id: str, *, identity_id: str | None = None) -> bool:
+        """Record that ``chunk_id`` was disputed.
+
+        Backward compat: when ``identity_id`` is None (no dissenter known --
+        legacy/direct callers), this always increments dissent_count exactly
+        as before, no dedup. When ``identity_id`` is given (CAP-T5), a repeat
+        dissent from the *same* identity against the *same* chunk is a no-op,
+        not a fresh penalty -- one agent can no longer inflate a chunk's
+        dissent_count by calling this (or ncp_emit_whisper type=dissent)
+        against it unlimited times. Reputation gating (opt-in,
+        [whispers].dissent_min_author_reputation): a dissent from an identity
+        below the reputation floor is still dedup-recorded (so it doesn't
+        start counting for free once reputation crosses the floor later) but
+        does not increment dissent_count.
+        """
         normalized = chunk_id.removeprefix("ctx://sub/")
         with self._connect() as connection:
-            cursor = connection.execute(
+            if identity_id is None:
+                cursor = connection.execute(
+                    "UPDATE chunks SET dissent_count = dissent_count + 1 WHERE chunk_id = ?",
+                    (normalized,),
+                )
+                return cursor.rowcount > 0
+
+            exists = connection.execute(
+                "SELECT 1 FROM chunks WHERE chunk_id = ?", (normalized,)
+            ).fetchone()
+            if exists is None:
+                return False
+
+            dedup_cursor = connection.execute(
+                "INSERT OR IGNORE INTO dissent_log (chunk_id, identity_id, created_at) VALUES (?, ?, ?)",
+                (normalized, identity_id, time.time()),
+            )
+            if dedup_cursor.rowcount == 0:
+                # Already dissented against this chunk -- no-op, not a fresh penalty.
+                return True
+
+            threshold = self.config.dissent_min_author_reputation if self.config is not None else 0.0
+            if threshold > 0.0:
+                rep_data = self._load_reputation(connection, {identity_id})
+                result = rep_data.get(identity_id)
+                score = (result[0] / (result[0] + result[1])) if result is not None else 0.5
+                if score < threshold:
+                    # Below the reputation floor: dedup-recorded above, but no
+                    # trust penalty from this dissenter.
+                    return True
+
+            connection.execute(
                 "UPDATE chunks SET dissent_count = dissent_count + 1 WHERE chunk_id = ?",
                 (normalized,),
             )
-            return cursor.rowcount > 0
+            return True
 
     def record_outcome(self, outcome: OutcomeRecord) -> bool:
         with self._connect() as connection:

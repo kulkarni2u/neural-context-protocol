@@ -71,7 +71,21 @@ class OpenAIEmbeddingAdapter(BaseEmbeddingAdapter):
 
 
 class LocalEmbeddingAdapter(BaseEmbeddingAdapter):
-    """Embedding adapter backed by fastembed local models."""
+    """Embedding adapter backed by fastembed local models.
+
+    Model construction is deferred to the first ``embed()`` call rather than
+    done in ``__init__``. ``TextEmbedding(model_name=...)`` downloads the
+    model (~130MB for the default BAAI/bge-small-en-v1.5) from Hugging Face
+    on first-ever use if it isn't already cached locally, which can block
+    for a long time -- or hang until a timeout -- on a slow, offline, or
+    firewalled network. Since [embedding].enabled now defaults to true, that
+    call used to run synchronously inside every default ``create_store()``,
+    including at ``ncp serve`` startup. Deferring it means startup stays
+    instant, and only the first real ``embed()`` call pays the download
+    cost (or fails, gracefully -- see ``ncp/stores/*.py``'s ``_try_embed``
+    helpers, which catch a failure here and fall back to lexical-only
+    retrieval for the rest of that store's lifetime).
+    """
 
     def __init__(self, model: str = "BAAI/bge-small-en-v1.5") -> None:
         try:
@@ -81,10 +95,19 @@ class LocalEmbeddingAdapter(BaseEmbeddingAdapter):
                 "fastembed is required for [embedding].provider = 'local'. "
                 "Install it with: pip install 'neural-context-protocol[local-embeddings]'"
             ) from err
-        self._model = TextEmbedding(model_name=model)
+        # Only the import happens here -- fast, no network -- so
+        # `_build_embedding_adapter` can still fast-fail immediately when
+        # the optional dependency genuinely isn't installed. The actual
+        # `TextEmbedding(...)` construction (which may hit the network) is
+        # deferred to the first `embed()` call below.
+        self._TextEmbedding = TextEmbedding
+        self._model_name = model
+        self._model: object | None = None
 
     def embed(self, text: str) -> list[float]:
         try:
+            if self._model is None:
+                self._model = self._TextEmbedding(model_name=self._model_name)
             first = next(iter(self._model.embed([text])))
             vector = first.tolist() if hasattr(first, "tolist") else list(first)
         except Exception as exc:
