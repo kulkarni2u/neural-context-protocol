@@ -121,7 +121,16 @@ DEFAULT_CONFIG = {
         "confidence_k": 20,
     },
     "embedding": {
-        "enabled": False,
+        # CAP-C4: cheap local embeddings on by default for hybrid
+        # lexical+vector retrieval. Default true -- when the optional
+        # `fastembed` dependency ([local-embeddings] extra) is missing,
+        # ncp/stores/factory.py::_build_embedding_adapter catches the
+        # ImportError, logs one warning, and returns None so the store
+        # falls back to lexical-only retrieval exactly as before; it never
+        # crashes server startup over a missing optional dependency. Set
+        # false to opt out entirely, or switch provider to "openai" (needs
+        # OPENAI_API_KEY, same graceful-fallback treatment applies).
+        "enabled": True,
         "provider": "local",
         "model": "BAAI/bge-small-en-v1.5",
     },

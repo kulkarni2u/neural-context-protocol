@@ -4,6 +4,33 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **Cheap embeddings on by default (CAP-C4)** (`ncp/config.py`,
+  `ncp/stores/factory.py`): `[embedding].enabled` now defaults to `true`, so
+  hybrid lexical+vector retrieval (`RetrievalPolicy.score_with_vector`, both
+  the SQLite `embedding BLOB` column and pgvector's native `vector(1536)`
+  column) is on out of the box via `LocalEmbeddingAdapter`
+  (`ncp/adapters/embedding.py`, `fastembed`-backed, no API key required).
+  That vector plumbing already existed end to end — the only prior gap was
+  the config default. Flipping it alone would have broken any environment
+  without the optional `fastembed` dependency installed (`pip install
+  'neural-context-protocol[local-embeddings]'`), since
+  `LocalEmbeddingAdapter.__init__` raises `ImportError` when it's missing.
+  `ncp/stores/factory.py::_build_embedding_adapter` now wraps adapter
+  construction (for both `provider = "local"` and `provider = "openai"`) in
+  a broad `except Exception` — a missing optional package, a missing
+  `OPENAI_API_KEY` (`NCPAdapterConfigurationError`), a blocked/failed model
+  download, or any other construction-time failure — logs a one-time
+  warning via `logging.getLogger("ncp")` naming the fix, and returns `None`
+  so `create_store()` proceeds with exactly the same lexical-only retrieval
+  it used when embeddings were off. An invalid `embedding_provider` value
+  is still a hard `ValueError`: only adapter-construction failures degrade
+  gracefully, not config/programmer errors. Set
+  `[embedding].enabled = false` to opt back out. See
+  `docs/NCP_NORTH_STAR_CAPABILITY_ROADMAP.md` (CAP-C4) for the full design
+  note.
+
 ## [1.5.0] - 2026-08-21
 
 ### Added

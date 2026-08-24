@@ -104,12 +104,18 @@ confidence_k = 20
 # tools, while "core" exposes only the bounded per-turn context lifecycle.
 # profile = "full"
 
-# [embedding]
-# Opt-in local semantic embeddings for SQLite hybrid/vector retrieval. Install
-# with: pip install 'neural-context-protocol[local-embeddings]'
-# enabled = true
-# provider = "local"
-# model = "BAAI/bge-small-en-v1.5"
+[embedding]
+# CAP-C4: local semantic embeddings for SQLite/pgvector hybrid lexical+vector
+# retrieval. Default true -- requires the fastembed-backed
+# [local-embeddings] extra (pip install
+# 'neural-context-protocol[local-embeddings]'); when it is not installed,
+# ncp logs one warning and falls back to lexical-only retrieval rather than
+# failing to start. Set enabled = false to opt out, or provider = "openai"
+# to use OPENAI_API_KEY instead (same graceful fallback if the key is
+# missing).
+enabled = true
+provider = "local"
+model = "BAAI/bge-small-en-v1.5"
 
 # [distillation]
 # Opt-in extractive distillation for oversized chunks during assembly.

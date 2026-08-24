@@ -367,7 +367,7 @@ Two multiplicative penalties then shape the result:
 - **Drift discount** — chunks written while `written_at_drift > 0.3` are scaled by `(1 - drift)`.
 - **Generation decay** — every chunk carries a `generation` integer that increments as it is re-derived; the score is multiplied by `generation_penalty_base ** generation` (default `0.9`), so heavily-rederived memory is naturally demoted in favor of primary sources.
 
-Beyond scoring, retrieval can **expand along `caused_by` edges** — pulling in causally-linked chunks with a decay factor (`[retrieval].edge_expansion`) — and optionally **rerank** with a cross-encoder (`[retrieval].rerank_*`). Semantic vector retrieval is available via the `[embedding]` block but is **off by default** (`enabled = false`); turn it on to add embedding similarity to the fusion.
+Beyond scoring, retrieval can **expand along `caused_by` edges** — pulling in causally-linked chunks with a decay factor (`[retrieval].edge_expansion`) — and optionally **rerank** with a cross-encoder (`[retrieval].rerank_*`). Semantic vector retrieval (CAP-C4) is **on by default** via the `[embedding]` block, blending embedding similarity into the fusion using a small local model (`provider = "local"`, `fastembed`-backed, no API key). This needs the optional `[local-embeddings]` extra (`pip install 'neural-context-protocol[local-embeddings]'`); if it isn't installed, NCP logs a one-time warning and falls back to lexical-only retrieval instead of failing to start. Set `[embedding].enabled = false` to opt out entirely, or `provider = "openai"` to use OpenAI embeddings instead (requires `OPENAI_API_KEY`; missing key or package degrades the same way).
 
 The self-improving loop closes through `ncp calibrate --feedback` (`ncp/stores/calibration.py`): chunks that keep getting retrieved gain trust (`+feedback_weight · min(1, retrievals/10)`), chunks that draw dissent lose it (`-dissent_weight · min(1, dissents/3)`), and a fraction of each net change propagates one hop along `caused_by` to credit or debit the cause. `user_verified` chunks are protected from automatic adjustment. Those same deltas feed the reputation rollup above.
 
@@ -564,7 +564,7 @@ for piece in ncp.stream(agent=fixer, turn="..."):  # streamed variant
 | **pgvector**   | Durable semantic retrieval across machines.              | Postgres + pgvector |
 | **Redis**      | Cross-agent coordination, whispers, fetch-session state. | Redis 7             |
 
-Start with SQLite. Add pgvector and Redis when you need richer retrieval or multiple agents coordinating across processes. Semantic vector retrieval is **off by default** even on pgvector — enable it under `[embedding]` (see Configuration); with embeddings off, pgvector still gives you durable, cross-machine lexical + trust + recency retrieval.
+Start with SQLite. Add pgvector and Redis when you need richer retrieval or multiple agents coordinating across processes. Semantic vector retrieval is **on by default**, including on pgvector — tune or disable it under `[embedding]` (see Configuration); with embeddings off (or gracefully falling back because `fastembed` isn't installed), pgvector still gives you durable, cross-machine lexical + trust + recency retrieval.
 
 Managed local Postgres + Redis from an installed CLI:
 
@@ -663,7 +663,7 @@ ncp explain --cwd /path/to/project
 | `[pipeline]`     | Working-set size and GC (`max_working_chunks`, `gc_threshold`, default TTL)                |
 | `[whispers]`     | Whisper TTL, max per drain, and `min_confidence` to deliver                                |
 | `[retrieval]`    | Signal weights, `generation_penalty_base`, `edge_expansion`, rerank, trust propagation, `reduce_fanin_enabled` |
-| `[embedding]`    | Semantic vector retrieval — off by default; provider and model                            |
+| `[embedding]`    | Semantic vector retrieval — on by default (local, no API key); provider, model, graceful lexical-only fallback if `fastembed` is absent |
 | `[reputation]`   | Beta-reputation `gain`, `forget`, `confidence_k`                                           |
 | `[consolidation]`| Similarity threshold, trust floor, and optional LLM model for memory compaction            |
 | `[retention]`    | Hard cap on working chunks per pipeline                                                    |

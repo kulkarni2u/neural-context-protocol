@@ -2,21 +2,67 @@
 
 from __future__ import annotations
 
+import logging
+
 from ncp.config import NCPConfig
 from ncp.stores.base import BaseStore
 from ncp.stores.pgvector import PgvectorStore
 from ncp.stores.sqlite import SQLiteStore
 
+logger = logging.getLogger("ncp")
+
 
 def _build_embedding_adapter(cfg: NCPConfig) -> object | None:
+    """Construct the configured embedding adapter, or None.
+
+    CAP-C4: [embedding].enabled defaults to true, so this runs on every
+    default `create_store()` call. Adapter construction can legitimately
+    fail for reasons outside anyone's control at deploy time -- the
+    optional `fastembed`/`openai` package isn't installed, OPENAI_API_KEY
+    isn't set, a model download times out or is blocked by a firewall,
+    etc. None of those are programmer errors, so none of them should ever
+    crash server startup: catch any exception construction raises, log one
+    warning naming the fix, and return None so the caller falls back to
+    exactly the lexical-only retrieval it used when embeddings were off.
+
+    An unrecognized `embedding_provider` value, by contrast, IS a
+    config/programmer error -- it can never be fixed by installing
+    something or waiting for the network -- so that branch still raises
+    ValueError rather than degrading silently.
+    """
     if not cfg.embedding_enabled:
         return None
     from ncp.adapters.embedding import LocalEmbeddingAdapter, OpenAIEmbeddingAdapter
 
     if cfg.embedding_provider == "openai":
-        return OpenAIEmbeddingAdapter(model=cfg.embedding_model)
+        try:
+            return OpenAIEmbeddingAdapter(model=cfg.embedding_model)
+        except Exception as exc:
+            logger.warning(
+                "Semantic retrieval disabled: could not construct the OpenAI "
+                "embedding adapter (%s: %s). Falling back to lexical-only "
+                "retrieval. Set OPENAI_API_KEY and install "
+                "'neural-context-protocol[providers]', or set "
+                "[embedding].enabled = false to silence this warning.",
+                type(exc).__name__,
+                exc,
+            )
+            return None
     if cfg.embedding_provider == "local":
-        return LocalEmbeddingAdapter(model=cfg.embedding_model)
+        try:
+            return LocalEmbeddingAdapter(model=cfg.embedding_model)
+        except Exception as exc:
+            logger.warning(
+                "Semantic retrieval disabled: could not construct the local "
+                "fastembed embedding adapter (%s: %s). Falling back to "
+                "lexical-only retrieval. Install the optional dependency "
+                "with: pip install 'neural-context-protocol[local-embeddings]'"
+                ", or set [embedding].enabled = false to silence this "
+                "warning.",
+                type(exc).__name__,
+                exc,
+            )
+            return None
     raise ValueError(
         "Unsupported embedding provider "
         f"{cfg.embedding_provider!r}; expected 'local' or 'openai'"

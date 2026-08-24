@@ -1050,6 +1050,91 @@ def test_create_store_selects_sqlite(tmp_path: Path) -> None:
     assert isinstance(store, SQLiteStore)
 
 
+def test_create_store_local_embeddings_enabled_without_fastembed_falls_back_to_lexical(
+    tmp_path: Path,
+) -> None:
+    """CAP-C4 graceful-degradation contract, exercised end to end through
+    create_store(): with embeddings on (the new default) and the optional
+    fastembed dependency genuinely absent, store construction must not
+    raise, and the resulting store must still serve lexical retrieval
+    exactly as it did with embeddings off."""
+    import sys
+
+    if "fastembed" in sys.modules:  # pragma: no cover - defensive, keeps the test honest
+        pytest.skip("fastembed is importable in this environment; see the companion test")
+
+    project = tmp_path / "repo"
+    project.mkdir()
+    config = NCPConfig(
+        values={
+            "store": {"type": "sqlite", "path": str(project / ".ncp" / "store.db")},
+            "embedding": {"enabled": True, "provider": "local", "model": "BAAI/bge-small-en-v1.5"},
+            "providers": {"pricing": {}},
+        },
+        project_root=project,
+    )
+
+    store = create_store(config)  # must not raise ImportError
+
+    assert isinstance(store, SQLiteStore)
+    assert store._embedding_adapter is None  # graceful fallback, not wired up
+
+    store.write(
+        SubconsciousChunk(
+            chunk_id="sub_fallback",
+            layer="semantic",
+            content="lexical only retrieval still works",
+            src="tool_result",
+        )
+    )
+    results = store.query("lexical only retrieval", k=3, min_score=0.0)
+    assert any(chunk.chunk_id == "sub_fallback" for chunk in results)
+
+
+def test_build_embedding_adapter_invalid_provider_still_raises(tmp_path: Path) -> None:
+    """Only the missing-optional-dependency / adapter-construction-failure case
+    degrades gracefully. A programmer/config error -- an unrecognized
+    provider name -- must still raise, not silently disable embeddings."""
+    from ncp.stores.factory import _build_embedding_adapter
+
+    project = tmp_path / "repo"
+    project.mkdir()
+    config = NCPConfig(
+        values={
+            "store": {"type": "sqlite", "path": str(project / ".ncp" / "store.db")},
+            "embedding": {"enabled": True, "provider": "not-a-real-provider"},
+            "providers": {"pricing": {}},
+        },
+        project_root=project,
+    )
+
+    with pytest.raises(ValueError, match="Unsupported embedding provider"):
+        _build_embedding_adapter(config)
+
+
+def test_build_embedding_adapter_openai_missing_dependency_or_key_falls_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same reasoning as the local-provider fallback: a default-on feature
+    must never crash server startup over a missing optional credential
+    (OPENAI_API_KEY) or the optional `openai` package."""
+    from ncp.stores.factory import _build_embedding_adapter
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    project = tmp_path / "repo"
+    project.mkdir()
+    config = NCPConfig(
+        values={
+            "store": {"type": "sqlite", "path": str(project / ".ncp" / "store.db")},
+            "embedding": {"enabled": True, "provider": "openai", "model": "text-embedding-3-small"},
+            "providers": {"pricing": {}},
+        },
+        project_root=project,
+    )
+
+    assert _build_embedding_adapter(config) is None
+
+
 def test_create_store_selects_pgvector(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     captured: dict[str, str] = {}
 
