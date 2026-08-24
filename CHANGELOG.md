@@ -4,6 +4,50 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Grounded claims (CAP-T2)** (`ncp/mcp/server.py`, `ncp/config.py`): new
+  opt-in, off-by-default `[identity].require_grounded_high_trust`. When
+  enabled, a `ncp_write_memory` call with `src="tool_result"` or
+  `"user_verified"` — the two highest static-trust tiers in
+  `_trust_from_args` — must be *grounded*: either `evidence_id` resolves to
+  a real, existing chunk (`store.get_chunks_by_ids`, not just a non-empty
+  string), or the write's own noise-filtering auto-produced a `raw_ref` to
+  the unfiltered original (the existing mechanism at the `fr.was_filtered`
+  write site). An ungrounded write is **demoted, not rejected** — matching
+  the roadmap's own "rejected or demoted" language, and the less disruptive
+  choice: `base_trust` is clamped to the `agent_inferred` ceiling (`0.60`)
+  and the response carries `trust_demoted: true` plus a reason. The clamp
+  applies to an explicit caller-supplied `base_trust` too — otherwise the
+  toggle would be trivially bypassed by passing `base_trust: 0.95` directly
+  instead of relying on the `src` table. Off by default: with the toggle
+  off (or for any other `src`), behavior is byte-for-byte unchanged.
+- **Dissent integrity (CAP-T5, dissent half)**
+  (`ncp/stores/sqlite.py`, `ncp/stores/pgvector.py`,
+  `ncp/stores/pgvector_async.py`, `ncp/stores/base.py`, `ncp/mcp/server.py`,
+  `ncp/config.py`, `ncp/migrations/013_add_dissent_log.sql`): dissent was
+  previously unauthenticated, un-deduplicated, and unweighted — one identity
+  could call `ncp_emit_whisper(type=dissent)` against the same chunk
+  unlimited times, and `calibration.py`'s `_DISSENT_SATURATION = 3` meant
+  three calls from *one* agent already applied the full trust penalty.
+  `record_dissent(chunk_id, *, identity_id=None)` now takes an optional
+  dissenting identity. When given, a new `dissent_log(chunk_id, identity_id,
+  created_at)` table (`INSERT OR IGNORE` / `ON CONFLICT DO NOTHING`) dedupes
+  per `(chunk_id, identity_id)` — only a genuinely new row increments
+  `chunks.dissent_count`, so a repeat dissent from the same identity against
+  the same chunk is a no-op, not a fresh penalty. A new opt-in
+  `[whispers].dissent_min_author_reputation` (default `0.0`, off) reuses the
+  exact CAP-T4 whisper-drain gating pattern (`_load_reputation`, Beta
+  posterior mean `alpha/(alpha+beta)`, uniform `0.5` prior for an unknown
+  identity): a dissent below the floor is still dedup-recorded (so it can't
+  be replayed for free once reputation later crosses the floor) but does not
+  debit trust. `ncp_emit_whisper` passes its `from` field through as
+  `identity_id`. `identity_id=None` (the default) preserves the exact
+  pre-existing behavior — always increment, no dedup — so every existing
+  direct caller of `record_dissent("chunk_id")` is unaffected. Implemented
+  identically across SQLite, pgvector, and async pgvector for backend
+  parity.
+
 ### Changed
 
 - **Cheap embeddings on by default (CAP-C4)** (`ncp/config.py`,

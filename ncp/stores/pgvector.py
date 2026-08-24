@@ -252,6 +252,16 @@ CREATE INDEX IF NOT EXISTS {prefix}idx_chunk_edges_src
     ON {schema}.{prefix}chunk_edges(src_chunk_id);
 CREATE INDEX IF NOT EXISTS {prefix}idx_chunk_edges_dst
     ON {schema}.{prefix}chunk_edges(dst_chunk_id);
+
+-- CAP-T5 (dissent integrity): per-(chunk_id, identity_id) dedup so one
+-- identity can't call ncp_emit_whisper(type=dissent) against the same chunk
+-- unlimited times to inflate its dissent_count.
+CREATE TABLE IF NOT EXISTS {schema}.{prefix}dissent_log (
+    chunk_id TEXT NOT NULL,
+    identity_id TEXT NOT NULL,
+    created_at DOUBLE PRECISION NOT NULL,
+    PRIMARY KEY (chunk_id, identity_id)
+);
 """
 
 
@@ -1202,9 +1212,66 @@ class PgvectorStore(BaseStore):
 
         return {"nodes": nodes, "edges": edges}
 
-    def record_dissent(self, chunk_id: str) -> bool:
+    def record_dissent(self, chunk_id: str, *, identity_id: str | None = None) -> bool:
+        """See ``BaseStore.record_dissent`` for the identity_id/dedup/reputation-gating contract."""
         normalized = chunk_id.removeprefix("ctx://sub/")
         with self._connect() as connection:
+            if identity_id is None:
+                cursor = connection.cursor()
+                try:
+                    cursor.execute(
+                        self._sql(
+                            "UPDATE {schema}.{prefix}chunks"
+                            " SET dissent_count = dissent_count + 1 WHERE chunk_id = %s"
+                        ),
+                        (normalized,),
+                    )
+                    connection.commit()
+                    return cursor.rowcount > 0
+                finally:
+                    self._close_cursor(cursor)
+
+            cursor = connection.cursor()
+            try:
+                cursor.execute(
+                    self._sql("SELECT 1 FROM {schema}.{prefix}chunks WHERE chunk_id = %s"),
+                    (normalized,),
+                )
+                exists = self._fetchall(cursor)
+            finally:
+                self._close_cursor(cursor)
+            if not exists:
+                connection.commit()
+                return False
+
+            cursor = connection.cursor()
+            try:
+                cursor.execute(
+                    self._sql(
+                        "INSERT INTO {schema}.{prefix}dissent_log (chunk_id, identity_id, created_at)"
+                        " VALUES (%s, %s, %s) ON CONFLICT DO NOTHING"
+                    ),
+                    (normalized, identity_id, time.time()),
+                )
+                inserted = cursor.rowcount > 0
+            finally:
+                self._close_cursor(cursor)
+            if not inserted:
+                # Already dissented against this chunk -- no-op, not a fresh penalty.
+                connection.commit()
+                return True
+
+            threshold = self.config.dissent_min_author_reputation if self.config is not None else 0.0
+            if threshold > 0.0:
+                rep_data = self._load_reputation(connection, {identity_id})
+                result = rep_data.get(identity_id)
+                score = (result[0] / (result[0] + result[1])) if result is not None else 0.5
+                if score < threshold:
+                    # Below the reputation floor: dedup-recorded above, but no
+                    # trust penalty from this dissenter.
+                    connection.commit()
+                    return True
+
             cursor = connection.cursor()
             try:
                 cursor.execute(
@@ -1215,7 +1282,7 @@ class PgvectorStore(BaseStore):
                     (normalized,),
                 )
                 connection.commit()
-                return cursor.rowcount > 0
+                return True
             finally:
                 self._close_cursor(cursor)
 

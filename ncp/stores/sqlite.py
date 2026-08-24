@@ -265,6 +265,16 @@ CREATE TABLE IF NOT EXISTS chunk_edges (
 
 CREATE INDEX IF NOT EXISTS idx_chunk_edges_src ON chunk_edges(src_chunk_id);
 CREATE INDEX IF NOT EXISTS idx_chunk_edges_dst ON chunk_edges(dst_chunk_id);
+
+-- CAP-T5 (dissent integrity): per-(chunk_id, identity_id) dedup so one
+-- identity can't call ncp_emit_whisper(type=dissent) against the same chunk
+-- unlimited times to inflate its dissent_count.
+CREATE TABLE IF NOT EXISTS dissent_log (
+    chunk_id TEXT NOT NULL,
+    identity_id TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    PRIMARY KEY (chunk_id, identity_id)
+);
 """
 
 
@@ -381,6 +391,7 @@ class SQLiteStore(BaseStore):
                 "CREATE TABLE IF NOT EXISTS identities (identity_id TEXT PRIMARY KEY, public_key TEXT NOT NULL, alg TEXT NOT NULL DEFAULT 'ed25519', label TEXT, created_at REAL NOT NULL, revoked_at REAL)",
                 "CREATE TABLE IF NOT EXISTS reputation (identity_id TEXT PRIMARY KEY, alpha REAL NOT NULL DEFAULT 1.0, beta REAL NOT NULL DEFAULT 1.0, obs_count INTEGER NOT NULL DEFAULT 0, last_updated REAL NOT NULL DEFAULT 0.0)",
                 "CREATE INDEX IF NOT EXISTS idx_reputation_updated ON reputation(last_updated)",
+                "CREATE TABLE IF NOT EXISTS dissent_log (chunk_id TEXT NOT NULL, identity_id TEXT NOT NULL, created_at REAL NOT NULL, PRIMARY KEY (chunk_id, identity_id))",  # CAP-T5
                 "INSERT INTO chunks_fts(chunks_fts) VALUES ('rebuild')",
             ):
                 try:
@@ -931,14 +942,59 @@ class SQLiteStore(BaseStore):
             )
             return cursor.rowcount > 0
 
-    def record_dissent(self, chunk_id: str) -> bool:
+    def record_dissent(self, chunk_id: str, *, identity_id: str | None = None) -> bool:
+        """Record that ``chunk_id`` was disputed.
+
+        Backward compat: when ``identity_id`` is None (no dissenter known --
+        legacy/direct callers), this always increments dissent_count exactly
+        as before, no dedup. When ``identity_id`` is given (CAP-T5), a repeat
+        dissent from the *same* identity against the *same* chunk is a no-op,
+        not a fresh penalty -- one agent can no longer inflate a chunk's
+        dissent_count by calling this (or ncp_emit_whisper type=dissent)
+        against it unlimited times. Reputation gating (opt-in,
+        [whispers].dissent_min_author_reputation): a dissent from an identity
+        below the reputation floor is still dedup-recorded (so it doesn't
+        start counting for free once reputation crosses the floor later) but
+        does not increment dissent_count.
+        """
         normalized = chunk_id.removeprefix("ctx://sub/")
         with self._connect() as connection:
-            cursor = connection.execute(
+            if identity_id is None:
+                cursor = connection.execute(
+                    "UPDATE chunks SET dissent_count = dissent_count + 1 WHERE chunk_id = ?",
+                    (normalized,),
+                )
+                return cursor.rowcount > 0
+
+            exists = connection.execute(
+                "SELECT 1 FROM chunks WHERE chunk_id = ?", (normalized,)
+            ).fetchone()
+            if exists is None:
+                return False
+
+            dedup_cursor = connection.execute(
+                "INSERT OR IGNORE INTO dissent_log (chunk_id, identity_id, created_at) VALUES (?, ?, ?)",
+                (normalized, identity_id, time.time()),
+            )
+            if dedup_cursor.rowcount == 0:
+                # Already dissented against this chunk -- no-op, not a fresh penalty.
+                return True
+
+            threshold = self.config.dissent_min_author_reputation if self.config is not None else 0.0
+            if threshold > 0.0:
+                rep_data = self._load_reputation(connection, {identity_id})
+                result = rep_data.get(identity_id)
+                score = (result[0] / (result[0] + result[1])) if result is not None else 0.5
+                if score < threshold:
+                    # Below the reputation floor: dedup-recorded above, but no
+                    # trust penalty from this dissenter.
+                    return True
+
+            connection.execute(
                 "UPDATE chunks SET dissent_count = dissent_count + 1 WHERE chunk_id = ?",
                 (normalized,),
             )
-            return cursor.rowcount > 0
+            return True
 
     def record_outcome(self, outcome: OutcomeRecord) -> bool:
         with self._connect() as connection:

@@ -212,7 +212,7 @@ it (evidence), and did it prove out (outcomes).**
   precondition for trust-weighted retrieval to mean anything.
 - **Deps:** none (uses existing keystore).
 
-### CAP-T2 · Grounded claims (evidence-linked trust) — impact: HIGH, effort: M
+### CAP-T2 · Grounded claims (evidence-linked trust) — impact: HIGH, effort: M — **implemented, `ncp/mcp/server.py`, `ncp/config.py`**
 - **Why:** a chunk claiming `src=tool_result` should have to *point at* the tool
   result. Today `src` is a self-asserted label worth 0.95. Trust should derive
   from grounding, not declaration.
@@ -223,6 +223,17 @@ it (evidence), and did it prove out (outcomes).**
 - **Approach:** enforce evidence presence for high-trust `src` values at
   `ncp_write_memory`; derive `base_trust` from `src` × grounding, not from the
   client's number. Keep the reversible `raw_ref` machinery that already exists.
+- **Implementation note:** opt-in, off by default, via `[identity].require_grounded_high_trust`.
+  When on, `ncp_write_memory` with `src="tool_result"`/`"user_verified"` must be
+  grounded — `evidence_id` resolving to a real chunk (`store.get_chunks_by_ids`),
+  or the write's own noise-filtering auto-producing a `raw_ref` (the existing
+  mechanism). Per the "rejected or demoted" language above, an ungrounded write
+  is **demoted, not rejected**: `base_trust` is clamped to the `agent_inferred`
+  ceiling (`0.60`) and the response carries `trust_demoted: true` with a reason.
+  The clamp applies to an explicit caller-supplied `base_trust` too, so the
+  toggle can't be bypassed by asserting a number directly — grounding governs
+  the ceiling, not the client's number. Orthogonal to CAP-T1/`require_signatures`
+  (grounding is about evidence, not authorship).
 - **Impact:** closes the biggest trust hole — you can no longer *assert* your way
   to maximum trust.
 - **Deps:** CAP-T1 (so the grounding claim is itself attributable).
@@ -265,6 +276,20 @@ it (evidence), and did it prove out (outcomes).**
   CAP-T1). Drift then feeds CAP-C6 adaptive budgeting.
 - **Impact:** trust and drift stop being spoofable honor-system floats.
 - **Deps:** CAP-T1, WI-016.
+- **Partial implementation note:** the *dissent-integrity* half of this entry is
+  now closed — `ncp/stores/{sqlite,pgvector,pgvector_async}.py`,
+  `ncp/mcp/server.py`, `ncp/config.py`. `record_dissent()` takes an optional
+  `identity_id` and dedupes per `(chunk_id, identity_id)` via a new
+  `dissent_log` table (`INSERT OR IGNORE`/`ON CONFLICT DO NOTHING`; only a
+  genuinely new row increments `chunks.dissent_count`), and gates on the
+  dissenter's reputation via `[whispers].dissent_min_author_reputation`
+  (opt-in, default `0.0`, reusing the CAP-T4 Beta-posterior-mean gating
+  pattern). `ncp_emit_whisper` wires `from` through as the dissenting
+  identity. This entry is **not** fully implemented, though: the *computed
+  drift* half (WI-016 real topical-divergence drift, as opposed to the
+  self-reported `drift_score` described under "Trust-aware transport" in the
+  README) is tracked and gated separately (`[drift].drift_computed_enabled`)
+  and is out of scope for this note.
 
 ---
 

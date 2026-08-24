@@ -147,12 +147,20 @@ class BaseStore(ABC):
             partial(self.supersede, old_chunk_id, new_chunk_id, valid_to=valid_to)
         )
 
-    def record_dissent(self, chunk_id: str) -> bool:
+    def record_dissent(self, chunk_id: str, *, identity_id: str | None = None) -> bool:
         """Record that ``chunk_id`` was disputed (e.g. by a dissent whisper).
 
         Increments the chunk's dissent counter so feedback calibration can apply
         a trust penalty and propagate it along ``caused_by`` edges. Best-effort:
         backends that do not implement this return False.
+
+        CAP-T5 (dissent integrity): when ``identity_id`` is supplied, backends
+        dedup per (chunk_id, identity_id) -- a repeat dissent from the same
+        identity against the same chunk is a no-op, not a fresh penalty -- and
+        may additionally gate on the dissenter's reputation
+        ([whispers].dissent_min_author_reputation, opt-in). ``identity_id=None``
+        (the default) preserves the pre-CAP-T5 behavior: always increment, no
+        dedup, for any existing direct caller that doesn't pass one.
         """
         return False
 
@@ -678,9 +686,11 @@ class BaseStore(ABC):
         """Asynchronously persist a whisper using thread pool."""
         await anyio.to_thread.run_sync(self.emit_whisper, whisper)
 
-    async def async_record_dissent(self, chunk_id: str) -> bool:
+    async def async_record_dissent(self, chunk_id: str, *, identity_id: str | None = None) -> bool:
         """Asynchronously record a dissent against a chunk using thread pool."""
-        return await anyio.to_thread.run_sync(self.record_dissent, chunk_id)
+        return await anyio.to_thread.run_sync(
+            partial(self.record_dissent, chunk_id, identity_id=identity_id)
+        )
 
     async def async_drain_whispers(
         self,

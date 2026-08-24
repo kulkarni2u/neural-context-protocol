@@ -1671,10 +1671,57 @@ class AsyncPgvectorStore(BaseStore):
 
         return {"nodes": nodes, "edges": edges}
 
-    async def async_record_dissent(self, chunk_id: str) -> bool:
-        """Increment a chunk's dissent counter via native async DB I/O."""
+    async def async_record_dissent(self, chunk_id: str, *, identity_id: str | None = None) -> bool:
+        """Increment a chunk's dissent counter via native async DB I/O.
+
+        See ``BaseStore.record_dissent`` for the identity_id/dedup/
+        reputation-gating contract (mirrors ``PgvectorStore.record_dissent``).
+        """
         normalized = chunk_id.removeprefix("ctx://sub/")
         async with self._aconnect() as conn:
+            if identity_id is None:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        self._sql(
+                            "UPDATE {schema}.{prefix}chunks"
+                            " SET dissent_count = dissent_count + 1 WHERE chunk_id = %s"
+                        ),
+                        (normalized,),
+                    )
+                    return cur.rowcount > 0
+
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    self._sql("SELECT 1 FROM {schema}.{prefix}chunks WHERE chunk_id = %s"),
+                    (normalized,),
+                )
+                exists = await self._afetchall(cur)
+            if not exists:
+                return False
+
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    self._sql(
+                        "INSERT INTO {schema}.{prefix}dissent_log (chunk_id, identity_id, created_at)"
+                        " VALUES (%s, %s, %s) ON CONFLICT DO NOTHING"
+                    ),
+                    (normalized, identity_id, time.time()),
+                )
+                inserted = cur.rowcount > 0
+            if not inserted:
+                # Already dissented against this chunk -- no-op, not a fresh penalty.
+                return True
+
+            threshold = self.config.dissent_min_author_reputation if self.config is not None else 0.0
+            if threshold > 0.0:
+                rep_data = await self._aload_reputation(conn, {identity_id})
+                result = rep_data.get(identity_id)
+                score = (result[0] / (result[0] + result[1])) if result is not None else 0.5
+                if score < threshold:
+                    # Below the reputation floor: dedup-recorded above, but no
+                    # trust penalty from this dissenter.
+                    return True
+
             async with conn.cursor() as cur:
                 await cur.execute(
                     self._sql(
@@ -1683,7 +1730,7 @@ class AsyncPgvectorStore(BaseStore):
                     ),
                     (normalized,),
                 )
-                return cur.rowcount > 0
+            return True
 
     async def async_record_outcome(self, outcome: OutcomeRecord) -> bool:
         """Persist a task outcome via native async DB I/O."""

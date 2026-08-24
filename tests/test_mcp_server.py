@@ -891,6 +891,185 @@ class TestWriteMemory:
         assert "raw_ref" not in result
 
 
+def _grounding_config(tmp_path: Path, *, enabled: bool):
+    config = load_config(cwd=tmp_path)
+    config.values["identity"]["require_grounded_high_trust"] = enabled
+    return config
+
+
+class TestGroundedClaims:
+    """CAP-T2: [identity].require_grounded_high_trust (opt-in, off by default)."""
+
+    def test_off_by_default_no_regression(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "test.db")
+        handlers = make_handlers(store)  # no config -- toggle defaults off
+
+        result = _content(_handle_request(
+            _call("ncp_write_memory", {
+                "content": "an ungrounded tool claim",
+                "layer": "semantic",
+                "src": "tool_result",
+            }),
+            handlers,
+        ))
+
+        assert "trust_demoted" not in result
+        chunk = next(c for c in store.get_working_zone(pipeline_id=None) if c.chunk_id == result["chunk_id"])
+        assert chunk.base_trust == 0.80
+
+    def test_demotes_ungrounded_tool_result_when_enabled(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "test.db")
+        handlers = make_handlers(store, config=_grounding_config(tmp_path, enabled=True))
+
+        result = _content(_handle_request(
+            _call("ncp_write_memory", {
+                "content": "an ungrounded tool claim with no evidence at all",
+                "layer": "semantic",
+                "src": "tool_result",
+            }),
+            handlers,
+        ))
+
+        assert result["trust_demoted"] is True
+        assert "require_grounded_high_trust" in result["trust_demoted_reason"]
+        chunk = next(c for c in store.get_working_zone(pipeline_id=None) if c.chunk_id == result["chunk_id"])
+        assert chunk.base_trust == 0.60  # agent_inferred ceiling, not 0.80
+
+    def test_demotes_ungrounded_user_verified_when_enabled(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "test.db")
+        handlers = make_handlers(store, config=_grounding_config(tmp_path, enabled=True))
+
+        result = _content(_handle_request(
+            _call("ncp_write_memory", {
+                "content": "an unverified 'user_verified' claim",
+                "layer": "semantic",
+                "src": "user_verified",
+            }),
+            handlers,
+        ))
+
+        assert result["trust_demoted"] is True
+        chunk = next(c for c in store.get_working_zone(pipeline_id=None) if c.chunk_id == result["chunk_id"])
+        assert chunk.base_trust == 0.60
+
+    def test_no_demotion_when_src_is_not_high_tier(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "test.db")
+        handlers = make_handlers(store, config=_grounding_config(tmp_path, enabled=True))
+
+        result = _content(_handle_request(
+            _call("ncp_write_memory", {
+                "content": "an ordinary inference, not a high-trust claim",
+                "layer": "semantic",
+                "src": "agent_inferred",
+            }),
+            handlers,
+        ))
+
+        assert "trust_demoted" not in result
+        chunk = next(c for c in store.get_working_zone(pipeline_id=None) if c.chunk_id == result["chunk_id"])
+        assert chunk.base_trust == 0.60  # unchanged: agent_inferred was already 0.60
+
+    def test_grounded_via_resolvable_evidence_id_is_not_demoted(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "test.db")
+        handlers = make_handlers(store, config=_grounding_config(tmp_path, enabled=True))
+        store.write(SubconsciousChunk(
+            chunk_id="proof_1",
+            layer="semantic",
+            content="the actual tool output backing the claim below",
+            src="agent_inferred",
+            base_trust=0.5,
+        ))
+
+        result = _content(_handle_request(
+            _call("ncp_write_memory", {
+                "content": "a grounded tool claim",
+                "layer": "semantic",
+                "src": "tool_result",
+                "evidence_id": "proof_1",
+            }),
+            handlers,
+        ))
+
+        assert "trust_demoted" not in result
+        chunk = next(c for c in store.get_working_zone(pipeline_id=None) if c.chunk_id == result["chunk_id"])
+        assert chunk.base_trust == 0.80
+
+    def test_evidence_id_pointing_at_nonexistent_chunk_still_demotes(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "test.db")
+        handlers = make_handlers(store, config=_grounding_config(tmp_path, enabled=True))
+
+        result = _content(_handle_request(
+            _call("ncp_write_memory", {
+                "content": "a claim with a fake evidence_id",
+                "layer": "semantic",
+                "src": "tool_result",
+                "evidence_id": "does_not_exist",
+            }),
+            handlers,
+        ))
+
+        assert result["trust_demoted"] is True
+        chunk = next(c for c in store.get_working_zone(pipeline_id=None) if c.chunk_id == result["chunk_id"])
+        assert chunk.base_trust == 0.60
+
+    def test_grounded_via_auto_raw_ref_is_not_demoted(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "test.db")
+        handlers = make_handlers(store, config=_grounding_config(tmp_path, enabled=True))
+        noisy = "unique_marker line\nunique_marker line\nunique_marker line\nresult"
+
+        result = _content(_handle_request(
+            _call("ncp_write_memory", {
+                "content": noisy,
+                "layer": "episodic",
+                "src": "tool_result",
+            }),
+            handlers,
+        ))
+
+        assert "trust_demoted" not in result
+        assert "raw_ref" in result  # write-time filtering produced real grounding
+        chunk = next(c for c in store.get_working_zone(pipeline_id=None) if c.chunk_id == result["chunk_id"])
+        assert chunk.base_trust == 0.80
+
+    def test_explicit_base_trust_is_clamped_not_bypassed(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "test.db")
+        handlers = make_handlers(store, config=_grounding_config(tmp_path, enabled=True))
+
+        result = _content(_handle_request(
+            _call("ncp_write_memory", {
+                "content": "trying to bypass grounding with an explicit base_trust",
+                "layer": "semantic",
+                "src": "tool_result",
+                "base_trust": 0.95,
+            }),
+            handlers,
+        ))
+
+        assert result["trust_demoted"] is True
+        chunk = next(c for c in store.get_working_zone(pipeline_id=None) if c.chunk_id == result["chunk_id"])
+        assert chunk.base_trust == 0.60  # clamped to the agent_inferred ceiling, not left at 0.95
+
+    def test_explicit_low_base_trust_is_left_alone(self, tmp_path: Path) -> None:
+        """Clamping only ever lowers trust -- an explicit base_trust already below
+        the ceiling is not raised or otherwise disturbed."""
+        store = SQLiteStore(tmp_path / "test.db")
+        handlers = make_handlers(store, config=_grounding_config(tmp_path, enabled=True))
+
+        result = _content(_handle_request(
+            _call("ncp_write_memory", {
+                "content": "an explicitly low-trust tool claim",
+                "layer": "semantic",
+                "src": "tool_result",
+                "base_trust": 0.3,
+            }),
+            handlers,
+        ))
+
+        assert result["trust_demoted"] is True
+        chunk = next(c for c in store.get_working_zone(pipeline_id=None) if c.chunk_id == result["chunk_id"])
+        assert chunk.base_trust == 0.3
+
+
 class TestEmitWhisper:
     def test_emits_and_returns_true(self, tmp_path: Path) -> None:
         store = SQLiteStore(tmp_path / "test.db")

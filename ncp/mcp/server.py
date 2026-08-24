@@ -791,6 +791,8 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
     coordination = getattr(store, "coordination", None)
     default_whisper_ttl = config.whisper_ttl_default if config is not None else 1800
     require_signatures = config.require_signatures if config is not None else False
+    # CAP-T2: grounded claims, opt-in and off by default -- see _grounded_trust_from_args.
+    require_grounded_high_trust = config.require_grounded_high_trust if config is not None else False
     # CAP-E2: per-pipeline budget governance settings.
     pipeline_budget_usd = config.pipeline_budget_usd if config is not None else None
     budget_warn_fraction = config.budget_warn_fraction if config is not None else 0.8
@@ -1194,13 +1196,24 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         valid_to = None if valid_to_raw is None else _parse_iso_timestamp(valid_to_raw, field="valid_to")
         supersedes = args.get("supersedes")
 
+        # CAP-T2: grounded claims. Whether this write's own noise-filtering will
+        # auto-create a raw_ref chunk (real, existing evidence) is already known
+        # here -- fr.was_filtered was computed above, before any of this.
+        will_produce_raw_ref = fr.was_filtered and len(raw_content) <= 2000
+        trust, trust_demoted, trust_demoted_reason = _grounded_trust_from_args(
+            args,
+            store=store,
+            require_grounded_high_trust=require_grounded_high_trust,
+            will_produce_raw_ref=will_produce_raw_ref,
+        )
+
         kwargs: dict = {
             "content": content,
             "layer": str(args["layer"]),
             "src": str(args["src"]),
             "written_by": written_by,
             "pipeline_id": pipeline_id,
-            "base_trust": _trust_from_args(args),
+            "base_trust": trust,
             "written_at_drift": 0.0 if latest is None else latest.drift_score,
             "verified": verified,
             "valid_from": valid_from,
@@ -1271,6 +1284,9 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             result["reduction_ratio"] = round(fr.reduction_ratio, 3)
             if raw_ref is not None:
                 result["raw_ref"] = raw_ref
+        if trust_demoted:
+            result["trust_demoted"] = True
+            result["trust_demoted_reason"] = trust_demoted_reason
         if supersedes is not None:
             # Honest supersedence: the old chunk is never deleted, only marked.
             # Its valid_to becomes this chunk's valid_from (or "now" if unset).
@@ -1327,7 +1343,9 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         if signature is not None:
             result["verified"] = verified
         if whisper_type == "dissent" and ref:
-            result["dissent_recorded"] = store.record_dissent(str(ref))
+            # CAP-T5: identity_id enables per-identity dedup + reputation
+            # gating in the store (see BaseStore.record_dissent).
+            result["dissent_recorded"] = store.record_dissent(str(ref), identity_id=from_agent)
         return result
 
     def _handle_post_turn(args: dict[str, object]) -> object:
@@ -1823,6 +1841,69 @@ def _trust_from_args(args: dict[str, object]) -> float:
         "subcon_retrieved": 0.55,
         "skill_ref": 0.60,
     }.get(str(args.get("src", "")), 0.70)
+
+
+# CAP-T2: the two highest static-trust tiers in _trust_from_args -- the ones
+# that assert the strongest claim ("a tool actually produced this" / "a human
+# verified this") purely from a self-declared `src` string.
+_GROUNDING_REQUIRED_SRCS = frozenset({"tool_result", "user_verified"})
+# Demotion ceiling: same value _trust_from_args gives "agent_inferred", i.e.
+# an ungrounded high-trust claim is worth no more than an ordinary inference.
+_GROUNDED_DEMOTION_CEILING = 0.60
+
+
+def _write_is_grounded(
+    args: dict[str, object], store: BaseStore, *, will_produce_raw_ref: bool
+) -> bool:
+    """CAP-T2: has this write actually pointed at something real?
+
+    Grounded means either (a) this write's own noise-filtering auto-created a
+    raw_ref chunk pointing at the unfiltered original (the existing mechanism
+    at the raw_ref write site), or (b) the caller supplied an evidence_id that
+    resolves to a real, existing chunk in the store -- not just a non-empty
+    string.
+    """
+    if will_produce_raw_ref:
+        return True
+    evidence_id = args.get("evidence_id")
+    if not evidence_id:
+        return False
+    return len(store.get_chunks_by_ids([str(evidence_id)])) > 0
+
+
+def _grounded_trust_from_args(
+    args: dict[str, object],
+    *,
+    store: BaseStore,
+    require_grounded_high_trust: bool,
+    will_produce_raw_ref: bool,
+) -> tuple[float, bool, str | None]:
+    """CAP-T2: _trust_from_args, but demoting ungrounded high-trust claims.
+
+    When require_grounded_high_trust is off (default), this is exactly
+    _trust_from_args -- no behavior change. When on and src is tool_result or
+    user_verified, the write must be grounded (see _write_is_grounded); if it
+    isn't, trust is clamped to the agent_inferred ceiling. This clamp applies
+    even to an explicit caller-supplied base_trust -- otherwise the toggle
+    would be trivially bypassed by passing base_trust: 0.95 directly instead
+    of relying on the src table. We demote rather than reject the write: a
+    less disruptive way to make ungrounded claims stop paying off, matching
+    the roadmap's "rejected or demoted" language.
+    """
+    trust = _trust_from_args(args)
+    src = str(args.get("src", ""))
+    if not require_grounded_high_trust or src not in _GROUNDING_REQUIRED_SRCS:
+        return trust, False, None
+    if _write_is_grounded(args, store, will_produce_raw_ref=will_produce_raw_ref):
+        return trust, False, None
+    demoted = min(trust, _GROUNDED_DEMOTION_CEILING)
+    reason = (
+        f"src={src!r} requires grounding under [identity].require_grounded_high_trust "
+        "(a resolvable evidence_id, or write-time noise filtering that produced an "
+        f"auto raw_ref); neither was present, so base_trust was demoted to the "
+        f"agent_inferred ceiling ({_GROUNDED_DEMOTION_CEILING})."
+    )
+    return demoted, True, reason
 
 
 _SUPPORTED_VERSIONS = {"2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"}
