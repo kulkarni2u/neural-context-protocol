@@ -259,6 +259,7 @@ class TestToolsList:
             "ncp_record_outcome",
             "ncp_lookup_memo",
             "ncp_record_memo",
+            "ncp_verify_memo",
         ]
 
     def test_tool_names_match_constants(self) -> None:

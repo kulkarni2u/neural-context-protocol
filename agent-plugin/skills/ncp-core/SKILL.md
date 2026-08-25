@@ -67,7 +67,10 @@ around it silently, and distinguish which case you're in:
    `ncp_get_context` already gave you.
 4. If step 2 missed (or wasn't available), call `ncp_record_memo` with the
    result once you have it, so a future call with the same task+context
-   can skip the work entirely.
+   can skip the work entirely. A newly recorded memo is unverified and
+   `ncp_lookup_memo` will not return it as-is — once you've confirmed the
+   result was actually correct, call `ncp_verify_memo` with the same
+   task+context (or the signature `ncp_record_memo` returned).
 5. **Write** durable memory before you finish: `ncp_write_memory` with
    `content` (max 2000 chars), `layer`, and `src`. Write the distilled
    finding, not raw tool output — NCP filters noise but a chunk that

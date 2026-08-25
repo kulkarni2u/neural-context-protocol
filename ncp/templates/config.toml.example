@@ -95,7 +95,9 @@ confidence_k = 20
 # max_age_hours = 24
 # Minimum recorded outcome score a memo needs to be returned (default 0.0).
 # min_outcome = 0.0
-# Return memos that were never verified via update_memo_outcome (default false).
+# Return memos that were never verified via ncp_verify_memo (default false).
+# A freshly recorded memo is unverified; leaving this false (the default)
+# means ncp_lookup_memo won't return it until ncp_verify_memo is called.
 # allow_unverified = false
 # Reserved for similarity-based signature matching (default 0.95; exact
 # signature match is what ships today).
