@@ -6,6 +6,23 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ### Added
 
+- **CAP-C3 memoization wired into real hosts** (`ncp/api.py`, `ncp/types.py`,
+  `claude-plugin/`, `agent-plugin/`, `examples/03_langgraph/pipeline.py`):
+  exact-match work memoization existed as MCP tools
+  (`ncp_lookup_memo`/`ncp_record_memo`) but nothing actually called them.
+  `ncp.run()`/`ncp.stream()` now check `[memoization]` (still off by
+  default) and, when enabled, look up a memo keyed on the turn text plus
+  the agent's stable `agent_id`/`task`/`slot` — deliberately *not* the
+  fully assembled `[NCP:...]` context block, which changes every call and
+  would make an exact-match signature never repeat — skip the provider
+  call on a hit, and record one on a miss. A memo-served response reports
+  `cost_source="memoized"` and `cost_usd=0.0`, surfaced through the
+  existing `ncp status`/`ncp cost` memo telemetry. The Claude Code plugin's
+  session-start hook and skill, and the generic agent-plugin's skill, now
+  instruct hosts to use `ncp_lookup_memo`/`ncp_record_memo` around
+  repeated/expensive sub-tasks. The LangGraph example pipeline wires the
+  same lookup/record contract directly against the store (`_memoized_work`)
+  as a runnable reference for in-process integrations.
 - **Grounded claims (CAP-T2)** (`ncp/mcp/server.py`, `ncp/config.py`): new
   opt-in, off-by-default `[identity].require_grounded_high_trust`. When
   enabled, a `ncp_write_memory` call with `src="tool_result"` or

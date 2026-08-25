@@ -215,6 +215,100 @@ def test_local_adapter_turn_is_marked_estimated_not_authoritative(tmp_path: Path
     assert response.cost_usd == 0.0
 
 
+class _CountingAdapter(BaseAdapter):
+    """Mock adapter that counts real calls, to prove a memo hit skips them."""
+
+    def __init__(self, *, model: str = "gpt-4o") -> None:
+        self._model = model
+        self.call_count = 0
+
+    def call(self, ncp_context: str, user_turn: str) -> str:
+        self.call_count += 1
+        self.last_usage = TokenUsage(input_tokens=10, output_tokens=5)
+        return f"live_response_{self.call_count}"
+
+    def stream(self, ncp_context: str, user_turn: str):
+        self.call_count += 1
+        self.last_usage = TokenUsage(input_tokens=10, output_tokens=5)
+        yield f"live_response_{self.call_count}"
+
+
+def _memo_agent() -> object:
+    return ncp.agent(
+        id="executor",
+        role="build",
+        owns=["implementation"],
+        must_not=["planning"],
+        task="repeated_subtask",
+        slot="classify_chunk",
+        intent="reuse_prior_work",
+    )
+
+
+def test_run_skips_second_provider_call_on_memo_hit(tmp_path: Path) -> None:
+    project = tmp_path / "repo"
+    (project / ".git").mkdir(parents=True)
+    config = NCPConfig(values={"memoization": {"enabled": True}}, project_root=project)
+    store = SQLiteStore(project / ".ncp" / "store.db", config=config)
+    adapter = _CountingAdapter()
+
+    first = ncp.run(agent=_memo_agent(), turn="classify this chunk", adapter=adapter, config=config, store=store)
+    second = ncp.run(agent=_memo_agent(), turn="classify this chunk", adapter=adapter, config=config, store=store)
+
+    assert adapter.call_count == 1
+    assert first.cost_source == "measured"
+    assert second.cost_source == "memoized"
+    assert second.cost_usd == 0.0
+    assert second.content == first.content
+    assert store.memo_stats()["hits"] == 1
+
+
+def test_run_does_not_reuse_memo_across_different_agents_or_turns(tmp_path: Path) -> None:
+    project = tmp_path / "repo"
+    (project / ".git").mkdir(parents=True)
+    config = NCPConfig(values={"memoization": {"enabled": True}}, project_root=project)
+    store = SQLiteStore(project / ".ncp" / "store.db", config=config)
+    adapter = _CountingAdapter()
+
+    ncp.run(agent=_memo_agent(), turn="classify this chunk", adapter=adapter, config=config, store=store)
+    ncp.run(agent=_memo_agent(), turn="classify a different chunk", adapter=adapter, config=config, store=store)
+
+    assert adapter.call_count == 2
+
+
+def test_run_does_not_memoize_when_disabled(tmp_path: Path) -> None:
+    project = tmp_path / "repo"
+    (project / ".git").mkdir(parents=True)
+    ncp.configure(cwd=project)
+    store = SQLiteStore(project / ".ncp" / "store.db")
+    adapter = _CountingAdapter()
+
+    first = ncp.run(agent=_memo_agent(), turn="classify this chunk", adapter=adapter, store=store)
+    second = ncp.run(agent=_memo_agent(), turn="classify this chunk", adapter=adapter, store=store)
+
+    assert adapter.call_count == 2
+    assert first.cost_source == "measured"
+    assert second.cost_source == "measured"
+
+
+def test_stream_skips_second_provider_call_on_memo_hit(tmp_path: Path) -> None:
+    project = tmp_path / "repo"
+    (project / ".git").mkdir(parents=True)
+    config = NCPConfig(values={"memoization": {"enabled": True}}, project_root=project)
+    store = SQLiteStore(project / ".ncp" / "store.db", config=config)
+    adapter = _CountingAdapter()
+
+    first = "".join(
+        ncp.stream(agent=_memo_agent(), turn="classify this chunk", adapter=adapter, config=config, store=store)
+    )
+    second = "".join(
+        ncp.stream(agent=_memo_agent(), turn="classify this chunk", adapter=adapter, config=config, store=store)
+    )
+
+    assert adapter.call_count == 1
+    assert first == second
+
+
 def test_rapid_turns_do_not_overwrite_cost_log_rows(tmp_path: Path, monkeypatch) -> None:
     project = tmp_path / "repo"
     (project / ".git").mkdir(parents=True)

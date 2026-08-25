@@ -86,7 +86,9 @@ confidence_k = 20
 
 # [memoization]
 # Opt-in semantic work memoization (CAP-C3). Lookup-only: the host decides
-# whether a returned memo lets it skip its model call.
+# whether a returned memo lets it skip its model call. Applies both to the
+# ncp_lookup_memo/ncp_record_memo MCP tools and to ncp.run()/ncp.stream()
+# in the Python API, which check/record automatically when enabled.
 # Master switch; ncp_lookup_memo returns nothing while false (default).
 # enabled = false
 # Memos older than this many hours are treated as stale misses (default 24).
