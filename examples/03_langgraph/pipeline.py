@@ -22,6 +22,13 @@ The point of the example is the *memory contract*, not the text generation:
 4. The executor->reviewer handoff additionally emits a ``share`` whisper
    carrying a ``HandoffPayload``-shaped dict (``{"ask": ..., "files": [...]}``)
    so the reviewer's *next* assembly receives it from the whisper queue.
+5. Each node's "model call" goes through ``_memoized_work``, which checks
+   CAP-C3 (``store.lookup_memo``/``record_memo``) before doing the work and
+   records the result after a miss -- the same exact-match memoization
+   contract the ``ncp_lookup_memo``/``ncp_record_memo`` MCP tools expose,
+   wired in directly here since this example talks to the store in-process
+   rather than over MCP. See ``tests/test_langgraph_example.py`` for a
+   deterministic test that this actually skips repeated work on a hit.
 
 The LangGraph ``PipelineState`` (a TypedDict) stays intentionally tiny: it
 only carries ids, a round counter, and the last short message passed between
@@ -33,6 +40,7 @@ make that boundedness visible.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 import json
 import tempfile
@@ -40,6 +48,7 @@ import tempfile
 from langgraph.graph import END, StateGraph
 
 from ncp.assembler import Assembler
+from ncp.stores.memo import compute_memo_signature
 from ncp.stores.sqlite import SQLiteStore
 from ncp.tokens import estimate_tokens
 from ncp.types import (
@@ -87,6 +96,25 @@ def _agent(agent_id: str, role: str, owns: list[str], task: str, slot: str, inte
         intent=intent,
         pipeline_id=PIPELINE_ID,
     )
+
+
+def _memoized_work(store: SQLiteStore, *, task: str, context: str, work_fn: Callable[[], str]) -> tuple[str, bool]:
+    """Run ``work_fn()`` unless CAP-C3 already has a memo for this exact
+    ``task``+``context`` pair, in which case reuse it instead.
+
+    This is the same exact-match memoization contract the
+    ``ncp_lookup_memo``/``ncp_record_memo`` MCP tools expose, called directly
+    against the store since this example talks to NCP in-process. Returns
+    ``(result_text, was_memo_hit)``.
+    """
+    signature = compute_memo_signature(task, context)
+    memo = store.lookup_memo(signature)
+    if memo and memo.get("result_summary"):
+        return str(memo["result_summary"]), True
+
+    result = work_fn()
+    store.record_memo(signature=signature, task=task, chunk_ids=[], result_summary=result)
+    return result, False
 
 
 def _post_turn(
@@ -152,10 +180,16 @@ def make_graph(store: SQLiteStore) -> StateGraph:
 
         # >>> real model call would go here <<<
         # e.g. response = llm.invoke(assembly.context + "\n\n" + turn_prompt)
-        plan_text = f"plan round {round_no}: bound the executor to one small step"
+        plan_text, memo_hit = _memoized_work(
+            store,
+            task=conscious.task,
+            context=conscious.slot,
+            work_fn=lambda: f"plan round {round_no}: bound the executor to one small step",
+        )
 
         context_tokens = estimate_tokens(assembly.context)
-        print(f"[round {round_no}] planner   context_tokens={context_tokens}")
+        hit_note = " (memo hit, skipped model call)" if memo_hit else ""
+        print(f"[round {round_no}] planner   context_tokens={context_tokens}{hit_note}")
 
         _post_turn(
             assembler=assembler,
@@ -186,10 +220,16 @@ def make_graph(store: SQLiteStore) -> StateGraph:
         )
 
         # >>> real model call would go here <<<
-        build_text = f"build round {round_no}: implemented the planner's bounded step"
+        build_text, memo_hit = _memoized_work(
+            store,
+            task=conscious.task,
+            context=conscious.slot,
+            work_fn=lambda: f"build round {round_no}: implemented the planner's bounded step",
+        )
 
         context_tokens = estimate_tokens(assembly.context)
-        print(f"[round {round_no}] executor  context_tokens={context_tokens}")
+        hit_note = " (memo hit, skipped model call)" if memo_hit else ""
+        print(f"[round {round_no}] executor  context_tokens={context_tokens}{hit_note}")
 
         _post_turn(
             assembler=assembler,
@@ -248,10 +288,16 @@ def make_graph(store: SQLiteStore) -> StateGraph:
                 whisper_delivered = True
 
         # >>> real model call would go here <<<
-        review_text = f"review round {round_no}: handoff acknowledged, no blocking issues"
+        review_text, memo_hit = _memoized_work(
+            store,
+            task=conscious.task,
+            context=conscious.slot,
+            work_fn=lambda: f"review round {round_no}: handoff acknowledged, no blocking issues",
+        )
 
         context_tokens = estimate_tokens(assembly.context)
-        print(f"[round {round_no}] reviewer  context_tokens={context_tokens}")
+        hit_note = " (memo hit, skipped model call)" if memo_hit else ""
+        print(f"[round {round_no}] reviewer  context_tokens={context_tokens}{hit_note}")
 
         _post_turn(
             assembler=assembler,

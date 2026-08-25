@@ -658,6 +658,38 @@ MCP_TOOLS: list[dict[str, object]] = [
             "required": ["task", "chunk_ids"],
         },
     },
+    {
+        "name": "ncp_verify_memo",
+        "description": (
+            "Mark a previously recorded work memo as verified, with an outcome score. "
+            "A memo is not eligible for ncp_lookup_memo hits until it is verified "
+            "(unless [memoization].allow_unverified is set) — call this once you have "
+            "confirmed the memoized result was actually correct (e.g. tests passed, "
+            "output checked), the same way ncp_record_outcome confirms a chunk. "
+            "Provide either task+context or an explicit signature."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "description": "Task description for signature computation (ignored if signature is provided)",
+                },
+                "context": {
+                    "type": "string",
+                    "description": "Optional context string for signature computation",
+                },
+                "signature": {
+                    "type": "string",
+                    "description": "Explicit memo signature (overrides task+context hash)",
+                },
+                "outcome": {
+                    "type": "number",
+                    "description": "Outcome score for this memo (default 1.0 = confirmed good).",
+                },
+            },
+        },
+    },
 ]
 
 CORE_TOOL_NAMES = frozenset({
@@ -667,7 +699,7 @@ CORE_TOOL_NAMES = frozenset({
     "ncp_post_turn",
     "ncp_fetch",
 })
-MEMO_TOOL_NAMES = frozenset({"ncp_lookup_memo", "ncp_record_memo"})
+MEMO_TOOL_NAMES = frozenset({"ncp_lookup_memo", "ncp_record_memo", "ncp_verify_memo"})
 
 
 def tools_for_config(config: NCPConfig | None) -> list[dict[str, object]]:
@@ -1625,6 +1657,27 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         )
         return {"recorded": recorded, "signature": sig}
 
+    def _handle_verify_memo(args: dict[str, object]) -> object:
+        from ncp.stores.memo import compute_memo_signature
+        if config is not None and not config.memoization_enabled:
+            return {
+                "verified": False,
+                "disabled": True,
+                "reason": "memoization_disabled",
+            }
+        sig = args.get("signature")
+        if sig is None:
+            task = str(args.get("task", ""))
+            context = str(args.get("context", ""))
+            sig = compute_memo_signature(task, context)
+        sig = str(sig)
+        try:
+            outcome = float(args.get("outcome", 1.0))
+        except (TypeError, ValueError):
+            outcome = 1.0
+        updated = store.update_memo_outcome(sig, outcome, verified=True)
+        return {"verified": updated, "signature": sig}
+
     def _handle_remember(args: dict[str, object]) -> object:
         from ncp.memory import remember
 
@@ -1699,6 +1752,7 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         "ncp_record_outcome": _handle_record_outcome,
         "ncp_lookup_memo": _handle_lookup_memo,
         "ncp_record_memo": _handle_record_memo,
+        "ncp_verify_memo": _handle_verify_memo,
         "ncp_remember": _handle_remember,
         "ncp_recall": _handle_recall,
         "ncp_improve": _handle_improve,

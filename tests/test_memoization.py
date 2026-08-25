@@ -472,6 +472,89 @@ def test_usable_lookup_counts_exactly_one_hit(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# ncp_verify_memo: before this tool existed, nothing reachable over MCP could
+# ever set verified=True, so with the default allow_unverified=False,
+# ncp_lookup_memo could never return a hit for anything recorded purely via
+# MCP tool calls -- the only way to flip the flag was a direct, non-MCP
+# store.update_memo_outcome() call, as in test_usable_lookup_counts_exactly_one_hit
+# above. ncp_verify_memo closes that gap.
+# ---------------------------------------------------------------------------
+
+
+def test_ncp_verify_memo_end_to_end(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "store.db")
+    config = NCPConfig(
+        values={"memoization": {"enabled": True, "allow_unverified": False}},
+        project_root=tmp_path,
+    )
+    handlers = make_handlers(store, config=config)
+
+    _content(_handle_request(
+        _call("ncp_record_memo", {"task": "verify_me", "chunk_ids": [], "result_summary": "answer"}),
+        handlers,
+    ))
+    before = _content(_handle_request(_call("ncp_lookup_memo", {"task": "verify_me"}), handlers))
+    assert before["found"] is False, "unverified memo must not be usable under default gating"
+
+    verified = _content(_handle_request(
+        _call("ncp_verify_memo", {"task": "verify_me", "outcome": 0.9}),
+        handlers,
+    ))
+    assert verified["verified"] is True
+
+    after = _content(_handle_request(_call("ncp_lookup_memo", {"task": "verify_me"}), handlers))
+    assert after["found"] is True
+    assert after["memo"]["result_summary"] == "answer"
+
+
+def test_ncp_verify_memo_by_explicit_signature(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "store.db")
+    config = NCPConfig(values={"memoization": {"enabled": True}}, project_root=tmp_path)
+    handlers = make_handlers(store, config=config)
+    sig = compute_memo_signature("sig_task")
+    store.record_memo(sig, "sig_task", [], "content")
+
+    result = _content(_handle_request(
+        _call("ncp_verify_memo", {"signature": sig, "outcome": 1.0}),
+        handlers,
+    ))
+    assert result["verified"] is True
+    assert result["signature"] == sig
+    raw = store.peek_memo(sig)
+    assert raw is not None
+    assert bool(raw["verified"]) is True
+    assert raw["outcome"] == 1.0
+
+
+def test_ncp_verify_memo_unknown_signature_returns_false(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "store.db")
+    config = NCPConfig(values={"memoization": {"enabled": True}}, project_root=tmp_path)
+    handlers = make_handlers(store, config=config)
+
+    result = _content(_handle_request(
+        _call("ncp_verify_memo", {"task": "never_recorded"}),
+        handlers,
+    ))
+    assert result["verified"] is False
+
+
+def test_ncp_verify_memo_disabled_by_config(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "store.db")
+    config = NCPConfig(values={"memoization": {"enabled": False}}, project_root=tmp_path)
+    handlers = make_handlers(store, config=config)
+
+    result = _content(_handle_request(
+        _call("ncp_verify_memo", {"task": "irrelevant"}),
+        handlers,
+    ))
+    assert result == {
+        "verified": False,
+        "disabled": True,
+        "reason": "memoization_disabled",
+    }
+
+
+# ---------------------------------------------------------------------------
 # Fix 2: re-recording a memo must preserve hit_count/created_at/outcome/
 # verified, not reset them (SQLite previously used INSERT OR REPLACE).
 # ---------------------------------------------------------------------------

@@ -40,6 +40,12 @@ agent-to-agent communication channel for this project:
 
 - Start each turn with ncp_get_context; end it with ncp_write_memory; capture
   decisions with ncp_record_decision.
+- If ncp_lookup_memo/ncp_record_memo are available (memoization is enabled),
+  check ncp_lookup_memo before repeating an expensive/deterministic sub-task
+  you may have already done for this exact task+context; record the result
+  with ncp_record_memo when there was no hit, then call ncp_verify_memo once
+  you've confirmed the result was correct — an unverified memo is never
+  returned by ncp_lookup_memo.
 - Coordinate with other agents via ncp_emit_whisper — do not paste transcripts.
 - SUBAGENTS: whenever you dispatch a subagent (Task tool, \`ncp handoff\`,
   \`codex exec\`, etc.), prepend an ncp_get_context call and append an

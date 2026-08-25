@@ -12,12 +12,22 @@ transcripts or stuffing prompts.
 ## Per-turn loop
 
 1. **Read** bounded context: `ncp_get_context` at the start of the turn.
-2. Do the work (your own tools).
-3. **Write** durable memory: `ncp_write_memory` at the end (one distilled
+2. Before repeating expensive or deterministic work (the same task+context
+   you or another agent may have already done), check `ncp_lookup_memo`. On
+   a hit, reuse it and skip the work. These tools only appear when
+   memoization is enabled — if you don't see them, skip this step.
+3. Do the work (your own tools).
+4. If step 2 missed, record the result with `ncp_record_memo` so a future
+   identical task+context can skip redoing it. A newly recorded memo is
+   **not** returned by `ncp_lookup_memo` until it's verified — once you've
+   confirmed the result was actually correct (tests passed, output
+   checked), call `ncp_verify_memo` with the same task+context. Skipping
+   this means the memo you just recorded can never be reused.
+5. **Write** durable memory: `ncp_write_memory` at the end (one distilled
    chunk, not raw tool output — NCP filters noise and keeps a reversible
    `raw_ref`).
-4. Record significant decisions with `ncp_record_decision`.
-5. Use `ncp_fetch` only when the active turn needs more bounded retrieval
+6. Record significant decisions with `ncp_record_decision`.
+7. Use `ncp_fetch` only when the active turn needs more bounded retrieval
    (max 3 per turn).
 
 ## Talking to other agents

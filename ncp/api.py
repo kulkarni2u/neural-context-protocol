@@ -13,6 +13,7 @@ from ncp.config import NCPConfig, load_config
 from ncp.costs import calculate_cost
 from ncp.stores.base import BaseStore
 from ncp.stores.factory import create_store
+from ncp.stores.memo import compute_memo_signature
 from ncp.tokens import estimate_tokens
 from ncp.types import BudgetContext, ConsciousBlock, NCPResponse, SubconsciousChunk, Whisper
 
@@ -142,16 +143,32 @@ def run(
         diversity_limit=diversity_limit,
         max_tokens=max_tokens,
     )
-    content = resolved_adapter.call(assembly.context, turn)
-    response = _build_response(
-        agent=agent,
-        adapter=resolved_adapter,
-        context=assembly.context,
-        turn=turn,
-        content=content,
-        start=start,
-        config=resolved_config,
-    )
+
+    memo_signature = _memo_signature(resolved_config, agent, turn)
+    memo = resolved_store.lookup_memo(memo_signature) if memo_signature else None
+    if memo and memo.get("result_summary"):
+        content = str(memo["result_summary"])
+        response = _build_memo_response(agent=agent, adapter=resolved_adapter, memo=memo, start=start)
+    else:
+        content = resolved_adapter.call(assembly.context, turn)
+        response = _build_response(
+            agent=agent,
+            adapter=resolved_adapter,
+            context=assembly.context,
+            turn=turn,
+            content=content,
+            start=start,
+            config=resolved_config,
+        )
+        if memo_signature:
+            resolved_store.record_memo(
+                signature=memo_signature,
+                task=turn,
+                chunk_ids=[],
+                result_summary=content,
+                output_tokens_est=response.output_tokens,
+            )
+
     assembler.post_turn(
         conscious=agent,
         response=response,
@@ -191,26 +208,84 @@ def stream(
         max_tokens=max_tokens,
     )
     start = time.perf_counter()
-    chunks: list[str] = []
-    for chunk in resolved_adapter.stream(assembly.context, turn):
-        chunks.append(chunk)
-        yield chunk
 
-    content = "".join(chunks)
-    response = _build_response(
-        agent=agent,
-        adapter=resolved_adapter,
-        context=assembly.context,
-        turn=turn,
-        content=content,
-        start=start,
-        config=resolved_config,
-    )
+    memo_signature = _memo_signature(resolved_config, agent, turn)
+    memo = resolved_store.lookup_memo(memo_signature) if memo_signature else None
+    if memo and memo.get("result_summary"):
+        # Memo hit: synthesize a single-chunk "stream" from the cached content
+        # instead of calling the provider.
+        content = str(memo["result_summary"])
+        yield content
+        response = _build_memo_response(agent=agent, adapter=resolved_adapter, memo=memo, start=start)
+    else:
+        chunks: list[str] = []
+        for chunk in resolved_adapter.stream(assembly.context, turn):
+            chunks.append(chunk)
+            yield chunk
+
+        content = "".join(chunks)
+        response = _build_response(
+            agent=agent,
+            adapter=resolved_adapter,
+            context=assembly.context,
+            turn=turn,
+            content=content,
+            start=start,
+            config=resolved_config,
+        )
+        if memo_signature:
+            resolved_store.record_memo(
+                signature=memo_signature,
+                task=turn,
+                chunk_ids=[],
+                result_summary=content,
+                output_tokens_est=response.output_tokens,
+            )
+
     assembler.post_turn(
         conscious=agent,
         response=response,
         result_summary=content.splitlines()[0] if content else "",
         result_full=content,
+    )
+
+
+def _memo_signature(config: NCPConfig, agent: ConsciousBlock, turn: str) -> str | None:
+    """CAP-C3 signature for this turn, or None when memoization is disabled.
+
+    Deliberately excludes the fully assembled ``[NCP:...]`` context block:
+    recent-turn refs, whisper payloads, and live budget figures all change
+    from call to call, so keying on it would make an exact-match signature
+    almost never repeat. Instead this keys on the turn text plus the
+    agent's own stable identity/task/slot fields, which do repeat across
+    retries or repeated sub-task calls.
+    """
+    if not config.memoization_enabled:
+        return None
+    stable_context = f"{agent.agent_id}|{agent.task}|{agent.slot}"
+    return compute_memo_signature(turn, stable_context)
+
+
+def _build_memo_response(
+    *,
+    agent: ConsciousBlock,
+    adapter: BaseAdapter,
+    memo: dict[str, object],
+    start: float,
+) -> NCPResponse:
+    """Build the response for a CAP-C3 memo hit: no provider call, no cost."""
+
+    return NCPResponse(
+        content=str(memo.get("result_summary") or ""),
+        input_tokens=0,
+        output_tokens=int(memo.get("output_tokens_est") or 0),
+        cache_read_tokens=0,
+        cost_usd=0.0,
+        model=adapter.model_name,
+        pipeline_id=agent.pipeline_id,
+        turn_id=f"turn_{int(time.time() * 1000)}_{uuid4().hex[:8]}",
+        latency_ms=int((time.perf_counter() - start) * 1000),
+        cost_source="memoized",
     )
 
 

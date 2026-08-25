@@ -6,6 +6,25 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ### Added
 
+- **CAP-C3 memoization wired into real hosts** (`ncp/api.py`, `ncp/types.py`,
+  `claude-plugin/`, `agent-plugin/`, `examples/03_langgraph/pipeline.py`):
+  exact-match work memoization existed as MCP tools
+  (`ncp_lookup_memo`/`ncp_record_memo`) but nothing actually called them.
+  `ncp.run()`/`ncp.stream()` now check `[memoization]` (still off by
+  default) and, when enabled, look up a memo keyed on the turn text plus
+  the agent's stable `agent_id`/`task`/`slot` — deliberately *not* the
+  fully assembled `[NCP:...]` context block, which changes every call and
+  would make an exact-match signature never repeat — skip the provider
+  call on a hit, and record one on a miss. A memo-served response reports
+  `cost_source="memoized"` and `cost_usd=0.0`, surfaced through the
+  existing `ncp status`/`ncp cost` memo telemetry. The Claude Code plugin's
+  session-start hook and skill, and the generic agent-plugin's skill, now
+  instruct hosts to use `ncp_lookup_memo`/`ncp_record_memo` around
+  repeated/expensive sub-tasks. The LangGraph example pipeline wires the
+  same lookup/record contract directly against the store (`_memoized_work`)
+  as a runnable reference for in-process integrations. See also the
+  `ncp_verify_memo` fix below, found while validating this wiring against
+  real subagents.
 - **Grounded claims (CAP-T2)** (`ncp/mcp/server.py`, `ncp/config.py`): new
   opt-in, off-by-default `[identity].require_grounded_high_trust`. When
   enabled, a `ncp_write_memory` call with `src="tool_result"` or
@@ -97,6 +116,30 @@ All notable changes to Neural Context Protocol will be documented in this file.
   fallback: the caller asked for vector-mode specifically, so an embed
   failure there still raises rather than silently returning non-vector
   results.
+
+### Fixed
+
+- **`ncp_lookup_memo` could never return a hit through the MCP tool
+  interface under default config** (`ncp/mcp/server.py`): confirmed by
+  dispatching two independent subagents against a live `ncp serve` with
+  `[memoization].enabled = true` — the second subagent's `ncp_lookup_memo`
+  missed even though it hashed to the exact same signature the first had
+  just recorded via `ncp_record_memo`. Root cause: `ncp_lookup_memo` gates
+  every result on `verified` unless `[memoization].allow_unverified` is
+  set (default `false`), a freshly recorded memo always has `verified=0`,
+  and the only method that can flip it — `store.update_memo_outcome` — was
+  never wired to any MCP tool. `ncp_record_outcome` looks like the obvious
+  candidate but only updates chunk trust, not memo rows. Net effect: with
+  default settings, no memo recorded via `ncp_record_memo` could ever be
+  returned by `ncp_lookup_memo`, regardless of how faithfully a host
+  followed the intended check/record contract. Added `ncp_verify_memo`
+  (task+context or explicit `signature`, plus an `outcome` score,
+  default `1.0`) as the missing MCP-reachable path to
+  `update_memo_outcome`, gated behind `[memoization].enabled` like the
+  other two memo tools. The conservative default
+  (`allow_unverified = false`) is preserved — memos now require an
+  explicit verify call to become reusable, which is now actually possible
+  over MCP instead of only via direct, non-MCP store access.
 
 ## [1.5.0] - 2026-08-21
 

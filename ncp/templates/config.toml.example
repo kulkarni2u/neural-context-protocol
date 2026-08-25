@@ -86,14 +86,18 @@ confidence_k = 20
 
 # [memoization]
 # Opt-in semantic work memoization (CAP-C3). Lookup-only: the host decides
-# whether a returned memo lets it skip its model call.
+# whether a returned memo lets it skip its model call. Applies both to the
+# ncp_lookup_memo/ncp_record_memo MCP tools and to ncp.run()/ncp.stream()
+# in the Python API, which check/record automatically when enabled.
 # Master switch; ncp_lookup_memo returns nothing while false (default).
 # enabled = false
 # Memos older than this many hours are treated as stale misses (default 24).
 # max_age_hours = 24
 # Minimum recorded outcome score a memo needs to be returned (default 0.0).
 # min_outcome = 0.0
-# Return memos that were never verified via update_memo_outcome (default false).
+# Return memos that were never verified via ncp_verify_memo (default false).
+# A freshly recorded memo is unverified; leaving this false (the default)
+# means ncp_lookup_memo won't return it until ncp_verify_memo is called.
 # allow_unverified = false
 # Reserved for similarity-based signature matching (default 0.95; exact
 # signature match is what ships today).
