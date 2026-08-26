@@ -4,6 +4,8 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-08-26
+
 ### Added
 
 - **CAP-C3 memoization wired into real hosts** (`ncp/api.py`, `ncp/types.py`,
@@ -119,6 +121,11 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ### Fixed
 
+- **Async pgvector configuration can now be injected consistently**
+  (`ncp/stores/pgvector_async.py`): `AsyncPgvectorStore` now accepts the same
+  optional `NCPConfig` override as the SQLite and synchronous pgvector stores.
+  This keeps dissent reputation gating deterministic for callers and fixes the
+  async backend parity tests in the release preflight.
 - **`ncp_lookup_memo` could never return a hit through the MCP tool
   interface under default config** (`ncp/mcp/server.py`): confirmed by
   dispatching two independent subagents against a live `ncp serve` with
