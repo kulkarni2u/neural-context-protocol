@@ -26,6 +26,7 @@ from typing import Any, AsyncIterator
 import anyio
 import structlog
 
+from ncp.config import NCPConfig
 from ncp.stores.base import BaseStore, NCPStoreUnavailableError
 from ncp.stores.bitemporal import collect_successor_ids, filter_bitemporal
 from ncp.stores.graph import (
@@ -95,6 +96,7 @@ class AsyncPgvectorStore(BaseStore):
         coordination: AsyncRedisCoordination | None = None,
         embedding_adapter: object | None = None,
         ivfflat_probes: int = 10,
+        config: NCPConfig | None = None,
     ) -> None:
         self.dsn = dsn
         self.schema = _validate_identifier(schema, field="schema")
@@ -140,7 +142,7 @@ class AsyncPgvectorStore(BaseStore):
 
         from ncp.config import load_config
         try:
-            self.config = load_config()
+            self.config = config or load_config()
         except Exception:
             self.config = None
 
