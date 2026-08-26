@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tomllib
 
 from ncp.types import ConsciousBlock
 
@@ -263,6 +264,26 @@ def test_agent_plugin_files_exist() -> None:
     plugin_readme = (plugin_dir / "README.md").read_text()
     assert "claude-plugin" in plugin_readme
     assert "serve-stdio" in plugin_readme
+
+
+def test_plugin_manifest_versions_match_package_version() -> None:
+    package_version = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())["project"][
+        "version"
+    ]
+    manifest_paths = (
+        REPO_ROOT / ".claude-plugin" / "marketplace.json",
+        REPO_ROOT / "claude-plugin" / ".claude-plugin" / "plugin.json",
+        REPO_ROOT / "agent-plugin" / "plugin.json",
+    )
+
+    for path in manifest_paths:
+        manifest = json.loads(path.read_text())
+        version = (
+            manifest["plugins"][0]["version"]
+            if path.name == "marketplace.json"
+            else manifest["version"]
+        )
+        assert version == package_version, f"{path}: {version} != {package_version}"
 
 
 def test_ncp_instruction_intent_examples_match_protocol_contract() -> None:
