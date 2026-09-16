@@ -191,6 +191,39 @@ DEFAULT_CONFIG = {
     "tools": {
         "profile": "full",
     },
+    "decisions": {
+        # Typed decision contract (spec 4h). `enabled` gates the typed path:
+        # ncp_compile_decision_query and the typed fields on
+        # ncp_record_decision. When false both return a disabled payload and
+        # the legacy (rationale-shaped) ncp_record_decision keeps working
+        # unchanged -- same disable posture as [memoization].
+        "enabled": True,
+        # Advisory escalate threshold on compile's joint_confidence. NOT
+        # calibration: joint_confidence is a bounded heuristic over evidence
+        # trust, contradiction and drift. Tune from measured escalate rate
+        # (see `ncp dogfood --loop decision`), not from intuition.
+        "escalate_min_confidence": 0.55,
+        # Floor a precedent must clear before compile will surface it as a
+        # reuse candidate. NCP still never applies the choice itself.
+        "precedent_min_confidence": 0.80,
+        # Render a one-line [NCP:DECISION] jc/cm telemetry line into the
+        # assembled pidgin. Default FALSE: every existing deployment's
+        # injected context stays byte-identical until a host opts in.
+        "surface_joint_confidence": False,
+        # Mirror each typed decision into a reasoning_trace chunk so legacy
+        # retrieval still surfaces it. Default FALSE: this writes into the
+        # same pool ncp_get_context retrieves from, so turning it on changes
+        # ranking and token budgets for existing pipelines.
+        "dual_write_chunks": False,
+        # When true, an unregistered schema_id is rejected at record time
+        # instead of recorded-and-flagged. Default false for forward compat.
+        "strict_registered_schemas": False,
+        # Evidence cap for compile; `k` above this is clamped.
+        "max_evidence": 12,
+    },
+    # Optional inline decision-schema registry. Merged over the built-ins and
+    # over .ncp/decision_schemas.json. See ncp/decisions.py for entry shape.
+    "decision_schemas": {},
     "identity": {
         # OPT-IN authorship enforcement. When false (default) unsigned writes and
         # whispers keep working exactly as before and any supplied signature is
@@ -614,6 +647,40 @@ class NCPConfig:
     @property
     def memoization_similarity_threshold(self) -> float:
         return float(self.values.get("memoization", {}).get("similarity_threshold", 0.95))
+
+    @property
+    def decisions_enabled(self) -> bool:
+        return bool(self.values.get("decisions", {}).get("enabled", True))
+
+    @property
+    def decisions_escalate_min_confidence(self) -> float:
+        return float(self.values.get("decisions", {}).get("escalate_min_confidence", 0.55))
+
+    @property
+    def decisions_precedent_min_confidence(self) -> float:
+        return float(self.values.get("decisions", {}).get("precedent_min_confidence", 0.80))
+
+    @property
+    def decisions_surface_joint_confidence(self) -> bool:
+        return bool(self.values.get("decisions", {}).get("surface_joint_confidence", False))
+
+    @property
+    def decisions_dual_write_chunks(self) -> bool:
+        return bool(self.values.get("decisions", {}).get("dual_write_chunks", False))
+
+    @property
+    def decisions_strict_registered_schemas(self) -> bool:
+        return bool(self.values.get("decisions", {}).get("strict_registered_schemas", False))
+
+    @property
+    def decisions_max_evidence(self) -> int:
+        return max(1, int(self.values.get("decisions", {}).get("max_evidence", 12)))
+
+    @property
+    def decision_schemas(self) -> dict[str, Any]:
+        """Inline registry entries from [decision_schemas], keyed by schema_id."""
+        raw = self.values.get("decision_schemas", {})
+        return dict(raw) if isinstance(raw, dict) else {}
 
     @property
     def skill_cache_default_trust(self) -> float:

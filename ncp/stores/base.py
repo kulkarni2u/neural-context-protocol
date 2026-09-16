@@ -14,6 +14,7 @@ from ncp.types import (
     ConsolidationReport,
     ConsciousBlock,
     NCPResponse,
+    DecisionRecord,
     OutcomeRecord,
     SubconsciousChunk,
     TurnRecord,
@@ -552,6 +553,42 @@ class BaseStore(ABC):
           ``propagation_max_hops`` hops along ``caused_by`` ancestry (default 1
           hop, matching legacy behavior).
         """
+
+    def record_decision_record(self, decision: "DecisionRecord") -> bool:
+        """Persist a typed ``DecisionRecord``. Returns True when a row landed.
+
+        Distinct from the legacy ``ncp_record_decision`` MCP tool, which writes
+        a rationale-shaped ``reasoning_trace`` chunk; that path still works and
+        now additionally adapts into a DecisionRecord.
+        """
+        raise NotImplementedError("record_decision_record not implemented for this backend")
+
+    def get_decision(self, decision_id: str) -> "DecisionRecord | None":
+        """Fetch one decision by id, or None when it is not in this store."""
+        raise NotImplementedError("get_decision not implemented for this backend")
+
+    def query_decisions(
+        self,
+        *,
+        schema_id: str | None = None,
+        slot: str | None = None,
+        state_hash: str | None = None,
+        pipeline_id: str | None = None,
+        backend: str | None = None,
+        min_confidence: float = 0.0,
+        k: int = 5,
+    ) -> list["DecisionRecord"]:
+        """Precedent lookup over typed decisions.
+
+        Ranking contract: exact ``state_hash`` matches first, then same
+        ``schema_id`` + ``slot`` by recency and confidence. Rationale text is
+        never the ranker -- it is optional commentary, not the match key.
+        """
+        raise NotImplementedError("query_decisions not implemented for this backend")
+
+    def link_decision_outcome(self, decision_id: str, outcome_id: str) -> bool:
+        """Attach an outcome id to an existing decision. False when unknown."""
+        raise NotImplementedError("link_decision_outcome not implemented for this backend")
 
     def query_precedents(
         self,
