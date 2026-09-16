@@ -204,8 +204,18 @@ DEFAULT_CONFIG = {
         # (see `ncp dogfood --loop decision`), not from intuition.
         "escalate_min_confidence": 0.55,
         # Floor a precedent must clear before compile will surface it as a
-        # reuse candidate. NCP still never applies the choice itself.
-        "precedent_min_confidence": 0.80,
+        # reuse candidate, when no outcome is linked. NCP still never applies
+        # the choice itself.
+        #
+        # 0.60, not 0.80. A host that follows the documented pattern records
+        # confidence = joint_confidence, which for a single evidence tier is
+        # just that tier's trust: tool_result 0.80, synthesis 0.70,
+        # agent_inferred 0.60, subcon_retrieved 0.55. An 0.80 floor is
+        # therefore unreachable for everything below the top tier -- and only
+        # ties it there -- so most decisions could never be reused however
+        # often they recurred. A linked successful outcome bypasses this floor
+        # entirely; see _decision_outcome in ncp/mcp/server.py.
+        "precedent_min_confidence": 0.60,
         # Render a one-line [NCP:DECISION] jc/cm telemetry line into the
         # assembled pidgin. Default FALSE: every existing deployment's
         # injected context stays byte-identical until a host opts in.
@@ -658,7 +668,7 @@ class NCPConfig:
 
     @property
     def decisions_precedent_min_confidence(self) -> float:
-        return float(self.values.get("decisions", {}).get("precedent_min_confidence", 0.80))
+        return float(self.values.get("decisions", {}).get("precedent_min_confidence", 0.60))
 
     @property
     def decisions_surface_joint_confidence(self) -> bool:

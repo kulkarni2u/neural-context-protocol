@@ -547,3 +547,99 @@ def test_compile_clamps_a_hostile_k(tmp_path: Path) -> None:
     _seed(store, count=3)
     assert _compile(handlers, k=-5)["evidence_count"] >= 1
     assert _compile(handlers, k=10**9)["evidence_count"] <= 12
+
+
+# ── precedent reuse must be reachable, not just implemented ───────────────────
+
+@pytest.mark.parametrize(
+    ("src", "trust"),
+    [("tool_result", 0.80), ("synthesis", 0.70), ("agent_inferred", 0.60)],
+)
+def test_reuse_is_reachable_across_evidence_trust_tiers(
+    tmp_path: Path, src: str, trust: float
+) -> None:
+    """The third instance of the ncp_lookup_memo bug, caught before shipping.
+
+    A host that follows the documented pattern records
+    confidence = joint_confidence, which for a single evidence tier is just
+    that tier's trust. With the old 0.80 floor only tool_result could ever be
+    reused -- and only by an exact tie -- so every decision built on synthesis
+    or agent_inferred evidence was permanently unreusable however often it
+    recurred.
+    """
+    store, handlers, _ = _setup(tmp_path)
+    store.write(SubconsciousChunk(
+        layer="semantic",
+        content=f"the retry policy was validated under {src} provenance rules",
+        src=src,  # type: ignore[arg-type]
+        base_trust=trust,
+        pipeline_id="p1",
+    ))
+
+    first = _compile(handlers)
+    handlers["ncp_record_decision"]({
+        "decision": "continue", "rationale": "r", "agent_id": "agent_a",
+        "schema_id": SCHEMA, "slot": "retry-policy", "choice": "continue",
+        "confidence": first["joint_confidence"], "backend": "rule",
+        "state_hash": first["state_hash"], "pipeline_id": "p1",
+    })
+
+    second = _compile(handlers)
+    assert second["state_hash"] == first["state_hash"]
+    assert second["suggested_choice"] == "continue"
+    assert second["suggested_basis"] == "confidence"
+
+
+def test_a_successful_outcome_rescues_a_low_confidence_precedent(tmp_path: Path) -> None:
+    """A linked outcome is evidence about the decision; the floor is a heuristic
+    about evidence trust. "This exact choice over this exact state already
+    worked" beats any confidence number, so it bypasses the floor."""
+    store, handlers, _ = _setup(tmp_path)
+    store.write(SubconsciousChunk(
+        layer="semantic", content="a weak unconfirmed signal about the retry policy",
+        src="agent_inferred", base_trust=0.30, pipeline_id="p1",
+    ))
+
+    first = _compile(handlers)
+    assert first["joint_confidence"] < 0.60
+    recorded = handlers["ncp_record_decision"]({
+        "decision": "continue", "rationale": "r", "agent_id": "agent_a",
+        "schema_id": SCHEMA, "slot": "retry-policy", "choice": "continue",
+        "confidence": first["joint_confidence"], "state_hash": first["state_hash"],
+        "pipeline_id": "p1",
+    })
+
+    assert "suggested_choice" not in _compile(handlers)
+
+    handlers["ncp_record_outcome"]({
+        "success": True, "chunk_ids": ["sub_a"], "decision_id": recorded["decision_id"],
+    })
+    after = _compile(handlers)
+    assert after["suggested_choice"] == "continue"
+    assert after["suggested_basis"] == "outcome"
+
+
+def test_a_failed_outcome_still_blocks_reuse_however_confident(tmp_path: Path) -> None:
+    store, handlers, _ = _setup(tmp_path)
+    _seed(store, count=2, trust=0.95)
+    first = _compile(handlers)
+    recorded = handlers["ncp_record_decision"]({
+        "decision": "continue", "rationale": "r", "agent_id": "agent_a",
+        "schema_id": SCHEMA, "slot": "retry-policy", "choice": "continue",
+        "confidence": 0.99, "state_hash": first["state_hash"], "pipeline_id": "p1",
+    })
+    handlers["ncp_record_outcome"]({
+        "success": False, "chunk_ids": ["sub_a"], "decision_id": recorded["decision_id"],
+    })
+    assert "suggested_choice" not in _compile(handlers)
+
+
+def test_a_task_name_carrying_a_counter_defeats_reuse(tmp_path: Path) -> None:
+    """Documented integration trap: `task` is part of the state identity, so a
+    task string with a round counter is a new state every round."""
+    store, handlers, _ = _setup(tmp_path)
+    _seed(store, count=2)
+    rolling = {_compile(handlers, task=f"review-round-{n}")["state_hash"] for n in (1, 2, 3)}
+    stable = {_compile(handlers, task="review-handoff")["state_hash"] for _ in range(3)}
+    assert len(rolling) == 3
+    assert len(stable) == 1

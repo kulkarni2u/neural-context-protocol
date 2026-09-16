@@ -1946,9 +1946,15 @@ def _extract_opencode_export_metadata(
 # this loop, and the precedent hit rate is measured here for the same reason
 # ncp_lookup_memo shipped unable to hit: a reuse key nobody exercised.
 
-# A fixed workflow: (slot, schema_id, evidence sentences). Evidence content is
-# deliberately distinct per slot so write-time dedup does not collapse it.
-DECISION_WORKFLOW_SLOTS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+# A fixed workflow: (slot, schema_id, evidence sentences, src). Evidence content
+# is deliberately distinct per slot so write-time dedup does not collapse it, and
+# the `src` values deliberately SPAN TRUST TIERS (tool_result 0.80, synthesis
+# 0.70, agent_inferred 0.60). An earlier version of this loop seeded every slot
+# from tool_result alone, which reported a healthy precedent hit rate while
+# reuse was in fact impossible for every lower tier -- the loop measured the one
+# case that happened to clear the threshold. Spanning tiers is what makes the
+# hit rate mean something.
+DECISION_WORKFLOW_SLOTS: tuple[tuple[str, str, tuple[str, ...], str], ...] = (
     (
         "retry-policy",
         "ncp.slot.continue_or_escalate",
@@ -1956,6 +1962,7 @@ DECISION_WORKFLOW_SLOTS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
             "the auth service returns 401 when a bearer token has expired",
             "retrying an expired-token request twice clears it in 94 percent of traces",
         ),
+        "tool_result",
     ),
     (
         "handoff-review",
@@ -1964,6 +1971,7 @@ DECISION_WORKFLOW_SLOTS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
             "the upstream worker delivered a schema-valid payload with all fields present",
             "payload checksum matched the manifest recorded at dispatch time",
         ),
+        "synthesis",
     ),
     (
         "cache-enabled",
@@ -1972,6 +1980,7 @@ DECISION_WORKFLOW_SLOTS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
             "cache hit ratio measured at 0.81 across the last four reconciliation runs",
             "invalidation lag stays under two seconds at the observed write rate",
         ),
+        "agent_inferred",
     ),
     (
         "escalation-path",
@@ -1980,6 +1989,7 @@ DECISION_WORKFLOW_SLOTS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
             "queue depth exceeded the alert ceiling for eleven consecutive minutes",
             "no owning team acknowledged the page within the escalation window",
         ),
+        "tool_result",
     ),
 )
 
@@ -2027,12 +2037,12 @@ def run_decision_workflow_dogfood_loop(
         handlers = make_handlers(store, config=config)
 
         # Seed evidence for every slot in the workflow.
-        for slot, _schema_id, sentences in DECISION_WORKFLOW_SLOTS:
+        for slot, _schema_id, sentences, src in DECISION_WORKFLOW_SLOTS:
             for sentence in sentences:
                 handlers["ncp_write_memory"]({
                     "content": f"{slot}: {sentence}",
                     "layer": "semantic",
-                    "src": "tool_result",
+                    "src": src,
                     "agent_id": "dogfood_seeder",
                     "pipeline_id": pipeline_id,
                 })
@@ -2040,6 +2050,7 @@ def run_decision_workflow_dogfood_loop(
         escalate_count = 0
         reason_histogram: dict[str, int] = {}
         precedent_hits = 0
+        reuse_basis: dict[str, int] = {}
         type_errors = 0
         recorded = 0
         hash_by_slot: dict[str, str] = {}
@@ -2050,7 +2061,7 @@ def run_decision_workflow_dogfood_loop(
         degraded_reasons: dict[str, int] = {}
 
         for turn in range(max(1, turns)):
-            slot, schema_id, _sentences = DECISION_WORKFLOW_SLOTS[turn % len(DECISION_WORKFLOW_SLOTS)]
+            slot, schema_id, _sentences, _src = DECISION_WORKFLOW_SLOTS[turn % len(DECISION_WORKFLOW_SLOTS)]
             compiled = handlers["ncp_compile_decision_query"]({
                 "agent_id": "dogfood_agent",
                 "role": "decider",
@@ -2073,6 +2084,8 @@ def run_decision_workflow_dogfood_loop(
                 reason_histogram[str(reason)] = reason_histogram.get(str(reason), 0) + 1
             if "suggested_choice" in compiled:
                 precedent_hits += 1
+                basis = str(compiled.get("suggested_basis", "unknown"))
+                reuse_basis[basis] = reuse_basis.get(basis, 0) + 1
 
             choice = _rule_backend_choice(schema_id, int(compiled["evidence_count"]))
             result = handlers["ncp_record_decision"]({
@@ -2105,7 +2118,7 @@ def run_decision_workflow_dogfood_loop(
         # its own it cannot tell a working escalate path from a dead one. Here
         # each slot is compiled again under drift above the 0.40 line and an
         # unregistered schema, which must raise reasons rather than stay quiet.
-        for slot, _schema_id, _sentences in DECISION_WORKFLOW_SLOTS:
+        for slot, _schema_id, _sentences, _src in DECISION_WORKFLOW_SLOTS:
             degraded = handlers["ncp_compile_decision_query"]({
                 "agent_id": "dogfood_agent",
                 "role": "decider",
@@ -2129,12 +2142,14 @@ def run_decision_workflow_dogfood_loop(
             "loop": "decision_workflow",
             "pipeline_id": pipeline_id,
             "turns": compiles,
-            "slots": [slot for slot, _s, _e in DECISION_WORKFLOW_SLOTS],
+            "slots": [slot for slot, _s, _e, _src in DECISION_WORKFLOW_SLOTS],
             "decisions_recorded": recorded,
             "type_error_rate": round(type_errors / compiles, 4) if compiles else 0.0,
             "escalate_rate": round(escalate_count / compiles, 4) if compiles else 0.0,
             "escalate_reasons": dict(sorted(reason_histogram.items())),
             "precedent_hit_rate": round(precedent_hits / compiles, 4) if compiles else 0.0,
+            "reuse_basis": dict(sorted(reuse_basis.items())),
+            "evidence_tiers": sorted({src for _s, _sc, _e, src in DECISION_WORKFLOW_SLOTS}),
             "degraded_escalate_rate": round(
                 degraded_escalates / len(DECISION_WORKFLOW_SLOTS), 4
             ),

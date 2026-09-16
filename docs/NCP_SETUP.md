@@ -179,7 +179,7 @@ without it. Two defaults are deliberately off:
 [decisions]
 enabled = true                     # typed path; legacy record_decision always works
 escalate_min_confidence = 0.55
-precedent_min_confidence = 0.80
+precedent_min_confidence = 0.60    # reachable: see the note below
 surface_joint_confidence = false   # adding a pidgin line changes every injected turn
 dual_write_chunks = false          # mirroring writes into the pool get_context reads
 strict_registered_schemas = false

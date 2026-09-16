@@ -515,6 +515,20 @@ Query typed decisions from the CLI with `ncp precedents --schema-id ... --slot
 ...` (also `--state-hash`, `--backend`, `--min-confidence`); with a plain text
 argument the command keeps searching legacy decision traces as before.
 
+**Any harness, not a particular one.** The contract is three calls in order —
+compile, decide, record — over whichever integration surface a host already
+uses: MCP tools, raw HTTP JSON-RPC, or the in-process library. There is no
+preferred orchestrator and nothing to adopt beyond the tools you already call.
+[`examples/12_decision_loop.py`](./examples/12_decision_loop.py) is the loop
+with no framework at all and a pluggable backend, and
+[`examples/03_langgraph/`](./examples/03_langgraph/) shows the same contract
+driven by a real third-party harness.
+
+One integration trap worth knowing before you wire it: `task` is part of the
+state identity `state_hash` covers, so a task string carrying a round counter
+(`"review_round_7"`) is a different state every round and can never match a
+precedent. Name the decision, not the iteration.
+
 `ncp dogfood --loop decision` runs the whole contract end to end with no
 provider calls and reports escalate rate, precedent hit rate and `state_hash`
 stability — use it to tune the thresholds against your own workload instead of
@@ -792,6 +806,7 @@ Runnable examples in the repo:
 python3 examples/01_quickstart.py
 python3 examples/02_multi_agent.py
 python3 examples/03_langgraph/pipeline.py   # requires: pip install langgraph
+python3 examples/12_decision_loop.py        # typed decision contract, no framework
 ```
 
 Tool-specific setup lives in:

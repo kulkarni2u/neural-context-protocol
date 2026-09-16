@@ -968,9 +968,28 @@ ncp_compile_decision_query (normative):
                        contradiction | open_schema | critical_budget |
                        no_evidence
     tier_hint          reuses the existing CAP-E3 signal when enabled
-    suggested_choice   present only when a precedent has an exact state_hash
-                       match, confidence >= [decisions].precedent_min_confidence,
-                       and no linked failed outcome. NCP still does not apply it.
+    suggested_choice   present when a precedent has an exact state_hash match,
+                       no linked FAILED outcome, and either a linked SUCCEEDED
+                       outcome or confidence >= precedent_min_confidence.
+                       suggested_basis says which ("outcome" or "confidence").
+                       NCP surfaces it; it still does not apply it.
+
+  A succeeded outcome bypasses the confidence floor deliberately. The floor is a
+  heuristic over *evidence trust*; a linked outcome is evidence about the
+  *decision itself*, and "this exact choice over this exact state already
+  worked" is strictly better information than any confidence number.
+
+  On the 0.60 floor: a host following the documented pattern records
+  confidence = joint_confidence, which for a single evidence tier is that
+  tier's trust -- tool_result 0.80, synthesis 0.70, agent_inferred 0.60,
+  subcon_retrieved 0.55. An 0.80 floor is unreachable below the top tier and
+  only ties it there, which would make most decisions permanently unreusable
+  however often they recurred.
+
+  INTEGRATION TRAP: `task` is part of the state identity, so a task string
+  carrying a round or turn counter ("review_round_7") is a different state
+  every round and can never match a precedent. Name the decision, not the
+  iteration.
 
   Compile makes ZERO provider calls. It is store reads plus arithmetic, and a
   test makes any socket a failure. A compile step that can call a model is an
@@ -1027,7 +1046,7 @@ escalate (v1, normative):
 Config ([decisions], all optional):
   enabled                    true   gates the typed path; legacy still records
   escalate_min_confidence    0.55
-  precedent_min_confidence   0.80
+  precedent_min_confidence   0.60   floor when no outcome is linked
   surface_joint_confidence   false  no change to injected pidgin by default
   dual_write_chunks          false  mirroring writes into the same pool
                                     get_context retrieves from, which changes
@@ -1468,7 +1487,7 @@ drift_use_embeddings = false    # CAP-T5: optional local-embedding blend
 [decisions]                        # spec 4h: typed decision contract
 enabled = true                     # gates the typed path; legacy record still works
 escalate_min_confidence = 0.55     # advisory floor; retune from a measured run
-precedent_min_confidence = 0.80    # floor for offering suggested_choice
+precedent_min_confidence = 0.60    # floor for suggested_choice, when no outcome is linked
 surface_joint_confidence = false   # default off: no change to injected pidgin
 dual_write_chunks = false          # default off: mirroring changes retrieval ranking
 strict_registered_schemas = false  # true rejects unregistered schema_ids at record

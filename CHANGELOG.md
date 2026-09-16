@@ -66,6 +66,38 @@ All notable changes to Neural Context Protocol will be documented in this file.
   the legacy write is unaffected.
 - Existing SQLite and Postgres stores open without error and lose nothing.
 
+### Fixed before release
+
+- **Precedent reuse was unreachable for most evidence.**
+  `precedent_min_confidence` defaulted to 0.80, but a host following the
+  documented pattern records `confidence = joint_confidence`, which for a
+  single evidence tier is just that tier's trust: `tool_result` 0.80,
+  `synthesis` 0.70, `agent_inferred` 0.60, `subcon_retrieved` 0.55. So only
+  top-tier evidence could ever be reused, and only by an exact tie — every
+  decision built on anything weaker was permanently unreusable however often
+  it recurred. This is the same shape as the `ncp_lookup_memo` bug fixed in
+  1.6.0, and the decision dogfood loop initially reported a healthy hit rate
+  while hiding it, because the loop seeded every slot from `tool_result`
+  alone. The default is now 0.60, a **linked successful outcome bypasses the
+  floor entirely** (`suggested_basis` reports which applied), and the dogfood
+  loop now spans three trust tiers so the number means something.
+
+### Integration notes
+
+- `task` is part of the state identity `state_hash` covers, so a task string
+  carrying a round or turn counter (`"review_round_7"`) is a different state
+  every round and can never match a precedent. Name the decision, not the
+  iteration. This is called out in the spec, the integration guide, the README
+  and both runnable examples, because it silently costs a host the entire
+  reuse benefit.
+- The decision contract has no preferred harness. It is three calls in order —
+  compile, decide, record — over MCP tools, raw HTTP JSON-RPC, or the
+  in-process library, whichever a host already uses.
+  `examples/12_decision_loop.py` is the loop with no framework and a pluggable
+  backend; `examples/03_langgraph/` drives the identical contract from a real
+  third-party harness, deciding its `ncp.handoff.accept` slot with a rule
+  instead of a model call.
+
 ### Notes on the advisory scores
 
 - `joint_confidence` is **not calibration** and is labelled `advisory` in the

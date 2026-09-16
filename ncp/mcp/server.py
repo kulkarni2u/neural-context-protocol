@@ -910,24 +910,23 @@ def _contradiction_edges(
     return pairs
 
 
-def _decision_outcome_failed(store: BaseStore, decision: DecisionRecord) -> bool:
-    """True when a precedent has a linked outcome that did not succeed.
+def _decision_outcome(store: BaseStore, decision: DecisionRecord) -> bool | None:
+    """How a precedent's linked outcome resolved: True, False, or None.
 
-    A precedent whose outcome failed must never be offered as a reuse
-    candidate. Unknown (no linked outcome, or a store that cannot report
-    outcomes) is not treated as failure -- it is treated as unknown, and the
-    caller's own confidence floor is what gates reuse.
+    None means unknown -- no linked outcome, a store that cannot report
+    outcomes, or an outcome id that no longer resolves. Unknown is never
+    treated as failure; it falls back to the caller's confidence floor.
     """
     if not decision.outcome_id:
-        return False
+        return None
     try:
         outcomes = store.list_outcomes(limit=200)
     except Exception:  # noqa: BLE001 - advisory signal, never fatal
-        return False
+        return None
     for outcome in outcomes:
         if outcome.outcome_id == decision.outcome_id:
-            return not outcome.success
-    return False
+            return bool(outcome.success)
+    return None
 
 
 def _verify_authorship(
@@ -1049,7 +1048,7 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         config.decisions_escalate_min_confidence if config is not None else 0.55
     )
     decisions_precedent_min_confidence = (
-        config.decisions_precedent_min_confidence if config is not None else 0.80
+        config.decisions_precedent_min_confidence if config is not None else 0.60
     )
     decisions_dual_write_chunks = (
         config.decisions_dual_write_chunks if config is not None else False
@@ -2065,17 +2064,26 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             "escalate_reasons": reasons,
         }
 
-        # P1-C reuse candidate: an exact state_hash match, confident enough,
-        # with no failed outcome linked. NCP still never applies the choice.
+        # Reuse candidate: an exact state_hash match that is either backed by a
+        # successful outcome or confident enough on its own, and never one whose
+        # outcome failed. NCP surfaces it; the host decides whether to use it.
+        #
+        # A succeeded outcome overrides the confidence floor deliberately. The
+        # floor is a heuristic over *evidence trust*; a linked outcome is
+        # evidence about the *decision itself*, and "this exact choice over this
+        # exact state already worked" is strictly better information than any
+        # confidence number. Gating that behind the floor made the most reusable
+        # decisions in the store the least reusable.
         for precedent in precedents:
-            if (
-                precedent.state_hash
-                and precedent.state_hash == state_hash
-                and precedent.confidence >= decisions_precedent_min_confidence
-                and not _decision_outcome_failed(store, precedent)
-            ):
+            if not precedent.state_hash or precedent.state_hash != state_hash:
+                continue
+            verdict = _decision_outcome(store, precedent)
+            if verdict is False:
+                continue
+            if verdict is True or precedent.confidence >= decisions_precedent_min_confidence:
                 result["suggested_choice"] = precedent.choice
                 result["suggested_from"] = precedent.decision_id
+                result["suggested_basis"] = "outcome" if verdict is True else "confidence"
                 break
 
         if tier_hints_enabled:
