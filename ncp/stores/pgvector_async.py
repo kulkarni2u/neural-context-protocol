@@ -38,6 +38,7 @@ from ncp.stores.graph import (
 from ncp.stores.pgvector import (
     DEFAULT_RETRIEVAL_POLICY,
     PGVECTOR_SCHEMA_TEMPLATE,
+    PgvectorStore,
     _validate_identifier,
 )
 from ncp.stores.redis_coordination import AsyncRedisCoordination
@@ -63,6 +64,7 @@ from ncp.types import (
     ConsciousBlock,
     ConsolidationReport,
     NCPResponse,
+    DecisionRecord,
     OutcomeRecord,
     SubconsciousChunk,
     TurnRecord,
@@ -1793,6 +1795,88 @@ class AsyncPgvectorStore(BaseStore):
                         outcome.note,
                         outcome.created_at,
                     ),
+                )
+                return cur.rowcount > 0
+
+    # ── typed decisions (spec 4h) ─────────────────────────────────────────
+
+    async def async_record_decision_record(self, decision: DecisionRecord) -> bool:
+        """Persist a typed decision via native async DB I/O."""
+        async with self._aconnect() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    self._sql(
+                        f"INSERT INTO {{schema}}.{{prefix}}decisions ({PgvectorStore._DECISION_COLUMNS})"
+                        " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+                        " ON CONFLICT (decision_id) DO UPDATE SET"
+                        " outcome_id = EXCLUDED.outcome_id, confidence = EXCLUDED.confidence,"
+                        " confidence_source = EXCLUDED.confidence_source"
+                    ),
+                    PgvectorStore._decision_params(decision),
+                )
+                return cur.rowcount > 0
+
+    async def async_get_decision(self, decision_id: str) -> DecisionRecord | None:
+        async with self._aconnect() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    self._sql(
+                        f"SELECT {PgvectorStore._DECISION_COLUMNS}"
+                        " FROM {schema}.{prefix}decisions WHERE decision_id = %s"
+                    ),
+                    (decision_id,),
+                )
+                rows = await self._afetchall(cur)
+        return None if not rows else PgvectorStore._row_to_decision(rows[0])
+
+    async def async_query_decisions(
+        self,
+        *,
+        schema_id: str | None = None,
+        slot: str | None = None,
+        state_hash: str | None = None,
+        pipeline_id: str | None = None,
+        backend: str | None = None,
+        min_confidence: float = 0.0,
+        k: int = 5,
+    ) -> list[DecisionRecord]:
+        where, params = PgvectorStore._decision_filters(
+            schema_id=schema_id,
+            slot=slot,
+            pipeline_id=pipeline_id,
+            backend=backend,
+            min_confidence=min_confidence,
+        )
+        if state_hash:
+            order = (
+                "ORDER BY CASE WHEN state_hash = %s THEN 0 ELSE 1 END,"
+                " created_at DESC, confidence DESC"
+            )
+            order_params: list[object] = [state_hash]
+        else:
+            order = "ORDER BY created_at DESC, confidence DESC"
+            order_params = []
+        async with self._aconnect() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    self._sql(
+                        f"SELECT {PgvectorStore._DECISION_COLUMNS}"
+                        f" FROM {{schema}}.{{prefix}}decisions WHERE {where} {order} LIMIT %s"
+                    ),
+                    (*params, *order_params, max(1, int(k))),
+                )
+                rows = await self._afetchall(cur)
+        return [PgvectorStore._row_to_decision(row) for row in rows]
+
+    async def async_link_decision_outcome(self, decision_id: str, outcome_id: str) -> bool:
+        async with self._aconnect() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    self._sql(
+                        "UPDATE {schema}.{prefix}decisions SET outcome_id = %s"
+                        " WHERE decision_id = %s"
+                    ),
+                    (outcome_id, decision_id),
                 )
                 return cur.rowcount > 0
 

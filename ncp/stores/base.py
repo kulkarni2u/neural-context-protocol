@@ -590,6 +590,43 @@ class BaseStore(ABC):
         """Attach an outcome id to an existing decision. False when unknown."""
         raise NotImplementedError("link_decision_outcome not implemented for this backend")
 
+    async def async_record_decision_record(self, decision: "DecisionRecord") -> bool:
+        """Asynchronously persist a typed decision using thread pool."""
+        return await anyio.to_thread.run_sync(self.record_decision_record, decision)
+
+    async def async_get_decision(self, decision_id: str) -> "DecisionRecord | None":
+        """Asynchronously fetch one decision using thread pool."""
+        return await anyio.to_thread.run_sync(self.get_decision, decision_id)
+
+    async def async_query_decisions(
+        self,
+        *,
+        schema_id: str | None = None,
+        slot: str | None = None,
+        state_hash: str | None = None,
+        pipeline_id: str | None = None,
+        backend: str | None = None,
+        min_confidence: float = 0.0,
+        k: int = 5,
+    ) -> list["DecisionRecord"]:
+        """Asynchronously query precedent decisions using thread pool."""
+        fn = partial(
+            self.query_decisions,
+            schema_id=schema_id,
+            slot=slot,
+            state_hash=state_hash,
+            pipeline_id=pipeline_id,
+            backend=backend,
+            min_confidence=min_confidence,
+            k=k,
+        )
+        return await anyio.to_thread.run_sync(fn)
+
+    async def async_link_decision_outcome(self, decision_id: str, outcome_id: str) -> bool:
+        """Asynchronously attach an outcome id to a decision using thread pool."""
+        fn = partial(self.link_decision_outcome, decision_id, outcome_id)
+        return await anyio.to_thread.run_sync(fn)
+
     def query_precedents(
         self,
         query: str,
