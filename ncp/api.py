@@ -15,7 +15,7 @@ from ncp.stores.base import BaseStore
 from ncp.stores.factory import create_store
 from ncp.stores.memo import compute_memo_signature
 from ncp.tokens import estimate_tokens
-from ncp.types import BudgetContext, ConsciousBlock, NCPResponse, SubconsciousChunk, Whisper
+from ncp.types import BudgetContext, ConsciousBlock, DecisionRecord, NCPResponse, SubconsciousChunk, Whisper
 
 _CONFIG: NCPConfig | None = None
 
@@ -83,6 +83,78 @@ def get_context(
         diversity_limit=diversity_limit,
         max_tokens=max_tokens,
     ).context
+
+
+def compile_decision_query(
+    *,
+    agent: ConsciousBlock,
+    schema_id: str,
+    store: BaseStore | None = None,
+    config: NCPConfig | None = None,
+    k: int = 6,
+    min_confidence: float = 0.0,
+) -> dict:
+    """Compile a bounded decision packet for a decision backend (spec 4h).
+
+    Makes no provider calls: this is store reads plus arithmetic. Returns the
+    same object shape as the ``ncp_compile_decision_query`` MCP tool, because
+    it is literally the same handler -- the library and MCP surfaces cannot
+    drift apart into two subtly different packets.
+
+    NCP compiles; it does not choose. ``escalate`` says whether a stronger
+    backend is warranted and ``escalate_reasons`` says why, but nothing here
+    names a model: picking the backend is the host's job.
+    """
+    from ncp.mcp.server import make_handlers
+
+    resolved_config = config or _CONFIG or configure(cwd=Path.cwd())
+    resolved_store = store or create_store(resolved_config)
+    handler = make_handlers(resolved_store, config=resolved_config)["ncp_compile_decision_query"]
+    result = handler({
+        "agent_id": agent.agent_id,
+        "role": agent.role,
+        "owns": agent.owns,
+        "must_not": agent.must_not,
+        "task": agent.task,
+        "slot": agent.slot,
+        "intent": agent.intent,
+        "schema_id": schema_id,
+        "pipeline_id": agent.pipeline_id,
+        "tried": agent.tried,
+        "failed": agent.failed,
+        "drift_score": agent.drift_score,
+        "slot_confidence": agent.slot_confidence,
+        "pressure": agent.pressure,
+        "k": k,
+        "min_confidence": min_confidence,
+    })
+    return dict(result)  # type: ignore[arg-type]
+
+
+def record_decision(
+    decision: DecisionRecord,
+    *,
+    store: BaseStore | None = None,
+    config: NCPConfig | None = None,
+) -> bool:
+    """Persist a typed decision through the public API."""
+
+    resolved_config = config or _CONFIG or configure(cwd=Path.cwd())
+    resolved_store = store or create_store(resolved_config)
+    return resolved_store.record_decision_record(decision)
+
+
+def get_decision(
+    decision_id: str,
+    *,
+    store: BaseStore | None = None,
+    config: NCPConfig | None = None,
+) -> DecisionRecord | None:
+    """Fetch one typed decision by id, or None when the store has no such row."""
+
+    resolved_config = config or _CONFIG or configure(cwd=Path.cwd())
+    resolved_store = store or create_store(resolved_config)
+    return resolved_store.get_decision(decision_id)
 
 
 def write_memory(
