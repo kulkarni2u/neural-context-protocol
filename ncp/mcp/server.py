@@ -1673,11 +1673,11 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         decision: DecisionRecord,
         *,
         evidence_chunk_id: str | None,
-    ) -> None:
+    ) -> bool:
         """Persist the typed row, plus the optional mirror chunk and edges."""
-        store.record_decision_record(decision)
+        recorded = store.record_decision_record(decision)
         if not decisions_dual_write_chunks:
-            return
+            return recorded
         # Opt-in mirror so legacy retrieval still surfaces the decision. Off by
         # default: this writes into the same pool ncp_get_context retrieves
         # from, so enabling it changes ranking and token budgets.
@@ -1713,6 +1713,7 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
                     store.add_chunk_edges(edges)
                 except Exception:  # noqa: BLE001 - edges are additive, never fatal
                     pass
+        return recorded
 
     def _handle_record_decision(args: dict[str, object]) -> object:
         decision = str(args["decision"])
@@ -1837,10 +1838,19 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
                 "chunk_id": chunk.chunk_id,
             }
 
-        _record_decision_row(record, evidence_chunk_id=chunk.chunk_id)
+        typed_recorded = _record_decision_row(record, evidence_chunk_id=chunk.chunk_id)
         response["decision_id"] = record.decision_id
         response["schema_id"] = record.schema_id
         response["schema_registered"] = registered
+        # `ok` above is the *legacy trace chunk* write, which returns False when
+        # write-time dedup recognizes an identical earlier trace. For a typed
+        # call that must not be reported as "the decision was not recorded" --
+        # the typed row is the durable object, and two decisions with identical
+        # prose are still two decisions. Legacy-only calls keep the old meaning,
+        # since old clients read `recorded` as the chunk write.
+        if typed:
+            response["recorded"] = typed_recorded
+            response["trace_chunk_written"] = ok
         return response
 
     def _handle_get_decision(args: dict[str, object]) -> object:
@@ -1896,13 +1906,24 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         k = max(1, min(decisions_max_evidence, k))
         min_confidence = float(args.get("min_confidence", 0.0) or 0.0)
 
+        # Over-fetch, then drop reasoning_trace. Prior decisions are not
+        # evidence about the world, and letting them back in is actively
+        # harmful: every ncp_record_decision writes a trace chunk into the same
+        # pipeline, so including that layer makes each compile see a different
+        # evidence set than the last one, which moves state_hash and destroys
+        # precedent reuse. Prior decisions come back through `precedents`, as
+        # typed records with a choice and a confidence.
         chunks = store.query(
             text=f"{conscious.task} {conscious.slot} {conscious.intent}",
-            k=k,
+            k=k * 2,
             pipeline_id=pipeline_id,
             fallback_to_trust_recency=True,
         )
-        evidence = [c for c in chunks if evidence_confidence(c) >= min_confidence][:k]
+        evidence = [
+            c
+            for c in chunks
+            if c.layer != "reasoning_trace" and evidence_confidence(c) >= min_confidence
+        ][:k]
         chunk_ids = [c.chunk_id for c in evidence]
 
         # Contradictions from both signals NCP actually has: the deterministic

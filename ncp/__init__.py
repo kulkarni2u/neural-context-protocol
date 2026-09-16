@@ -20,6 +20,7 @@ from .dogfood import (
     run_adapter_continuation_dogfood_loop,
     run_canonical_dogfood_loop,
     run_canonical_http_dogfood_loop,
+    run_decision_workflow_dogfood_loop,
     run_live_adapter_continuation_attempt,
     run_repeatability_dogfood_loop,
 )
@@ -44,6 +45,7 @@ __all__ = [
     "run_adapter_continuation_dogfood_loop",
     "run_canonical_dogfood_loop",
     "run_canonical_http_dogfood_loop",
+    "run_decision_workflow_dogfood_loop",
     "run_live_adapter_continuation_attempt",
     "run_repeatability_dogfood_loop",
     "run",

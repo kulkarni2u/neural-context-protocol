@@ -1079,6 +1079,20 @@ def serve_stdio_command(cwd: Path | None, store_path: Path | None) -> None:
 @click.option("--adapter-timeout-seconds", default=None, type=float,
               help="Override the per-call timeout for CLI-backed continuation adapters.")
 @click.option("--transport", type=click.Choice(["http", "stdio"]), default="http", hidden=True)
+@click.option(
+    "--loop",
+    "loop_name",
+    type=click.Choice(["canonical", "decision"]),
+    default="canonical",
+    show_default=True,
+    help=(
+        "Which dogfood loop to run. 'decision' drives compile -> rule backend -> "
+        "record_decision -> record_outcome over a fixed typed workflow and reports "
+        "escalate rate, precedent hit rate and state_hash stability. No provider calls."
+    ),
+)
+@click.option("--turns", default=12, show_default=True, type=click.IntRange(1, 500),
+              help="Turns for --loop decision.")
 def dogfood_command(
     *,
     cwd: Path,
@@ -1091,6 +1105,8 @@ def dogfood_command(
     attempts: int,
     adapter_timeout_seconds: float | None,
     transport: str,
+    loop_name: str,
+    turns: int,
 ) -> None:
     """Run the canonical MCP dogfood loop or a continuation repeatability pass."""
 
@@ -1104,6 +1120,16 @@ def dogfood_command(
     )
 
     config = ncp.configure(cwd=cwd)
+    if loop_name == "decision":
+        from ncp.dogfood import run_decision_workflow_dogfood_loop
+
+        console.print_json(data=run_decision_workflow_dogfood_loop(
+            store_path=store_path or config.store_path,
+            cwd=cwd,
+            pipeline_id=pipeline_id if pipeline_id != "pipe_dogfood_mcp" else "pipe_dogfood_decision",
+            turns=turns,
+        ))
+        return
     common_kwargs = {
         "store_path": store_path or config.store_path,
         "cwd": Path(__file__).resolve().parents[1],
