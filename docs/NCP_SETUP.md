@@ -153,6 +153,7 @@ ncp status --cwd /path/to/project
 ncp cost --cwd /path/to/project
 ncp explain --cwd /path/to/project
 ncp dogfood --cwd /path/to/project
+ncp dogfood --loop decision --cwd /path/to/project
 ```
 
 What they tell you:
@@ -161,6 +162,46 @@ What they tell you:
 - `cost` — token and USD rollups
 - `explain` — human-readable operator summary
 - `dogfood` — deterministic MCP proof
+- `dogfood --loop decision` — drives the typed decision contract (spec §4h)
+  end to end: compile → rule backend → `ncp_record_decision` →
+  `ncp_record_outcome` over a fixed workflow, with no provider calls. Reports
+  escalate rate and its reason histogram, precedent hit rate, `state_hash`
+  stability, and a type-error rate that must stay at 0. Use it to retune
+  `[decisions].escalate_min_confidence` against a real workload rather than
+  guessing at the constant.
+
+## Decision Contract Settings
+
+`[decisions]` is optional and additive — every existing project keeps working
+without it. Two defaults are deliberately off:
+
+```toml
+[decisions]
+enabled = true                     # typed path; legacy record_decision always works
+escalate_min_confidence = 0.55
+precedent_min_confidence = 0.80
+surface_joint_confidence = false   # adding a pidgin line changes every injected turn
+dual_write_chunks = false          # mirroring writes into the pool get_context reads
+strict_registered_schemas = false
+max_evidence = 12
+```
+
+Turning on `dual_write_chunks` mirrors each decision into a `reasoning_trace`
+chunk so legacy retrieval surfaces it — at the cost of changing retrieval
+ranking and token budgets for pipelines that were tuned without it. Turning on
+`surface_joint_confidence` adds one telemetry line to the assembled pidgin.
+Both are worth enabling deliberately, after you have looked at the numbers, not
+by default.
+
+Register your own schemas in `.ncp/decision_schemas.json`:
+
+```json
+{"team.route": {"choice_type": "enum", "options": ["fast", "thorough"]}}
+```
+
+or inline under `[decision_schemas]` in `.ncp/config.toml`, which overlays the
+file. Unregistered schema ids still record; compile flags them with the
+`open_schema` escalate reason instead of rejecting them.
 
 ## Multi-Tool Sharing
 

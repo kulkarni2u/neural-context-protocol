@@ -90,6 +90,23 @@ around it silently, and distinguish which case you're in:
    optional `alternatives` and `evidence_refs`. This is what lets a later
    agent — or you, next session — find precedent instead of re-litigating
    the same choice.
+8. When the slot is a **classify / route / score / choose** — the answer is a
+   value, not a paragraph — and a `schema_id` exists for it:
+   - Call `ncp_compile_decision_query` first. You get bounded state, the
+     `questions` to answer, a `state_hash`, and any prior decisions over the
+     same state.
+   - If `escalate` is false and `suggested_choice` is present, a prior
+     decision already covers this state. Reuse it rather than re-deciding.
+   - Otherwise answer it yourself or with a cheap structured call — you do not
+     need a frontier model to pick from three options.
+   - Persist the result with `ncp_record_decision` including `schema_id`,
+     `choice` and the `state_hash` you were handed. A choice you do not record
+     cannot become anyone's precedent.
+   - If `escalate` is true, use normal `ncp_get_context` pidgin and reason it
+     out. `escalate_reasons` tells you why; it never tells you which model to
+     use, because that is not NCP's call.
+9. When the work resolves, call `ncp_record_outcome` with `decision_id` so the
+   decision is linked to what actually happened.
 
 ## Bounded context discipline
 

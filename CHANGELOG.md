@@ -4,6 +4,92 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Typed decision contract (spec §4h)** (`ncp/types.py`, `ncp/decisions.py`,
+  `ncp/stores/*`, `ncp/mcp/server.py`, `ncp/api.py`, `ncp/config.py`): a
+  decision used to be a `reasoning_trace` chunk with prose in it, so the thing
+  a host most needs later — what was chosen, how sure, over what state — was
+  only recoverable by parsing text. `DecisionRecord` makes it a durable object
+  (`schema_id`, `slot`, `choice`, `options`, `probs`, `confidence`,
+  `confidence_source`, `backend`, `state_hash`, `chunk_ids`) with `rationale`
+  demoted to optional commentary that nothing is ranked on. New `decisions`
+  table in SQLite (idempotent DDL) and Postgres (migration
+  `014_add_decisions_table.sql`, mirrored in the schema template). NCP
+  persists and compiles decisions; it never makes one.
+- **`ncp_compile_decision_query`** and `ncp.api.compile_decision_query`: compile
+  a bounded packet — conscious state plus evidence, the `questions` a backend
+  must answer, a stable `state_hash`, up to three precedents, advisory
+  `joint_confidence` / `contradiction_mass`, and `escalate` with reasons from a
+  closed set. Makes **zero provider calls**; a test makes any socket a failure.
+  `escalate_reasons` never names a model — NCP says why a stronger backend is
+  warranted, the host decides which. The library surface calls the same handler
+  the MCP tool does, so the two cannot drift into different packets.
+- **`ncp_get_decision`**, and `decision_id` on `ncp_record_outcome` to close
+  the decision → outcome loop.
+- **Minimal schema registry**: three built-ins
+  (`ncp.slot.continue_or_escalate`, `ncp.slot.binary`, `ncp.handoff.accept`),
+  overlaid by `.ncp/decision_schemas.json` and then by `[decision_schemas]`.
+  A registered schema rejects an unknown choice with
+  `{recorded: false, error: "schema_mismatch"}` and writes no partial row.
+  Unregistered ids still record (forward compat) and raise the `open_schema`
+  escalate reason instead.
+- **`ncp dogfood --loop decision`** (`ncp/dogfood.py`): drives compile → rule
+  backend → `ncp_record_decision` → `ncp_record_outcome` over a fixed typed
+  workflow and reports escalate rate with a reason histogram, precedent hit
+  rate, `state_hash` stability, and a type-error rate that must stay at 0. It
+  runs a clean pass and a degraded pass, because a clean pass alone cannot
+  tell a working escalate path from a dead one.
+
+### Compatibility
+
+- **`ncp_record_decision` is backward compatible.** The legacy call shape
+  (`decision`, `rationale`, `agent_id`, `alternatives`, `evidence_refs`,
+  `outcome`, `confidence`, `tags`) still writes its `reasoning_trace` chunk and
+  still returns `recorded` / `chunk_id` / `outcome` / `tag_count` /
+  `evidence_count`. It additionally adapts into a `DecisionRecord` under
+  `schema_id="legacy.untyped"`, with `choice` taken from `decision` — what was
+  decided. The rationale is not the choice: it is *why*, not *what*, and using
+  it as the choice would make precedent ranking a text search over
+  justifications.
+- On the typed path `recorded` reports the **typed row** and
+  `trace_chunk_written` reports the legacy chunk separately. These differ: two
+  decisions with identical prose hit write-time dedup on the chunk while both
+  typed rows land. Legacy-only calls keep the old meaning.
+- `[decisions].dual_write_chunks` and `[decisions].surface_joint_confidence`
+  both default to **false**. Mirroring decisions writes into the same pool
+  `ncp_get_context` retrieves from, which changes ranking and token budgets for
+  pipelines tuned without it; the telemetry line changes every injected turn.
+  Neither should arrive unasked.
+- `[decisions].enabled = false` returns a disabled payload from
+  `ncp_compile_decision_query` and `ncp_get_decision` and ignores typed fields;
+  the legacy write is unaffected.
+- Existing SQLite and Postgres stores open without error and lose nothing.
+
+### Notes on the advisory scores
+
+- `joint_confidence` is **not calibration** and is labelled `advisory` in the
+  payload. It is `geometric_mean(conf_i) * (1 - 0.5*cm) * (1 - drift)`. The
+  geometric mean is dragged down by a single weak chunk, so asking for more
+  evidence can lower it; `min_confidence` is the lever. Measured: fresh
+  `tool_result` evidence sits at trust 0.80 → jc 0.80, while trust decay
+  multiplies by 0.85 while `base_trust > 0.5`, so fully decayed evidence rests
+  at ~0.506 — just under the 0.55 escalate floor. That floor is kept
+  deliberately: evidence that decayed and was never re-validated should
+  escalate.
+- `contradiction_mass` is measured over **chunks, not pairs**. With the default
+  `k=6` a pair denominator is 15, so a genuine head-on contradiction would
+  score 0.067 and a 0.30 threshold would be unreachable. It fuses the
+  deterministic fan-in reducer (run directly by compile, so the signal is live
+  even where `[retrieval].reduce_fanin_enabled` is off) with explicit
+  `contradicts` edges — edges alone would be near-permanently zero, since
+  write-time inference only ever emits `refines`.
+- Compile excludes the `reasoning_trace` layer from evidence. Every
+  `ncp_record_decision` writes a trace chunk into the same pipeline, so
+  admitting that layer made each compile see a different evidence set than the
+  last, moving `state_hash` every turn and destroying precedent reuse. Prior
+  decisions return through `precedents` as typed records instead.
+
 ## [1.6.0] - 2026-08-26
 
 ### Added

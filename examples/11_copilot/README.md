@@ -64,3 +64,5 @@ Once the MCP server is registered, Copilot Chat (agent mode) should see:
 - `ncp_post_turn`
 - `ncp_fetch`
 - `ncp_record_decision`
+- `ncp_get_decision`
+- `ncp_compile_decision_query`

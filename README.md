@@ -91,6 +91,7 @@ Bounded retrieval is the entry point, not the whole story. The mechanisms below 
 - **Cryptographic agent identity** — Ed25519 keypairs, with optional signed authorship verified against a registered public key. See [Agent identity and reputation](#agent-identity-and-reputation).
 - **Per-agent reputation** — a Beta-distribution posterior over "produces trustworthy memory," updated from calibration's trust deltas, that can optionally weight retrieval or gate whispers.
 - **Decision traces and precedent** — `ncp_record_decision` captures structured rationale; `ncp precedents` queries past decisions.
+- **Typed decision records** — a decision is a durable object (`choice`, `confidence`, `schema_id`, `state_hash`), not prose to be re-parsed, and `ncp_compile_decision_query` compiles a bounded state packet any decision backend can answer. See [Decision records and compile](#decision-records-and-compile).
 
 ### Operability at scale
 
@@ -455,6 +456,68 @@ On a deterministic 40-worker benchmark, 25% of NCP's own bounded top-k retrieval
 
 -----
 
+## Decision records and compile
+
+Not every slot in a pipeline needs prose. Classify, route, score and choose are
+decisions: the answer is a value from a known set, not a paragraph. NCP stores
+those as first-class objects rather than as a chunk of text to be re-parsed
+later, and can compile the bounded state a decision backend needs to answer
+one.
+
+A `DecisionRecord` carries `schema_id`, `slot`, `choice`, `options`, `probs`,
+`confidence`, `confidence_source`, `backend`, `state_hash` and the evidence
+`chunk_ids` it was compiled from. `rationale` is optional commentary, capped at
+600 characters, and is never the key anything is matched on.
+
+```python
+import ncp
+
+packet = ncp.compile_decision_query(
+    agent=ncp.agent(id="executor", role="implementer",
+                    task="fix-auth", slot="retry-policy", intent="unblock-login"),
+    schema_id="ncp.slot.continue_or_escalate",
+)
+
+if packet["escalate"]:
+    ...  # call a generating model with normal ncp.get_context pidgin
+else:
+    ...  # hand packet["state"] and packet["questions"] to a rule, a JSON-mode
+         # cheap model, a schema-constrained backend, or a person
+```
+
+The packet contains the conscious state plus bounded evidence, the `questions`
+a backend must answer, a `state_hash`, up to three prior decisions over the
+same state, and advisory `joint_confidence` / `contradiction_mass` with an
+`escalate` flag and reasons from a closed set.
+
+Three things NCP deliberately does not do here:
+
+- **It does not choose.** The choice arrives from a backend or a human. NCP
+  compiles the question and persists the answer.
+- **It does not route.** `escalate_reasons` says *why* — `low_joint_confidence`,
+  `high_drift`, `contradiction`, `open_schema`, `critical_budget`,
+  `no_evidence` — and never names a model. Picking the backend is the host's job,
+  same as `tier_hint` has always been advisory.
+- **It does not claim calibration.** `joint_confidence` is a bounded heuristic
+  over evidence trust, contradiction and drift. Outcome-weighted trust is not
+  calibration, and this number is labelled `advisory` in the payload itself.
+
+Everything is additive and gated by `[decisions]`. Existing clients keep
+working: the old `ncp_record_decision` call shape still writes its
+`reasoning_trace` chunk and returns the same fields, and additionally adapts
+into a typed record under `schema_id = "legacy.untyped"`. Two defaults are off
+on purpose — `dual_write_chunks`, because mirroring decisions into the pool
+`ncp_get_context` retrieves from changes ranking and token budgets for
+pipelines that were tuned without it, and `surface_joint_confidence`, because
+adding a line to the injected pidgin changes every turn.
+
+`ncp dogfood --loop decision` runs the whole contract end to end with no
+provider calls and reports escalate rate, precedent hit rate and `state_hash`
+stability — use it to tune the thresholds against your own workload instead of
+trusting the defaults.
+
+-----
+
 ## What NCP is (and isn't)
 
 **NCP is the agent-to-agent memory bus and context protocol, not the orchestrator.**
@@ -521,8 +584,10 @@ ncp_remember         — compile raw content into deterministic semantic memory 
 ncp_recall           — query compiled semantic memory atoms
 ncp_improve          — consolidate and improve stored memory
 ncp_fetch            — pull additional bounded context mid-turn
-ncp_record_decision  — capture a structured decision trace for precedent queries
-ncp_record_outcome   — attach outcome feedback to chunks or turns
+ncp_record_decision  — capture a decision trace, and a typed DecisionRecord when a schema is given
+ncp_get_decision     — read one typed decision by id
+ncp_compile_decision_query — compile a bounded decision packet for any decision backend
+ncp_record_outcome   — attach outcome feedback to chunks, turns, or a decision
 ncp_lookup_memo      — check for reusable completed work by signature
 ncp_record_memo      — store reusable completed work by signature
 ```
