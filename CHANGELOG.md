@@ -82,6 +82,26 @@ All notable changes to Neural Context Protocol will be documented in this file.
   floor entirely** (`suggested_basis` reports which applied), and the dogfood
   loop now spans three trust tiers so the number means something.
 
+- **Postgres float precision on the decisions table.** `confidence` and
+  `created_at` were declared `REAL`, copied from the `outcomes` table. Postgres
+  `REAL` is float4 (~7 significant digits) while SQLite `REAL` is always an
+  8-byte double, so the whole test suite passed locally while Postgres silently
+  returned `created_at` over a minute off (`1789578308.8168755` came back as
+  `1789578400.0`), breaking the documented guarantee that a stored decision
+  round-trips to identical canonical JSON. Both columns are now
+  `DOUBLE PRECISION`, matching every other float column in the schema, with a
+  static DDL guard so this cannot regress without a live database.
+
+### Known issue (pre-existing, not introduced here)
+
+- The `outcomes` table has the same `REAL` columns (`weight`, `created_at`) in
+  migration 009 and the schema template, so `OutcomeRecord.created_at` loses
+  precision the same way on Postgres today. It is untouched here because
+  correcting it means a new migration that alters a column type on an existing
+  table, which is a separate change with its own deployment risk, and nothing
+  in the decision contract depends on it — decision/outcome linkage uses the
+  outcome id and success flag, not the timestamp.
+
 ### Integration notes
 
 - `task` is part of the state identity `state_hash` covers, so a task string

@@ -453,7 +453,12 @@ def test_pgvector_decision_record_roundtrip_and_precedents() -> None:
         choice="continue",
         options=["continue", "escalate", "stop"],
         probs={"continue": 0.8, "escalate": 0.15, "stop": 0.05},
-        confidence=0.88,
+        # Deliberately a value needing full float8 precision. 0.88 survives a
+        # float4 column by accident -- Postgres emits the shortest text form
+        # that round-trips as float4 ("0.88") and Python parses it back exactly
+        # -- so a low-precision column only shows up on a value like this one,
+        # or on a unix timestamp.
+        confidence=1.0 / 3.0,
         backend="rule",
         state_hash="a" * 64,
         chunk_ids=["sub_auth"],
@@ -488,8 +493,11 @@ def test_pgvector_decision_record_roundtrip_and_precedents() -> None:
     )
     assert [d.decision_id for d in ranked][0] == match.decision_id
 
+    assert fetched.confidence == 1.0 / 3.0
+    assert fetched.created_at == match.created_at
+
     # min_confidence filters, and outcome linkage persists.
-    assert all(d.confidence >= 0.80 for d in reopened.query_decisions(min_confidence=0.80))
+    assert all(d.confidence >= 0.30 for d in reopened.query_decisions(min_confidence=0.30))
     assert reopened.link_decision_outcome(match.decision_id, "out_it_1") is True
     assert reopened.get_decision(match.decision_id).outcome_id == "out_it_1"
     assert reopened.link_decision_outcome("dec_missing", "out_it_2") is False

@@ -353,6 +353,36 @@ def test_pgvector_decision_sql_arity_matches_params() -> None:
     assert rebuilt.canonical_json() == original.canonical_json()
 
 
+def test_pgvector_decision_floats_are_double_precision() -> None:
+    """Postgres REAL is float4; SQLite REAL is a full double. Do not mix them up.
+
+    Storing a unix timestamp in a Postgres REAL column silently drops it to
+    ~7 significant digits -- 1789578308.8168755 comes back as 1789578400.0,
+    over a minute off -- and a confidence with more than ~7 digits is rounded.
+    This is invisible in SQLite, where REAL is always an 8-byte double, so it
+    can only be caught either here or by the live pgvector CI job. It was
+    caught by the live job; this guard is so it never has to be again.
+    """
+    from ncp.stores.pgvector import PGVECTOR_SCHEMA_TEMPLATE
+
+    migration = Path("ncp/migrations/014_add_decisions_table.sql").read_text(encoding="utf-8")
+    up = migration.split("-- DOWN")[0]
+    rendered = PGVECTOR_SCHEMA_TEMPLATE.format(schema="ncp", prefix="ncp_")
+    # Only the decisions table; the rest of the schema is not this test's business.
+    start = rendered.index("ncp.ncp_decisions")
+    decisions_ddl = rendered[start:rendered.index(");", start)]
+
+    for source, sql in (("migration 014", up), ("schema template", decisions_ddl)):
+        for column in ("confidence", "created_at"):
+            line = next(
+                stripped
+                for stripped in (raw.strip() for raw in sql.splitlines())
+                if stripped.startswith(column) and not stripped.startswith("--")
+            )
+            assert "DOUBLE PRECISION" in line, f"{source}: {column} must be DOUBLE PRECISION, got {line!r}"
+            assert " REAL" not in line, f"{source}: {column} must not be REAL, got {line!r}"
+
+
 def test_pgvector_schema_template_and_migration_agree() -> None:
     """A fresh install and a migrated install must converge on the same table."""
     from ncp.stores.pgvector import PGVECTOR_SCHEMA_TEMPLATE

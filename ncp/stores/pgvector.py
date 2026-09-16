@@ -278,7 +278,9 @@ CREATE TABLE IF NOT EXISTS {schema}.{prefix}decisions (
     options TEXT NOT NULL DEFAULT '[]',
     choice TEXT NOT NULL DEFAULT 'null',
     probs TEXT NOT NULL DEFAULT '{{}}',
-    confidence REAL NOT NULL,
+    -- DOUBLE PRECISION, not REAL: Postgres REAL is float4 (~7 digits), which
+    -- loses tens of seconds off a unix timestamp. See migration 014.
+    confidence DOUBLE PRECISION NOT NULL,
     confidence_source TEXT NOT NULL DEFAULT 'self_reported',
     backend TEXT NOT NULL DEFAULT 'unknown',
     state_hash TEXT NOT NULL DEFAULT '',
@@ -286,7 +288,7 @@ CREATE TABLE IF NOT EXISTS {schema}.{prefix}decisions (
     turn_id TEXT,
     outcome_id TEXT,
     rationale TEXT,
-    created_at REAL NOT NULL
+    created_at DOUBLE PRECISION NOT NULL
 );
 CREATE INDEX IF NOT EXISTS {prefix}decisions_schema_slot_idx
     ON {schema}.{prefix}decisions (schema_id, slot, created_at DESC);
