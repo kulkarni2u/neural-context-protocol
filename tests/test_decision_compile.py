@@ -490,3 +490,60 @@ def test_core_profile_stays_minimal(tmp_path: Path) -> None:
     config.values["tools"]["profile"] = "core"
     names = {str(tool["name"]) for tool in tools_for_config(config)}
     assert "ncp_compile_decision_query" not in names
+
+
+# ── malformed input ───────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"probs": {"continue": "not-a-number"}},
+        {"probs": ["continue", "stop"]},
+        {"probs": {"continue": True}},
+        {"chunk_ids": "sub_a"},
+        {"options": "continue"},
+    ],
+)
+def test_malformed_typed_input_is_a_clean_error_with_no_row(
+    tmp_path: Path, bad: dict
+) -> None:
+    """A str is iterable, so `[str(c) for c in args["chunk_ids"]]` turns "sub_a"
+    into five one-character ids. A scalar where the schema says array has to
+    fail loudly, not corrupt the evidence list."""
+    store, handlers, _ = _setup(tmp_path)
+    args = {
+        "decision": "d", "rationale": "r", "agent_id": "a",
+        "schema_id": "open.thing", "slot": "s", "choice": "c", "confidence": 0.5,
+    }
+    args.update(bad)
+    result = handlers["ncp_record_decision"](args)
+    assert result["recorded"] is False
+    assert result["error"] == "validation_error"
+    assert store.query_decisions() == []
+
+
+def test_well_formed_lists_round_trip(tmp_path: Path) -> None:
+    store, handlers, _ = _setup(tmp_path)
+    result = handlers["ncp_record_decision"]({
+        "decision": "d", "rationale": "r", "agent_id": "a",
+        "schema_id": "open.thing", "slot": "s", "choice": "c", "confidence": 0.5,
+        "chunk_ids": ["sub_a", "sub_b"], "options": ["c", "d"],
+    })
+    stored = store.get_decision(result["decision_id"])
+    assert stored.chunk_ids == ["sub_a", "sub_b"]
+    assert stored.options == ["c", "d"]
+
+
+def test_compile_rejects_a_scalar_where_an_array_is_required(tmp_path: Path) -> None:
+    _, handlers, _ = _setup(tmp_path)
+    with pytest.raises(ValueError, match="must be an array"):
+        _compile(handlers, owns="auth")
+    with pytest.raises(ValueError, match="must be an array"):
+        _compile(handlers, tried="retry")
+
+
+def test_compile_clamps_a_hostile_k(tmp_path: Path) -> None:
+    store, handlers, _ = _setup(tmp_path)
+    _seed(store, count=3)
+    assert _compile(handlers, k=-5)["evidence_count"] >= 1
+    assert _compile(handlers, k=10**9)["evidence_count"] <= 12

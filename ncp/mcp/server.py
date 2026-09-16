@@ -851,6 +851,37 @@ def _encode_fetch_results(chunks: list[SubconsciousChunk]) -> str:
     return "\n".join(lines)
 
 
+def _decision_string_list(args: dict[str, object], key: str, default: list[str]) -> list[str]:
+    """Coerce a JSON array of ids to list[str], rejecting a bare string.
+
+    ``[str(c) for c in args[key]]`` looks right and silently turns the string
+    "sub_a" into five one-character chunk ids, because a str is iterable. A
+    caller that sends a scalar where the schema says array gets an error, not
+    corrupted evidence.
+    """
+    raw = args.get(key)
+    if raw is None:
+        return list(default)
+    if isinstance(raw, str) or not isinstance(raw, (list, tuple)):
+        raise ValueError(f"{key} must be an array of strings")
+    return [str(item) for item in raw]
+
+
+def _decision_probs(args: dict[str, object]) -> dict[str, float]:
+    """Coerce the probs mapping, turning a malformed value into a clean error."""
+    raw = args.get("probs")
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError("probs must be an object mapping option -> probability")
+    probs: dict[str, float] = {}
+    for key, value in raw.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"probs['{key}'] must be a number")
+        probs[str(key)] = float(value)
+    return probs
+
+
 def _contradiction_edges(
     store: BaseStore,
     chunk_ids: Sequence[str],
@@ -1777,14 +1808,19 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         # rationale -- becomes the choice. The rationale stays commentary and
         # is never the match key.
         raw_choice = args["choice"] if "choice" in args else decision[:600]
-        options = [str(o) for o in (args.get("options") or (alternatives if typed else []))]
-        probs_raw = args.get("probs") or {}
-        probs = (
-            {str(key): float(value) for key, value in probs_raw.items()}
-            if isinstance(probs_raw, dict)
-            else {}
-        )
-        chunk_ids = [str(c) for c in (args.get("chunk_ids") or evidence_refs)]
+        try:
+            options = _decision_string_list(
+                args, "options", alternatives if typed else []
+            )
+            probs = _decision_probs(args)
+            chunk_ids = _decision_string_list(args, "chunk_ids", evidence_refs)
+        except ValueError as exc:
+            return {
+                "recorded": False,
+                "error": "validation_error",
+                "details": str(exc),
+                "chunk_id": chunk.chunk_id,
+            }
 
         if typed and "schema_id" not in args:
             return {
@@ -1886,16 +1922,18 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         schema_id = str(args["schema_id"])
         slot = str(args["slot"])
         pipeline_id = None if args.get("pipeline_id") is None else str(args["pipeline_id"])
+        # These four feed the state_hash, so a bare string quietly iterated into
+        # one entry per character would corrupt the hash rather than fail loudly.
         conscious = ConsciousBlock(
             agent_id=str(args["agent_id"]),
             role=str(args.get("role") or "agent"),
-            owns=[str(o) for o in (args.get("owns") or [])],
-            must_not=[str(m) for m in (args.get("must_not") or [])],
+            owns=_decision_string_list(args, "owns", []),
+            must_not=_decision_string_list(args, "must_not", []),
             task=str(args["task"]),
             slot=slot,
             intent=str(args["intent"]),
-            tried=[str(t) for t in (args.get("tried") or [])],
-            failed=[str(f) for f in (args.get("failed") or [])],
+            tried=_decision_string_list(args, "tried", []),
+            failed=_decision_string_list(args, "failed", []),
             drift_score=float(args.get("drift_score", 0.0) or 0.0),
             slot_confidence=float(args.get("slot_confidence", 1.0) or 1.0),
             pressure=str(args.get("pressure") or "low"),  # type: ignore[arg-type]
