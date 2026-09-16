@@ -365,3 +365,76 @@ def test_pgvector_schema_template_and_migration_agree() -> None:
     assert "ncp.ncp_decisions" in up
     for column in ("schema_id", "state_hash", "confidence_source", "backend", "outcome_id"):
         assert column in rendered and column in up
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+def test_precedents_cli_typed_filters(tmp_path: Path) -> None:
+    from click.testing import CliRunner
+
+    from ncp.cli import main
+
+    store = SQLiteStore(tmp_path / ".ncp" / "store.db")
+    store.record_decision_record(
+        _decision(choice="continue", confidence=0.92, backend="rule", state_hash="a" * 64)
+    )
+    store.record_decision_record(
+        DecisionRecord(
+            schema_id="team.route", slot="routing", choice="fast",
+            confidence=0.40, backend="human",
+        )
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["precedents", "--cwd", str(tmp_path), "--schema-id", "ncp.slot.continue_or_escalate",
+         "--json-output"],
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["count"] == 1
+    assert payload["decisions"][0]["choice"] == "continue"
+
+    # min_confidence alone also selects the typed path.
+    filtered = runner.invoke(
+        main, ["precedents", "--cwd", str(tmp_path), "--min-confidence", "0.9", "--json-output"]
+    )
+    assert json.loads(filtered.output)["count"] == 1
+
+    # Backend filter.
+    human = runner.invoke(
+        main, ["precedents", "--cwd", str(tmp_path), "--backend", "human", "--json-output"]
+    )
+    assert json.loads(human.output)["decisions"][0]["slot"] == "routing"
+
+
+def test_precedents_cli_requires_a_query_or_a_typed_filter(tmp_path: Path) -> None:
+    from click.testing import CliRunner
+
+    from ncp.cli import main
+
+    result = CliRunner().invoke(main, ["precedents", "--cwd", str(tmp_path)])
+    assert result.exit_code != 0
+    assert "typed filter" in result.output
+
+
+def test_precedents_cli_text_query_still_works(tmp_path: Path) -> None:
+    """The legacy text path must keep working untouched."""
+    from click.testing import CliRunner
+
+    from ncp.cli import main
+
+    store = SQLiteStore(tmp_path / ".ncp" / "store.db")
+    store.write(
+        SubconsciousChunk(
+            layer="reasoning_trace",
+            content="decision: apply null guard\nrationale: retryCount is null for ACH\noutcome: succeeded",
+            src="agent_inferred",
+        )
+    )
+    result = CliRunner().invoke(
+        main, ["precedents", "null guard", "--cwd", str(tmp_path), "--json-output"]
+    )
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["count"] >= 1

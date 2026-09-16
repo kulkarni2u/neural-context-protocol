@@ -2144,12 +2144,20 @@ def reputation_command(cwd: Path | None, top: int, json_output: bool) -> None:
 
 
 @main.command("precedents")
-@click.argument("query")
+@click.argument("query", required=False, default="")
 @click.option("--cwd", type=click.Path(path_type=Path), default=Path.cwd)
 @click.option("--pipeline-id", default=None, help="Optional pipeline scope filter.")
 @click.option("--k", default=5, show_default=True, type=click.IntRange(1, 20), help="Number of precedents to return.")
 @click.option("--tag", "tags", multiple=True, help="Filter by tag (may be repeated).")
 @click.option("--outcome", default=None, type=click.Choice(["pending", "succeeded", "failed", "superseded"]), help="Filter by outcome.")
+@click.option("--schema-id", default=None, help="Typed decisions only (spec 4h): filter by schema_id.")
+@click.option("--slot", default=None, help="Typed decisions only: filter by slot.")
+@click.option("--state-hash", default=None, help="Typed decisions only: rank an exact state_hash match first.")
+@click.option("--backend", default=None,
+              type=click.Choice(["rule", "llm_constrained", "system_one", "human", "unknown"]),
+              help="Typed decisions only: filter by what produced the choice.")
+@click.option("--min-confidence", default=0.0, show_default=True, type=click.FloatRange(0.0, 1.0),
+              help="Typed decisions only: minimum confidence.")
 @click.option("--json-output", is_flag=True, help="Emit machine-readable JSON instead of tables.")
 def precedents_command(
     query: str,
@@ -2158,12 +2166,79 @@ def precedents_command(
     k: int,
     tags: tuple[str, ...],
     outcome: str | None,
+    schema_id: str | None,
+    slot: str | None,
+    state_hash: str | None,
+    backend: str | None,
+    min_confidence: float,
     json_output: bool,
 ) -> None:
-    """Query past decisions: 'show me decisions like this one and how they turned out.'"""
+    """Query past decisions: 'show me decisions like this one and how they turned out.'
+
+    With no typed filter this searches legacy decision traces by text. Any of
+    --schema-id / --slot / --state-hash / --backend / --min-confidence switches
+    to typed DecisionRecords (spec 4h), which are ranked on schema_id + slot +
+    state_hash rather than on rationale text.
+    """
+
+    typed = any(
+        value is not None for value in (schema_id, slot, state_hash, backend)
+    ) or min_confidence > 0.0
+    if not typed and not query:
+        raise click.UsageError(
+            "Provide a text QUERY, or a typed filter such as --schema-id / --slot."
+        )
 
     try:
         config = ncp.configure(cwd=cwd)
+        if typed:
+            store = _resolve_reporting_store(config, "precedents", "query_decisions")
+            decisions = store.query_decisions(
+                schema_id=schema_id,
+                slot=slot,
+                state_hash=state_hash,
+                pipeline_id=pipeline_id,
+                backend=backend,
+                min_confidence=min_confidence,
+                k=k,
+            )
+            payload = [json.loads(d.canonical_json()) for d in decisions]
+            if json_output:
+                console.print_json(data={
+                    "schema_id": schema_id,
+                    "slot": slot,
+                    "pipeline_id": pipeline_id,
+                    "count": len(payload),
+                    "decisions": payload,
+                })
+                return
+            console.print("[bold]NCP Typed Decisions[/bold]"
+                          + (f"  schema={schema_id}" if schema_id else "")
+                          + (f"  slot={slot}" if slot else ""))
+            if not payload:
+                console.print("[dim]No matching decisions found.[/dim]")
+                return
+            table = Table(box=box.SIMPLE)
+            table.add_column("Decision", style="cyan")
+            table.add_column("Schema")
+            table.add_column("Slot")
+            table.add_column("Choice")
+            table.add_column("Conf", justify="right")
+            table.add_column("Backend")
+            table.add_column("Outcome")
+            for row in payload:
+                table.add_row(
+                    str(row["decision_id"])[:16],
+                    str(row["schema_id"]),
+                    str(row["slot"]),
+                    json.dumps(row["choice"])[:32],
+                    f"{float(row['confidence']):.2f}",
+                    str(row["backend"]),
+                    str(row.get("outcome_id") or "-")[:16],
+                )
+            console.print(table)
+            return
+
         store = _resolve_reporting_store(config, "precedents", "query_precedents")
         results = store.query_precedents(
             query,

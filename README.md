@@ -511,6 +511,10 @@ on purpose — `dual_write_chunks`, because mirroring decisions into the pool
 pipelines that were tuned without it, and `surface_joint_confidence`, because
 adding a line to the injected pidgin changes every turn.
 
+Query typed decisions from the CLI with `ncp precedents --schema-id ... --slot
+...` (also `--state-hash`, `--backend`, `--min-confidence`); with a plain text
+argument the command keeps searching legacy decision traces as before.
+
 `ncp dogfood --loop decision` runs the whole contract end to end with no
 provider calls and reports escalate rate, precedent hit rate and `state_hash`
 stability — use it to tune the thresholds against your own workload instead of
