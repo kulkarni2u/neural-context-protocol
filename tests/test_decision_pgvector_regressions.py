@@ -18,6 +18,14 @@ def sync_store():
 
 
 def async_store():
+    # AsyncPgvectorStore imports psycopg_pool.AsyncConnectionPool at
+    # construction, and the patch below has to import the module to patch it.
+    # The base `test` CI job installs only .[dev,providers], so skip there and
+    # let the pgvector-redis job (which installs the pgvector extra) run these.
+    # The sync tests in this module deliberately stay unguarded: PgvectorStore
+    # takes a connect_factory and needs no driver at all.
+    pytest.importorskip("psycopg_pool", reason="pgvector extra not installed")
+
     from ncp.stores.pgvector_async import AsyncPgvectorStore
     pool = MagicMock()
     conn = MagicMock()
