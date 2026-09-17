@@ -870,6 +870,7 @@ class AsyncPgvectorStore(BaseStore):
         embedding: list[float] | None = None,
         diversity_limit: int = 2,
         as_of: float | None = None,
+        allow_embedding: bool = True,
     ) -> list[SubconsciousChunk]:
         """Query chunks using native async DB I/O; score computation stays synchronous."""
         _VALID_RETRIEVAL_MODES = ("hybrid", "trust_recency", "vector")
@@ -877,6 +878,8 @@ class AsyncPgvectorStore(BaseStore):
             raise ValueError(
                 f"Unknown retrieval_mode {retrieval_mode!r}; expected one of {_VALID_RETRIEVAL_MODES}"
             )
+        if retrieval_mode == "vector" and embedding is None and not allow_embedding:
+            raise ValueError("vector retrieval requires an embedding when allow_embedding=False")
         if retrieval_mode == "vector":
             return await self._async_query_vector(
                 text=text,
@@ -890,7 +893,7 @@ class AsyncPgvectorStore(BaseStore):
                 diversity_limit=diversity_limit,
                 as_of=as_of,
             )
-        if embedding is None and self._embedding_adapter is not None:
+        if allow_embedding and embedding is None and self._embedding_adapter is not None:
             embedding = await self._try_embed(text, pipeline_id=pipeline_id, op="query")
         if embedding is not None and len(embedding) != 1536:
             raise ValueError(f"embedding must have 1536 dimensions, got {len(embedding)}")
@@ -1797,6 +1800,16 @@ class AsyncPgvectorStore(BaseStore):
                     ),
                 )
                 return cur.rowcount > 0
+
+    async def async_get_outcome(self, outcome_id: str) -> OutcomeRecord | None:
+        async with self._aconnect() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    self._sql("SELECT * FROM {schema}.{prefix}outcomes WHERE outcome_id = %s"),
+                    (outcome_id,),
+                )
+                rows = await self._afetchall(cur)
+        return PgvectorStore._row_to_outcome(rows[0]) if rows else None
 
     # ── typed decisions (spec 4h) ─────────────────────────────────────────
 

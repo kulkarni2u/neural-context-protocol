@@ -705,6 +705,7 @@ class PgvectorStore(BaseStore):
         diversity_limit: int = 2,
         fallback_to_trust_recency: bool = False,
         as_of: float | None = None,
+        allow_embedding: bool = True,
     ) -> list[SubconsciousChunk]:
         _VALID_RETRIEVAL_MODES = ("hybrid", "trust_recency", "vector")
         if retrieval_mode not in _VALID_RETRIEVAL_MODES:
@@ -712,13 +713,15 @@ class PgvectorStore(BaseStore):
                 f"Unknown retrieval_mode {retrieval_mode!r}; expected one of {_VALID_RETRIEVAL_MODES}"
             )
 
+        if retrieval_mode == "vector" and embedding is None and not allow_embedding:
+            raise ValueError("vector retrieval requires an embedding when allow_embedding=False")
         if retrieval_mode == "vector":
             return self._query_vector(
                 text=text, embedding=embedding, k=k, min_score=min_score,
                 layer=layer, pipeline_id=pipeline_id, scope=scope, zone=zone,
                 diversity_limit=diversity_limit, as_of=as_of,
             )
-        if embedding is None and self._embedding_adapter is not None:
+        if allow_embedding and embedding is None and self._embedding_adapter is not None:
             embedding = self._try_embed(text, pipeline_id=pipeline_id, op="query")
         if embedding is not None and len(embedding) != 1536:
             raise ValueError(f"embedding must have 1536 dimensions, got {len(embedding)}")
@@ -1385,6 +1388,29 @@ class PgvectorStore(BaseStore):
                 return cursor.rowcount > 0
             finally:
                 self._close_cursor(cursor)
+
+    @staticmethod
+    def _row_to_outcome(row: dict[str, Any]) -> OutcomeRecord:
+        return OutcomeRecord(
+            outcome_id=str(row["outcome_id"]), turn_id=row["turn_id"],
+            chunk_ids=json.loads(row["chunk_ids"]) if row["chunk_ids"] else [],
+            success=bool(row["success"]), weight=float(row["weight"]),
+            note=row["note"], created_at=float(row["created_at"]),
+            consumed=bool(row["consumed"]),
+        )
+
+    def get_outcome(self, outcome_id: str) -> OutcomeRecord | None:
+        with self._connect() as connection:
+            cursor = connection.cursor()
+            try:
+                cursor.execute(
+                    self._sql("SELECT * FROM {schema}.{prefix}outcomes WHERE outcome_id = %s"),
+                    (outcome_id,),
+                )
+                rows = self._fetchall(cursor)
+            finally:
+                self._close_cursor(cursor)
+        return self._row_to_outcome(rows[0]) if rows else None
 
     # ── typed decisions (spec 4h) ─────────────────────────────────────────
 

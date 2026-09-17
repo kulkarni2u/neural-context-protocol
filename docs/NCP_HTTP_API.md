@@ -271,8 +271,10 @@ curl -s $BASE/mcp -H "$AUTH" -H 'Content-Type: application/json' -d '{
   }}}'
 ```
 
-`schema_id` is required on the typed path. A registered schema validates the
-choice and the prob keys; a mismatch returns
+`schema_id` is required on the typed path. `schema_version` defaults to the
+current registered version; an explicitly stale version is rejected. Zero
+confidence is preserved. A registered schema validates the choice and the
+prob keys; a mismatch returns
 `{"recorded": false, "error": "schema_mismatch", "details": "..."}` and writes
 no row. On success `recorded` reports the typed row and `trace_chunk_written`
 reports the legacy chunk separately — they differ when two decisions share
@@ -312,7 +314,11 @@ backend must answer, a stable `state_hash`, up to three `precedents`, advisory
 `escalate_reasons` never names a model: NCP says *why* a stronger backend is
 warranted, and the host decides *which one*. When `escalate` is false and a
 `suggested_choice` is present, a prior decision over the same state is
-available for reuse — NCP still does not apply it.
+available for reuse — NCP still does not apply it. Reuse requires the current
+schema version and a choice valid under that schema. A linked failed, missing,
+or unreadable outcome blocks reuse, regardless of confidence or outcome age.
+The packet includes `schema_version` for clients recording the decision.
+Compilation suppresses automatic embedding calls on every store backend.
 
 ## Streaming
 

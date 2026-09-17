@@ -68,6 +68,15 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ### Fixed before release
 
+- Decision reuse resolves outcomes directly by ID on SQLite and both PostgreSQL
+  stores, including older/consumed outcomes. Unreadable linked outcomes block reuse.
+- The Python decision API shares schema/config validation and optional mirror
+  persistence with MCP. Explicit zero confidence is preserved on the MCP path.
+- Reuse rejects stale schema versions and choices invalid under the current
+  registry. Compilation returns the current schema version for recording.
+- Decision compilation disables automatic embedding calls across all stores;
+  normal retrieval retains its configured embedding behavior.
+
 - **Precedent reuse was unreachable for most evidence.**
   `precedent_min_confidence` defaulted to 0.80, but a host following the
   documented pattern records `confidence = joint_confidence`, which for a

@@ -968,11 +968,25 @@ ncp_compile_decision_query (normative):
                        contradiction | open_schema | critical_budget |
                        no_evidence
     tier_hint          reuses the existing CAP-E3 signal when enabled
+    schema_version     current registry version, or null for an open schema
     suggested_choice   present when a precedent has an exact state_hash match,
-                       no linked FAILED outcome, and either a linked SUCCEEDED
+                       the current schema version and a still-valid choice,
+                       no failed or unreadable linked outcome, and either a linked SUCCEEDED
                        outcome or confidence >= precedent_min_confidence.
                        suggested_basis says which ("outcome" or "confidence").
                        NCP surfaces it; it still does not apply it.
+
+  Linked outcomes are fetched by ID, including consumed and older outcomes,
+  on SQLite and PostgreSQL. Missing/unreadable linked outcomes block reuse;
+  only decisions with no outcome link may fall back to confidence alone.
+  Registry changes require a version bump even when the options stay the same.
+  Compile exposes that version; MCP recording defaults to it when omitted,
+  while Python callers set DecisionRecord.schema_version explicitly.
+
+  The Python record_decision API shares typed validation and optional mirror
+  persistence with MCP. It returns False when disabled and raises ValueError
+  for an invalid choice, stale schema version or unregistered strict schema
+  before writing. Caller-supplied decision IDs and metadata are preserved.
 
   A succeeded outcome bypasses the confidence floor deliberately. The floor is a
   heuristic over *evidence trust*; a linked outcome is evidence about the
@@ -991,8 +1005,9 @@ ncp_compile_decision_query (normative):
   every round and can never match a precedent. Name the decision, not the
   iteration.
 
-  Compile makes ZERO provider calls. It is store reads plus arithmetic, and a
-  test makes any socket a failure. A compile step that can call a model is an
+  Compile makes ZERO provider calls. It is store reads plus arithmetic;
+  query-time automatic embedding is explicitly disabled, even with an embedding
+  adapter configured. Normal retrieval keeps its existing embedding behavior. A compile step that can call a model is an
   orchestrator, and NCP is not an orchestrator.
 
   Evidence EXCLUDES the reasoning_trace layer. Every ncp_record_decision writes

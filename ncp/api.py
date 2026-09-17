@@ -137,11 +137,25 @@ def record_decision(
     store: BaseStore | None = None,
     config: NCPConfig | None = None,
 ) -> bool:
-    """Persist a typed decision through the public API."""
+    """Validate and persist a typed decision using the same policy as MCP.
+
+    Returns False when decisions are disabled. Invalid schemas, choices or
+    versions raise ValueError before writing. Honors dual_write_chunks and
+    preserves the supplied decision ID and metadata.
+    """
 
     resolved_config = config or _CONFIG or configure(cwd=Path.cwd())
     resolved_store = store or create_store(resolved_config)
-    return resolved_store.record_decision_record(decision)
+    from ncp.decisions import SchemaRegistry, persist_decision_record
+
+    return persist_decision_record(
+        decision, store=resolved_store,
+        registry=SchemaRegistry.load(inline=resolved_config.decision_schemas,
+                                     project_root=resolved_config.project_root),
+        enabled=resolved_config.decisions_enabled,
+        strict_schemas=resolved_config.decisions_strict_registered_schemas,
+        dual_write_chunks=resolved_config.decisions_dual_write_chunks,
+    )
 
 
 def get_decision(

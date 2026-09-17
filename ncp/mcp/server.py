@@ -30,6 +30,7 @@ from ncp.stores.factory import create_store
 from ncp.tiering import compute_tier_signal
 from ncp.decisions import (
     SchemaRegistry,
+    persist_decision_record,
     compute_state_hash,
     contradiction_mass as compute_contradiction_mass,
     evidence_confidence,
@@ -557,7 +558,7 @@ MCP_TOOLS: list[dict[str, object]] = [
                         "calls still record, adapted as schema_id='legacy.untyped'."
                     ),
                 },
-                "schema_version": {"type": "integer", "description": "Schema version. Default 1."},
+                "schema_version": {"type": "integer", "description": "Schema version. Defaults to the current registered version, or 1 for an open schema."},
                 "slot": {"type": "string", "description": "Slot this decision resolves (no whitespace). Mirrors ConsciousBlock.slot."},
                 "choice": {
                     "description": (
@@ -913,20 +914,16 @@ def _contradiction_edges(
 def _decision_outcome(store: BaseStore, decision: DecisionRecord) -> bool | None:
     """How a precedent's linked outcome resolved: True, False, or None.
 
-    None means unknown -- no linked outcome, a store that cannot report
-    outcomes, or an outcome id that no longer resolves. Unknown is never
-    treated as failure; it falls back to the caller's confidence floor.
+    None means no outcome is linked. A linked outcome that cannot be resolved
+    blocks reuse, rather than treating an unreadable failure as confidence-only.
     """
     if not decision.outcome_id:
         return None
     try:
-        outcomes = store.list_outcomes(limit=200)
-    except Exception:  # noqa: BLE001 - advisory signal, never fatal
-        return None
-    for outcome in outcomes:
-        if outcome.outcome_id == decision.outcome_id:
-            return bool(outcome.success)
-    return None
+        outcome = store.get_outcome(decision.outcome_id)
+    except Exception:  # noqa: BLE001 - unavailable evidence cannot authorize reuse
+        return False
+    return bool(outcome.success) if outcome is not None else False
 
 
 def _verify_authorship(
@@ -1699,52 +1696,6 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             for key in ("schema_id", "choice", "probs", "options", "backend", "state_hash", "chunk_ids")
         )
 
-    def _record_decision_row(
-        decision: DecisionRecord,
-        *,
-        evidence_chunk_id: str | None,
-    ) -> bool:
-        """Persist the typed row, plus the optional mirror chunk and edges."""
-        recorded = store.record_decision_record(decision)
-        if not decisions_dual_write_chunks:
-            return recorded
-        # Opt-in mirror so legacy retrieval still surfaces the decision. Off by
-        # default: this writes into the same pool ncp_get_context retrieves
-        # from, so enabling it changes ranking and token budgets.
-        mirror = SubconsciousChunk(
-            layer="reasoning_trace",
-            content=decision.canonical_json()[:2000],
-            src="tool_result",
-            chunk_type="json",
-            written_by=decision.agent_id or "system",
-            pipeline_id=decision.pipeline_id,
-            caused_by=evidence_chunk_id,
-            base_trust=decision.confidence,
-            result_confidence=decision.confidence,
-            source_refs=list(decision.chunk_ids),
-        )
-        if store.write(mirror) and decision.chunk_ids:
-            # Graph: the decision chunk is derived from each evidence chunk.
-            # add_chunk_edges only joins chunks in the same pipeline scope, so
-            # a decision recorded without a pipeline_id legitimately links to
-            # nothing rather than reaching across a scope boundary.
-            edges = [
-                ChunkEdge(
-                    src_chunk_id=mirror.chunk_id,
-                    dst_chunk_id=evidence_id,
-                    edge_type="derived_from",
-                    created_by="ncp:decision",
-                )
-                for evidence_id in decision.chunk_ids
-                if evidence_id != mirror.chunk_id
-            ]
-            if edges:
-                try:
-                    store.add_chunk_edges(edges)
-                except Exception:  # noqa: BLE001 - edges are additive, never fatal
-                    pass
-        return recorded
-
     def _handle_record_decision(args: dict[str, object]) -> object:
         decision = str(args["decision"])
         rationale = str(args["rationale"])
@@ -1752,7 +1703,8 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         alternatives = [str(a) for a in (args.get("alternatives") or [])]
         evidence_refs = [str(r) for r in (args.get("evidence_refs") or [])]
         outcome = str(args.get("outcome", "pending"))
-        confidence = float(args.get("confidence", 0.8) or 0.8)
+        raw_confidence = args.get("confidence")
+        confidence = float(0.8 if raw_confidence is None else raw_confidence)
         pipeline_id = args.get("pipeline_id")
         caused_by = args.get("caused_by")
         tags = [str(t) for t in (args.get("tags") or [])]
@@ -1850,7 +1802,7 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         try:
             record = DecisionRecord(
                 schema_id=schema_id,
-                schema_version=int(args.get("schema_version", 1) or 1),
+                schema_version=int(args.get("schema_version", decision_registry.get(schema_id).version if registered else 1)),
                 slot=str(args.get("slot") or "legacy"),
                 pipeline_id=None if pipeline_id is None else str(pipeline_id),
                 agent_id=agent_id,
@@ -1873,7 +1825,15 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
                 "chunk_id": chunk.chunk_id,
             }
 
-        typed_recorded = _record_decision_row(record, evidence_chunk_id=chunk.chunk_id)
+        try:
+            typed_recorded = persist_decision_record(
+                record, store=store, registry=decision_registry, enabled=decisions_enabled,
+                strict_schemas=decisions_strict_schemas,
+                dual_write_chunks=decisions_dual_write_chunks, evidence_chunk_id=chunk.chunk_id,
+            )
+        except ValueError as exc:
+            return {"recorded": False, "error": "validation_error", "details": str(exc),
+                    "chunk_id": chunk.chunk_id}
         response["decision_id"] = record.decision_id
         response["schema_id"] = record.schema_id
         response["schema_registered"] = registered
@@ -1955,6 +1915,7 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             k=k * 2,
             pipeline_id=pipeline_id,
             fallback_to_trust_recency=True,
+            allow_embedding=False,
         )
         evidence = [
             c
@@ -2052,6 +2013,7 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             "questions": questions,
             "schema_id": schema_id,
             "schema_registered": entry is not None,
+            "schema_version": entry.version if entry is not None else None,
             "state_hash": state_hash,
             "precedents": [json.loads(p.canonical_json()) for p in precedents],
             "joint_confidence": round(jc, 4),
@@ -2076,6 +2038,10 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         # decisions in the store the least reusable.
         for precedent in precedents:
             if not precedent.state_hash or precedent.state_hash != state_hash:
+                continue
+            if entry is None or precedent.schema_version != entry.version:
+                continue
+            if decision_registry.validate_choice(schema_id, precedent.choice, probs=precedent.probs) is not None:
                 continue
             verdict = _decision_outcome(store, precedent)
             if verdict is False:

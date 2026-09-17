@@ -654,6 +654,7 @@ class SQLiteStore(BaseStore):
         diversity_limit: int = 2,
         fallback_to_trust_recency: bool = False,
         as_of: float | None = None,
+        allow_embedding: bool = True,
     ) -> list[SubconsciousChunk]:
         _VALID_RETRIEVAL_MODES = ("hybrid", "trust_recency", "vector")
         if retrieval_mode not in _VALID_RETRIEVAL_MODES:
@@ -661,7 +662,8 @@ class SQLiteStore(BaseStore):
                 f"Unknown retrieval_mode {retrieval_mode!r}; expected one of {_VALID_RETRIEVAL_MODES}"
             )
         if (
-            embedding is None
+            allow_embedding
+            and embedding is None
             and self._embedding_adapter is not None
             and retrieval_mode in {"hybrid", "vector"}
         ):
@@ -1095,6 +1097,21 @@ class SQLiteStore(BaseStore):
                 ),
             )
             return True
+
+    def get_outcome(self, outcome_id: str) -> OutcomeRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM outcomes WHERE outcome_id = ?", (outcome_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        return OutcomeRecord(
+            outcome_id=str(row["outcome_id"]), turn_id=row["turn_id"],
+            chunk_ids=json.loads(row["chunk_ids"]) if row["chunk_ids"] else [],
+            success=bool(row["success"]), weight=float(row["weight"]),
+            note=row["note"], created_at=float(row["created_at"]),
+            consumed=bool(row["consumed"]),
+        )
 
     def list_outcomes(
         self,

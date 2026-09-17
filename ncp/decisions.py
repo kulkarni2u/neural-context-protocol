@@ -26,9 +26,12 @@ import json
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Literal, Sequence
+from typing import TYPE_CHECKING, Any, Iterable, Literal, Sequence
 
-from ncp.types import ConsciousBlock, SubconsciousChunk
+from ncp.types import ChunkEdge, ConsciousBlock, DecisionRecord, LEGACY_SCHEMA_ID, SubconsciousChunk
+
+if TYPE_CHECKING:
+    from ncp.stores.base import BaseStore
 
 ChoiceType = Literal["enum", "boolean", "number", "string", "object"]
 
@@ -308,3 +311,65 @@ def joint_confidence(
     cm = max(0.0, min(1.0, float(contradiction_mass)))
     drift = max(0.0, min(1.0, float(drift_score)))
     return max(0.0, min(1.0, geo * (1.0 - 0.5 * cm) * (1.0 - drift)))
+
+
+def persist_decision_record(
+    decision: DecisionRecord,
+    *,
+    store: "BaseStore",
+    registry: SchemaRegistry,
+    enabled: bool = True,
+    strict_schemas: bool = False,
+    dual_write_chunks: bool = False,
+    evidence_chunk_id: str | None = None,
+) -> bool:
+    """Shared Python/MCP validation and persistence; invalid contracts never write."""
+    if not enabled:
+        return False
+    if strict_schemas and not registry.is_registered(decision.schema_id) and decision.schema_id != LEGACY_SCHEMA_ID:
+        raise ValueError(f"schema_id {decision.schema_id!r} is not registered and strict mode is on")
+    mismatch = registry.validate_choice(decision.schema_id, decision.choice, probs=decision.probs)
+    if mismatch is not None:
+        raise ValueError(mismatch)
+    entry = registry.get(decision.schema_id)
+    if entry is not None and decision.schema_version != entry.version:
+        raise ValueError(f"schema_version must be {entry.version} for schema {decision.schema_id}")
+    recorded = store.record_decision_record(decision)
+    if not recorded or not dual_write_chunks:
+        return recorded
+    # Opt-in mirror so legacy retrieval still surfaces the decision. Off by
+    # default: this writes into the same pool ncp_get_context retrieves
+    # from, so enabling it changes ranking and token budgets.
+    mirror = SubconsciousChunk(
+        layer="reasoning_trace",
+        content=decision.canonical_json()[:2000],
+        src="tool_result",
+        chunk_type="json",
+        written_by=decision.agent_id or "system",
+        pipeline_id=decision.pipeline_id,
+        caused_by=evidence_chunk_id,
+        base_trust=decision.confidence,
+        result_confidence=decision.confidence,
+        source_refs=list(decision.chunk_ids),
+    )
+    if store.write(mirror) and decision.chunk_ids:
+        # Graph: the decision chunk is derived from each evidence chunk.
+        # add_chunk_edges only joins chunks in the same pipeline scope, so
+        # a decision recorded without a pipeline_id legitimately links to
+        # nothing rather than reaching across a scope boundary.
+        edges = [
+            ChunkEdge(
+                src_chunk_id=mirror.chunk_id,
+                dst_chunk_id=evidence_id,
+                edge_type="derived_from",
+                created_by="ncp:decision",
+            )
+            for evidence_id in decision.chunk_ids
+            if evidence_id != mirror.chunk_id
+        ]
+        if edges:
+            try:
+                store.add_chunk_edges(edges)
+            except Exception:  # noqa: BLE001 - edges are additive, never fatal
+                pass
+    return recorded

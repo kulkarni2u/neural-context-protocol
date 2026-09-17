@@ -69,6 +69,7 @@ class BaseStore(ABC):
         diversity_limit: int = 2,
         fallback_to_trust_recency: bool = False,
         as_of: float | None = None,
+        allow_embedding: bool = True,
     ) -> list[SubconsciousChunk]:
         """Query stored chunks by text relevance.
 
@@ -80,6 +81,9 @@ class BaseStore(ABC):
         - ``"vector"``: cosine search using stored embeddings.
           Requires ``embedding`` to be provided or an embedding adapter
           configured.  Pgvector uses ANN; SQLite uses a brute-force scan.
+
+        ``allow_embedding=False`` forbids automatic provider embedding calls;
+        caller-supplied vectors remain usable. Defaults to True for normal retrieval.
 
         ``diversity_limit`` caps the number of results per author
         (``written_by``).  Default 2 preserves existing behavior.
@@ -178,6 +182,13 @@ class BaseStore(ABC):
     async def async_record_outcome(self, outcome: OutcomeRecord) -> bool:
         """Asynchronously record a task outcome."""
         return await anyio.to_thread.run_sync(self.record_outcome, outcome)
+
+    def get_outcome(self, outcome_id: str) -> OutcomeRecord | None:
+        """Fetch an outcome by ID, including consumed outcomes, without a scan limit."""
+        return None
+
+    async def async_get_outcome(self, outcome_id: str) -> OutcomeRecord | None:
+        return await anyio.to_thread.run_sync(self.get_outcome, outcome_id)
 
     def list_outcomes(
         self,
@@ -739,6 +750,7 @@ class BaseStore(ABC):
         retrieval_mode: str = "hybrid",
         embedding: list[float] | None = None,
         as_of: float | None = None,
+        allow_embedding: bool = True,
     ) -> list[SubconsciousChunk]:
         """Asynchronously query stored chunks by text relevance using thread pool."""
         fn = partial(
@@ -752,6 +764,7 @@ class BaseStore(ABC):
             zone=zone,
             retrieval_mode=retrieval_mode,
             embedding=embedding,
+            allow_embedding=allow_embedding,
             as_of=as_of,
         )
         return await anyio.to_thread.run_sync(fn)
