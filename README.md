@@ -458,6 +458,10 @@ On a deterministic 40-worker benchmark, 25% of NCP's own bounded top-k retrieval
 
 ## Decision records and compile
 
+The typed Decision API is an initial implementation in v1.6.1 and remains
+incomplete and under active development. The interfaces below describe what
+is currently available, not a completed Decision API.
+
 Not every slot in a pipeline needs prose. Classify, route, score and choose are
 decisions: the answer is a value from a known set, not a paragraph. NCP stores
 those as first-class objects rather than as a chunk of text to be re-parsed
