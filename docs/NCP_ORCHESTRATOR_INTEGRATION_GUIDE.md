@@ -191,8 +191,10 @@ Rules that keep the loop honest:
 | `ncp_fetch` | mid-turn | Targeted retrieval; **max 3 calls per turn, k ≤ 4**, optional layer filter. |
 | `ncp_write_memory` | any | Write one durable chunk (max 2000 chars) with layer/src/trust; content is noise-filtered at ingestion. |
 | `ncp_emit_whisper` | any | Directed signal to a peer: `nudge`, `alert`, `share`, `request`, `dissent`, `world_check`, `consolidation_ready`. Max 600 chars, default TTL 1800s. |
-| `ncp_record_decision` | any | Structured decision trace (`reasoning_trace` chunk with `caused_by` edges) for precedent queries. |
-| `ncp_record_outcome` | after task completes | Success/failure evidence that feeds reputation calibration (CAP-T3). |
+| `ncp_record_decision` | any | Structured decision trace, plus a typed `DecisionRecord` when `schema_id`/`choice` are supplied (spec §4h). |
+| `ncp_compile_decision_query` | before a classify/route/score/choose call | Bounded decision packet: state, questions, `state_hash`, precedents, advisory confidence, `escalate`. No provider calls. |
+| `ncp_get_decision` | any | Read one typed decision by id. |
+| `ncp_record_outcome` | after task completes | Success/failure evidence that feeds reputation calibration (CAP-T3). Pass `decision_id` to close the decision loop. |
 | `ncp_lookup_memo` / `ncp_record_memo` | around expensive work | Semantic memoization: skip work already done for the same task signature (CAP-C3). |
 
 Normative details for each: [`docs/NCP_PROTOCOL_SPEC.md`](./NCP_PROTOCOL_SPEC.md).
@@ -289,6 +291,30 @@ writes. Expectations to calibrate against:
 `reviewer`. The reviewer's next `ncp_get_context` delivers it in
 `[NCP:WHISPERS]`; the reviewer acks it on its `post_turn`. No transcript
 pasting, no orchestrator state carrying the payload.
+
+**Typed decisions (spec §4h).** When a slot is a classify / route / score /
+choose — not prose — you do not need a generating model for it:
+
+1. Call `ncp_compile_decision_query` with your conscious fields and a
+   `schema_id`. You get bounded state, the `questions` a backend must answer,
+   a stable `state_hash`, and up to three `precedents`.
+2. If `escalate` is false and `suggested_choice` is present, a prior decision
+   over the same state is available for reuse. NCP does not apply it — that is
+   your call.
+3. Otherwise hand `state` and `questions` to whatever decides: a rule, a
+   JSON-mode cheap model, a schema-constrained backend, or a human.
+4. Persist the result with `ncp_record_decision` including `schema_id`,
+   `choice` and the `state_hash` you were given. Never persist a backend's
+   choice without recording it — an unrecorded decision cannot become a
+   precedent.
+5. When the work resolves, call `ncp_record_outcome` with `decision_id`.
+
+If `escalate` is true, call a generating model with normal `ncp_get_context`
+pidgin. `escalate_reasons` tells you why (`low_joint_confidence`, `high_drift`,
+`contradiction`, `open_schema`, `critical_budget`, `no_evidence`) and never
+which model — NCP does not route. `joint_confidence` is advisory: a bounded
+heuristic over evidence trust, contradiction and drift, not a calibrated
+probability, and it must not be reported as one.
 
 **Dissent.** An agent that disputes a stored claim emits a `dissent` whisper
 with `ref` set to the disputed `chunk_id`. This increments the chunk's

@@ -42,7 +42,8 @@ Install `agent-plugin/` with whatever mechanism your client uses to load an
 Agent Plugin directory (consult your client's docs — the spec defines the
 package format, not a universal install command). Once loaded, a
 spec-compliant client should expose `ncp_get_context`, `ncp_write_memory`,
-`ncp_emit_whisper`, `ncp_post_turn`, `ncp_fetch`, `ncp_record_decision`, and
+`ncp_emit_whisper`, `ncp_post_turn`, `ncp_fetch`, `ncp_record_decision`,
+`ncp_get_decision`, `ncp_compile_decision_query`, and
 `ncp_record_outcome` as tools, and should make `ncp-core` (and
 `ncp-multi-agent`, when relevant) available as skills.
 

@@ -25,13 +25,24 @@ from ncp.chunker import filter_content
 from ncp.config import NCPConfig, load_config
 from ncp.drift import EmbeddingAdapter, compute_drift
 from ncp.stores.base import BaseStore
+from ncp.stores.consolidation import reduce_candidates
 from ncp.stores.factory import create_store
 from ncp.tiering import compute_tier_signal
+from ncp.decisions import (
+    SchemaRegistry,
+    persist_decision_record,
+    compute_state_hash,
+    contradiction_mass as compute_contradiction_mass,
+    evidence_confidence,
+    joint_confidence as compute_joint_confidence,
+)
 from ncp.types import (
     BudgetContext,
     ChunkEdge,
     ChunkEdgeType,
     ConsciousBlock,
+    DecisionRecord,
+    LEGACY_SCHEMA_ID,
     NCPResponse,
     OutcomeRecord,
     SubconsciousChunk,
@@ -539,8 +550,108 @@ MCP_TOOLS: list[dict[str, object]] = [
                     "items": {"type": "string"},
                     "description": "Searchable tags for precedent queries (e.g. 'architecture', 'null-guard', 'retry-logic')",
                 },
+                "schema_id": {
+                    "type": "string",
+                    "description": (
+                        "Typed contract id this decision satisfies (no whitespace). Supply it "
+                        "together with 'choice' to persist a typed DecisionRecord. Omitted "
+                        "calls still record, adapted as schema_id='legacy.untyped'."
+                    ),
+                },
+                "schema_version": {"type": "integer", "description": "Schema version. Defaults to the current registered version, or 1 for an open schema."},
+                "slot": {"type": "string", "description": "Slot this decision resolves (no whitespace). Mirrors ConsciousBlock.slot."},
+                "choice": {
+                    "description": (
+                        "The selected value: string, number, boolean or object. Validated "
+                        "against schema_id when that schema is registered. This -- not the "
+                        "rationale -- is the match key for precedent lookup."
+                    ),
+                },
+                "options": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Enumerated choices when the contract is finite. Empty for an open scalar.",
+                },
+                "probs": {
+                    "type": "object",
+                    "description": (
+                        "option -> probability in [0,1]. When options are enumerated these "
+                        "must sum to 1.0 +/- 0.02 and use only keys from options."
+                    ),
+                },
+                "confidence_source": {
+                    "type": "string",
+                    "enum": ["self_reported", "backend_claimed", "outcome_calibrated"],
+                    "description": "Where the confidence came from. Default self_reported.",
+                },
+                "backend": {
+                    "type": "string",
+                    "enum": ["rule", "llm_constrained", "system_one", "human", "unknown"],
+                    "description": "What produced the choice. NCP never chooses. Default unknown.",
+                },
+                "state_hash": {
+                    "type": "string",
+                    "description": "state_hash from ncp_compile_decision_query, linking this decision to the state it was made over.",
+                },
+                "chunk_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Evidence chunk ids used to compile the decision. Defaults to evidence_refs.",
+                },
+                "turn_id": {"type": "string", "description": "Optional turn link."},
             },
             "required": ["decision", "rationale", "agent_id"],
+        },
+    },
+    {
+        "name": "ncp_get_decision",
+        "description": (
+            "Fetch one typed DecisionRecord by id. Returns the canonical JSON form -- "
+            "identical bytes across processes for the same stored decision."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "decision_id": {"type": "string", "description": "Decision id (dec_...)"},
+            },
+            "required": ["decision_id"],
+        },
+    },
+    {
+        "name": "ncp_compile_decision_query",
+        "description": (
+            "Compile a bounded, machine-usable decision packet for a decision backend: "
+            "conscious state, evidence, questions, precedents, a stable state_hash, and "
+            "advisory joint_confidence / contradiction_mass with an escalate flag. "
+            "Makes zero provider calls -- it is a pure function of the conscious block "
+            "plus what is already in the store. NCP compiles; it does not choose, and it "
+            "never names a model in escalate_reasons."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "agent_id": {"type": "string", "description": "Agent identifier (no spaces)"},
+                "role": {"type": "string", "description": "Role label (no spaces)"},
+                "owns": {"type": "array", "items": {"type": "string"}, "description": "Capabilities this agent owns"},
+                "must_not": {"type": "array", "items": {"type": "string"}, "description": "Hard capability boundaries"},
+                "task": {"type": "string", "description": "Current objective (no spaces)"},
+                "slot": {"type": "string", "description": "What is being decided (no spaces)"},
+                "intent": {"type": "string", "description": "Why this action (no spaces)"},
+                "schema_id": {"type": "string", "description": "Typed contract the backend must satisfy (no whitespace)"},
+                "pipeline_id": {"type": "string", "description": "Pipeline scope"},
+                "tried": {"type": "array", "items": {"type": "string"}, "description": "Attempted actions"},
+                "failed": {"type": "array", "items": {"type": "string"}, "description": "Failed actions"},
+                "drift_score": {"type": "number", "description": "Drift 0.0-1.0. Feeds joint_confidence and the high_drift escalate reason."},
+                "slot_confidence": {"type": "number", "description": "Slot confidence 0.0-1.0."},
+                "pressure": {
+                    "type": "string",
+                    "enum": ["low", "medium", "high", "critical"],
+                    "description": "Budget pressure. 'critical' raises the critical_budget escalate reason.",
+                },
+                "k": {"type": "integer", "description": "Evidence cap. Default 6, clamped to [decisions].max_evidence (12)."},
+                "min_confidence": {"type": "number", "description": "Drop evidence below this confidence. Default 0.0."},
+            },
+            "required": ["agent_id", "task", "slot", "intent", "schema_id"],
         },
     },
     {
@@ -565,6 +676,10 @@ MCP_TOOLS: list[dict[str, object]] = [
                 "turn_id": {
                     "type": "string",
                     "description": "Turn ID to resolve to chunk_ids. Exclusive with chunk_ids.",
+                },
+                "decision_id": {
+                    "type": "string",
+                    "description": "Optional typed decision (dec_...) this outcome resolves; sets DecisionRecord.outcome_id.",
                 },
                 "outcome_id": {
                     "type": "string",
@@ -737,6 +852,80 @@ def _encode_fetch_results(chunks: list[SubconsciousChunk]) -> str:
     return "\n".join(lines)
 
 
+def _decision_string_list(args: dict[str, object], key: str, default: list[str]) -> list[str]:
+    """Coerce a JSON array of ids to list[str], rejecting a bare string.
+
+    ``[str(c) for c in args[key]]`` looks right and silently turns the string
+    "sub_a" into five one-character chunk ids, because a str is iterable. A
+    caller that sends a scalar where the schema says array gets an error, not
+    corrupted evidence.
+    """
+    raw = args.get(key)
+    if raw is None:
+        return list(default)
+    if isinstance(raw, str) or not isinstance(raw, (list, tuple)):
+        raise ValueError(f"{key} must be an array of strings")
+    return [str(item) for item in raw]
+
+
+def _decision_probs(args: dict[str, object]) -> dict[str, float]:
+    """Coerce the probs mapping, turning a malformed value into a clean error."""
+    raw = args.get("probs")
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError("probs must be an object mapping option -> probability")
+    probs: dict[str, float] = {}
+    for key, value in raw.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"probs['{key}'] must be a number")
+        probs[str(key)] = float(value)
+    return probs
+
+
+def _contradiction_edges(
+    store: BaseStore,
+    chunk_ids: Sequence[str],
+) -> list[tuple[str, str]]:
+    """Explicit `contradicts` edges among the injected evidence.
+
+    Best-effort: a backend without edge support, or an edge read that fails,
+    contributes nothing rather than failing the compile. Edges alone would be
+    a near-permanently empty signal -- write-time inference only ever emits
+    `refines` -- which is why compile fuses them with the fan-in reducer's
+    contradictions instead of relying on them.
+    """
+    if not chunk_ids:
+        return []
+    injected = set(chunk_ids)
+    pairs: list[tuple[str, str]] = []
+    try:
+        edges = store.get_chunk_edges(
+            sorted(injected), edge_types=["contradicts"], direction="both"
+        )
+    except Exception:  # noqa: BLE001 - advisory signal, never fatal
+        return []
+    for edge in edges:
+        if edge.src_chunk_id in injected and edge.dst_chunk_id in injected:
+            pairs.append((edge.src_chunk_id, edge.dst_chunk_id))
+    return pairs
+
+
+def _decision_outcome(store: BaseStore, decision: DecisionRecord) -> bool | None:
+    """How a precedent's linked outcome resolved: True, False, or None.
+
+    None means no outcome is linked. A linked outcome that cannot be resolved
+    blocks reuse, rather than treating an unreadable failure as confidence-only.
+    """
+    if not decision.outcome_id:
+        return None
+    try:
+        outcome = store.get_outcome(decision.outcome_id)
+    except Exception:  # noqa: BLE001 - unavailable evidence cannot authorize reuse
+        return False
+    return bool(outcome.success) if outcome is not None else False
+
+
 def _verify_authorship(
     store: BaseStore,
     *,
@@ -848,6 +1037,27 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
     # CAP-C7/WI-P2: write-time edge inference, opt-in (off by default -- the
     # `edges_inferred` response field is only surfaced when enabled).
     infer_edges_enabled = config.infer_edges if config is not None else False
+    # Typed decision contract (spec 4h). `decisions_enabled` gates only the
+    # typed path -- the legacy rationale-shaped ncp_record_decision call keeps
+    # working either way, same disable posture as memoization.
+    decisions_enabled = config.decisions_enabled if config is not None else True
+    decisions_escalate_min_confidence = (
+        config.decisions_escalate_min_confidence if config is not None else 0.55
+    )
+    decisions_precedent_min_confidence = (
+        config.decisions_precedent_min_confidence if config is not None else 0.60
+    )
+    decisions_dual_write_chunks = (
+        config.decisions_dual_write_chunks if config is not None else False
+    )
+    decisions_strict_schemas = (
+        config.decisions_strict_registered_schemas if config is not None else False
+    )
+    decisions_max_evidence = config.decisions_max_evidence if config is not None else 12
+    decision_registry = SchemaRegistry.load(
+        inline=config.decision_schemas if config is not None else None,
+        project_root=config.project_root if config is not None else None,
+    )
     drift_embedding_adapter: EmbeddingAdapter | None = None
     if drift_computed_enabled and drift_use_embeddings:
         drift_embedding_adapter = _build_drift_embedding_adapter(config)
@@ -1479,6 +1689,13 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             return {"result": "ncp_fetch:no_results query_too_specific_or_layer_empty"}
         return {"result": _encode_fetch_results(chunks)}
 
+    def _typed_decision_args(args: dict[str, object]) -> bool:
+        """True when the caller supplied any field from the typed contract."""
+        return any(
+            key in args
+            for key in ("schema_id", "choice", "probs", "options", "backend", "state_hash", "chunk_ids")
+        )
+
     def _handle_record_decision(args: dict[str, object]) -> object:
         decision = str(args["decision"])
         rationale = str(args["rationale"])
@@ -1486,7 +1703,8 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         alternatives = [str(a) for a in (args.get("alternatives") or [])]
         evidence_refs = [str(r) for r in (args.get("evidence_refs") or [])]
         outcome = str(args.get("outcome", "pending"))
-        confidence = float(args.get("confidence", 0.8) or 0.8)
+        raw_confidence = args.get("confidence")
+        confidence = float(0.8 if raw_confidence is None else raw_confidence)
         pipeline_id = args.get("pipeline_id")
         caused_by = args.get("caused_by")
         tags = [str(t) for t in (args.get("tags") or [])]
@@ -1523,13 +1741,329 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             source_refs=evidence_refs,
         )
         ok = store.write(chunk)
-        return {
+        response: dict[str, object] = {
             "recorded": ok,
             "chunk_id": chunk.chunk_id,
             "outcome": outcome,
             "tag_count": len(tags),
             "evidence_count": len(evidence_refs),
         }
+        if not decisions_enabled:
+            # Disabled payload: the legacy trace above still landed.
+            response["decisions_enabled"] = False
+            return response
+
+        typed = _typed_decision_args(args)
+        schema_id = str(args.get("schema_id") or LEGACY_SCHEMA_ID)
+        # Legacy adapter: `decision` is what was decided, so it -- not the
+        # rationale -- becomes the choice. The rationale stays commentary and
+        # is never the match key.
+        raw_choice = args["choice"] if "choice" in args else decision[:600]
+        try:
+            options = _decision_string_list(
+                args, "options", alternatives if typed else []
+            )
+            probs = _decision_probs(args)
+            chunk_ids = _decision_string_list(args, "chunk_ids", evidence_refs)
+        except ValueError as exc:
+            return {
+                "recorded": False,
+                "error": "validation_error",
+                "details": str(exc),
+                "chunk_id": chunk.chunk_id,
+            }
+
+        if typed and "schema_id" not in args:
+            return {
+                "recorded": False,
+                "error": "schema_id_required",
+                "details": "typed decision fields were supplied without a schema_id",
+                "chunk_id": chunk.chunk_id,
+            }
+
+        registered = decision_registry.is_registered(schema_id)
+        if decisions_strict_schemas and not registered and schema_id != LEGACY_SCHEMA_ID:
+            return {
+                "recorded": False,
+                "error": "schema_unregistered",
+                "details": f"schema_id {schema_id!r} is not registered and strict mode is on",
+                "chunk_id": chunk.chunk_id,
+            }
+        mismatch = decision_registry.validate_choice(schema_id, raw_choice, probs=probs)
+        if mismatch is not None:
+            # No partial row: the typed write is refused outright.
+            return {
+                "recorded": False,
+                "error": "schema_mismatch",
+                "details": mismatch,
+                "chunk_id": chunk.chunk_id,
+            }
+
+        try:
+            record = DecisionRecord(
+                schema_id=schema_id,
+                schema_version=int(args.get("schema_version", decision_registry.get(schema_id).version if registered else 1)),
+                slot=str(args.get("slot") or "legacy"),
+                pipeline_id=None if pipeline_id is None else str(pipeline_id),
+                agent_id=agent_id,
+                options=options,
+                choice=raw_choice,
+                probs=probs,
+                confidence=confidence if typed else min(1.0, max(0.0, confidence)),
+                confidence_source=str(args.get("confidence_source") or "self_reported"),
+                backend=str(args.get("backend") or "unknown"),
+                state_hash=str(args.get("state_hash") or ""),
+                chunk_ids=chunk_ids,
+                turn_id=None if args.get("turn_id") is None else str(args["turn_id"]),
+                rationale=rationale[:600] or None,
+            )
+        except ValueError as exc:
+            return {
+                "recorded": False,
+                "error": "validation_error",
+                "details": str(exc),
+                "chunk_id": chunk.chunk_id,
+            }
+
+        try:
+            typed_recorded = persist_decision_record(
+                record, store=store, registry=decision_registry, enabled=decisions_enabled,
+                strict_schemas=decisions_strict_schemas,
+                dual_write_chunks=decisions_dual_write_chunks, evidence_chunk_id=chunk.chunk_id,
+            )
+        except ValueError as exc:
+            return {"recorded": False, "error": "validation_error", "details": str(exc),
+                    "chunk_id": chunk.chunk_id}
+        response["decision_id"] = record.decision_id
+        response["schema_id"] = record.schema_id
+        response["schema_registered"] = registered
+        # `ok` above is the *legacy trace chunk* write, which returns False when
+        # write-time dedup recognizes an identical earlier trace. For a typed
+        # call that must not be reported as "the decision was not recorded" --
+        # the typed row is the durable object, and two decisions with identical
+        # prose are still two decisions. Legacy-only calls keep the old meaning,
+        # since old clients read `recorded` as the chunk write.
+        if typed:
+            response["recorded"] = typed_recorded
+            response["trace_chunk_written"] = ok
+        return response
+
+    def _handle_get_decision(args: dict[str, object]) -> object:
+        if not decisions_enabled:
+            return {"found": False, "decisions_enabled": False}
+        decision_id = str(args["decision_id"])
+        record = store.get_decision(decision_id)
+        if record is None:
+            return {"found": False, "decision_id": decision_id}
+        return {"found": True, "decision": json.loads(record.canonical_json())}
+
+    def _handle_compile_decision_query(args: dict[str, object]) -> object:
+        """P0-B: a bounded, machine-usable decision packet. No provider calls.
+
+        Everything here is store reads plus arithmetic. The acceptance test
+        asserts zero provider calls, and that is a contract, not an accident:
+        a compile step that can call a model is just an orchestrator wearing a
+        different hat, and NCP is not an orchestrator.
+        """
+        if not decisions_enabled:
+            return {
+                "decisions_enabled": False,
+                "state": {},
+                "questions": [],
+                "state_hash": "",
+                "precedents": [],
+                "joint_confidence": 0.0,
+                "contradiction_mass": 0.0,
+                "escalate": False,
+                "escalate_reasons": [],
+            }
+
+        schema_id = str(args["schema_id"])
+        slot = str(args["slot"])
+        pipeline_id = None if args.get("pipeline_id") is None else str(args["pipeline_id"])
+        # These four feed the state_hash, so a bare string quietly iterated into
+        # one entry per character would corrupt the hash rather than fail loudly.
+        conscious = ConsciousBlock(
+            agent_id=str(args["agent_id"]),
+            role=str(args.get("role") or "agent"),
+            owns=_decision_string_list(args, "owns", []),
+            must_not=_decision_string_list(args, "must_not", []),
+            task=str(args["task"]),
+            slot=slot,
+            intent=str(args["intent"]),
+            tried=_decision_string_list(args, "tried", []),
+            failed=_decision_string_list(args, "failed", []),
+            drift_score=float(args.get("drift_score", 0.0) or 0.0),
+            slot_confidence=float(args.get("slot_confidence", 1.0) or 1.0),
+            pressure=str(args.get("pressure") or "low"),  # type: ignore[arg-type]
+            pipeline_id=pipeline_id,
+        )
+
+        k = int(args.get("k", 6) or 6)
+        k = max(1, min(decisions_max_evidence, k))
+        min_confidence = float(args.get("min_confidence", 0.0) or 0.0)
+
+        # Over-fetch, then drop reasoning_trace. Prior decisions are not
+        # evidence about the world, and letting them back in is actively
+        # harmful: every ncp_record_decision writes a trace chunk into the same
+        # pipeline, so including that layer makes each compile see a different
+        # evidence set than the last one, which moves state_hash and destroys
+        # precedent reuse. Prior decisions come back through `precedents`, as
+        # typed records with a choice and a confidence.
+        chunks = store.query(
+            text=f"{conscious.task} {conscious.slot} {conscious.intent}",
+            k=k * 2,
+            pipeline_id=pipeline_id,
+            fallback_to_trust_recency=True,
+            allow_embedding=False,
+        )
+        evidence = [
+            c
+            for c in chunks
+            if c.layer != "reasoning_trace" and evidence_confidence(c) >= min_confidence
+        ][:k]
+        chunk_ids = [c.chunk_id for c in evidence]
+
+        # Contradictions from both signals NCP actually has: the deterministic
+        # fan-in reducer (run directly here, so compile reports contradictions
+        # even where [retrieval].reduce_fanin_enabled is off) and any explicit
+        # `contradicts` edges a host wrote.
+        pairs: list[tuple[str, str]] = []
+        if evidence:
+            reduced = reduce_candidates(
+                list(evidence),
+                similarity_threshold=(
+                    config.reduce_fanin_similarity_threshold if config is not None else 0.4
+                ),
+                contradict_floor=(
+                    config.reduce_fanin_contradict_floor if config is not None else 0.15
+                ),
+                min_cluster=2,
+            )
+            pairs.extend(reduced.contradictions)
+        pairs.extend(_contradiction_edges(store, chunk_ids))
+
+        cm = compute_contradiction_mass(chunk_ids=chunk_ids, contradiction_pairs=pairs)
+        jc = compute_joint_confidence(
+            confidences=[evidence_confidence(c) for c in evidence],
+            contradiction_mass=cm,
+            drift_score=conscious.drift_score,
+        )
+        state_hash = compute_state_hash(
+            schema_id=schema_id, slot=slot, conscious=conscious, chunk_ids=chunk_ids
+        )
+
+        entry = decision_registry.get(schema_id)
+        questions = (
+            entry.as_questions()
+            if entry is not None
+            else [{"key": "choice", "type": "string"}]
+        )
+
+        precedents = store.query_decisions(
+            schema_id=schema_id,
+            slot=slot,
+            state_hash=state_hash,
+            pipeline_id=pipeline_id,
+            min_confidence=min_confidence,
+            k=3,
+        )
+
+        # Escalate reasons fire independently and accumulate. They are
+        # correlated by construction -- drift and contradiction both depress
+        # joint_confidence as well as raising their own flag -- so a caller
+        # reads "is this reason present", never "is this the only reason".
+        reasons: list[str] = []
+        if jc < decisions_escalate_min_confidence:
+            reasons.append("low_joint_confidence")
+        if conscious.drift_score >= 0.40:
+            reasons.append("high_drift")
+        if cm >= 0.30:
+            reasons.append("contradiction")
+        if entry is None or schema_id.startswith("legacy."):
+            reasons.append("open_schema")
+        if conscious.pressure == "critical":
+            reasons.append("critical_budget")
+        if not evidence:
+            reasons.append("no_evidence")
+
+        result: dict[str, object] = {
+            "state": {
+                "task": conscious.task,
+                "slot": conscious.slot,
+                "intent": conscious.intent,
+                "owns": conscious.owns,
+                "must_not": conscious.must_not,
+                "tried": conscious.tried,
+                "failed": conscious.failed,
+                "drift_score": round(conscious.drift_score, 4),
+                "slot_confidence": round(conscious.slot_confidence, 4),
+                "evidence": [
+                    {
+                        "chunk_id": c.chunk_id,
+                        "layer": c.layer,
+                        "trust": round(c.base_trust, 4),
+                        "result_confidence": c.result_confidence,
+                        "content": c.content[:400],
+                        "src": c.src,
+                    }
+                    for c in evidence
+                ],
+            },
+            "questions": questions,
+            "schema_id": schema_id,
+            "schema_registered": entry is not None,
+            "schema_version": entry.version if entry is not None else None,
+            "state_hash": state_hash,
+            "precedents": [json.loads(p.canonical_json()) for p in precedents],
+            "joint_confidence": round(jc, 4),
+            "contradiction_mass": round(cm, 4),
+            "evidence_count": len(evidence),
+            # Labelled advisory, and it stays labelled until outcomes back it.
+            # Outcome-weighted trust is not calibration.
+            "confidence_label": "advisory",
+            "escalate": bool(reasons),
+            "escalate_reasons": reasons,
+        }
+
+        # Reuse candidate: an exact state_hash match that is either backed by a
+        # successful outcome or confident enough on its own, and never one whose
+        # outcome failed. NCP surfaces it; the host decides whether to use it.
+        #
+        # A succeeded outcome overrides the confidence floor deliberately. The
+        # floor is a heuristic over *evidence trust*; a linked outcome is
+        # evidence about the *decision itself*, and "this exact choice over this
+        # exact state already worked" is strictly better information than any
+        # confidence number. Gating that behind the floor made the most reusable
+        # decisions in the store the least reusable.
+        for precedent in precedents:
+            if not precedent.state_hash or precedent.state_hash != state_hash:
+                continue
+            if entry is None or precedent.schema_version != entry.version:
+                continue
+            if decision_registry.validate_choice(schema_id, precedent.choice, probs=precedent.probs) is not None:
+                continue
+            verdict = _decision_outcome(store, precedent)
+            if verdict is False:
+                continue
+            if verdict is True or precedent.confidence >= decisions_precedent_min_confidence:
+                result["suggested_choice"] = precedent.choice
+                result["suggested_from"] = precedent.decision_id
+                result["suggested_basis"] = "outcome" if verdict is True else "confidence"
+                break
+
+        if tier_hints_enabled:
+            signal = compute_tier_signal(
+                query_text=f"{conscious.task} {conscious.slot}",
+                chunk_count=len(evidence),
+                distinct_authors=len({c.written_by for c in evidence}),
+                drift_score=conscious.drift_score,
+                pressure=conscious.pressure,
+                cold_start=not evidence,
+            )
+            result["tier_hint"] = signal.tier_hint
+            result["complexity_signal"] = round(signal.complexity_signal, 4)
+        return result
 
     def _handle_record_outcome(args: dict[str, object]) -> object:
         success_raw = args.get("success")
@@ -1560,7 +2094,16 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             note=note,
         )
         recorded = store.record_outcome(outcome)
-        return {"recorded": recorded, "outcome_id": outcome.outcome_id}
+        response: dict[str, object] = {"recorded": recorded, "outcome_id": outcome.outcome_id}
+        # Close the decision -> outcome loop when the caller names a decision.
+        # Silently ignored when the typed path is off or the id is unknown, so
+        # an old client passing a stale id never loses its outcome write.
+        decision_id = args.get("decision_id")
+        if recorded and decisions_enabled and isinstance(decision_id, str) and decision_id:
+            response["decision_linked"] = bool(
+                store.link_decision_outcome(decision_id, outcome.outcome_id)
+            )
+        return response
 
     def _memo_counters() -> dict[str, int] | None:
         """Cheap hits/misses totals for hosts (S4.1 memoization telemetry)."""
@@ -1749,6 +2292,8 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         "ncp_post_turn": _handle_post_turn,
         "ncp_fetch": _handle_fetch,
         "ncp_record_decision": _handle_record_decision,
+        "ncp_get_decision": _handle_get_decision,
+        "ncp_compile_decision_query": _handle_compile_decision_query,
         "ncp_record_outcome": _handle_record_outcome,
         "ncp_lookup_memo": _handle_lookup_memo,
         "ncp_record_memo": _handle_record_memo,

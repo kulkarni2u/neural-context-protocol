@@ -723,3 +723,132 @@ class OutcomeRecord(NCPModel):
     note: str | None = None
     created_at: float = Field(default_factory=time.time)
     consumed: bool = False
+
+
+# ── Decision contract (spec §4h) ──────────────────────────────────────────────
+# A decision is a first-class durable object, not a memory chunk with extra
+# prose. ``choice`` is the machine-shaped selected value and is the match key;
+# ``rationale`` is optional commentary that is never ranked on.
+ConfidenceSource = Literal["self_reported", "backend_claimed", "outcome_calibrated"]
+DecisionBackend = Literal["rule", "llm_constrained", "system_one", "human", "unknown"]
+# Closed set. NCP never names a model here -- escalation says *why*, the host
+# decides *what to call*.
+EscalateReason = Literal[
+    "low_joint_confidence",
+    "high_drift",
+    "contradiction",
+    "open_schema",
+    "critical_budget",
+    "no_evidence",
+]
+# schema_id used when a legacy (untyped) ncp_record_decision call is adapted
+# into a DecisionRecord. Reserved: never register a schema under this id.
+LEGACY_SCHEMA_ID = "legacy.untyped"
+# Tolerance on sum(probs) when options are enumerated. Wide enough for float
+# round-tripping through JSON, tight enough to catch a real normalization bug.
+PROBS_SUM_TOLERANCE = 0.02
+RATIONALE_MAX_CHARS = 600
+
+
+class DecisionRecord(NCPModel):
+    """A typed, durable decision: what was chosen, how sure, and over what state."""
+
+    decision_id: str = Field(default_factory=lambda: f"dec_{uuid4().hex[:12]}")
+    schema_id: str
+    schema_version: int = 1
+    slot: str
+
+    pipeline_id: str | None = None
+    agent_id: str | None = None
+
+    options: list[str] = Field(default_factory=list)
+    choice: str | float | int | bool | dict
+    probs: dict[str, float] = Field(default_factory=dict)
+
+    confidence: float
+    confidence_source: ConfidenceSource = "self_reported"
+    backend: DecisionBackend = "unknown"
+
+    # sha256 of the canonical compiled state this decision was made over. Covers
+    # stable identity only (schema_id, slot, semantic conscious fields, sorted
+    # evidence chunk ids) -- never scores, trust, ages or content, all of which
+    # drift continuously and would make the hash unmatchable. See
+    # ncp.decisions.compute_state_hash.
+    state_hash: str = ""
+    chunk_ids: list[str] = Field(default_factory=list)
+    turn_id: str | None = None
+    outcome_id: str | None = None
+
+    rationale: str | None = None
+    created_at: float = Field(default_factory=time.time)
+
+    @field_validator("schema_id", "slot")
+    @classmethod
+    def _decision_fields_no_spaces(cls, value: str, info: object) -> str:
+        field_name = getattr(info, "field_name", "field")
+        if not value:
+            raise ValueError(f"{field_name} must not be empty")
+        return _validate_no_spaces(value, field_name)
+
+    @field_validator("decision_id")
+    @classmethod
+    def _decision_id_no_spaces(cls, value: str) -> str:
+        return _validate_no_spaces(value, "decision_id")
+
+    @field_validator("confidence")
+    @classmethod
+    def _confidence_in_unit_range(cls, value: float) -> float:
+        if not 0.0 <= value <= 1.0:
+            raise ValueError("confidence must be in [0.0, 1.0]")
+        return value
+
+    @field_validator("schema_version")
+    @classmethod
+    def _schema_version_positive(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("schema_version must be >= 1")
+        return value
+
+    @field_validator("created_at")
+    @classmethod
+    def _created_at_non_negative(cls, value: float) -> float:
+        if value < 0.0:
+            raise ValueError("created_at must be >= 0.0")
+        return value
+
+    @field_validator("rationale")
+    @classmethod
+    def _rationale_bounded(cls, value: str | None) -> str | None:
+        if value is not None and len(value) > RATIONALE_MAX_CHARS:
+            raise ValueError(f"rationale must be <= {RATIONALE_MAX_CHARS} characters")
+        return value
+
+    @field_validator("probs")
+    @classmethod
+    def _probs_are_probabilities(cls, value: dict[str, float]) -> dict[str, float]:
+        for key, prob in value.items():
+            if not 0.0 <= prob <= 1.0:
+                raise ValueError(f"probs['{key}'] must be in [0.0, 1.0]")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_probs_against_options(self) -> Self:
+        if self.options and self.probs:
+            total = sum(self.probs.values())
+            if abs(total - 1.0) > PROBS_SUM_TOLERANCE:
+                raise ValueError(
+                    f"probs must sum to 1.0 +/- {PROBS_SUM_TOLERANCE} when options "
+                    f"are enumerated, got {total:.4f}"
+                )
+            unknown = sorted(set(self.probs) - set(self.options))
+            if unknown:
+                raise ValueError(f"probs contains keys not in options: {unknown}")
+        return self
+
+    def canonical_json(self) -> str:
+        """Stable JSON serialization: sorted keys, no whitespace variance.
+
+        Used for the dual-write chunk body and for round-trip equality checks
+        across processes, so it must not depend on field declaration order.
+        """
+        return json.dumps(self.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))

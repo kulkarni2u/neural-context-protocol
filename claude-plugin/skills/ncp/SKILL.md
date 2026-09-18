@@ -27,6 +27,12 @@ transcripts or stuffing prompts.
    chunk, not raw tool output — NCP filters noise and keeps a reversible
    `raw_ref`).
 6. Record significant decisions with `ncp_record_decision`.
+7. For classify/route/score/choose slots with a `schema_id`: call
+   `ncp_compile_decision_query`, reuse `suggested_choice` when it is offered,
+   otherwise answer from the compiled `state` and `questions` (a cheap
+   structured call is enough), then persist with `ncp_record_decision`
+   carrying `schema_id`, `choice` and the returned `state_hash`. Escalate to
+   full reasoning only when the packet says `escalate`.
 7. Use `ncp_fetch` only when the active turn needs more bounded retrieval
    (max 3 per turn).
 

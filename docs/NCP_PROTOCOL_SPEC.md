@@ -847,6 +847,242 @@ Upsert and conflict (UNIQUE constraint):
 
 ---
 
+## 4h. Decision Contract (normative)
+
+```
+Why: a decision was previously a reasoning_trace chunk with prose in it, which
+means the thing a host most needs to look up later -- what was chosen, how
+sure, over what state -- was only recoverable by parsing text. A DecisionRecord
+makes the choice a first-class durable object with the rationale demoted to
+optional commentary. NCP persists and compiles decisions; it never makes one.
+The choice arrives from a backend (rule, constrained LLM, System One model, or
+a human) that lives outside the bus.
+
+DecisionRecord fields:
+  decision_id       str    dec_{12 hex}; auto-generated if omitted
+  schema_id         str    required, no whitespace; the closed output contract
+  schema_version    int    default 1, >= 1
+  slot              str    required, no whitespace; mirrors ConsciousBlock.slot
+  pipeline_id       str?   scope
+  agent_id          str?   who recorded it
+  options           list[str]  enumerated choices; empty for an open scalar
+  choice            str | number | bool | dict  the selected value
+  probs             dict[str, float]  option -> p in [0,1]
+  confidence        float  required, [0.0, 1.0]
+  confidence_source str    self_reported | backend_claimed | outcome_calibrated
+  backend           str    rule | llm_constrained | system_one | human | unknown
+  state_hash        str    sha256 of the canonical state identity (below)
+  chunk_ids         list[str]  evidence chunk ids used to compile
+  turn_id           str?   optional link
+  outcome_id        str?   set by ncp_record_outcome(decision_id=...)
+  rationale         str?   optional, max 600 chars; NEVER the match key
+  created_at        float  unix seconds
+
+Validation (rejected at construction, no partial row is written):
+  confidence outside [0.0, 1.0]
+  whitespace or empty schema_id / slot
+  probs values outside [0.0, 1.0]
+  when options is non-empty and probs is supplied:
+    sum(probs) must be 1.0 +/- 0.02, and every prob key must be in options
+  rationale longer than 600 characters
+
+state_hash (normative):
+  sha256 over the canonical JSON (sorted keys, no whitespace variance) of:
+    {schema_id, slot, task, intent, sorted(owns), sorted(must_not),
+     sorted(tried), sorted(failed), sorted(chunk_ids)}
+
+  Deliberately EXCLUDED, because each one moves continuously and a hash that
+  includes it can never match twice:
+    retrieval scores / relevance   recomputed per query from a 4h half-life
+    base_trust, result_confidence  moved by decay, feedback and dissent
+    age_seconds, timestamps        monotonic by construction
+    chunk content                  truncated for display, rewritten by consolidation
+    evidence ordering              a ranking artifact, not part of the situation
+    drift_score, slot_confidence   continuous turn-local telemetry
+  Also excluded: agent_id and pipeline_id. Two agents facing the same slot with
+  the same evidence are in the same state; scoping is applied at query time.
+
+Schema registry (minimal, v1):
+  Built-ins shipped in the package:
+    ncp.slot.continue_or_escalate   enum: continue | escalate | stop
+    ncp.slot.binary                 boolean
+    ncp.handoff.accept              enum: accept | reject | defer
+  Overlay order: built-ins < .ncp/decision_schemas.json < [decision_schemas]
+  Entry: schema_id, version, choice_type (enum|boolean|number|string|object),
+         options?, required_prob_keys?
+  A malformed entry is skipped, never fatal. An unregistered schema_id is
+  allowed (forward compat) and raises the open_schema escalate reason instead;
+  [decisions].strict_registered_schemas = true rejects it at record time.
+
+ncp_record_decision (extended, backward compatible):
+  The legacy call shape (decision, rationale, agent_id, alternatives,
+  evidence_refs, outcome, confidence, tags) still writes its reasoning_trace
+  chunk and still returns recorded / chunk_id / outcome / tag_count /
+  evidence_count. It additionally adapts into a DecisionRecord with
+  schema_id="legacy.untyped", backend="unknown", confidence_source=
+  "self_reported", and choice taken from `decision` -- what was decided.
+  The rationale is NOT the choice: it is why, not what, and using it as the
+  choice would make precedent ranking a text search over justifications.
+
+  Supplying any typed field (schema_id, choice, probs, options, backend,
+  state_hash, chunk_ids) selects the typed path. Then:
+    schema_id is required; omitting it returns error="schema_id_required"
+    a registered schema validates choice and prob keys; a mismatch returns
+      {recorded: false, error: "schema_mismatch", details} and writes no row
+    `recorded` reports the TYPED row, and `trace_chunk_written` reports the
+      legacy chunk separately. These differ: two decisions with identical
+      prose hit write-time dedup on the chunk while both typed rows land.
+
+ncp_get_decision(decision_id) -> {found, decision}
+  Returns the canonical JSON form: identical bytes across processes.
+
+ncp_record_outcome(..., decision_id?) sets DecisionRecord.outcome_id.
+  An unknown decision_id never fails the outcome write; decision_linked
+  reports whether the link landed.
+
+ncp_compile_decision_query (normative):
+  Arguments: the same conscious fields ncp_get_context takes (agent_id, role,
+  owns, must_not, task, slot, intent, tried, failed, drift_score,
+  slot_confidence, pressure, pipeline_id) plus schema_id, k (default 6,
+  clamped to [decisions].max_evidence), min_confidence (default 0.0).
+
+  NCP does not own conscious state -- ncp_get_context requires it from the
+  caller every turn -- so compile requires it too. Hydrating it from the last
+  logged turn instead would make the packet, and its hash, depend on state the
+  caller cannot see.
+
+  Result:
+    state              conscious fields plus evidence[] of
+                       {chunk_id, layer, trust, result_confidence, content, src}
+    questions          [{key, type, options?}] from the registry, or
+                       [{key: "choice", type: "string"}] for an open schema
+    state_hash         as defined above
+    precedents         up to 3 prior DecisionRecords, exact state_hash first,
+                       then same schema_id+slot by recency and confidence
+    joint_confidence   advisory float [0,1]
+    contradiction_mass advisory float [0,1]
+    evidence_count     int
+    confidence_label   always "advisory"
+    escalate           bool
+    escalate_reasons   closed set: low_joint_confidence | high_drift |
+                       contradiction | open_schema | critical_budget |
+                       no_evidence
+    tier_hint          reuses the existing CAP-E3 signal when enabled
+    schema_version     current registry version, or null for an open schema
+    suggested_choice   present when a precedent has an exact state_hash match,
+                       the current schema version and a still-valid choice,
+                       no failed or unreadable linked outcome, and either a linked SUCCEEDED
+                       outcome or confidence >= precedent_min_confidence.
+                       suggested_basis says which ("outcome" or "confidence").
+                       NCP surfaces it; it still does not apply it.
+
+  Linked outcomes are fetched by ID, including consumed and older outcomes,
+  on SQLite and PostgreSQL. Missing/unreadable linked outcomes block reuse;
+  only decisions with no outcome link may fall back to confidence alone.
+  Registry changes require a version bump even when the options stay the same.
+  Compile exposes that version; MCP recording defaults to it when omitted,
+  while Python callers set DecisionRecord.schema_version explicitly.
+
+  The Python record_decision API shares typed validation and optional mirror
+  persistence with MCP. It returns False when disabled and raises ValueError
+  for an invalid choice, stale schema version or unregistered strict schema
+  before writing. Caller-supplied decision IDs and metadata are preserved.
+
+  A succeeded outcome bypasses the confidence floor deliberately. The floor is a
+  heuristic over *evidence trust*; a linked outcome is evidence about the
+  *decision itself*, and "this exact choice over this exact state already
+  worked" is strictly better information than any confidence number.
+
+  On the 0.60 floor: a host following the documented pattern records
+  confidence = joint_confidence, which for a single evidence tier is that
+  tier's trust -- tool_result 0.80, synthesis 0.70, agent_inferred 0.60,
+  subcon_retrieved 0.55. An 0.80 floor is unreachable below the top tier and
+  only ties it there, which would make most decisions permanently unreusable
+  however often they recurred.
+
+  INTEGRATION TRAP: `task` is part of the state identity, so a task string
+  carrying a round or turn counter ("review_round_7") is a different state
+  every round and can never match a precedent. Name the decision, not the
+  iteration.
+
+  Compile makes ZERO provider calls. It is store reads plus arithmetic;
+  query-time automatic embedding is explicitly disabled, even with an embedding
+  adapter configured. Normal retrieval keeps its existing embedding behavior. A compile step that can call a model is an
+  orchestrator, and NCP is not an orchestrator.
+
+  Evidence EXCLUDES the reasoning_trace layer. Every ncp_record_decision writes
+  a trace chunk into the same pipeline, so admitting that layer makes each
+  compile see a different evidence set than the last, which moves state_hash
+  and destroys precedent reuse. Prior decisions return through `precedents`.
+
+joint_confidence (v1, advisory -- NOT calibration):
+  conf_i = result_confidence if set, else base_trust, per injected chunk
+  no evidence -> 0.0
+  else clamp(geometric_mean(conf_i) * (1 - 0.5*contradiction_mass)
+             * (1 - drift_score), 0, 1)
+
+  Known property, documented rather than hidden: the geometric mean is dragged
+  down hard by a single weak chunk, so asking for more evidence can lower this
+  number. min_confidence is the lever. Outcome-weighted trust is not
+  calibration and this value must never be presented as a calibrated
+  probability or scored as ECE.
+
+contradiction_mass (v1, advisory):
+  (chunks party to a contradiction) / (injected chunks), clamped to [0,1].
+  Measured over CHUNKS, not pairs: with the default k=6 a pair denominator is
+  15, so a genuine head-on contradiction would score 0.067 and the 0.30
+  threshold would be unreachable.
+  Sources fused: the deterministic fan-in reducer (run directly by compile, so
+  the signal is live even where [retrieval].reduce_fanin_enabled is off) and
+  explicit `contradicts` edges. Edges alone would be near-permanently zero --
+  write-time edge inference only ever emits `refines`.
+
+escalate (v1, normative):
+  escalate = true when ANY of:
+    joint_confidence < [decisions].escalate_min_confidence (default 0.55)
+    drift_score >= 0.40
+    contradiction_mass >= 0.30
+    schema_id unregistered, or starting with "legacy."
+    pressure == "critical"
+    evidence count == 0
+  Reasons accumulate and are correlated by construction: drift and
+  contradiction each depress joint_confidence as well as raising their own
+  flag. A caller reads "is this reason present", never "is this the only one".
+  NCP never names a model in escalate_reasons. Which backend to call is the
+  host's decision.
+
+  On the 0.55 default: fresh tool_result evidence sits at trust 0.80. Trust
+  decay multiplies eligible chunks by 0.85 while base_trust > 0.5, so fully
+  decayed evidence rests at ~0.506 -- just under the floor. This is deliberate:
+  evidence that fully decayed and was never re-validated escalates, anything
+  fresher does not. Retune from a measured run (`ncp dogfood --loop decision`),
+  never from intuition.
+
+Config ([decisions], all optional):
+  enabled                    true   gates the typed path; legacy still records
+  escalate_min_confidence    0.55
+  precedent_min_confidence   0.60   floor when no outcome is linked
+  surface_joint_confidence   false  no change to injected pidgin by default
+  dual_write_chunks          false  mirroring writes into the same pool
+                                    get_context retrieves from, which changes
+                                    ranking and token budgets for existing
+                                    pipelines -- opt in deliberately
+  strict_registered_schemas  false
+  max_evidence               12
+
+  When enabled = false, ncp_compile_decision_query and ncp_get_decision return
+  a disabled payload and typed fields are ignored; the legacy
+  ncp_record_decision write is unaffected.
+
+Store: table `decisions`, additive in both backends. SQLite gains it through
+the idempotent DDL list in SQLiteStore._init_db; Postgres through migration
+014_add_decisions_table.sql, mirrored in PGVECTOR_SCHEMA_TEMPLATE so a fresh
+install and a migrated install converge. An existing database opens without
+error and loses nothing.
+```
+
+---
+
 ## 5. Trust Boundaries (normative, first-class)
 
 These rules are enforced by the assembler and store. Not optional.
@@ -1146,6 +1382,30 @@ CREATE INDEX idx_cost_pipeline ON cost_log(pipeline_id, logged_at);
 -- PRAGMA synchronous=NORMAL;
 -- PRAGMA foreign_keys=ON;
 -- PRAGMA cache_size=-64000;
+CREATE TABLE decisions (              -- spec 4h, typed decision contract
+    decision_id       TEXT PRIMARY KEY,
+    schema_id         TEXT NOT NULL,
+    schema_version    INTEGER NOT NULL DEFAULT 1,
+    slot              TEXT NOT NULL,
+    pipeline_id       TEXT,
+    agent_id          TEXT,
+    options           TEXT NOT NULL DEFAULT '[]',   -- JSON array
+    choice            TEXT NOT NULL DEFAULT 'null', -- JSON scalar or object,
+                                                    -- so a bool stays a bool
+    probs             TEXT NOT NULL DEFAULT '{}',   -- JSON object
+    confidence        REAL NOT NULL,
+    confidence_source TEXT NOT NULL DEFAULT 'self_reported',
+    backend           TEXT NOT NULL DEFAULT 'unknown',
+    state_hash        TEXT NOT NULL DEFAULT '',
+    chunk_ids         TEXT NOT NULL DEFAULT '[]',   -- JSON array
+    turn_id           TEXT,
+    outcome_id        TEXT,
+    rationale         TEXT,                          -- commentary, never ranked on
+    created_at        REAL NOT NULL
+);
+CREATE INDEX idx_decisions_schema_slot ON decisions(schema_id, slot, created_at);
+CREATE INDEX idx_decisions_state_hash  ON decisions(state_hash);
+CREATE INDEX idx_decisions_pipeline    ON decisions(pipeline_id, created_at);
 ```
 
 ---
@@ -1238,6 +1498,19 @@ tier_hints_enabled = true      # CAP-E3
 drift_computed_enabled = false  # CAP-T5: opt-in; see §4e
 drift_window_turns = 5          # CAP-T5
 drift_use_embeddings = false    # CAP-T5: optional local-embedding blend
+
+[decisions]                        # spec 4h: typed decision contract
+enabled = true                     # gates the typed path; legacy record still works
+escalate_min_confidence = 0.55     # advisory floor; retune from a measured run
+precedent_min_confidence = 0.60    # floor for suggested_choice, when no outcome is linked
+surface_joint_confidence = false   # default off: no change to injected pidgin
+dual_write_chunks = false          # default off: mirroring changes retrieval ranking
+strict_registered_schemas = false  # true rejects unregistered schema_ids at record
+max_evidence = 12                  # clamp on compile's k
+
+[decision_schemas]                 # optional inline registry, overlays the
+                                   # built-ins and .ncp/decision_schemas.json
+# "team.route" = { choice_type = "enum", options = ["fast", "thorough"] }
 
 [chunking]
 max_chunk_tokens = 200

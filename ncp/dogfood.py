@@ -1935,3 +1935,250 @@ def _extract_opencode_export_metadata(
         "cli_version": version.strip(),
         "session_id": expected_session_id,
     }
+
+
+# ── decision workflow loop (spec 4h) ──────────────────────────────────────────
+#
+# The brief's P2 is a full workflow eval harness. This is the cheap half of it,
+# pulled forward because it is the only thing that distinguishes "the code
+# matches the document" from "the feature works". The escalate thresholds and
+# the contradiction floor are provisional until they are read off a run of
+# this loop, and the precedent hit rate is measured here for the same reason
+# ncp_lookup_memo shipped unable to hit: a reuse key nobody exercised.
+
+# A fixed workflow: (slot, schema_id, evidence sentences, src). Evidence content
+# is deliberately distinct per slot so write-time dedup does not collapse it, and
+# the `src` values deliberately SPAN TRUST TIERS (tool_result 0.80, synthesis
+# 0.70, agent_inferred 0.60). An earlier version of this loop seeded every slot
+# from tool_result alone, which reported a healthy precedent hit rate while
+# reuse was in fact impossible for every lower tier -- the loop measured the one
+# case that happened to clear the threshold. Spanning tiers is what makes the
+# hit rate mean something.
+DECISION_WORKFLOW_SLOTS: tuple[tuple[str, str, tuple[str, ...], str], ...] = (
+    (
+        "retry-policy",
+        "ncp.slot.continue_or_escalate",
+        (
+            "the auth service returns 401 when a bearer token has expired",
+            "retrying an expired-token request twice clears it in 94 percent of traces",
+        ),
+        "tool_result",
+    ),
+    (
+        "handoff-review",
+        "ncp.handoff.accept",
+        (
+            "the upstream worker delivered a schema-valid payload with all fields present",
+            "payload checksum matched the manifest recorded at dispatch time",
+        ),
+        "synthesis",
+    ),
+    (
+        "cache-enabled",
+        "ncp.slot.binary",
+        (
+            "cache hit ratio measured at 0.81 across the last four reconciliation runs",
+            "invalidation lag stays under two seconds at the observed write rate",
+        ),
+        "agent_inferred",
+    ),
+    (
+        "escalation-path",
+        "ncp.slot.continue_or_escalate",
+        (
+            "queue depth exceeded the alert ceiling for eleven consecutive minutes",
+            "no owning team acknowledged the page within the escalation window",
+        ),
+        "tool_result",
+    ),
+)
+
+
+def _rule_backend_choice(schema_id: str, evidence_count: int) -> object:
+    """A deterministic stand-in for a System One backend.
+
+    Not a model and not a router: a fixed rule, so the loop measures NCP's
+    own compile/record/precedent machinery rather than a backend's behavior.
+    """
+    if schema_id == "ncp.slot.binary":
+        return evidence_count >= 2
+    if schema_id == "ncp.handoff.accept":
+        return "accept" if evidence_count >= 2 else "defer"
+    return "continue" if evidence_count >= 2 else "escalate"
+
+
+def run_decision_workflow_dogfood_loop(
+    *,
+    store_path: str | Path | None = None,
+    cwd: str | Path | None = None,
+    pipeline_id: str = "pipe_dogfood_decision",
+    turns: int = 12,
+) -> dict[str, object]:
+    """Drive compile -> rule backend -> record_decision -> record_outcome.
+
+    Returns the metrics the escalate thresholds should be tuned against:
+    escalate rate and its reason histogram, precedent hit rate, state_hash
+    stability, and a type-error count that must stay at zero on registered
+    schemas. Makes no provider calls.
+    """
+    from ncp.mcp.server import make_handlers
+
+    temp_dir: tempfile.TemporaryDirectory | None = None
+    if store_path is None:
+        temp_dir = tempfile.TemporaryDirectory()
+        root = Path(temp_dir.name)
+        store_path = root / "decision_dogfood.db"
+    else:
+        root = Path(cwd) if cwd is not None else Path(store_path).parent
+
+    try:
+        config = load_config(cwd=root)
+        store = SQLiteStore(Path(store_path))
+        handlers = make_handlers(store, config=config)
+
+        # Seed evidence for every slot in the workflow.
+        for slot, _schema_id, sentences, src in DECISION_WORKFLOW_SLOTS:
+            for sentence in sentences:
+                handlers["ncp_write_memory"]({
+                    "content": f"{slot}: {sentence}",
+                    "layer": "semantic",
+                    "src": src,
+                    "agent_id": "dogfood_seeder",
+                    "pipeline_id": pipeline_id,
+                })
+
+        escalate_count = 0
+        reason_histogram: dict[str, int] = {}
+        precedent_hits = 0
+        reuse_basis: dict[str, int] = {}
+        type_errors = 0
+        recorded = 0
+        hash_by_slot: dict[str, str] = {}
+        hash_unstable: list[str] = []
+        compiles = 0
+
+        degraded_escalates = 0
+        degraded_reasons: dict[str, int] = {}
+
+        for turn in range(max(1, turns)):
+            slot, schema_id, _sentences, _src = DECISION_WORKFLOW_SLOTS[turn % len(DECISION_WORKFLOW_SLOTS)]
+            compiled = handlers["ncp_compile_decision_query"]({
+                "agent_id": "dogfood_agent",
+                "role": "decider",
+                "task": f"resolve-{slot}",
+                "slot": slot,
+                "intent": "close-the-slot",
+                "schema_id": schema_id,
+                "pipeline_id": pipeline_id,
+            })
+            compiles += 1
+
+            state_hash = str(compiled["state_hash"])
+            if slot in hash_by_slot and hash_by_slot[slot] != state_hash:
+                hash_unstable.append(slot)
+            hash_by_slot.setdefault(slot, state_hash)
+
+            if compiled["escalate"]:
+                escalate_count += 1
+            for reason in compiled["escalate_reasons"]:  # type: ignore[union-attr]
+                reason_histogram[str(reason)] = reason_histogram.get(str(reason), 0) + 1
+            if "suggested_choice" in compiled:
+                precedent_hits += 1
+                basis = str(compiled.get("suggested_basis", "unknown"))
+                reuse_basis[basis] = reuse_basis.get(basis, 0) + 1
+
+            choice = _rule_backend_choice(schema_id, int(compiled["evidence_count"]))
+            result = handlers["ncp_record_decision"]({
+                "decision": f"{slot}-resolved",
+                "rationale": "rule backend over compiled evidence",
+                "agent_id": "dogfood_agent",
+                "schema_id": schema_id,
+                "slot": slot,
+                "choice": choice,
+                "confidence": round(float(compiled["joint_confidence"]), 4),
+                "confidence_source": "backend_claimed",
+                "backend": "rule",
+                "state_hash": state_hash,
+                "chunk_ids": [e["chunk_id"] for e in compiled["state"]["evidence"]],  # type: ignore[index]
+                "pipeline_id": pipeline_id,
+            })
+            if not result.get("recorded"):
+                # A type error on a registered schema is a protocol bug, not a
+                # tuning knob. This counter must stay at zero.
+                type_errors += 1
+                continue
+            recorded += 1
+            handlers["ncp_record_outcome"]({
+                "success": True,
+                "chunk_ids": [e["chunk_id"] for e in compiled["state"]["evidence"]],  # type: ignore[index]
+                "decision_id": result["decision_id"],
+            })
+
+        # Degraded pass: the clean workflow above never trips escalate, so on
+        # its own it cannot tell a working escalate path from a dead one. Here
+        # each slot is compiled again under drift above the 0.40 line and an
+        # unregistered schema, which must raise reasons rather than stay quiet.
+        for slot, _schema_id, _sentences, _src in DECISION_WORKFLOW_SLOTS:
+            degraded = handlers["ncp_compile_decision_query"]({
+                "agent_id": "dogfood_agent",
+                "role": "decider",
+                "task": f"resolve-{slot}",
+                "slot": slot,
+                "intent": "close-the-slot",
+                "schema_id": "dogfood.unregistered.schema",
+                "pipeline_id": pipeline_id,
+                "drift_score": 0.55,
+                "pressure": "critical",
+            })
+            if degraded["escalate"]:
+                degraded_escalates += 1
+            for reason in degraded["escalate_reasons"]:  # type: ignore[union-attr]
+                degraded_reasons[str(reason)] = degraded_reasons.get(str(reason), 0) + 1
+
+        confidences = [
+            d.confidence for d in store.query_decisions(pipeline_id=pipeline_id, k=1000)
+        ]
+        return {
+            "loop": "decision_workflow",
+            "pipeline_id": pipeline_id,
+            "turns": compiles,
+            "slots": [slot for slot, _s, _e, _src in DECISION_WORKFLOW_SLOTS],
+            "decisions_recorded": recorded,
+            "type_error_rate": round(type_errors / compiles, 4) if compiles else 0.0,
+            "escalate_rate": round(escalate_count / compiles, 4) if compiles else 0.0,
+            "escalate_reasons": dict(sorted(reason_histogram.items())),
+            "precedent_hit_rate": round(precedent_hits / compiles, 4) if compiles else 0.0,
+            "reuse_basis": dict(sorted(reuse_basis.items())),
+            "evidence_tiers": sorted({src for _s, _sc, _e, src in DECISION_WORKFLOW_SLOTS}),
+            "degraded_escalate_rate": round(
+                degraded_escalates / len(DECISION_WORKFLOW_SLOTS), 4
+            ),
+            "degraded_escalate_reasons": dict(sorted(degraded_reasons.items())),
+            "state_hash_stable": not hash_unstable,
+            "unstable_slots": sorted(set(hash_unstable)),
+            "joint_confidence_mean": (
+                round(sum(confidences) / len(confidences), 4) if confidences else 0.0
+            ),
+            "joint_confidence_min": round(min(confidences), 4) if confidences else 0.0,
+            "joint_confidence_max": round(max(confidences), 4) if confidences else 0.0,
+            "escalate_min_confidence": config.decisions_escalate_min_confidence,
+            "precedent_min_confidence": config.decisions_precedent_min_confidence,
+            "provider_calls": 0,
+            "summary": {
+                # Type errors are the only hard gate. The rest are readings to
+                # tune against, not pass/fail criteria -- an escalate rate is
+                # only meaningful next to the workload that produced it.
+                # Three hard gates. Everything else is a reading to tune
+                # against: an escalate rate only means something next to the
+                # workload that produced it.
+                "pass": (
+                    type_errors == 0
+                    and not hash_unstable
+                    and degraded_escalates == len(DECISION_WORKFLOW_SLOTS)
+                ),
+                "type_errors": type_errors,
+            },
+        }
+    finally:
+        if temp_dir is not None:
+            temp_dir.cleanup()

@@ -42,7 +42,7 @@ from ncp.stores.retrieval import (
     score_vector_distance,
 )
 from ncp.tokens import estimate_tokens
-from ncp.types import CalibrationReport, ChunkEdge, ConsolidationReport, ConsciousBlock, NCPResponse, OutcomeRecord, SubconsciousChunk, TurnRecord, Whisper
+from ncp.types import CalibrationReport, ChunkEdge, ConsolidationReport, ConsciousBlock, DecisionRecord, NCPResponse, OutcomeRecord, SubconsciousChunk, TurnRecord, Whisper
 
 logger = logging.getLogger("ncp")
 
@@ -265,6 +265,37 @@ CREATE TABLE IF NOT EXISTS {schema}.{prefix}dissent_log (
     created_at DOUBLE PRECISION NOT NULL,
     PRIMARY KEY (chunk_id, identity_id)
 );
+
+-- Typed decision contract (spec 4h). Mirrors migration 014 so a fresh
+-- install and a migrated install converge on the same shape.
+CREATE TABLE IF NOT EXISTS {schema}.{prefix}decisions (
+    decision_id TEXT PRIMARY KEY,
+    schema_id TEXT NOT NULL,
+    schema_version INTEGER NOT NULL DEFAULT 1,
+    slot TEXT NOT NULL,
+    pipeline_id TEXT,
+    agent_id TEXT,
+    options TEXT NOT NULL DEFAULT '[]',
+    choice TEXT NOT NULL DEFAULT 'null',
+    probs TEXT NOT NULL DEFAULT '{{}}',
+    -- DOUBLE PRECISION, not REAL: Postgres REAL is float4 (~7 digits), which
+    -- loses tens of seconds off a unix timestamp. See migration 014.
+    confidence DOUBLE PRECISION NOT NULL,
+    confidence_source TEXT NOT NULL DEFAULT 'self_reported',
+    backend TEXT NOT NULL DEFAULT 'unknown',
+    state_hash TEXT NOT NULL DEFAULT '',
+    chunk_ids TEXT NOT NULL DEFAULT '[]',
+    turn_id TEXT,
+    outcome_id TEXT,
+    rationale TEXT,
+    created_at DOUBLE PRECISION NOT NULL
+);
+CREATE INDEX IF NOT EXISTS {prefix}decisions_schema_slot_idx
+    ON {schema}.{prefix}decisions (schema_id, slot, created_at DESC);
+CREATE INDEX IF NOT EXISTS {prefix}decisions_state_hash_idx
+    ON {schema}.{prefix}decisions (state_hash);
+CREATE INDEX IF NOT EXISTS {prefix}decisions_pipeline_idx
+    ON {schema}.{prefix}decisions (pipeline_id, created_at DESC);
 """
 
 
@@ -674,6 +705,7 @@ class PgvectorStore(BaseStore):
         diversity_limit: int = 2,
         fallback_to_trust_recency: bool = False,
         as_of: float | None = None,
+        allow_embedding: bool = True,
     ) -> list[SubconsciousChunk]:
         _VALID_RETRIEVAL_MODES = ("hybrid", "trust_recency", "vector")
         if retrieval_mode not in _VALID_RETRIEVAL_MODES:
@@ -681,13 +713,15 @@ class PgvectorStore(BaseStore):
                 f"Unknown retrieval_mode {retrieval_mode!r}; expected one of {_VALID_RETRIEVAL_MODES}"
             )
 
+        if retrieval_mode == "vector" and embedding is None and not allow_embedding:
+            raise ValueError("vector retrieval requires an embedding when allow_embedding=False")
         if retrieval_mode == "vector":
             return self._query_vector(
                 text=text, embedding=embedding, k=k, min_score=min_score,
                 layer=layer, pipeline_id=pipeline_id, scope=scope, zone=zone,
                 diversity_limit=diversity_limit, as_of=as_of,
             )
-        if embedding is None and self._embedding_adapter is not None:
+        if allow_embedding and embedding is None and self._embedding_adapter is not None:
             embedding = self._try_embed(text, pipeline_id=pipeline_id, op="query")
         if embedding is not None and len(embedding) != 1536:
             raise ValueError(f"embedding must have 1536 dimensions, got {len(embedding)}")
@@ -1349,6 +1383,200 @@ class PgvectorStore(BaseStore):
                         outcome.note,
                         outcome.created_at,
                     ),
+                )
+                connection.commit()
+                return cursor.rowcount > 0
+            finally:
+                self._close_cursor(cursor)
+
+    @staticmethod
+    def _row_to_outcome(row: dict[str, Any]) -> OutcomeRecord:
+        return OutcomeRecord(
+            outcome_id=str(row["outcome_id"]), turn_id=row["turn_id"],
+            chunk_ids=json.loads(row["chunk_ids"]) if row["chunk_ids"] else [],
+            success=bool(row["success"]), weight=float(row["weight"]),
+            note=row["note"], created_at=float(row["created_at"]),
+            consumed=bool(row["consumed"]),
+        )
+
+    def get_outcome(self, outcome_id: str) -> OutcomeRecord | None:
+        with self._connect() as connection:
+            cursor = connection.cursor()
+            try:
+                cursor.execute(
+                    self._sql("SELECT * FROM {schema}.{prefix}outcomes WHERE outcome_id = %s"),
+                    (outcome_id,),
+                )
+                rows = self._fetchall(cursor)
+            finally:
+                self._close_cursor(cursor)
+        return self._row_to_outcome(rows[0]) if rows else None
+
+    # ── typed decisions (spec 4h) ─────────────────────────────────────────
+
+    _DECISION_COLUMNS = (
+        "decision_id, schema_id, schema_version, slot, pipeline_id, agent_id,"
+        " options, choice, probs, confidence, confidence_source, backend,"
+        " state_hash, chunk_ids, turn_id, outcome_id, rationale, created_at"
+    )
+
+    @staticmethod
+    def _decision_params(decision: DecisionRecord) -> tuple[object, ...]:
+        return (
+            decision.decision_id,
+            decision.schema_id,
+            decision.schema_version,
+            decision.slot,
+            decision.pipeline_id,
+            decision.agent_id,
+            json.dumps(decision.options),
+            # JSON, not str(): a bool choice must come back a bool and an
+            # object choice must come back a dict.
+            json.dumps(decision.choice),
+            json.dumps(decision.probs),
+            decision.confidence,
+            decision.confidence_source,
+            decision.backend,
+            decision.state_hash,
+            json.dumps(decision.chunk_ids),
+            decision.turn_id,
+            decision.outcome_id,
+            decision.rationale,
+            decision.created_at,
+        )
+
+    @staticmethod
+    def _row_to_decision(row: Sequence[Any]) -> DecisionRecord:
+        return DecisionRecord(
+            decision_id=str(row[0]),
+            schema_id=str(row[1]),
+            schema_version=int(row[2]),
+            slot=str(row[3]),
+            pipeline_id=row[4],
+            agent_id=row[5],
+            options=json.loads(row[6]) if row[6] else [],
+            choice=json.loads(row[7]) if row[7] is not None else "",
+            probs=json.loads(row[8]) if row[8] else {},
+            confidence=float(row[9]),
+            confidence_source=str(row[10]),
+            backend=str(row[11]),
+            state_hash=str(row[12] or ""),
+            chunk_ids=json.loads(row[13]) if row[13] else [],
+            turn_id=row[14],
+            outcome_id=row[15],
+            rationale=row[16],
+            created_at=float(row[17]),
+        )
+
+    @staticmethod
+    def _decision_filters(
+        *,
+        schema_id: str | None,
+        slot: str | None,
+        pipeline_id: str | None,
+        backend: str | None,
+        min_confidence: float,
+    ) -> tuple[str, list[object]]:
+        clauses = ["confidence >= %s"]
+        params: list[object] = [float(min_confidence)]
+        for column, value in (
+            ("schema_id", schema_id),
+            ("slot", slot),
+            ("pipeline_id", pipeline_id),
+            ("backend", backend),
+        ):
+            if value is not None:
+                clauses.append(f"{column} = %s")
+                params.append(value)
+        return " AND ".join(clauses), params
+
+    def record_decision_record(self, decision: DecisionRecord) -> bool:
+        with self._connect() as connection:
+            cursor = connection.cursor()
+            try:
+                cursor.execute(
+                    self._sql(
+                        f"INSERT INTO {{schema}}.{{prefix}}decisions ({self._DECISION_COLUMNS})"
+                        " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+                        " ON CONFLICT (decision_id) DO UPDATE SET"
+                        " outcome_id = EXCLUDED.outcome_id, confidence = EXCLUDED.confidence,"
+                        " confidence_source = EXCLUDED.confidence_source"
+                    ),
+                    self._decision_params(decision),
+                )
+                connection.commit()
+                return cursor.rowcount > 0
+            finally:
+                self._close_cursor(cursor)
+
+    def get_decision(self, decision_id: str) -> DecisionRecord | None:
+        with self._connect() as connection:
+            cursor = connection.cursor()
+            try:
+                cursor.execute(
+                    self._sql(
+                        f"SELECT {self._DECISION_COLUMNS} FROM {{schema}}.{{prefix}}decisions"
+                        " WHERE decision_id = %s"
+                    ),
+                    (decision_id,),
+                )
+                row = cursor.fetchone()
+            finally:
+                self._close_cursor(cursor)
+        return None if row is None else self._row_to_decision(row)
+
+    def query_decisions(
+        self,
+        *,
+        schema_id: str | None = None,
+        slot: str | None = None,
+        state_hash: str | None = None,
+        pipeline_id: str | None = None,
+        backend: str | None = None,
+        min_confidence: float = 0.0,
+        k: int = 5,
+    ) -> list[DecisionRecord]:
+        where, params = self._decision_filters(
+            schema_id=schema_id,
+            slot=slot,
+            pipeline_id=pipeline_id,
+            backend=backend,
+            min_confidence=min_confidence,
+        )
+        if state_hash:
+            order = (
+                "ORDER BY CASE WHEN state_hash = %s THEN 0 ELSE 1 END,"
+                " created_at DESC, confidence DESC"
+            )
+            order_params: list[object] = [state_hash]
+        else:
+            order = "ORDER BY created_at DESC, confidence DESC"
+            order_params = []
+        with self._connect() as connection:
+            cursor = connection.cursor()
+            try:
+                cursor.execute(
+                    self._sql(
+                        f"SELECT {self._DECISION_COLUMNS} FROM {{schema}}.{{prefix}}decisions"
+                        f" WHERE {where} {order} LIMIT %s"
+                    ),
+                    (*params, *order_params, max(1, int(k))),
+                )
+                rows = cursor.fetchall()
+            finally:
+                self._close_cursor(cursor)
+        return [self._row_to_decision(row) for row in rows]
+
+    def link_decision_outcome(self, decision_id: str, outcome_id: str) -> bool:
+        with self._connect() as connection:
+            cursor = connection.cursor()
+            try:
+                cursor.execute(
+                    self._sql(
+                        "UPDATE {schema}.{prefix}decisions SET outcome_id = %s"
+                        " WHERE decision_id = %s"
+                    ),
+                    (outcome_id, decision_id),
                 )
                 connection.commit()
                 return cursor.rowcount > 0

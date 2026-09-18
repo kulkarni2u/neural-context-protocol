@@ -44,6 +44,7 @@ from ncp.types import (
     ConsolidationReport,
     ConsciousBlock,
     NCPResponse,
+    DecisionRecord,
     OutcomeRecord,
     SubconsciousChunk,
     TurnRecord,
@@ -237,6 +238,31 @@ CREATE TABLE IF NOT EXISTS outcomes (
     consumed INTEGER NOT NULL DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS decisions (
+    decision_id TEXT PRIMARY KEY,
+    schema_id TEXT NOT NULL,
+    schema_version INTEGER NOT NULL DEFAULT 1,
+    slot TEXT NOT NULL,
+    pipeline_id TEXT,
+    agent_id TEXT,
+    options TEXT NOT NULL DEFAULT '[]',
+    choice TEXT NOT NULL DEFAULT 'null',
+    probs TEXT NOT NULL DEFAULT '{}',
+    confidence REAL NOT NULL,
+    confidence_source TEXT NOT NULL DEFAULT 'self_reported',
+    backend TEXT NOT NULL DEFAULT 'unknown',
+    state_hash TEXT NOT NULL DEFAULT '',
+    chunk_ids TEXT NOT NULL DEFAULT '[]',
+    turn_id TEXT,
+    outcome_id TEXT,
+    rationale TEXT,
+    created_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_decisions_schema_slot ON decisions(schema_id, slot, created_at);
+CREATE INDEX IF NOT EXISTS idx_decisions_state_hash ON decisions(state_hash);
+CREATE INDEX IF NOT EXISTS idx_decisions_pipeline ON decisions(pipeline_id, created_at);
+
 CREATE TABLE IF NOT EXISTS memo_entries (
     signature TEXT PRIMARY KEY,
     task TEXT NOT NULL,
@@ -395,6 +421,12 @@ class SQLiteStore(BaseStore):
                 "CREATE TABLE IF NOT EXISTS reputation (identity_id TEXT PRIMARY KEY, alpha REAL NOT NULL DEFAULT 1.0, beta REAL NOT NULL DEFAULT 1.0, obs_count INTEGER NOT NULL DEFAULT 0, last_updated REAL NOT NULL DEFAULT 0.0)",
                 "CREATE INDEX IF NOT EXISTS idx_reputation_updated ON reputation(last_updated)",
                 "CREATE TABLE IF NOT EXISTS dissent_log (chunk_id TEXT NOT NULL, identity_id TEXT NOT NULL, created_at REAL NOT NULL, PRIMARY KEY (chunk_id, identity_id))",  # CAP-T5
+                # Decision contract (spec 4h). Additive: an existing database
+                # opens and keeps every chunk, it just gains an empty table.
+                "CREATE TABLE IF NOT EXISTS decisions (decision_id TEXT PRIMARY KEY, schema_id TEXT NOT NULL, schema_version INTEGER NOT NULL DEFAULT 1, slot TEXT NOT NULL, pipeline_id TEXT, agent_id TEXT, options TEXT NOT NULL DEFAULT '[]', choice TEXT NOT NULL DEFAULT 'null', probs TEXT NOT NULL DEFAULT '{}', confidence REAL NOT NULL, confidence_source TEXT NOT NULL DEFAULT 'self_reported', backend TEXT NOT NULL DEFAULT 'unknown', state_hash TEXT NOT NULL DEFAULT '', chunk_ids TEXT NOT NULL DEFAULT '[]', turn_id TEXT, outcome_id TEXT, rationale TEXT, created_at REAL NOT NULL)",
+                "CREATE INDEX IF NOT EXISTS idx_decisions_schema_slot ON decisions(schema_id, slot, created_at)",
+                "CREATE INDEX IF NOT EXISTS idx_decisions_state_hash ON decisions(state_hash)",
+                "CREATE INDEX IF NOT EXISTS idx_decisions_pipeline ON decisions(pipeline_id, created_at)",
                 "INSERT INTO chunks_fts(chunks_fts) VALUES ('rebuild')",
             ):
                 try:
@@ -622,6 +654,7 @@ class SQLiteStore(BaseStore):
         diversity_limit: int = 2,
         fallback_to_trust_recency: bool = False,
         as_of: float | None = None,
+        allow_embedding: bool = True,
     ) -> list[SubconsciousChunk]:
         _VALID_RETRIEVAL_MODES = ("hybrid", "trust_recency", "vector")
         if retrieval_mode not in _VALID_RETRIEVAL_MODES:
@@ -629,7 +662,8 @@ class SQLiteStore(BaseStore):
                 f"Unknown retrieval_mode {retrieval_mode!r}; expected one of {_VALID_RETRIEVAL_MODES}"
             )
         if (
-            embedding is None
+            allow_embedding
+            and embedding is None
             and self._embedding_adapter is not None
             and retrieval_mode in {"hybrid", "vector"}
         ):
@@ -1063,6 +1097,21 @@ class SQLiteStore(BaseStore):
                 ),
             )
             return True
+
+    def get_outcome(self, outcome_id: str) -> OutcomeRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM outcomes WHERE outcome_id = ?", (outcome_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        return OutcomeRecord(
+            outcome_id=str(row["outcome_id"]), turn_id=row["turn_id"],
+            chunk_ids=json.loads(row["chunk_ids"]) if row["chunk_ids"] else [],
+            success=bool(row["success"]), weight=float(row["weight"]),
+            note=row["note"], created_at=float(row["created_at"]),
+            consumed=bool(row["consumed"]),
+        )
 
     def list_outcomes(
         self,
@@ -2790,6 +2839,126 @@ class SQLiteStore(BaseStore):
             }
             for row in rows
         ]
+
+    # ── typed decisions (spec 4h) ─────────────────────────────────────────
+
+    @staticmethod
+    def _decision_to_row(decision: DecisionRecord) -> tuple[object, ...]:
+        return (
+            decision.decision_id,
+            decision.schema_id,
+            decision.schema_version,
+            decision.slot,
+            decision.pipeline_id,
+            decision.agent_id,
+            json.dumps(decision.options),
+            # choice is a JSON scalar-or-object, so it round-trips as JSON
+            # rather than str() -- otherwise True comes back as "True" and a
+            # dict choice comes back as a Python repr that json can't read.
+            json.dumps(decision.choice),
+            json.dumps(decision.probs),
+            decision.confidence,
+            decision.confidence_source,
+            decision.backend,
+            decision.state_hash,
+            json.dumps(decision.chunk_ids),
+            decision.turn_id,
+            decision.outcome_id,
+            decision.rationale,
+            decision.created_at,
+        )
+
+    @staticmethod
+    def _row_to_decision(row: object) -> DecisionRecord:
+        return DecisionRecord(
+            decision_id=str(row["decision_id"]),
+            schema_id=str(row["schema_id"]),
+            schema_version=int(row["schema_version"]),
+            slot=str(row["slot"]),
+            pipeline_id=row["pipeline_id"],
+            agent_id=row["agent_id"],
+            options=json.loads(row["options"]) if row["options"] else [],
+            choice=json.loads(row["choice"]) if row["choice"] is not None else "",
+            probs=json.loads(row["probs"]) if row["probs"] else {},
+            confidence=float(row["confidence"]),
+            confidence_source=str(row["confidence_source"]),
+            backend=str(row["backend"]),
+            state_hash=str(row["state_hash"] or ""),
+            chunk_ids=json.loads(row["chunk_ids"]) if row["chunk_ids"] else [],
+            turn_id=row["turn_id"],
+            outcome_id=row["outcome_id"],
+            rationale=row["rationale"],
+            created_at=float(row["created_at"]),
+        )
+
+    def record_decision_record(self, decision: DecisionRecord) -> bool:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO decisions (
+                    decision_id, schema_id, schema_version, slot, pipeline_id, agent_id,
+                    options, choice, probs, confidence, confidence_source, backend,
+                    state_hash, chunk_ids, turn_id, outcome_id, rationale, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                self._decision_to_row(decision),
+            )
+            return True
+
+    def get_decision(self, decision_id: str) -> DecisionRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM decisions WHERE decision_id = ?", (decision_id,)
+            ).fetchone()
+        return None if row is None else self._row_to_decision(row)
+
+    def query_decisions(
+        self,
+        *,
+        schema_id: str | None = None,
+        slot: str | None = None,
+        state_hash: str | None = None,
+        pipeline_id: str | None = None,
+        backend: str | None = None,
+        min_confidence: float = 0.0,
+        k: int = 5,
+    ) -> list[DecisionRecord]:
+        clauses: list[str] = ["confidence >= ?"]
+        params: list[object] = [float(min_confidence)]
+        for column, value in (
+            ("schema_id", schema_id),
+            ("slot", slot),
+            ("pipeline_id", pipeline_id),
+            ("backend", backend),
+        ):
+            if value is not None:
+                clauses.append(f"{column} = ?")
+                params.append(value)
+        where = f"WHERE {' AND '.join(clauses)}"
+
+        # Exact state_hash first, then recency and confidence. SQLite sorts
+        # the CASE column ascending, so the 0 bucket (an exact match) leads.
+        if state_hash:
+            order = "ORDER BY CASE WHEN state_hash = ? THEN 0 ELSE 1 END, created_at DESC, confidence DESC"
+            order_params: list[object] = [state_hash]
+        else:
+            order = "ORDER BY created_at DESC, confidence DESC"
+            order_params = []
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM decisions {where} {order} LIMIT ?",
+                [*params, *order_params, max(1, int(k))],
+            ).fetchall()
+        return [self._row_to_decision(row) for row in rows]
+
+    def link_decision_outcome(self, decision_id: str, outcome_id: str) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE decisions SET outcome_id = ? WHERE decision_id = ?",
+                (outcome_id, decision_id),
+            )
+            return cursor.rowcount > 0
 
     def query_precedents(
         self,

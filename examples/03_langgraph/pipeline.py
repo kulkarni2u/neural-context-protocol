@@ -47,13 +47,16 @@ import tempfile
 
 from langgraph.graph import END, StateGraph
 
+import ncp
 from ncp.assembler import Assembler
+from ncp.config import NCPConfig, load_config
 from ncp.stores.memo import compute_memo_signature
 from ncp.stores.sqlite import SQLiteStore
 from ncp.tokens import estimate_tokens
 from ncp.types import (
     BudgetContext,
     ConsciousBlock,
+    DecisionRecord,
     NCPResponse,
     SubconsciousChunk,
     Whisper,
@@ -83,6 +86,7 @@ class PipelineState(TypedDict):
     last_message: str
     context_tokens: dict[str, int]
     whisper_delivered: bool
+    handoff_verdicts: list[str]
 
 
 def _agent(agent_id: str, role: str, owns: list[str], task: str, slot: str, intent: str) -> ConsciousBlock:
@@ -115,6 +119,56 @@ def _memoized_work(store: SQLiteStore, *, task: str, context: str, work_fn: Call
     result = work_fn()
     store.record_memo(signature=signature, task=task, chunk_ids=[], result_summary=result)
     return result, False
+
+
+def _decide(
+    store: SQLiteStore,
+    config: NCPConfig,
+    *,
+    conscious: ConsciousBlock,
+    schema_id: str,
+    backend_fn: Callable[[dict, list], object],
+) -> tuple[object, bool]:
+    """Resolve one typed decision slot: compile -> backend -> record.
+
+    This is the spec 4h decision contract, called in-process against the store
+    the same way ``_memoized_work`` calls the memo contract. Nothing here is
+    LangGraph-specific: any harness that can build a ``ConsciousBlock`` runs
+    the identical three steps, over MCP or over HTTP if it does not embed NCP.
+
+    ``backend_fn(state, questions) -> choice`` is whatever decides. Here it is
+    a plain rule, because the point is that NCP does not care: a rule, a
+    JSON-mode cheap model, a schema-constrained model and a human are all the
+    same shape to the bus. Returns ``(choice, reused_precedent)``.
+    """
+    packet = ncp.compile_decision_query(
+        agent=conscious, schema_id=schema_id, store=store, config=config
+    )
+
+    # A prior decision over the same state, confident enough and not linked to
+    # a failed outcome. Reuse skips the backend call entirely; NCP surfaces the
+    # candidate but never applies it, so the harness makes this call.
+    if not packet["escalate"] and "suggested_choice" in packet:
+        return packet["suggested_choice"], True
+
+    choice = backend_fn(packet["state"], packet["questions"])
+    ncp.record_decision(
+        DecisionRecord(
+            schema_id=schema_id,
+            slot=conscious.slot,
+            pipeline_id=PIPELINE_ID,
+            agent_id=conscious.agent_id,
+            choice=choice,
+            confidence=float(packet["joint_confidence"]),
+            confidence_source="backend_claimed",
+            backend="rule",
+            state_hash=str(packet["state_hash"]),
+            chunk_ids=[e["chunk_id"] for e in packet["state"]["evidence"]],
+        ),
+        store=store,
+        config=config,
+    )
+    return choice, False
 
 
 def _post_turn(
@@ -157,10 +211,11 @@ def _post_turn(
     )
 
 
-def make_graph(store: SQLiteStore) -> StateGraph:
+def make_graph(store: SQLiteStore, config: NCPConfig | None = None) -> StateGraph:
     """Build the planner -> executor -> reviewer LangGraph over a shared NCP store."""
 
     assembler = Assembler(store=store)
+    resolved_config = config or load_config(cwd=Path(tempfile.gettempdir()))
 
     def planner_node(state: PipelineState) -> PipelineState:
         round_no = state["round"]
@@ -287,12 +342,45 @@ def make_graph(store: SQLiteStore) -> StateGraph:
                 print(f"[round {round_no}] reviewer  received whisper from executor: ask={data.get('ask')!r}")
                 whisper_delivered = True
 
+        # "Accept this handoff?" is a decision slot, not a writing task: the
+        # answer is one of three values. It goes through the spec 4h contract
+        # instead of a generating model -- compile, decide, record.
+        # NOTE the task name: "review_handoff", not "review_round_{n}".
+        # `task` is part of the state identity that state_hash covers, so a
+        # task string carrying a round counter is a different state every
+        # round and can never match a precedent. Naming the *decision* rather
+        # than the iteration is what makes reuse possible -- round 2 below
+        # reuses round 1's verdict and skips the backend entirely.
+        accept_conscious = _agent(
+            agent_id="reviewer",
+            role="review",
+            owns=["review"],
+            task="review_handoff",
+            slot="handoff-accept",
+            intent="check_handoff_quality",
+        )
+        verdict, reused = _decide(
+            store,
+            resolved_config,
+            conscious=accept_conscious,
+            schema_id="ncp.handoff.accept",
+            # A rule, deliberately. Swap in a JSON-mode model call or a human
+            # prompt and nothing else in this function changes.
+            backend_fn=lambda state, questions: (
+                "accept" if state["evidence"] and whisper_delivered else "defer"
+            ),
+        )
+        reuse_note = " (precedent reused, backend skipped)" if reused else ""
+        print(f"[round {round_no}] reviewer  handoff-accept={verdict}{reuse_note}")
+
         # >>> real model call would go here <<<
         review_text, memo_hit = _memoized_work(
             store,
             task=conscious.task,
             context=conscious.slot,
-            work_fn=lambda: f"review round {round_no}: handoff acknowledged, no blocking issues",
+            work_fn=lambda: (
+                f"review round {round_no}: handoff {verdict}, no blocking issues"
+            ),
         )
 
         context_tokens = estimate_tokens(assembly.context)
@@ -314,6 +402,7 @@ def make_graph(store: SQLiteStore) -> StateGraph:
             "last_message": review_text,
             "context_tokens": new_tokens,
             "whisper_delivered": whisper_delivered,
+            "handoff_verdicts": [*state["handoff_verdicts"], str(verdict)],
             "round": round_no + 1,
         }
 
@@ -336,7 +425,8 @@ def main() -> dict[str, object]:
 
     with tempfile.TemporaryDirectory(prefix="ncp_langgraph_") as tmp:
         store = SQLiteStore(Path(tmp) / "store.db")
-        graph = make_graph(store).compile()
+        config = load_config(cwd=Path(tmp))
+        graph = make_graph(store, config).compile()
 
         initial_state: PipelineState = {
             "pipeline_id": PIPELINE_ID,
@@ -345,6 +435,7 @@ def main() -> dict[str, object]:
             "last_message": "kickoff: build a small bounded feature",
             "context_tokens": {},
             "whisper_delivered": False,
+            "handoff_verdicts": [],
         }
 
         final_state = graph.invoke(initial_state)
@@ -354,6 +445,8 @@ def main() -> dict[str, object]:
             "final_context_tokens": final_state["context_tokens"],
             "whisper_delivered": final_state["whisper_delivered"],
             "turn_record_count": store.status()["turn_record_count"],
+            "handoff_verdicts": final_state["handoff_verdicts"],
+            "decisions_recorded": len(store.query_decisions(pipeline_id=PIPELINE_ID, k=100)),
         }
         return result
 

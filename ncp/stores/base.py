@@ -14,6 +14,7 @@ from ncp.types import (
     ConsolidationReport,
     ConsciousBlock,
     NCPResponse,
+    DecisionRecord,
     OutcomeRecord,
     SubconsciousChunk,
     TurnRecord,
@@ -68,6 +69,7 @@ class BaseStore(ABC):
         diversity_limit: int = 2,
         fallback_to_trust_recency: bool = False,
         as_of: float | None = None,
+        allow_embedding: bool = True,
     ) -> list[SubconsciousChunk]:
         """Query stored chunks by text relevance.
 
@@ -79,6 +81,9 @@ class BaseStore(ABC):
         - ``"vector"``: cosine search using stored embeddings.
           Requires ``embedding`` to be provided or an embedding adapter
           configured.  Pgvector uses ANN; SQLite uses a brute-force scan.
+
+        ``allow_embedding=False`` forbids automatic provider embedding calls;
+        caller-supplied vectors remain usable. Defaults to True for normal retrieval.
 
         ``diversity_limit`` caps the number of results per author
         (``written_by``).  Default 2 preserves existing behavior.
@@ -177,6 +182,13 @@ class BaseStore(ABC):
     async def async_record_outcome(self, outcome: OutcomeRecord) -> bool:
         """Asynchronously record a task outcome."""
         return await anyio.to_thread.run_sync(self.record_outcome, outcome)
+
+    def get_outcome(self, outcome_id: str) -> OutcomeRecord | None:
+        """Fetch an outcome by ID, including consumed outcomes, without a scan limit."""
+        return None
+
+    async def async_get_outcome(self, outcome_id: str) -> OutcomeRecord | None:
+        return await anyio.to_thread.run_sync(self.get_outcome, outcome_id)
 
     def list_outcomes(
         self,
@@ -553,6 +565,79 @@ class BaseStore(ABC):
           hop, matching legacy behavior).
         """
 
+    def record_decision_record(self, decision: "DecisionRecord") -> bool:
+        """Persist a typed ``DecisionRecord``. Returns True when a row landed.
+
+        Distinct from the legacy ``ncp_record_decision`` MCP tool, which writes
+        a rationale-shaped ``reasoning_trace`` chunk; that path still works and
+        now additionally adapts into a DecisionRecord.
+        """
+        raise NotImplementedError("record_decision_record not implemented for this backend")
+
+    def get_decision(self, decision_id: str) -> "DecisionRecord | None":
+        """Fetch one decision by id, or None when it is not in this store."""
+        raise NotImplementedError("get_decision not implemented for this backend")
+
+    def query_decisions(
+        self,
+        *,
+        schema_id: str | None = None,
+        slot: str | None = None,
+        state_hash: str | None = None,
+        pipeline_id: str | None = None,
+        backend: str | None = None,
+        min_confidence: float = 0.0,
+        k: int = 5,
+    ) -> list["DecisionRecord"]:
+        """Precedent lookup over typed decisions.
+
+        Ranking contract: exact ``state_hash`` matches first, then same
+        ``schema_id`` + ``slot`` by recency and confidence. Rationale text is
+        never the ranker -- it is optional commentary, not the match key.
+        """
+        raise NotImplementedError("query_decisions not implemented for this backend")
+
+    def link_decision_outcome(self, decision_id: str, outcome_id: str) -> bool:
+        """Attach an outcome id to an existing decision. False when unknown."""
+        raise NotImplementedError("link_decision_outcome not implemented for this backend")
+
+    async def async_record_decision_record(self, decision: "DecisionRecord") -> bool:
+        """Asynchronously persist a typed decision using thread pool."""
+        return await anyio.to_thread.run_sync(self.record_decision_record, decision)
+
+    async def async_get_decision(self, decision_id: str) -> "DecisionRecord | None":
+        """Asynchronously fetch one decision using thread pool."""
+        return await anyio.to_thread.run_sync(self.get_decision, decision_id)
+
+    async def async_query_decisions(
+        self,
+        *,
+        schema_id: str | None = None,
+        slot: str | None = None,
+        state_hash: str | None = None,
+        pipeline_id: str | None = None,
+        backend: str | None = None,
+        min_confidence: float = 0.0,
+        k: int = 5,
+    ) -> list["DecisionRecord"]:
+        """Asynchronously query precedent decisions using thread pool."""
+        fn = partial(
+            self.query_decisions,
+            schema_id=schema_id,
+            slot=slot,
+            state_hash=state_hash,
+            pipeline_id=pipeline_id,
+            backend=backend,
+            min_confidence=min_confidence,
+            k=k,
+        )
+        return await anyio.to_thread.run_sync(fn)
+
+    async def async_link_decision_outcome(self, decision_id: str, outcome_id: str) -> bool:
+        """Asynchronously attach an outcome id to a decision using thread pool."""
+        fn = partial(self.link_decision_outcome, decision_id, outcome_id)
+        return await anyio.to_thread.run_sync(fn)
+
     def query_precedents(
         self,
         query: str,
@@ -665,6 +750,7 @@ class BaseStore(ABC):
         retrieval_mode: str = "hybrid",
         embedding: list[float] | None = None,
         as_of: float | None = None,
+        allow_embedding: bool = True,
     ) -> list[SubconsciousChunk]:
         """Asynchronously query stored chunks by text relevance using thread pool."""
         fn = partial(
@@ -678,6 +764,7 @@ class BaseStore(ABC):
             zone=zone,
             retrieval_mode=retrieval_mode,
             embedding=embedding,
+            allow_embedding=allow_embedding,
             as_of=as_of,
         )
         return await anyio.to_thread.run_sync(fn)

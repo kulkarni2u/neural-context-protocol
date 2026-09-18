@@ -440,3 +440,64 @@ def test_pgvector_live_record_dissent_dedups_per_identity() -> None:
         if c.chunk_id == "sub_live_dissent"
     )
     assert chunk.dissent_count == 3
+
+
+def test_pgvector_decision_record_roundtrip_and_precedents() -> None:
+    """Typed decisions survive a store restart and rank exact state_hash first."""
+    from ncp.types import DecisionRecord
+
+    store = _pgvector_store()
+    match = DecisionRecord(
+        schema_id="ncp.slot.continue_or_escalate",
+        slot="auth",
+        choice="continue",
+        options=["continue", "escalate", "stop"],
+        probs={"continue": 0.8, "escalate": 0.15, "stop": 0.05},
+        # Deliberately a value needing full float8 precision. 0.88 survives a
+        # float4 column by accident -- Postgres emits the shortest text form
+        # that round-trips as float4 ("0.88") and Python parses it back exactly
+        # -- so a low-precision column only shows up on a value like this one,
+        # or on a unix timestamp.
+        confidence=1.0 / 3.0,
+        backend="rule",
+        state_hash="a" * 64,
+        chunk_ids=["sub_auth"],
+        pipeline_id="pipe_it",
+    )
+    other = DecisionRecord(
+        schema_id="ncp.slot.continue_or_escalate",
+        slot="auth",
+        choice="escalate",
+        confidence=0.60,
+        backend="human",
+        state_hash="b" * 64,
+        pipeline_id="pipe_it",
+    )
+    assert store.record_decision_record(match) is True
+    assert store.record_decision_record(other) is True
+
+    # Restart: a fresh store instance against the same schema must return the
+    # identical canonical JSON, not just equal-ish fields.
+    reopened = PgvectorStore(store.dsn, schema=store.schema, table_prefix="it_")
+    fetched = reopened.get_decision(match.decision_id)
+    assert fetched is not None
+    assert fetched.canonical_json() == match.canonical_json()
+    assert fetched.choice == "continue"
+
+    # `other` is newer, but the exact state_hash match must still lead.
+    ranked = reopened.query_decisions(
+        schema_id="ncp.slot.continue_or_escalate",
+        slot="auth",
+        state_hash="a" * 64,
+        k=5,
+    )
+    assert [d.decision_id for d in ranked][0] == match.decision_id
+
+    assert fetched.confidence == 1.0 / 3.0
+    assert fetched.created_at == match.created_at
+
+    # min_confidence filters, and outcome linkage persists.
+    assert all(d.confidence >= 0.30 for d in reopened.query_decisions(min_confidence=0.30))
+    assert reopened.link_decision_outcome(match.decision_id, "out_it_1") is True
+    assert reopened.get_decision(match.decision_id).outcome_id == "out_it_1"
+    assert reopened.link_decision_outcome("dec_missing", "out_it_2") is False

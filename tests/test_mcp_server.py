@@ -38,6 +38,8 @@ FULL_NON_MEMO_TOOL_NAMES = [
     "ncp_improve",
     "ncp_fetch",
     "ncp_record_decision",
+    "ncp_get_decision",
+    "ncp_compile_decision_query",
     "ncp_record_outcome",
 ]
 
@@ -256,6 +258,8 @@ class TestToolsList:
             "ncp_improve",
             "ncp_fetch",
             "ncp_record_decision",
+            "ncp_get_decision",
+            "ncp_compile_decision_query",
             "ncp_record_outcome",
             "ncp_lookup_memo",
             "ncp_record_memo",

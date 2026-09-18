@@ -49,9 +49,10 @@ curl -s $BASE/mcp -H "$AUTH" -H 'Content-Type: application/json' -d '{
 }'
 ```
 
-Returns the six tools: `ncp_get_context`, `ncp_write_memory`,
-`ncp_emit_whisper`, `ncp_post_turn`, `ncp_fetch`, `ncp_record_decision`, each
-with a JSON Schema under `inputSchema`.
+Returns the enabled tool catalog — `ncp_get_context`, `ncp_write_memory`,
+`ncp_emit_whisper`, `ncp_post_turn`, `ncp_fetch`, `ncp_record_decision`,
+`ncp_get_decision`, `ncp_compile_decision_query`, `ncp_record_outcome` and the
+memo tools when enabled — each with a JSON Schema under `inputSchema`.
 
 ## Tool calls
 
@@ -243,6 +244,81 @@ The decoded result is:
 {"recorded": true, "chunk_id": "...", "outcome": "succeeded",
  "tag_count": 2, "evidence_count": 2}
 ```
+
+Since NCP 1.7.0 this call additionally adapts into a typed `DecisionRecord`
+(spec §4h) with `schema_id: "legacy.untyped"`, so the decision is durable and
+queryable rather than only parseable out of chunk text. The choice is taken
+from `decision` — what was decided — not from `rationale`.
+
+### ncp_record_decision — typed decision (spec §4h)
+
+Supplying any typed field selects the typed path:
+
+```bash
+curl -s $BASE/mcp -H "$AUTH" -H 'Content-Type: application/json' -d '{
+  "jsonrpc": "2.0", "id": 8, "method": "tools/call",
+  "params": {"name": "ncp_record_decision", "arguments": {
+    "decision": "continue-with-backoff",
+    "rationale": "two independent traces agree on transient failure",
+    "agent_id": "executor", "pipeline_id": "pipe_demo",
+    "schema_id": "ncp.slot.continue_or_escalate", "slot": "retry-policy",
+    "choice": "continue", "options": ["continue", "escalate", "stop"],
+    "probs": {"continue": 0.8, "escalate": 0.15, "stop": 0.05},
+    "confidence": 0.9, "backend": "system_one",
+    "confidence_source": "backend_claimed",
+    "state_hash": "<from ncp_compile_decision_query>",
+    "chunk_ids": ["chunk_abc", "chunk_def"]
+  }}}'
+```
+
+`schema_id` is required on the typed path. `schema_version` defaults to the
+current registered version; an explicitly stale version is rejected. Zero
+confidence is preserved. A registered schema validates the choice and the
+prob keys; a mismatch returns
+`{"recorded": false, "error": "schema_mismatch", "details": "..."}` and writes
+no row. On success `recorded` reports the typed row and `trace_chunk_written`
+reports the legacy chunk separately — they differ when two decisions share
+identical prose and the chunk hits write-time dedup.
+
+### ncp_get_decision — read one typed decision
+
+```bash
+curl -s $BASE/mcp -H "$AUTH" -H 'Content-Type: application/json' -d '{
+  "jsonrpc": "2.0", "id": 9, "method": "tools/call",
+  "params": {"name": "ncp_get_decision", "arguments": {
+    "decision_id": "dec_3f2a91c4be07"
+  }}}'
+```
+
+Returns `{"found": true, "decision": {...}}` in canonical form — identical
+bytes across processes for the same stored decision.
+
+### ncp_compile_decision_query — compile a decision packet
+
+```bash
+curl -s $BASE/mcp -H "$AUTH" -H 'Content-Type: application/json' -d '{
+  "jsonrpc": "2.0", "id": 10, "method": "tools/call",
+  "params": {"name": "ncp_compile_decision_query", "arguments": {
+    "agent_id": "executor", "role": "implementer",
+    "task": "fix-auth", "slot": "retry-policy", "intent": "unblock-login",
+    "schema_id": "ncp.slot.continue_or_escalate",
+    "pipeline_id": "pipe_demo", "k": 6
+  }}}'
+```
+
+Returns `state` (conscious fields plus bounded evidence), `questions` the
+backend must answer, a stable `state_hash`, up to three `precedents`, advisory
+`joint_confidence` and `contradiction_mass`, and `escalate` with
+`escalate_reasons` from a closed set. Makes zero provider calls.
+
+`escalate_reasons` never names a model: NCP says *why* a stronger backend is
+warranted, and the host decides *which one*. When `escalate` is false and a
+`suggested_choice` is present, a prior decision over the same state is
+available for reuse — NCP still does not apply it. Reuse requires the current
+schema version and a choice valid under that schema. A linked failed, missing,
+or unreadable outcome blocks reuse, regardless of confidence or outcome age.
+The packet includes `schema_version` for clients recording the decision.
+Compilation suppresses automatic embedding calls on every store backend.
 
 ## Streaming
 
