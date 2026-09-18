@@ -4,6 +4,15 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [Unreleased]
 
+## [1.6.1] - 2026-09-17
+
+### Release scope
+
+This patch release includes the initial typed Decision API implementation and
+correctness fixes. The Decision API remains incomplete and under active
+development; this release does not mark its completion. Existing legacy
+decision calls remain supported.
+
 ### Added
 
 - **Typed decision contract (spec §4h)** (`ncp/types.py`, `ncp/decisions.py`,
