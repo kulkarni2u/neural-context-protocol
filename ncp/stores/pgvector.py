@@ -15,7 +15,7 @@ from typing import Any
 import time
 
 from ncp.config import NCPConfig
-from ncp.stores.base import BaseStore, NCPStoreUnavailableError
+from ncp.stores.base import BaseStore, NCPStoreUnavailableError, _validate_turn_chunk_relation
 from ncp.stores.bitemporal import collect_successor_ids, filter_bitemporal
 from ncp.stores.calibration import (
     FeedbackRow,
@@ -23,7 +23,7 @@ from ncp.stores.calibration import (
     compute_feedback_updates,
     rollup_reputation,
 )
-from ncp.stores.consolidation import cluster_by_tags, find_merge_candidates
+from ncp.stores.consolidation import cluster_by_tags, find_merge_candidates, split_current_and_historical
 from ncp.stores.graph import (
     backfill_edges_for_chunk,
     infer_edges_for_chunk,
@@ -45,6 +45,8 @@ from ncp.tokens import estimate_tokens
 from ncp.types import CalibrationReport, ChunkEdge, ConsolidationReport, ConsciousBlock, DecisionRecord, NCPResponse, OutcomeRecord, SubconsciousChunk, TurnRecord, Whisper
 
 logger = logging.getLogger("ncp")
+
+_IN_BATCH = 500  # ids per IN (...) query
 
 
 PGVECTOR_SCHEMA_TEMPLATE = """
@@ -219,6 +221,13 @@ CREATE TABLE IF NOT EXISTS {schema}.{prefix}outcomes (
     consumed INTEGER NOT NULL DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS {schema}.{prefix}outcome_applications (
+    outcome_id TEXT NOT NULL,
+    chunk_id TEXT NOT NULL,
+    applied_at DOUBLE PRECISION NOT NULL,
+    PRIMARY KEY (outcome_id, chunk_id)
+);
+
 CREATE TABLE IF NOT EXISTS {schema}.{prefix}memo_entries (
     signature TEXT PRIMARY KEY,
     task TEXT NOT NULL,
@@ -264,6 +273,15 @@ CREATE TABLE IF NOT EXISTS {schema}.{prefix}dissent_log (
     identity_id TEXT NOT NULL,
     created_at DOUBLE PRECISION NOT NULL,
     PRIMARY KEY (chunk_id, identity_id)
+);
+
+-- Turn-to-chunk associations for turn-based outcomes. Mirrors migration 015.
+CREATE TABLE IF NOT EXISTS {schema}.{prefix}turn_chunks (
+    turn_id TEXT NOT NULL,
+    chunk_id TEXT NOT NULL,
+    relation TEXT NOT NULL,
+    created_at DOUBLE PRECISION NOT NULL,
+    PRIMARY KEY (turn_id, chunk_id, relation)
 );
 
 -- Typed decision contract (spec 4h). Mirrors migration 014 so a fresh
@@ -1115,44 +1133,54 @@ class PgvectorStore(BaseStore):
         *,
         edge_types: Sequence[str] | None = None,
         direction: str = "out",
-        limit: int = 200,
+        limit: int | None = 200,
     ) -> list[ChunkEdge]:
         if direction not in ("out", "in", "both"):
             raise ValueError(f"Unknown direction {direction!r}; expected 'out', 'in', or 'both'")
         unique_ids = [cid for cid in dict.fromkeys(chunk_ids) if cid]
         if not unique_ids:
             return []
-        placeholders = ", ".join(["%s"] * len(unique_ids))
-        params: list[object] = []
-        if direction == "out":
-            where = f"src_chunk_id IN ({placeholders})"
-            params.extend(unique_ids)
-        elif direction == "in":
-            where = f"dst_chunk_id IN ({placeholders})"
-            params.extend(unique_ids)
-        else:
-            where = f"(src_chunk_id IN ({placeholders}) OR dst_chunk_id IN ({placeholders}))"
-            params.extend(unique_ids)
-            params.extend(unique_ids)
-        if edge_types:
-            type_placeholders = ", ".join(["%s"] * len(edge_types))
-            where += f" AND edge_type IN ({type_placeholders})"
-            params.extend(edge_types)
-        capped_limit = max(0, int(limit))
+        capped_limit = None if limit is None else max(0, int(limit))
+        edge_type_list = list(edge_types) if edge_types else []
+        collected: dict[str, dict[str, Any]] = {}
         with self._connect() as connection:
-            cursor = connection.cursor()
-            try:
-                cursor.execute(
-                    self._sql(
-                        f"SELECT * FROM {{schema}}.{{prefix}}chunk_edges WHERE {where}"
-                        " ORDER BY created_at DESC LIMIT %s"
-                    ),
-                    (*params, capped_limit),
+            for start in range(0, len(unique_ids), _IN_BATCH):
+                batch = unique_ids[start:start + _IN_BATCH]
+                placeholders = ", ".join(["%s"] * len(batch))
+                params: list[object] = []
+                if direction == "out":
+                    where = f"src_chunk_id IN ({placeholders})"
+                    params.extend(batch)
+                elif direction == "in":
+                    where = f"dst_chunk_id IN ({placeholders})"
+                    params.extend(batch)
+                else:
+                    where = f"(src_chunk_id IN ({placeholders}) OR dst_chunk_id IN ({placeholders}))"
+                    params.extend(batch)
+                    params.extend(batch)
+                if edge_type_list:
+                    type_placeholders = ", ".join(["%s"] * len(edge_type_list))
+                    where += f" AND edge_type IN ({type_placeholders})"
+                    params.extend(edge_type_list)
+                sql = (
+                    f"SELECT * FROM {{schema}}.{{prefix}}chunk_edges WHERE {where}"
+                    " ORDER BY created_at DESC"
                 )
-                rows = self._fetchall(cursor)
-            finally:
-                self._close_cursor(cursor)
-        return [self._row_to_chunk_edge(row) for row in rows]
+                if capped_limit is not None:
+                    sql += " LIMIT %s"
+                    params.append(capped_limit)
+                cursor = connection.cursor()
+                try:
+                    cursor.execute(self._sql(sql), tuple(params))
+                    rows = self._fetchall(cursor)
+                finally:
+                    self._close_cursor(cursor)
+                for row in rows:
+                    collected.setdefault(str(row["edge_id"]), row)
+        merged = sorted(collected.values(), key=lambda r: float(r["created_at"]), reverse=True)
+        if capped_limit is not None:
+            merged = merged[:capped_limit]
+        return [self._row_to_chunk_edge(row) for row in merged]
 
     @staticmethod
     def _row_to_chunk_edge(row: dict[str, Any]) -> ChunkEdge:
@@ -1352,6 +1380,30 @@ class PgvectorStore(BaseStore):
             finally:
                 self._close_cursor(cursor)
 
+    def link_turn_chunks(self, turn_id: str, chunk_ids: Sequence[str], *, relation: str) -> int:
+        _validate_turn_chunk_relation(relation)
+        unique = list(dict.fromkeys(str(c) for c in chunk_ids if c))
+        if not turn_id or not unique:
+            return 0
+        now = time.time()
+        created = 0
+        with self._connect() as connection:
+            cursor = connection.cursor()
+            try:
+                for chunk_id in unique:
+                    cursor.execute(
+                        self._sql(
+                            "INSERT INTO {schema}.{prefix}turn_chunks (turn_id, chunk_id, relation, created_at)"
+                            " VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING"
+                        ),
+                        (turn_id, chunk_id, relation, now),
+                    )
+                    created += max(0, cursor.rowcount)
+                connection.commit()
+            finally:
+                self._close_cursor(cursor)
+        return created
+
     def record_outcome(self, outcome: OutcomeRecord) -> bool:
         chunk_ids = outcome.chunk_ids
         with self._connect() as connection:
@@ -1361,13 +1413,22 @@ class PgvectorStore(BaseStore):
                 if outcome.turn_id and not chunk_ids:
                     cursor.execute(
                         self._sql(
+                            "SELECT chunk_id FROM {schema}.{prefix}turn_chunks WHERE turn_id = %s"
+                            " ORDER BY CASE relation WHEN 'wrote' THEN 0 ELSE 1 END, created_at, chunk_id"
+                        ),
+                        (outcome.turn_id,),
+                    )
+                    linked_rows = cursor.fetchall()
+                    cursor.execute(
+                        self._sql(
                             "SELECT chunk_id FROM {schema}.{prefix}chunks"
                             " WHERE caused_by = %s OR conscious_hash = %s"
                         ),
                         (outcome.turn_id, outcome.turn_id),
                     )
-                    rows = cursor.fetchall()
-                    chunk_ids = [str(r[0]) for r in rows]
+                    legacy_rows = cursor.fetchall()
+                    # Explicit links first, then legacy match; de-duplicated.
+                    chunk_ids = list(dict.fromkeys(str(r[0]) for r in [*linked_rows, *legacy_rows]))
                 cursor.execute(
                     self._sql(
                         "INSERT INTO {schema}.{prefix}outcomes"
@@ -2390,6 +2451,9 @@ class PgvectorStore(BaseStore):
                 self._close_cursor(cursor)
 
         all_chunks = [self._row_to_chunk(row) for row in rows]
+        # Historical (superseded / expired) versions are never merge candidates.
+        all_chunks, historical = split_current_and_historical(all_chunks)
+        report.skipped += len(historical)
         eligible = [c for c in all_chunks if c.base_trust >= trust_floor]
         report.skipped += len(all_chunks) - len(eligible)
         clusters = cluster_by_tags(eligible)
@@ -2414,6 +2478,14 @@ class PgvectorStore(BaseStore):
                                 cursor.execute(
                                     self._sql("DELETE FROM {schema}.{prefix}chunks WHERE chunk_id = %s"),
                                     (loser_id,),
+                                )
+                                # Repoint historical rows so version chains never dangle.
+                                cursor.execute(
+                                    self._sql(
+                                        "UPDATE {schema}.{prefix}chunks"
+                                        " SET superseded_by = %s WHERE superseded_by = %s"
+                                    ),
+                                    (keeper.chunk_id, loser_id),
                                 )
                                 cursor.execute(
                                     self._sql(
@@ -2594,6 +2666,7 @@ class PgvectorStore(BaseStore):
 
                 # CAP-T3: initialize outcome tracking
                 consumed_outcome_ids: list[str] = []
+                applied_now: list[tuple[str, str]] = []
                 if feedback_mode and feedback_rows:
                     # WI-G3: chunks without a caused_by scalar (e.g. edges added
                     # via the MCP edges arg only) still get an ancestor via a
@@ -2601,7 +2674,7 @@ class PgvectorStore(BaseStore):
                     missing_parent_ids = [row.chunk_id for row in feedback_rows if not row.caused_by]
                     if missing_parent_ids and propagation_factor > 0.0 and propagation_max_hops > 0:
                         fallback_edges = self.get_chunk_edges(
-                            missing_parent_ids, edge_types=["caused_by"], direction="out"
+                            missing_parent_ids, edge_types=["caused_by"], direction="out", limit=None
                         )
                         fallback_parent = resolve_caused_by_fallback(fallback_edges)
                         if fallback_parent:
@@ -2615,9 +2688,29 @@ class PgvectorStore(BaseStore):
                     outcomes = self._load_unconsumed_outcomes(connection)
                     outcome_evidence = None
                     if outcomes:
-                        from ncp.stores.calibration import compute_outcome_evidence
-                        outcome_evidence = compute_outcome_evidence(outcomes)
-                        consumed_outcome_ids = [o.outcome_id for o in outcomes]
+                        from ncp.stores.calibration import (
+                            compute_outcome_evidence,
+                            scope_outcomes_to_rows,
+                            settled_outcome_ids,
+                        )
+                        prior_pairs = self._load_outcome_applications(
+                            connection, [o.outcome_id for o in outcomes]
+                        )
+                        scoped = scope_outcomes_to_rows(
+                            outcomes, {r.chunk_id for r in feedback_rows}, prior_pairs
+                        )
+                        if scoped:
+                            outcome_evidence = compute_outcome_evidence(scoped)
+                        applied_now = [
+                            (o.outcome_id, cid) for o in scoped for cid in o.chunk_ids
+                        ]
+                        calibratable = self._calibratable_chunk_ids(
+                            connection,
+                            [cid for o in outcomes for cid in o.chunk_ids],
+                        )
+                        consumed_outcome_ids = settled_outcome_ids(
+                            outcomes, prior_pairs | set(applied_now), calibratable
+                        )
 
                     fb = compute_feedback_updates(
                         feedback_rows,
@@ -2689,6 +2782,7 @@ class PgvectorStore(BaseStore):
                             )
                         finally:
                             self._close_cursor(reset_cursor)
+                    self._record_outcome_applications(connection, applied_now, now=now)
                     if consumed_outcome_ids:
                         self._mark_outcomes_consumed(connection, consumed_outcome_ids)
 
@@ -3008,6 +3102,79 @@ class PgvectorStore(BaseStore):
                 consumed=bool(row["consumed"]),
             ))
         return results
+
+    def _load_outcome_applications(
+        self, connection: Any, outcome_ids: Sequence[str]
+    ) -> set[tuple[str, str]]:
+        pairs: set[tuple[str, str]] = set()
+        ids = list(dict.fromkeys(outcome_ids))
+        for start in range(0, len(ids), _IN_BATCH):
+            batch = ids[start:start + _IN_BATCH]
+            placeholders = ",".join(["%s"] * len(batch))
+            cursor = connection.cursor()
+            try:
+                cursor.execute(
+                    self._sql(
+                        "SELECT outcome_id, chunk_id FROM {schema}.{prefix}outcome_applications"
+                        f" WHERE outcome_id IN ({placeholders})"
+                    ),
+                    tuple(batch),
+                )
+                rows = self._fetchall(cursor)
+            finally:
+                self._close_cursor(cursor)
+            for row in rows:
+                pairs.add((str(row["outcome_id"]), str(row["chunk_id"])))
+        return pairs
+
+    def _calibratable_chunk_ids(
+        self, connection: Any, chunk_ids: Sequence[str]
+    ) -> set[str]:
+        """Chunk ids that still exist, are not tombstoned and are not user_verified."""
+        found: set[str] = set()
+        ids = list(dict.fromkeys(chunk_ids))
+        for start in range(0, len(ids), _IN_BATCH):
+            batch = ids[start:start + _IN_BATCH]
+            placeholders = ",".join(["%s"] * len(batch))
+            cursor = connection.cursor()
+            try:
+                cursor.execute(
+                    self._sql(
+                        "SELECT chunk_id FROM {schema}.{prefix}chunks"
+                        f" WHERE chunk_id IN ({placeholders})"
+                        " AND src != 'user_verified'"
+                        " AND chunk_id NOT IN (SELECT chunk_id FROM {schema}.{prefix}tombstones)"
+                    ),
+                    tuple(batch),
+                )
+                rows = self._fetchall(cursor)
+            finally:
+                self._close_cursor(cursor)
+            found.update(str(row["chunk_id"]) for row in rows)
+        return found
+
+    def _record_outcome_applications(
+        self,
+        connection: Any,
+        pairs: Sequence[tuple[str, str]],
+        *,
+        now: float,
+    ) -> None:
+        if not pairs:
+            return
+        cursor = connection.cursor()
+        try:
+            for oid, cid in pairs:
+                cursor.execute(
+                    self._sql(
+                        "INSERT INTO {schema}.{prefix}outcome_applications"
+                        " (outcome_id, chunk_id, applied_at) VALUES (%s, %s, %s)"
+                        " ON CONFLICT (outcome_id, chunk_id) DO NOTHING"
+                    ),
+                    (oid, cid, now),
+                )
+        finally:
+            self._close_cursor(cursor)
 
     def _mark_outcomes_consumed(
         self, connection: Any, outcome_ids: list[str]

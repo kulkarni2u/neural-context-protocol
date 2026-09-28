@@ -22,6 +22,17 @@ from ncp.types import (
 )
 
 
+TURN_CHUNK_RELATIONS: frozenset[str] = frozenset({"wrote", "retrieved"})
+
+
+def _validate_turn_chunk_relation(relation: str) -> str:
+    if relation not in TURN_CHUNK_RELATIONS:
+        raise ValueError(
+            f"invalid turn-chunk relation {relation!r}; expected one of {sorted(TURN_CHUNK_RELATIONS)}"
+        )
+    return relation
+
+
 class NCPStoreError(RuntimeError):
     """Base class for store-related failures."""
 
@@ -176,8 +187,31 @@ class BaseStore(ABC):
         the chunks that turn wrote + retrieved) or ``chunk_ids``.  The outcome
         evidence feeds into calibration as the primary trust signal in place of
         retrieval counts.  Backends that do not implement this return False.
+
+        Turn resolution: when only ``turn_id`` is given, the chunk set is the
+        chunks explicitly linked to that turn via ``link_turn_chunks`` (both
+        ``wrote`` and ``retrieved`` relations, written-first then by link
+        time), UNIONed with any chunk whose legacy ``caused_by`` or
+        ``conscious_hash`` equals the turn id, de-duplicated with a stable
+        order.  ``Assembler.post_turn`` and ``ncp_post_turn`` create the links.
         """
         return False
+
+    def link_turn_chunks(self, turn_id: str, chunk_ids: Sequence[str], *, relation: str) -> int:
+        """Associate chunks with a turn so turn-based outcomes can resolve them.
+
+        ``relation`` is ``'wrote'`` (the turn persisted the chunk) or
+        ``'retrieved'`` (the chunk was served as context to the turn); any
+        other value raises ``ValueError``.  Idempotent per
+        (turn_id, chunk_id, relation).  Returns the number of new links
+        created.  Backends that do not implement this return 0.
+        """
+        _validate_turn_chunk_relation(relation)
+        return 0
+
+    async def async_link_turn_chunks(self, turn_id: str, chunk_ids: Sequence[str], *, relation: str) -> int:
+        """Asynchronously link chunks to a turn."""
+        return await anyio.to_thread.run_sync(partial(self.link_turn_chunks, turn_id, chunk_ids, relation=relation))
 
     async def async_record_outcome(self, outcome: OutcomeRecord) -> bool:
         """Asynchronously record a task outcome."""
@@ -238,7 +272,7 @@ class BaseStore(ABC):
         *,
         edge_types: Sequence[str] | None = None,
         direction: str = "out",
-        limit: int = 200,
+        limit: int | None = 200,
     ) -> list[ChunkEdge]:
         """Return typed edges touching ``chunk_ids``.
 
@@ -246,8 +280,10 @@ class BaseStore(ABC):
         ``"out"`` (default) matches edges whose ``src_chunk_id`` is in the
         set, ``"in"`` matches ``dst_chunk_id``, ``"both"`` matches either.
         ``edge_types`` optionally restricts to a subset of the closed edge
-        type set. Backends that do not implement this return an empty list,
-        which disables graph traversal gracefully.
+        type set. ``limit`` caps the newest-first result (default 200);
+        ``None`` means unlimited, for callers (e.g. calibration) that need
+        the complete edge set. Backends that do not implement this return an
+        empty list, which disables graph traversal gracefully.
         """
         return []
 
@@ -284,7 +320,7 @@ class BaseStore(ABC):
         *,
         edge_types: Sequence[str] | None = None,
         direction: str = "out",
-        limit: int = 200,
+        limit: int | None = 200,
     ) -> list[ChunkEdge]:
         """Asynchronously fetch typed chunk edges using thread pool."""
         fn = partial(
@@ -534,7 +570,15 @@ class BaseStore(ABC):
         similarity_threshold: float = 0.65,
         trust_floor: float = 0.10,
     ) -> ConsolidationReport:
-        """Merge redundant chunks and tombstone noise. Returns a report of what changed."""
+        """Merge redundant chunks and tombstone noise. Returns a report of what changed.
+
+        Version-chain rule: only *current* chunks (``superseded_by IS NULL`` and
+        ``valid_to`` unset or in the future) are merge candidates. Historical
+        versions are never keeper or loser (counted in ``report.skipped``) so
+        ``supersede`` history is never deleted. When a current chunk is merged
+        away, historical chunks whose ``superseded_by`` pointed at it are
+        repointed to the keeper in the same transaction.
+        """
 
     @abstractmethod
     def calibrate(

@@ -1,7 +1,8 @@
 # Example Claude Code Conventions
 
 - Start each turn by calling `ncp_get_context`.
-- Record the finished turn with `ncp_post_turn`, passing back `pending_whisper_ids`.
+- Record the finished turn with `ncp_post_turn`, passing back `pending_whisper_ids`
+  and the `retrieved_chunk_ids` from `ncp_get_context`.
 - End each turn by writing durable memory with `ncp_write_memory`.
 - Use `ncp_fetch` only when the active turn needs bounded retrieval.
 - Prefer recent refs and whispers over replaying full chat history.

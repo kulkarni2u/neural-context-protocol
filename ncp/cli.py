@@ -33,7 +33,8 @@ console = Console()
 CLAUDE_MD_TEMPLATE = """# NCP Conventions
 
 - Call `ncp_get_context` at the start of each turn once the MCP server exists.
-- Record the finished turn with `ncp_post_turn`, passing back `pending_whisper_ids`.
+- Record the finished turn with `ncp_post_turn`, passing back `pending_whisper_ids`
+  and the `retrieved_chunk_ids` from `ncp_get_context`.
 - Write durable memory with `ncp_write_memory` at the end of each turn.
 - Keep context bounded and prefer recent refs over full-history replay.
 
