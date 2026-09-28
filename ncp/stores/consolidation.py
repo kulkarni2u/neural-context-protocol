@@ -2,12 +2,34 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ncp.types import SubconsciousChunk
+
+def split_current_and_historical(
+    chunks: list[SubconsciousChunk], *, now: float | None = None
+) -> tuple[list[SubconsciousChunk], list[SubconsciousChunk]]:
+    """Partition chunks into (current, historical).
+
+    Mirrors the retrieval definition of "current" (``superseded_by IS NULL AND
+    (valid_to IS NULL OR valid_to > now)``). Historical chunks -- superseded
+    versions or ones whose validity window has closed -- are retained for
+    ``as_of`` queries and must never be merged, either as keeper or loser.
+    """
+    ts = time.time() if now is None else now
+    current: list[SubconsciousChunk] = []
+    historical: list[SubconsciousChunk] = []
+    for chunk in chunks:
+        superseded = getattr(chunk, "superseded_by", None) is not None
+        valid_to = getattr(chunk, "valid_to", None)
+        expired = valid_to is not None and valid_to <= ts
+        (historical if superseded or expired else current).append(chunk)
+    return current, historical
+
 
 _BM25_CLUSTER_MIN = 5  # use BM25 for clusters >= this size; SequenceMatcher below
 

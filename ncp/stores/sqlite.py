@@ -20,7 +20,7 @@ from ncp.stores.calibration import (
     compute_feedback_updates,
     rollup_reputation,
 )
-from ncp.stores.consolidation import cluster_by_tags, find_merge_candidates
+from ncp.stores.consolidation import cluster_by_tags, find_merge_candidates, split_current_and_historical
 from ncp.stores.graph import (
     backfill_edges_for_chunk,
     infer_edges_for_chunk,
@@ -1972,6 +1972,9 @@ class SQLiteStore(BaseStore):
             rows = connection.execute(query, params).fetchall()
 
             all_chunks = [self._row_to_chunk(row) for row in rows]
+            # Historical (superseded / expired) versions are never merge candidates.
+            all_chunks, historical = split_current_and_historical(all_chunks)
+            report.skipped += len(historical)
             eligible = [c for c in all_chunks if c.base_trust >= trust_floor]
             report.skipped += len(all_chunks) - len(eligible)
             clusters = cluster_by_tags(eligible)
@@ -1993,6 +1996,12 @@ class SQLiteStore(BaseStore):
                         new_gen = keeper.generation + 1
                         for loser_id in loser_ids:
                             connection.execute("DELETE FROM chunks WHERE chunk_id = ?", (loser_id,))
+                            # Keep version chains intact: historical rows that pointed at the
+                            # merged-away loser now point at the surviving keeper.
+                            connection.execute(
+                                "UPDATE chunks SET superseded_by = ? WHERE superseded_by = ?",
+                                (keeper.chunk_id, loser_id),
+                            )
                             connection.execute(
                                 "INSERT OR REPLACE INTO tombstones (chunk_id, forward_ref, tombstoned_at, expires_at)"
                                 " VALUES (?, ?, ?, ?)",

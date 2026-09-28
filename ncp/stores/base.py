@@ -534,7 +534,15 @@ class BaseStore(ABC):
         similarity_threshold: float = 0.65,
         trust_floor: float = 0.10,
     ) -> ConsolidationReport:
-        """Merge redundant chunks and tombstone noise. Returns a report of what changed."""
+        """Merge redundant chunks and tombstone noise. Returns a report of what changed.
+
+        Version-chain rule: only *current* chunks (``superseded_by IS NULL`` and
+        ``valid_to`` unset or in the future) are merge candidates. Historical
+        versions are never keeper or loser (counted in ``report.skipped``) so
+        ``supersede`` history is never deleted. When a current chunk is merged
+        away, historical chunks whose ``superseded_by`` pointed at it are
+        repointed to the keeper in the same transaction.
+        """
 
     @abstractmethod
     def calibrate(
