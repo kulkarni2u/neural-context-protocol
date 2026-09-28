@@ -23,7 +23,7 @@ from ncp.stores.calibration import (
     compute_feedback_updates,
     rollup_reputation,
 )
-from ncp.stores.consolidation import cluster_by_tags, find_merge_candidates
+from ncp.stores.consolidation import cluster_by_tags, find_merge_candidates, split_current_and_historical
 from ncp.stores.graph import (
     backfill_edges_for_chunk,
     infer_edges_for_chunk,
@@ -2390,6 +2390,9 @@ class PgvectorStore(BaseStore):
                 self._close_cursor(cursor)
 
         all_chunks = [self._row_to_chunk(row) for row in rows]
+        # Historical (superseded / expired) versions are never merge candidates.
+        all_chunks, historical = split_current_and_historical(all_chunks)
+        report.skipped += len(historical)
         eligible = [c for c in all_chunks if c.base_trust >= trust_floor]
         report.skipped += len(all_chunks) - len(eligible)
         clusters = cluster_by_tags(eligible)
@@ -2414,6 +2417,14 @@ class PgvectorStore(BaseStore):
                                 cursor.execute(
                                     self._sql("DELETE FROM {schema}.{prefix}chunks WHERE chunk_id = %s"),
                                     (loser_id,),
+                                )
+                                # Repoint historical rows so version chains never dangle.
+                                cursor.execute(
+                                    self._sql(
+                                        "UPDATE {schema}.{prefix}chunks"
+                                        " SET superseded_by = %s WHERE superseded_by = %s"
+                                    ),
+                                    (keeper.chunk_id, loser_id),
                                 )
                                 cursor.execute(
                                     self._sql(

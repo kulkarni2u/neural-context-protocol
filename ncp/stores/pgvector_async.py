@@ -56,7 +56,7 @@ from ncp.stores.calibration import (
     compute_feedback_updates,
     rollup_reputation,
 )
-from ncp.stores.consolidation import cluster_by_tags, find_merge_candidates
+from ncp.stores.consolidation import cluster_by_tags, find_merge_candidates, split_current_and_historical
 from ncp.tokens import estimate_tokens
 from ncp.types import (
     CalibrationReport,
@@ -2600,6 +2600,9 @@ class AsyncPgvectorStore(BaseStore):
                 desc = cur.description
 
         all_chunks = [self._row_to_chunk(self._normalize_row(r, desc)) for r in rows]
+        # Historical (superseded / expired) versions are never merge candidates.
+        all_chunks, historical = split_current_and_historical(all_chunks)
+        report.skipped += len(historical)
         eligible = [c for c in all_chunks if c.base_trust >= trust_floor]
         report.skipped += len(all_chunks) - len(eligible)
         clusters = cluster_by_tags(eligible)
@@ -2626,6 +2629,14 @@ class AsyncPgvectorStore(BaseStore):
                                         " WHERE chunk_id = %s"
                                     ),
                                     (loser_id,),
+                                )
+                                # Repoint historical rows so version chains never dangle.
+                                await cur.execute(
+                                    self._sql(
+                                        "UPDATE {schema}.{prefix}chunks"
+                                        " SET superseded_by = %s WHERE superseded_by = %s"
+                                    ),
+                                    (keeper.chunk_id, loser_id),
                                 )
                                 await cur.execute(
                                     self._sql(
