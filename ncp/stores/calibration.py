@@ -207,6 +207,52 @@ def compute_feedback_updates(
     return result
 
 
+def scope_outcomes_to_rows(
+    outcomes: list[OutcomeRecord],
+    eligible_ids: "set[str] | frozenset[str]",
+    applied_pairs: "set[tuple[str, str]]",
+) -> list[OutcomeRecord]:
+    """Restrict each outcome to chunks this calibration run may still apply it to.
+
+    A chunk is kept when it is in ``eligible_ids`` (the calibrated feedback
+    rows) and the ``(outcome_id, chunk_id)`` pair is not already in
+    ``applied_pairs``. Outcomes left with no chunks are dropped.
+    """
+    scoped: list[OutcomeRecord] = []
+    for out in outcomes:
+        kept = [
+            cid
+            for cid in dict.fromkeys(out.chunk_ids)
+            if cid in eligible_ids and (out.outcome_id, cid) not in applied_pairs
+        ]
+        if not kept:
+            continue
+        scoped.append(out.model_copy(update={"chunk_ids": kept}))
+    return scoped
+
+
+def settled_outcome_ids(
+    outcomes: list[OutcomeRecord],
+    applied_pairs: "set[tuple[str, str]]",
+    calibratable_ids: "set[str] | frozenset[str]",
+) -> list[str]:
+    """Return ids of outcomes whose every chunk is settled.
+
+    A chunk is settled when its pair is in ``applied_pairs`` (previously or
+    just applied) or it is not in ``calibratable_ids`` (missing, tombstoned or
+    ``user_verified``, so it can never receive evidence). Outcomes with no
+    chunk ids are trivially settled.
+    """
+    return [
+        out.outcome_id
+        for out in outcomes
+        if all(
+            (out.outcome_id, cid) in applied_pairs or cid not in calibratable_ids
+            for cid in out.chunk_ids
+        )
+    ]
+
+
 def compute_outcome_evidence(outcomes: list[OutcomeRecord]) -> dict[str, float]:
     """Aggregate outcome evidence into per-chunk deltas.
 
