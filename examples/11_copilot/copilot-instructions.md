@@ -5,7 +5,8 @@ MCP server (`http://127.0.0.1:4242/mcp`, registered in `.vscode/mcp.json`).
 Use it as the shared channel instead of replaying transcripts:
 
 - Start each turn by calling `ncp_get_context`.
-- Record the finished turn with `ncp_post_turn`, passing back `pending_whisper_ids`.
+- Record the finished turn with `ncp_post_turn`, passing back `pending_whisper_ids`
+  and the `retrieved_chunk_ids` from `ncp_get_context`.
 - End each turn by writing durable memory with `ncp_write_memory` (one
   distilled chunk, not raw tool output).
 - Capture significant decisions with `ncp_record_decision`.

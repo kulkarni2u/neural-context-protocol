@@ -3,7 +3,9 @@
 ## Primary path: MCP tools (when `ncp serve` is connected)
 
 - Call `ncp_get_context` at the start of each turn to assemble bounded context.
-- Record the finished turn with `ncp_post_turn`, passing back `pending_whisper_ids`.
+- Record the finished turn with `ncp_post_turn`, passing back `pending_whisper_ids`
+  and the `retrieved_chunk_ids` from `ncp_get_context` (so outcomes recorded
+  by `turn_id` credit the chunks the turn used).
 - Write durable memory with `ncp_write_memory` at the end of each turn.
 - Send bounded signals to other agents with `ncp_emit_whisper`.
 - Mid-turn, retrieve extra context with `ncp_fetch` (max 3 calls per turn).
