@@ -13,7 +13,7 @@ import sqlite3
 import time
 
 from ncp.config import NCPConfig
-from ncp.stores.base import BaseStore, NCPStoreUnavailableError
+from ncp.stores.base import BaseStore, NCPStoreUnavailableError, _validate_turn_chunk_relation
 from ncp.stores.calibration import (
     FeedbackRow,
     ReputationUpdate,
@@ -152,6 +152,14 @@ CREATE TABLE IF NOT EXISTS turn_records (
     result_full TEXT NOT NULL,
     created_at REAL NOT NULL,
     expires_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS turn_chunks (
+    turn_id TEXT NOT NULL,
+    chunk_id TEXT NOT NULL,
+    relation TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    PRIMARY KEY (turn_id, chunk_id, relation)
 );
 
 CREATE TABLE IF NOT EXISTS conscious_log (
@@ -427,6 +435,7 @@ class SQLiteStore(BaseStore):
                 "CREATE INDEX IF NOT EXISTS idx_decisions_schema_slot ON decisions(schema_id, slot, created_at)",
                 "CREATE INDEX IF NOT EXISTS idx_decisions_state_hash ON decisions(state_hash)",
                 "CREATE INDEX IF NOT EXISTS idx_decisions_pipeline ON decisions(pipeline_id, created_at)",
+                "CREATE TABLE IF NOT EXISTS turn_chunks (turn_id TEXT NOT NULL, chunk_id TEXT NOT NULL, relation TEXT NOT NULL, created_at REAL NOT NULL, PRIMARY KEY (turn_id, chunk_id, relation))",
                 "INSERT INTO chunks_fts(chunks_fts) VALUES ('rebuild')",
             ):
                 try:
@@ -1070,17 +1079,42 @@ class SQLiteStore(BaseStore):
             )
             return True
 
+    def link_turn_chunks(self, turn_id: str, chunk_ids: Sequence[str], *, relation: str) -> int:
+        _validate_turn_chunk_relation(relation)
+        unique = list(dict.fromkeys(str(c) for c in chunk_ids if c))
+        if not turn_id or not unique:
+            return 0
+        now = time.time()
+        created = 0
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            for chunk_id in unique:
+                cursor = connection.execute(
+                    "INSERT OR IGNORE INTO turn_chunks (turn_id, chunk_id, relation, created_at)"
+                    " VALUES (?, ?, ?, ?)",
+                    (turn_id, chunk_id, relation, now),
+                )
+                created += max(0, cursor.rowcount)
+        return created
+
     def record_outcome(self, outcome: OutcomeRecord) -> bool:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             chunk_ids = outcome.chunk_ids
             # Resolve turn_id to chunk_ids if turn_id is provided and chunk_ids is empty
             if outcome.turn_id and not chunk_ids:
-                rows = connection.execute(
+                linked = connection.execute(
+                    "SELECT chunk_id FROM turn_chunks WHERE turn_id = ?"
+                    " ORDER BY CASE relation WHEN 'wrote' THEN 0 ELSE 1 END, created_at, chunk_id",
+                    (outcome.turn_id,),
+                ).fetchall()
+                legacy = connection.execute(
                     "SELECT chunk_id FROM chunks WHERE caused_by = ? OR conscious_hash = ?",
                     (outcome.turn_id, outcome.turn_id),
                 ).fetchall()
-                chunk_ids = [str(r["chunk_id"]) for r in rows]
+                # Explicit links first, then the legacy caused_by/conscious_hash
+                # match; de-duplicated, order-stable.
+                chunk_ids = list(dict.fromkeys(str(r["chunk_id"]) for r in [*linked, *legacy]))
             connection.execute(
                 """
                 INSERT INTO outcomes (outcome_id, turn_id, chunk_ids, success, weight, note, created_at, consumed)

@@ -15,7 +15,7 @@ from typing import Any
 import time
 
 from ncp.config import NCPConfig
-from ncp.stores.base import BaseStore, NCPStoreUnavailableError
+from ncp.stores.base import BaseStore, NCPStoreUnavailableError, _validate_turn_chunk_relation
 from ncp.stores.bitemporal import collect_successor_ids, filter_bitemporal
 from ncp.stores.calibration import (
     FeedbackRow,
@@ -264,6 +264,15 @@ CREATE TABLE IF NOT EXISTS {schema}.{prefix}dissent_log (
     identity_id TEXT NOT NULL,
     created_at DOUBLE PRECISION NOT NULL,
     PRIMARY KEY (chunk_id, identity_id)
+);
+
+-- Turn-to-chunk associations for turn-based outcomes. Mirrors migration 015.
+CREATE TABLE IF NOT EXISTS {schema}.{prefix}turn_chunks (
+    turn_id TEXT NOT NULL,
+    chunk_id TEXT NOT NULL,
+    relation TEXT NOT NULL,
+    created_at DOUBLE PRECISION NOT NULL,
+    PRIMARY KEY (turn_id, chunk_id, relation)
 );
 
 -- Typed decision contract (spec 4h). Mirrors migration 014 so a fresh
@@ -1352,6 +1361,30 @@ class PgvectorStore(BaseStore):
             finally:
                 self._close_cursor(cursor)
 
+    def link_turn_chunks(self, turn_id: str, chunk_ids: Sequence[str], *, relation: str) -> int:
+        _validate_turn_chunk_relation(relation)
+        unique = list(dict.fromkeys(str(c) for c in chunk_ids if c))
+        if not turn_id or not unique:
+            return 0
+        now = time.time()
+        created = 0
+        with self._connect() as connection:
+            cursor = connection.cursor()
+            try:
+                for chunk_id in unique:
+                    cursor.execute(
+                        self._sql(
+                            "INSERT INTO {schema}.{prefix}turn_chunks (turn_id, chunk_id, relation, created_at)"
+                            " VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING"
+                        ),
+                        (turn_id, chunk_id, relation, now),
+                    )
+                    created += max(0, cursor.rowcount)
+                connection.commit()
+            finally:
+                self._close_cursor(cursor)
+        return created
+
     def record_outcome(self, outcome: OutcomeRecord) -> bool:
         chunk_ids = outcome.chunk_ids
         with self._connect() as connection:
@@ -1361,13 +1394,22 @@ class PgvectorStore(BaseStore):
                 if outcome.turn_id and not chunk_ids:
                     cursor.execute(
                         self._sql(
+                            "SELECT chunk_id FROM {schema}.{prefix}turn_chunks WHERE turn_id = %s"
+                            " ORDER BY CASE relation WHEN 'wrote' THEN 0 ELSE 1 END, created_at, chunk_id"
+                        ),
+                        (outcome.turn_id,),
+                    )
+                    linked_rows = cursor.fetchall()
+                    cursor.execute(
+                        self._sql(
                             "SELECT chunk_id FROM {schema}.{prefix}chunks"
                             " WHERE caused_by = %s OR conscious_hash = %s"
                         ),
                         (outcome.turn_id, outcome.turn_id),
                     )
-                    rows = cursor.fetchall()
-                    chunk_ids = [str(r[0]) for r in rows]
+                    legacy_rows = cursor.fetchall()
+                    # Explicit links first, then legacy match; de-duplicated.
+                    chunk_ids = list(dict.fromkeys(str(r[0]) for r in [*linked_rows, *legacy_rows]))
                 cursor.execute(
                     self._sql(
                         "INSERT INTO {schema}.{prefix}outcomes"

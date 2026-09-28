@@ -22,6 +22,17 @@ from ncp.types import (
 )
 
 
+TURN_CHUNK_RELATIONS: frozenset[str] = frozenset({"wrote", "retrieved"})
+
+
+def _validate_turn_chunk_relation(relation: str) -> str:
+    if relation not in TURN_CHUNK_RELATIONS:
+        raise ValueError(
+            f"invalid turn-chunk relation {relation!r}; expected one of {sorted(TURN_CHUNK_RELATIONS)}"
+        )
+    return relation
+
+
 class NCPStoreError(RuntimeError):
     """Base class for store-related failures."""
 
@@ -176,8 +187,31 @@ class BaseStore(ABC):
         the chunks that turn wrote + retrieved) or ``chunk_ids``.  The outcome
         evidence feeds into calibration as the primary trust signal in place of
         retrieval counts.  Backends that do not implement this return False.
+
+        Turn resolution: when only ``turn_id`` is given, the chunk set is the
+        chunks explicitly linked to that turn via ``link_turn_chunks`` (both
+        ``wrote`` and ``retrieved`` relations, written-first then by link
+        time), UNIONed with any chunk whose legacy ``caused_by`` or
+        ``conscious_hash`` equals the turn id, de-duplicated with a stable
+        order.  ``Assembler.post_turn`` and ``ncp_post_turn`` create the links.
         """
         return False
+
+    def link_turn_chunks(self, turn_id: str, chunk_ids: Sequence[str], *, relation: str) -> int:
+        """Associate chunks with a turn so turn-based outcomes can resolve them.
+
+        ``relation`` is ``'wrote'`` (the turn persisted the chunk) or
+        ``'retrieved'`` (the chunk was served as context to the turn); any
+        other value raises ``ValueError``.  Idempotent per
+        (turn_id, chunk_id, relation).  Returns the number of new links
+        created.  Backends that do not implement this return 0.
+        """
+        _validate_turn_chunk_relation(relation)
+        return 0
+
+    async def async_link_turn_chunks(self, turn_id: str, chunk_ids: Sequence[str], *, relation: str) -> int:
+        """Asynchronously link chunks to a turn."""
+        return await anyio.to_thread.run_sync(partial(self.link_turn_chunks, turn_id, chunk_ids, relation=relation))
 
     async def async_record_outcome(self, outcome: OutcomeRecord) -> bool:
         """Asynchronously record a task outcome."""

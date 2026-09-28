@@ -27,7 +27,7 @@ import anyio
 import structlog
 
 from ncp.config import NCPConfig
-from ncp.stores.base import BaseStore, NCPStoreUnavailableError
+from ncp.stores.base import BaseStore, NCPStoreUnavailableError, _validate_turn_chunk_relation
 from ncp.stores.bitemporal import collect_successor_ids, filter_bitemporal
 from ncp.stores.graph import (
     backfill_edges_for_chunk,
@@ -1767,6 +1767,28 @@ class AsyncPgvectorStore(BaseStore):
                 )
             return True
 
+    async def async_link_turn_chunks(  # type: ignore[override]
+        self, turn_id: str, chunk_ids: Sequence[str], *, relation: str
+    ) -> int:
+        _validate_turn_chunk_relation(relation)
+        unique = list(dict.fromkeys(str(c) for c in chunk_ids if c))
+        if not turn_id or not unique:
+            return 0
+        now = time.time()
+        created = 0
+        async with self._aconnect() as conn:
+            async with conn.cursor() as cur:
+                for chunk_id in unique:
+                    await cur.execute(
+                        self._sql(
+                            "INSERT INTO {schema}.{prefix}turn_chunks (turn_id, chunk_id, relation, created_at)"
+                            " VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING"
+                        ),
+                        (turn_id, chunk_id, relation, now),
+                    )
+                    created += max(0, cur.rowcount)
+        return created
+
     async def async_record_outcome(self, outcome: OutcomeRecord) -> bool:
         """Persist a task outcome via native async DB I/O."""
         chunk_ids = outcome.chunk_ids
@@ -1775,13 +1797,22 @@ class AsyncPgvectorStore(BaseStore):
                 async with conn.cursor() as cur:
                     await cur.execute(
                         self._sql(
+                            "SELECT chunk_id FROM {schema}.{prefix}turn_chunks WHERE turn_id = %s"
+                            " ORDER BY CASE relation WHEN 'wrote' THEN 0 ELSE 1 END, created_at, chunk_id"
+                        ),
+                        (outcome.turn_id,),
+                    )
+                    linked_rows = await self._afetchall(cur)
+                    await cur.execute(
+                        self._sql(
                             "SELECT chunk_id FROM {schema}.{prefix}chunks"
                             " WHERE caused_by = %s OR conscious_hash = %s"
                         ),
                         (outcome.turn_id, outcome.turn_id),
                     )
-                    rows = await self._afetchall(cur)
-                    chunk_ids = [str(r[0]) for r in rows]
+                    legacy_rows = await self._afetchall(cur)
+                    # Explicit links first, then legacy match; de-duplicated.
+                    chunk_ids = list(dict.fromkeys(str(r[0]) for r in [*linked_rows, *legacy_rows]))
             async with conn.cursor() as cur:
                 await cur.execute(
                     self._sql(
