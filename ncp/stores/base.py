@@ -238,7 +238,7 @@ class BaseStore(ABC):
         *,
         edge_types: Sequence[str] | None = None,
         direction: str = "out",
-        limit: int = 200,
+        limit: int | None = 200,
     ) -> list[ChunkEdge]:
         """Return typed edges touching ``chunk_ids``.
 
@@ -246,8 +246,10 @@ class BaseStore(ABC):
         ``"out"`` (default) matches edges whose ``src_chunk_id`` is in the
         set, ``"in"`` matches ``dst_chunk_id``, ``"both"`` matches either.
         ``edge_types`` optionally restricts to a subset of the closed edge
-        type set. Backends that do not implement this return an empty list,
-        which disables graph traversal gracefully.
+        type set. ``limit`` caps the newest-first result (default 200);
+        ``None`` means unlimited, for callers (e.g. calibration) that need
+        the complete edge set. Backends that do not implement this return an
+        empty list, which disables graph traversal gracefully.
         """
         return []
 
@@ -284,7 +286,7 @@ class BaseStore(ABC):
         *,
         edge_types: Sequence[str] | None = None,
         direction: str = "out",
-        limit: int = 200,
+        limit: int | None = 200,
     ) -> list[ChunkEdge]:
         """Asynchronously fetch typed chunk edges using thread pool."""
         fn = partial(

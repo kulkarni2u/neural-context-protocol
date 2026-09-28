@@ -54,6 +54,8 @@ from ncp.types import (
 logger = logging.getLogger("ncp")
 
 
+_IN_BATCH = 500  # ids per IN (...) query; stays under SQLite's variable limit
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS chunks (
     chunk_id TEXT PRIMARY KEY,
@@ -236,6 +238,13 @@ CREATE TABLE IF NOT EXISTS outcomes (
     note TEXT,
     created_at REAL NOT NULL,
     consumed INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS outcome_applications (
+    outcome_id TEXT NOT NULL,
+    chunk_id TEXT NOT NULL,
+    applied_at REAL NOT NULL,
+    PRIMARY KEY (outcome_id, chunk_id)
 );
 
 CREATE TABLE IF NOT EXISTS decisions (
@@ -427,6 +436,7 @@ class SQLiteStore(BaseStore):
                 "CREATE INDEX IF NOT EXISTS idx_decisions_schema_slot ON decisions(schema_id, slot, created_at)",
                 "CREATE INDEX IF NOT EXISTS idx_decisions_state_hash ON decisions(state_hash)",
                 "CREATE INDEX IF NOT EXISTS idx_decisions_pipeline ON decisions(pipeline_id, created_at)",
+                "CREATE TABLE IF NOT EXISTS outcome_applications (outcome_id TEXT NOT NULL, chunk_id TEXT NOT NULL, applied_at REAL NOT NULL, PRIMARY KEY (outcome_id, chunk_id))",
                 "INSERT INTO chunks_fts(chunks_fts) VALUES ('rebuild')",
             ):
                 try:
@@ -1285,6 +1295,55 @@ class SQLiteStore(BaseStore):
             ))
         return results
 
+    def _load_outcome_applications(
+        self, connection: sqlite3.Connection, outcome_ids: Sequence[str]
+    ) -> set[tuple[str, str]]:
+        pairs: set[tuple[str, str]] = set()
+        ids = list(dict.fromkeys(outcome_ids))
+        for start in range(0, len(ids), _IN_BATCH):
+            batch = ids[start:start + _IN_BATCH]
+            placeholders = ",".join("?" * len(batch))
+            for row in connection.execute(
+                "SELECT outcome_id, chunk_id FROM outcome_applications"
+                f" WHERE outcome_id IN ({placeholders})",
+                batch,
+            ).fetchall():
+                pairs.add((str(row["outcome_id"]), str(row["chunk_id"])))
+        return pairs
+
+    def _calibratable_chunk_ids(
+        self, connection: sqlite3.Connection, chunk_ids: Sequence[str]
+    ) -> set[str]:
+        """Chunk ids that still exist, are not tombstoned and are not user_verified."""
+        found: set[str] = set()
+        ids = list(dict.fromkeys(chunk_ids))
+        for start in range(0, len(ids), _IN_BATCH):
+            batch = ids[start:start + _IN_BATCH]
+            placeholders = ",".join("?" * len(batch))
+            for row in connection.execute(
+                f"SELECT chunk_id FROM chunks WHERE chunk_id IN ({placeholders})"
+                " AND src != 'user_verified'"
+                " AND chunk_id NOT IN (SELECT chunk_id FROM tombstones)",
+                batch,
+            ).fetchall():
+                found.add(str(row["chunk_id"]))
+        return found
+
+    def _record_outcome_applications(
+        self,
+        connection: sqlite3.Connection,
+        pairs: Sequence[tuple[str, str]],
+        *,
+        now: float,
+    ) -> None:
+        if not pairs:
+            return
+        connection.executemany(
+            "INSERT OR IGNORE INTO outcome_applications (outcome_id, chunk_id, applied_at)"
+            " VALUES (?, ?, ?)",
+            [(oid, cid, now) for oid, cid in pairs],
+        )
+
     def _mark_outcomes_consumed(
         self, connection: sqlite3.Connection, outcome_ids: list[str]
     ) -> None:
@@ -1410,35 +1469,44 @@ class SQLiteStore(BaseStore):
         *,
         edge_types: Sequence[str] | None = None,
         direction: str = "out",
-        limit: int = 200,
+        limit: int | None = 200,
     ) -> list[ChunkEdge]:
         if direction not in ("out", "in", "both"):
             raise ValueError(f"Unknown direction {direction!r}; expected 'out', 'in', or 'both'")
         unique_ids = [cid for cid in dict.fromkeys(chunk_ids) if cid]
         if not unique_ids:
             return []
-        placeholders = ",".join("?" * len(unique_ids))
-        params: list[object] = []
-        if direction == "out":
-            where = f"src_chunk_id IN ({placeholders})"
-            params.extend(unique_ids)
-        elif direction == "in":
-            where = f"dst_chunk_id IN ({placeholders})"
-            params.extend(unique_ids)
-        else:
-            where = f"(src_chunk_id IN ({placeholders}) OR dst_chunk_id IN ({placeholders}))"
-            params.extend(unique_ids)
-            params.extend(unique_ids)
-        if edge_types:
-            type_placeholders = ",".join("?" * len(edge_types))
-            where += f" AND edge_type IN ({type_placeholders})"
-            params.extend(edge_types)
-        capped_limit = max(0, int(limit))
+        capped_limit = None if limit is None else max(0, int(limit))
+        edge_type_list = list(edge_types) if edge_types else []
+        collected: dict[str, sqlite3.Row] = {}
         with self._connect() as connection:
-            rows = connection.execute(
-                f"SELECT * FROM chunk_edges WHERE {where} ORDER BY created_at DESC LIMIT ?",
-                [*params, capped_limit],
-            ).fetchall()
+            for start in range(0, len(unique_ids), _IN_BATCH):
+                batch = unique_ids[start:start + _IN_BATCH]
+                placeholders = ",".join("?" * len(batch))
+                params: list[object] = []
+                if direction == "out":
+                    where = f"src_chunk_id IN ({placeholders})"
+                    params.extend(batch)
+                elif direction == "in":
+                    where = f"dst_chunk_id IN ({placeholders})"
+                    params.extend(batch)
+                else:
+                    where = f"(src_chunk_id IN ({placeholders}) OR dst_chunk_id IN ({placeholders}))"
+                    params.extend(batch)
+                    params.extend(batch)
+                if edge_type_list:
+                    type_placeholders = ",".join("?" * len(edge_type_list))
+                    where += f" AND edge_type IN ({type_placeholders})"
+                    params.extend(edge_type_list)
+                sql = f"SELECT * FROM chunk_edges WHERE {where} ORDER BY created_at DESC"
+                if capped_limit is not None:
+                    sql += " LIMIT ?"
+                    params.append(capped_limit)
+                for row in connection.execute(sql, params).fetchall():
+                    collected.setdefault(str(row["edge_id"]), row)
+        rows = sorted(collected.values(), key=lambda r: float(r["created_at"]), reverse=True)
+        if capped_limit is not None:
+            rows = rows[:capped_limit]
         return [self._row_to_chunk_edge(row) for row in rows]
 
     @staticmethod
@@ -2139,6 +2207,7 @@ class SQLiteStore(BaseStore):
 
                 # CAP-T3: initialize outcome tracking
                 consumed_outcome_ids: list[str] = []
+                applied_now: list[tuple[str, str]] = []
                 if feedback_mode and feedback_rows:
                     # WI-G3: chunks without a caused_by scalar (e.g. edges added
                     # via the MCP edges arg only) still get an ancestor via a
@@ -2146,7 +2215,7 @@ class SQLiteStore(BaseStore):
                     missing_parent_ids = [row.chunk_id for row in feedback_rows if not row.caused_by]
                     if missing_parent_ids and propagation_factor > 0.0 and propagation_max_hops > 0:
                         fallback_edges = self.get_chunk_edges(
-                            missing_parent_ids, edge_types=["caused_by"], direction="out"
+                            missing_parent_ids, edge_types=["caused_by"], direction="out", limit=None
                         )
                         fallback_parent = resolve_caused_by_fallback(fallback_edges)
                         if fallback_parent:
@@ -2160,9 +2229,29 @@ class SQLiteStore(BaseStore):
                     outcomes = self._load_unconsumed_outcomes(connection)
                     outcome_evidence = None
                     if outcomes:
-                        from ncp.stores.calibration import compute_outcome_evidence
-                        outcome_evidence = compute_outcome_evidence(outcomes)
-                        consumed_outcome_ids = [o.outcome_id for o in outcomes]
+                        from ncp.stores.calibration import (
+                            compute_outcome_evidence,
+                            scope_outcomes_to_rows,
+                            settled_outcome_ids,
+                        )
+                        prior_pairs = self._load_outcome_applications(
+                            connection, [o.outcome_id for o in outcomes]
+                        )
+                        scoped = scope_outcomes_to_rows(
+                            outcomes, {r.chunk_id for r in feedback_rows}, prior_pairs
+                        )
+                        if scoped:
+                            outcome_evidence = compute_outcome_evidence(scoped)
+                        applied_now = [
+                            (o.outcome_id, cid) for o in scoped for cid in o.chunk_ids
+                        ]
+                        calibratable = self._calibratable_chunk_ids(
+                            connection,
+                            [cid for o in outcomes for cid in o.chunk_ids],
+                        )
+                        consumed_outcome_ids = settled_outcome_ids(
+                            outcomes, prior_pairs | set(applied_now), calibratable
+                        )
 
                     fb = compute_feedback_updates(
                         feedback_rows,
@@ -2221,6 +2310,7 @@ class SQLiteStore(BaseStore):
                             f"WHERE chunk_id IN ({placeholders})",
                             consumed_feedback_ids,
                         )
+                    self._record_outcome_applications(connection, applied_now, now=now)
                     if consumed_outcome_ids:
                         self._mark_outcomes_consumed(connection, consumed_outcome_ids)
 
