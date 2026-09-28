@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from ncp.types import SubconsciousChunk
 
+
 def split_current_and_historical(
     chunks: list[SubconsciousChunk], *, now: float | None = None
 ) -> tuple[list[SubconsciousChunk], list[SubconsciousChunk]]:
