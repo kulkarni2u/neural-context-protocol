@@ -422,6 +422,15 @@ MCP_TOOLS: list[dict[str, object]] = [
                 "escalate_to": {"type": "string", "description": "Optional escalation target overriding hydrated conscious state."},
                 "calibration_id": {"type": "string", "description": "Optional calibration pass id overriding hydrated conscious state."},
                 "ack_whisper_ids": {"type": "array", "items": {"type": "string"}},
+                "retrieved_chunk_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Optional chunk ids that were served as context to this turn (the "
+                        "retrieved_chunk_ids returned by ncp_get_context). Linked to the turn so "
+                        "ncp_record_outcome(turn_id=...) can resolve them."
+                    ),
+                },
                 "memory_chunks": {
                     "type": "array",
                     "description": (
@@ -1269,6 +1278,18 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         drift_block["self_reported"] = self_reported
         return updated_conscious, drift_block
 
+    def _retrieved_chunk_ids(result: object) -> list[str]:
+        """Ids of real stored chunks assembled into the context, for round-tripping
+        into ncp_post_turn(retrieved_chunk_ids=...). Synthetic recent-ref chunks
+        (``recent_<turn_id>``) are not stored chunks and are excluded."""
+        ids: list[str] = []
+        for chunk in getattr(result, "chunks", []) or []:
+            chunk_id = str(chunk.chunk_id)
+            if chunk_id.startswith("recent_") or chunk_id in ids:
+                continue
+            ids.append(chunk_id)
+        return ids
+
     def _handle_get_context(args: dict[str, object]) -> object:
         session_id = _session_id_from_args(args)
         pipeline_id = args.get("pipeline_id")
@@ -1343,6 +1364,7 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
                 "context": stream_result.context,
                 "session_id": session_id,
                 "pending_whisper_ids": stream_result.pending_whisper_ids,
+                "retrieved_chunk_ids": _retrieved_chunk_ids(stream_result),
                 "telemetry": _context_telemetry(stream_result, session_id=session_id),
             }
             if budget_snapshot is not None:
@@ -1372,6 +1394,7 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             "context": result.context,
             "session_id": session_id,
             "pending_whisper_ids": result.pending_whisper_ids,
+            "retrieved_chunk_ids": _retrieved_chunk_ids(result),
             "telemetry": _context_telemetry(result, session_id=session_id),
         }
         if budget_snapshot is not None:
@@ -1606,6 +1629,10 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             latency_ms=_int_arg(args, "latency_ms", 0),
         )
         ack_ids = [str(item) for item in list(args.get("ack_whisper_ids", []) or [])]
+        raw_retrieved = args.get("retrieved_chunk_ids")
+        if raw_retrieved is not None and not isinstance(raw_retrieved, list):
+            raise ValueError("ncp_post_turn: 'retrieved_chunk_ids' must be an array of strings")
+        retrieved_ids = [str(item) for item in (raw_retrieved or [])]
         memory_chunks: list[SubconsciousChunk] = []
         for item in list(args.get("memory_chunks", []) or []):
             if not isinstance(item, dict):
@@ -1634,6 +1661,7 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             result_full=str(args["result_full"]),
             memory_chunks=memory_chunks or None,
             ack_whisper_ids=ack_ids,
+            retrieved_chunk_ids=retrieved_ids or None,
         )
         result: dict[str, object] = {"posted": True, "turn_id": record.turn_id, "acknowledged_whisper_ids": ack_ids}
         # WI-007(a): surface dedup-suppressed memory writes to the host.
