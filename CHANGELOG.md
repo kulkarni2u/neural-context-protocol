@@ -4,6 +4,41 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Turn-to-chunk associations** (`ncp/stores/*`, `ncp/assembler.py`,
+  `ncp/mcp/server.py`): new `turn_chunks` table (SQLite idempotent DDL;
+  Postgres migration `015_add_turn_chunks.sql`) and
+  `BaseStore.link_turn_chunks`. `Assembler.post_turn` links the chunks a turn
+  wrote and accepts `retrieved_chunk_ids`; `ncp_get_context` now returns
+  `retrieved_chunk_ids` and `ncp_post_turn` accepts them back.
+- **Per-chunk outcome consumption** (`ncp/stores/*`): new
+  `outcome_applications` table (Postgres migration
+  `016_add_outcome_applications.sql`) records which (outcome, chunk) pairs a
+  calibration pass has applied.
+- `get_chunk_edges(limit=None)` returns every matching edge, querying ids in
+  batches.
+
+### Fixed
+
+- **Calibrating one pipeline consumed another pipeline's outcomes.** Feedback
+  calibration loaded and marked every unconsumed outcome globally, so an
+  outcome for pipeline B was discarded when pipeline A was calibrated first.
+  Outcomes now apply only to chunks in the calibrated set, and an outcome is
+  marked consumed once each of its chunks has been applied or can no longer be
+  calibrated (missing, tombstoned or `user_verified`).
+- **Consolidation could delete the current version of a superseded chunk.**
+  Superseded or expired (`valid_to` in the past) chunks are now never merge
+  candidates, and historical rows that pointed at a merged-away chunk are
+  repointed to the keeper, preserving the `supersede` retention contract.
+- **Turn-based outcomes resolved to no chunks.** `record_outcome(turn_id=...)`
+  matched `caused_by`/`conscious_hash`, which nothing set to a turn id. It now
+  resolves through `turn_chunks` (wrote, then retrieved), falling back to the
+  legacy match.
+- **Calibration ignored `caused_by` edges beyond the first 200.** The
+  edge-fallback ancestry lookup used the default page of 200 newest edges;
+  calibration now loads all of them.
+
 ## [1.6.1] - 2026-09-17
 
 ### Release scope

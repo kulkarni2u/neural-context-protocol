@@ -414,6 +414,7 @@ class Assembler:
         result_full: str,
         memory_chunks: list[SubconsciousChunk] | None = None,
         ack_whisper_ids: list[str] | None = None,
+        retrieved_chunk_ids: list[str] | None = None,
     ) -> TurnRecord:
         record = TurnRecord(
             turn_id=response.turn_id,
@@ -435,13 +436,27 @@ class Assembler:
             self.store.acknowledge_whispers(ack_whisper_ids, agent_id=conscious.agent_id)
 
         suppressed_chunk_ids: list[str] = []
+        written_chunk_ids: list[str] = []
         for chunk in memory_chunks or []:
             chunk = self.middleware.pre_write(chunk)
             # WI-007(a): surface dedup-suppressed writes to the caller instead
             # of silently dropping them.
-            if not self._write_with_retry(chunk):
+            if self._write_with_retry(chunk):
+                written_chunk_ids.append(chunk.chunk_id)
+            else:
                 suppressed_chunk_ids.append(chunk.chunk_id)
         record.suppressed_chunk_ids = suppressed_chunk_ids
+
+        # Persist turn-to-chunk associations so a turn-based outcome resolves
+        # to what this turn wrote + retrieved. Dedup-suppressed writes are not
+        # linked: the store does not report which existing chunk absorbed them.
+        # Duck-typed stores that predate the method simply skip linking.
+        link = getattr(self.store, "link_turn_chunks", None)
+        if link is not None:
+            if written_chunk_ids:
+                link(record.turn_id, written_chunk_ids, relation="wrote")
+            if retrieved_chunk_ids:
+                link(record.turn_id, retrieved_chunk_ids, relation="retrieved")
 
         return record
 
@@ -454,6 +469,7 @@ class Assembler:
         result_full: str,
         memory_chunks: list[SubconsciousChunk] | None = None,
         ack_whisper_ids: list[str] | None = None,
+        retrieved_chunk_ids: list[str] | None = None,
     ) -> TurnRecord:
         record = TurnRecord(
             turn_id=response.turn_id,
@@ -472,8 +488,13 @@ class Assembler:
         # dedup-suppressed writes via a shared list populated by a closure.
         suppressed_chunk_ids: list[str] = []
 
+        written_ids: set[str] = set()
+        write_order: list[str] = []
+
         async def _write_and_track(chunk: SubconsciousChunk) -> None:
-            if not await self._alog_write_with_retry(chunk):
+            if await self._alog_write_with_retry(chunk):
+                written_ids.add(chunk.chunk_id)
+            else:
                 suppressed_chunk_ids.append(chunk.chunk_id)
 
         async with anyio.create_task_group() as tg:
@@ -484,9 +505,20 @@ class Assembler:
                 tg.start_soon(self._aacknowledge_whispers, ack_whisper_ids, conscious.agent_id)
             for chunk in memory_chunks or []:
                 chunk = self.middleware.pre_write(chunk)
+                write_order.append(chunk.chunk_id)
                 tg.start_soon(_write_and_track, chunk)
 
         record.suppressed_chunk_ids = suppressed_chunk_ids
+
+        # Turn-to-chunk associations (see post_turn). Linked in submission
+        # order so resolution order is deterministic despite concurrent writes.
+        wrote = [cid for cid in dict.fromkeys(write_order) if cid in written_ids]
+        alink = getattr(self.store, "async_link_turn_chunks", None)
+        if alink is not None:
+            if wrote:
+                await alink(record.turn_id, wrote, relation="wrote")
+            if retrieved_chunk_ids:
+                await alink(record.turn_id, retrieved_chunk_ids, relation="retrieved")
         return record
 
     # ------------------------------------------------------------------

@@ -102,6 +102,9 @@ The decoded result contains:
 - `pending_whisper_ids` — whisper ids consumed this turn; pass them to
   `ncp_post_turn` to acknowledge (at-least-once delivery: unacked whispers
   are redelivered next turn)
+- `retrieved_chunk_ids` — ids of the stored chunks assembled into `context`;
+  pass them to `ncp_post_turn` as `retrieved_chunk_ids` so a later
+  `ncp_record_outcome(turn_id=...)` credits the memory that informed the turn
 - `telemetry` — eviction counts, `fetch_budget_remaining`, and a `fetch_hint`
   when relevant context was evicted under the token budget
 
@@ -126,6 +129,12 @@ curl -s $BASE/mcp -H "$AUTH" -H 'Content-Type: application/json' -d '{
 
 Returns `{"posted": true, "turn_id": "...", "acknowledged_whisper_ids": [...]}`.
 This is what makes recent-ref continuity, `ncp cost`, and `ncp status` work.
+
+Optional `retrieved_chunk_ids` (array of strings, from `ncp_get_context`) and
+`memory_chunks` are linked to the turn (relations `retrieved` and `wrote`;
+dedup-suppressed chunks are not linked). `ncp_record_outcome` with only a
+`turn_id` then resolves to those linked chunks, plus any chunk whose legacy
+`caused_by` equals the turn id.
 
 ### ncp_write_memory — persist a durable chunk
 
