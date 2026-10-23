@@ -66,6 +66,17 @@ def test_key_order_does_not_change_hash():
     assert resolve_context_policy(make_config({"p": c}), "p").identity.sha256 != ia.sha256
 
 
+def test_edge_type_order_and_repeats_do_not_change_hash():
+    def resolve(types):
+        return resolve_context_policy(cfg_with({"retrieval": {"edge_expansion_types": types}}), "p")
+
+    a = resolve(["supports", "caused_by"])
+    b = resolve(["caused_by", "supports", "caused_by"])
+    assert a.identity == b.identity
+    assert a.config.edge_expansion_types == ["caused_by", "supports"]
+    assert b.config.edge_expansion_types == ["caused_by", "supports"]
+
+
 def test_none_selection_returns_same_config_even_with_invalid_unused_policy():
     config = make_config({"bad": {"name": "bad", "version": 0, "bogus": 1}})
     result = resolve_context_policy(config, None)
@@ -180,6 +191,7 @@ def test_non_finite_rejected(field, bad):
     [
         {"edge_expansion_types": ["nonsense"]},
         {"edge_expansion_types": "caused_by"},
+        {"edge_expansion_types": []},
         {"edge_max_hops": -1},
         {"reduce_fanin_min_cluster": 0},
         {"reduce_fanin_overfetch": 0},

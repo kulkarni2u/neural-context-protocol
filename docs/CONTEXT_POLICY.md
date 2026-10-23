@@ -29,6 +29,9 @@ by a policy.
 
 Values are strictly typed: no coercion (`"true"`, `1` for booleans, bool for numbers), no
 NaN/infinity, ratios in `[0, 1]`, hops `>= 0`, sizes positive, edge types from the closed set.
+`edge_expansion_types` must be non-empty (disable expansion with `edge_expansion = false` or
+`edge_max_hops = 0`) and is normalized to a sorted, de-duplicated list, so order and repeats do
+not change the resolved config or the identity hash.
 An explicitly contradictory pair (`adaptive_budget_floor_tokens` above
 `adaptive_budget_ceiling_tokens` in the same policy) is rejected at registry load, without any
 deployment config. Partial ranges are deferred to the resolver.

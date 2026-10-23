@@ -32,7 +32,7 @@ Fixed and regression-tested: explicit inverted budget pairs now fail model/regis
 
 Opus: spec compliance PASS; quality PASS with minor follow-ups. Sonnet scoped re-review: PASS, M2 and M3 addressed, no new breakage.
 
-Remaining non-blocking integration considerations: definition hashing preserves explicit edge-array order; traversal/overfetch caps require runtime integration and benchmarking. Direct Pydantic validation retains Pydantic's normal error behavior; docs distinguish it from sanitized registry/resolver parsing errors. A loose budget-error regex in one test is a minor test-quality observation, not a missing runtime guard.
+Remaining non-blocking integration considerations: edge types are now normalized (sorted, de-duplicated, non-empty) before hashing; traversal/overfetch caps require runtime integration and benchmarking. Direct Pydantic validation retains Pydantic's normal error behavior; docs distinguish it from sanitized registry/resolver parsing errors. A loose budget-error regex in one test is a minor test-quality observation, not a missing runtime guard.
 
 ## Verification
 

@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from ncp.config import NCPConfig
 from ncp.types import ChunkEdgeType
@@ -46,6 +46,18 @@ class RetrievalPolicy(_StrictModel):
     reduce_fanin_contradict_floor: float | None = Field(default=None, ge=0.0, le=1.0)
     reduce_fanin_overfetch: int | None = Field(default=None, ge=1)
     fallback_to_trust_recency_enabled: bool | None = None
+
+    @field_validator("edge_expansion_types")
+    @classmethod
+    def _normalize_edge_types(cls, value: list[ChunkEdgeType] | None) -> list[ChunkEdgeType] | None:
+        # Types are a traversal filter, so order and repeats carry no meaning;
+        # normalizing keeps equivalent policies on the same identity hash.
+        # Disable expansion with edge_expansion = false or edge_max_hops = 0.
+        if value is None:
+            return None
+        if not value:
+            raise ValueError("edge_expansion_types must list at least one edge type")
+        return sorted(set(value))
 
 
 class BudgetPolicy(_StrictModel):
