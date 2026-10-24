@@ -25,9 +25,24 @@ Identity, signature/grounding, handoff, store/backend, embedding/provider, memoi
 pipeline-dollar governance, scoring trust weights and `budget.max_tokens_per_call` cannot be set
 by a policy.
 
+## Precedence
+
+A selected policy is applied last, on top of the fully loaded config:
+
+1. built-in defaults (`DEFAULT_CONFIG`)
+2. the TOML file
+3. `NCP_*` environment overrides
+4. the selected policy's explicit overrides
+
+So a policy value beats an `NCP_*` environment variable for the same setting. Settings a policy
+leaves unset keep whatever the first three layers produced, and the budget bounds below are
+checked against that merged result.
+
 ## Validation
 
-Values are strictly typed: no coercion (`"true"`, `1` for booleans, bool for numbers), no
+Values are strictly typed: strings are never converted (`"true"`, `"0.5"`), booleans accept only
+`true`/`false` (not `1`), numbers reject booleans, and integer fields reject floats. The one
+widening allowed is an integer for a float field (`diversity_lambda = 1` resolves to `1.0`). No
 NaN/infinity, ratios in `[0, 1]`, hops `>= 0`, sizes positive, edge types from the closed set.
 `edge_expansion_types` must be non-empty (disable expansion with `edge_expansion = false` or
 `edge_max_hops = 0`) and is normalized to a sorted, de-duplicated list, so order and repeats do
@@ -60,6 +75,10 @@ resolved.config    # detached effective NCPConfig (project_root preserved)
 resolved.identity  # name, version, SHA-256 of the explicit policy definition
 resolve_context_policy(config, None)  # same config object, identity None, no validation
 ```
+
+With a policy selected, `resolved.config` is a deep copy and is safe to modify. With `None`,
+`resolved.config` **is** the caller's config object, not a copy: treat it as read-only, because a
+change to it changes the deployment config for every later request.
 
 `ContextPolicyRegistry.from_config(config)` validates every entry. Selecting by name validates
 only the selected entry. The hash covers the validated policy definition (name, version and
@@ -107,4 +126,17 @@ context_token_budget = 1200
 
 Selection on Python/MCP requests, request-local overlays in both the Assembler and MCP closures,
 capping explicit request budgets for selected policies, and any authorization claims are not
-part of this slice.
+part of this slice. Obligations for that integration:
+
+- Apply the overlay per request. Mutating the process-level cached config would leak one agent's
+  policy into other agents' requests.
+- Settings are captured in both the Assembler and the MCP server closures; applying the overlay to
+  only one is incomplete.
+- `budget.max_tokens_per_call` is not a universal runtime cap today, and an explicit MCP
+  `max_tokens` bypasses adaptive budgeting. Selected policies must cap explicit request budgets;
+  requests with no policy keep the current behavior.
+- Before any authorization claim, audit every read path: graph expansion, recent refs, hydration,
+  direct fetches, decision packets, memoization, skill-cache reads and whispers. A minimum-trust
+  gate is not the same as reweighting trust in ranking.
+- The policy hash identifies the policy definition, not effective deployment behavior; request
+  explanations should eventually report both.

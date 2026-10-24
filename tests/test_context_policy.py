@@ -385,7 +385,7 @@ def test_empty_name_rejected():
 def test_documented_examples_validate():
     import re
 
-    text = (Path(__file__).resolve().parents[1] / "docs" / "CONTEXT_POLICY.md").read_text()
+    text = (Path(__file__).resolve().parents[1] / "docs" / "NCP_CONTEXT_POLICY.md").read_text()
     blocks = re.findall(r"```toml\n(.*?)```", text, re.S)
     assert blocks
     import tomllib
