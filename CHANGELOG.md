@@ -6,6 +6,12 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ### Added
 
+- **Context policy foundation** (`ncp/context_policy.py`): strictly validated
+  named policies under `[context_policies.<name>]` that may override an
+  allowlist of retrieval, budget and distillation settings, plus a pure
+  `resolve_context_policy(config, name)` returning a detached effective config
+  and a name/version/SHA-256 identity. Not yet wired into any request path;
+  see `docs/NCP_CONTEXT_POLICY.md`.
 - **Turn-to-chunk associations** (`ncp/stores/*`, `ncp/assembler.py`,
   `ncp/mcp/server.py`): new `turn_chunks` table (SQLite idempotent DDL;
   Postgres migration `015_add_turn_chunks.sql`) and
