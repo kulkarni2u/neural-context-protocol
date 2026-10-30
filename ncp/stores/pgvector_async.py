@@ -27,7 +27,12 @@ import anyio
 import structlog
 
 from ncp.config import NCPConfig
-from ncp.stores.base import BaseStore, NCPStoreUnavailableError, _validate_turn_chunk_relation
+from ncp.stores.base import (
+    BaseStore,
+    NCPStoreUnavailableError,
+    _validate_turn_chunk_relation,
+    merge_outcome_chunk_rows,
+)
 from ncp.stores.bitemporal import collect_successor_ids, filter_bitemporal
 from ncp.stores.graph import (
     backfill_edges_for_chunk,
@@ -1827,13 +1832,14 @@ class AsyncPgvectorStore(BaseStore):
                     )
                     legacy_rows = await self._afetchall(cur)
                     # Explicit links first, then legacy match; de-duplicated.
-                    chunk_ids = list(dict.fromkeys(str(r[0]) for r in [*linked_rows, *legacy_rows]))
+                    chunk_ids = merge_outcome_chunk_rows(linked_rows, legacy_rows)
             async with conn.cursor() as cur:
                 await cur.execute(
                     self._sql(
                         "INSERT INTO {schema}.{prefix}outcomes"
                         " (outcome_id, turn_id, chunk_ids, success, weight, note, created_at, consumed)"
                         " VALUES (%s, %s, %s, %s, %s, %s, %s, 0)"
+                        " ON CONFLICT (outcome_id) DO NOTHING"
                     ),
                     (
                         outcome.outcome_id,

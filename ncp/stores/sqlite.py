@@ -13,7 +13,12 @@ import sqlite3
 import time
 
 from ncp.config import NCPConfig
-from ncp.stores.base import BaseStore, NCPStoreUnavailableError, _validate_turn_chunk_relation
+from ncp.stores.base import (
+    BaseStore,
+    NCPStoreUnavailableError,
+    _validate_turn_chunk_relation,
+    merge_outcome_chunk_rows,
+)
 from ncp.stores.calibration import (
     FeedbackRow,
     ReputationUpdate,
@@ -1124,10 +1129,10 @@ class SQLiteStore(BaseStore):
                 ).fetchall()
                 # Explicit links first, then the legacy caused_by/conscious_hash
                 # match; de-duplicated, order-stable.
-                chunk_ids = list(dict.fromkeys(str(r["chunk_id"]) for r in [*linked, *legacy]))
-            connection.execute(
+                chunk_ids = merge_outcome_chunk_rows(linked, legacy)
+            cursor = connection.execute(
                 """
-                INSERT INTO outcomes (outcome_id, turn_id, chunk_ids, success, weight, note, created_at, consumed)
+                INSERT OR IGNORE INTO outcomes (outcome_id, turn_id, chunk_ids, success, weight, note, created_at, consumed)
                 VALUES (?, ?, ?, ?, ?, ?, ?, 0)
                 """,
                 (
@@ -1140,7 +1145,8 @@ class SQLiteStore(BaseStore):
                     outcome.created_at,
                 ),
             )
-            return True
+            # A replayed outcome_id is a no-op so host retries record exactly once.
+            return cursor.rowcount > 0
 
     def get_outcome(self, outcome_id: str) -> OutcomeRecord | None:
         with self._connect() as connection:

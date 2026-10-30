@@ -111,4 +111,5 @@ jobs:
           tests/test_pgvector_integration.py
           tests/test_migrations.py
           tests/test_retrieval_feedback.py
+          tests/test_outcome_turn_resolution.py
           tests/test_async_redis_coordination.py
