@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import time
 from uuid import uuid4
 
 from ncp.adapters.base import BaseAdapter
 from ncp.adapters.local import LocalAdapter
-from ncp.assembler import Assembler
+from ncp.assembler import Assembler, AssemblyResult
 from ncp.config import NCPConfig, load_config
 from ncp.context_policy import resolve_context_policy
 from ncp.costs import calculate_cost
@@ -16,7 +17,15 @@ from ncp.stores.base import BaseStore
 from ncp.stores.factory import create_store
 from ncp.stores.memo import compute_memo_signature
 from ncp.tokens import estimate_tokens
-from ncp.types import BudgetContext, ConsciousBlock, DecisionRecord, NCPResponse, SubconsciousChunk, Whisper
+from ncp.types import (
+    BudgetContext,
+    ConsciousBlock,
+    DecisionRecord,
+    EvidenceAttribution,
+    NCPResponse,
+    SubconsciousChunk,
+    Whisper,
+)
 
 _CONFIG: NCPConfig | None = None
 
@@ -237,7 +246,9 @@ def run(
 
     memo_signature = _memo_signature(resolved_config, agent, turn)
     memo = resolved_store.lookup_memo(memo_signature) if memo_signature else None
-    if memo and memo.get("result_summary"):
+    if not (memo and memo.get("result_summary")):
+        memo = None  # an empty memo row is a miss, not a reusable result
+    if memo is not None:
         content = str(memo["result_summary"])
         response = _build_memo_response(agent=agent, adapter=resolved_adapter, memo=memo, start=start)
     else:
@@ -251,20 +262,16 @@ def run(
             start=start,
             config=resolved_config,
         )
-        if memo_signature:
-            resolved_store.record_memo(
-                signature=memo_signature,
-                task=turn,
-                chunk_ids=[],
-                result_summary=content,
-                output_tokens_est=response.output_tokens,
-            )
 
-    assembler.post_turn(
-        conscious=agent,
+    response = _finish_turn(
+        assembler=assembler,
+        assembly=assembly,
+        agent=agent,
+        turn=turn,
+        content=content,
         response=response,
-        result_summary=content.splitlines()[0] if content else "",
-        result_full=content,
+        memo=memo,
+        memo_signature=memo_signature,
     )
     return response
 
@@ -304,7 +311,9 @@ def stream(
 
     memo_signature = _memo_signature(resolved_config, agent, turn)
     memo = resolved_store.lookup_memo(memo_signature) if memo_signature else None
-    if memo and memo.get("result_summary"):
+    if not (memo and memo.get("result_summary")):
+        memo = None  # an empty memo row is a miss, not a reusable result
+    if memo is not None:
         # Memo hit: synthesize a single-chunk "stream" from the cached content
         # instead of calling the provider.
         content = str(memo["result_summary"])
@@ -326,21 +335,67 @@ def stream(
             start=start,
             config=resolved_config,
         )
-        if memo_signature:
-            resolved_store.record_memo(
-                signature=memo_signature,
-                task=turn,
-                chunk_ids=[],
-                result_summary=content,
-                output_tokens_est=response.output_tokens,
-            )
 
+    _finish_turn(
+        assembler=assembler,
+        assembly=assembly,
+        agent=agent,
+        turn=turn,
+        content=content,
+        response=response,
+        memo=memo,
+        memo_signature=memo_signature,
+    )
+
+
+def _attribute_evidence(assembly: AssemblyResult, memo: dict[str, object] | None) -> EvidenceAttribution:
+    """Evidence a run/stream turn rests on (see ``EvidenceAttribution``)."""
+    if memo is not None:
+        raw = memo.get("chunk_ids") or []
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except ValueError:
+                raw = []
+        memo_ids = [str(c) for c in raw] if isinstance(raw, list) else []
+        return EvidenceAttribution(presented=False, memo_chunk_ids=memo_ids)
+    return EvidenceAttribution(
+        presented=True,
+        chunk_ids=assembly.stored_evidence_ids(),
+        sources=dict(assembly.evidence_sources),  # type: ignore[arg-type]
+    )
+
+
+def _finish_turn(
+    *,
+    assembler: Assembler,
+    assembly: AssemblyResult,
+    agent: ConsciousBlock,
+    turn: str,
+    content: str,
+    response: NCPResponse,
+    memo: dict[str, object] | None,
+    memo_signature: str | None,
+) -> NCPResponse:
+    """Shared run/stream tail: attribute evidence, memoize, and post the turn."""
+    evidence = _attribute_evidence(assembly, memo)
+    response = response.model_copy(update={"evidence": evidence})
+    if memo is None and memo_signature:
+        assembler.store.record_memo(
+            signature=memo_signature,
+            task=turn,
+            chunk_ids=evidence.chunk_ids,
+            result_summary=content,
+            output_tokens_est=response.output_tokens,
+        )
     assembler.post_turn(
         conscious=agent,
         response=response,
         result_summary=content.splitlines()[0] if content else "",
         result_full=content,
+        retrieved_chunk_ids=evidence.chunk_ids or None,
     )
+    return response
 
 
 def _memo_signature(config: NCPConfig, agent: ConsciousBlock, turn: str) -> str | None:

@@ -19,7 +19,7 @@ from pathlib import Path, PurePosixPath
 from typing import BinaryIO, Sequence, get_args
 
 from ncp.adaptive_budget import AdaptiveBudgetResult, compute_adaptive_budget
-from ncp.assembler import Assembler
+from ncp.assembler import Assembler, stored_evidence_ids
 from ncp.budget import BudgetSnapshot, evaluate_budget
 from ncp.chunker import filter_content
 from ncp.config import NCPConfig, load_config
@@ -1302,15 +1302,12 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
 
     def _retrieved_chunk_ids(result: object) -> list[str]:
         """Ids of real stored chunks assembled into the context, for round-tripping
-        into ncp_post_turn(retrieved_chunk_ids=...). Synthetic recent-ref chunks
-        (``recent_<turn_id>``) are not stored chunks and are excluded."""
-        ids: list[str] = []
-        for chunk in getattr(result, "chunks", []) or []:
-            chunk_id = str(chunk.chunk_id)
-            if chunk_id.startswith("recent_") or chunk_id in ids:
-                continue
-            ids.append(chunk_id)
-        return ids
+        into ncp_post_turn(retrieved_chunk_ids=...). Synthetic recent-ref and
+        cold-start chunks are not stored chunks and are excluded."""
+        return stored_evidence_ids(
+            list(getattr(result, "chunks", []) or []),
+            getattr(result, "evidence_sources", None),
+        )
 
     def _handle_get_context(args: dict[str, object]) -> object:
         session_id = _session_id_from_args(args)

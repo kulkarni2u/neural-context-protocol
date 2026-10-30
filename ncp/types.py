@@ -633,6 +633,26 @@ class TurnRecord(NCPModel):
         return self
 
 
+class EvidenceAttribution(NCPModel):
+    """Which stored evidence a turn's response actually rests on.
+
+    ``presented`` is True when ``chunk_ids`` were part of the model-visible
+    request; those are the ids linked to the turn as ``retrieved`` so a later
+    turn-based outcome credits them. On a memo hit no request is made:
+    ``presented`` is False, ``chunk_ids`` is empty, and ``memo_chunk_ids``
+    keeps the evidence recorded with the cached result for audit only.
+    ``sources`` maps every delivered chunk id (including synthetic recent-ref
+    and cold-start chunks) to how it reached the context.
+    """
+
+    presented: bool
+    chunk_ids: list[str] = Field(default_factory=list)
+    sources: dict[str, Literal["retrieval", "graph_expansion", "recent_ref", "cold_start"]] = Field(
+        default_factory=dict
+    )
+    memo_chunk_ids: list[str] = Field(default_factory=list)
+
+
 class NCPResponse(NCPModel):
     """Normalized provider response metadata returned by NCP."""
 
@@ -650,6 +670,8 @@ class NCPResponse(NCPModel):
     # "memoized" when a CAP-C3 memo hit served the response and no provider call
     # was made at all.
     cost_source: Literal["measured", "estimated", "memoized"] = "measured"
+    # Set by ncp.run/ncp.stream; None for responses built elsewhere.
+    evidence: EvidenceAttribution | None = None
 
     @field_validator("model", "turn_id")
     @classmethod
