@@ -31,6 +31,18 @@ All notable changes to Neural Context Protocol will be documented in this file.
   must apply `017_add_chunk_aliases.sql`.
 - `ncp_post_turn` `memory_chunks` items accept `base_trust`, `signature`,
   `evidence_id` and `caused_by`; the response lists `trust_demoted_chunk_ids`.
+- **Final response budgets and compact mode for `ncp_get_context`**:
+  `response_max_tokens` caps the whole serialized response, dropping optional
+  diagnostics first and then re-fitting the already-retrieved context (no
+  second retrieval). Evidence ids always match the returned context, and a
+  `truncated` block reports what was cut. `compact=true` returns signal-only
+  telemetry plus `context_sha256`. Both are opt-in.
+- `ncp_lookup_memo`/`ncp_record_memo`/`ncp_verify_memo` accept optional
+  `pipeline_id`, `model` and `provider`. When set, the memo key is scoped to
+  them; without them, keys are unchanged.
+- `AsyncPgvectorStore(redis_stream=...)`, matching `PgvectorStore`.
+- `benchmarks/memo_reuse`: cost per verified success and memo false-hit rate,
+  with a CI gate.
 
 ### Changed
 
@@ -50,6 +62,9 @@ All notable changes to Neural Context Protocol will be documented in this file.
   above `reduce_fanin_contradict_floor`.
 - Recording an outcome with an existing `outcome_id` is a no-op returning
   `recorded: false` instead of raising.
+- The Anthropic prompt-cache breakpoint now sits before `[NCP:WHISPERS]` when
+  whispers are present, because whispers and their relative ages change
+  every turn.
 
 ### Fixed
 
@@ -67,6 +82,13 @@ All notable changes to Neural Context Protocol will be documented in this file.
 - `ncp_post_turn` `memory_chunks` bypassed `require_signatures`,
   `require_grounded_high_trust` and provenance; the whole batch is now
   validated before anything is written.
+- Concurrent writing calibrations on pgvector (sync or async) double-counted
+  outcomes and retrieval counts into reputation; they are now serialized
+  with a transaction-scoped advisory lock.
+- Write-time dedup dropped corrections that changed only a value or flipped
+  polarity ("v1" -> "v2", "3 retries" -> "5 retries"), so the following
+  supersede failed and stale values kept being served. Consolidation and
+  fan-in no longer merge such pairs either.
 
 ## [1.7.0] - 2026-10-30
 

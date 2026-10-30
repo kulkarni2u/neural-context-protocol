@@ -14,18 +14,18 @@ Status: **Done** (on this branch, tested) · **Partial** · **Missing**.
 |---|------|--------|-------|-----------------------|
 | 1 | Async PG outcome row access | Done | `stores/base.py::merge_outcome_chunk_rows`, all 3 stores | Live sync+async PG parity for linked/legacy/combined/empty/duplicate; outcome inserts idempotent on `outcome_id`. In the CI pgvector job. |
 | 2 | Python evidence attribution | Done | `api.py::_finish_turn`, `AssemblyResult.evidence_sources` | Post-trim ids only; origins tracked; memo hit links nothing and records the cached result's evidence apart. |
-| 3 | Outcomes through consolidation | Done | `chunk_aliases` + `calibration.apply_outcome_aliases`, migration 017 | Equivalent merges only; prior loser applications carried; never across supersession/contradiction. **Not covered:** concurrent PG calibrations racing on the same outcome (that race predates this work). |
-| 4a | Memo key context | Done (Python path) | `stores/memo.py::compute_turn_memo_signature` | MCP `ncp_lookup_memo` still keys on host-supplied `task`+`context`; adding pipeline/model there would change existing host signatures, so it needs a decision. |
+| 3 | Outcomes through consolidation | Done | `chunk_aliases` + `calibration.apply_outcome_aliases`, migration 017 | Equivalent merges only; prior loser applications carried; never across supersession/contradiction. Concurrent PG calibrations are serialized by an advisory lock (live sync and mixed sync/async tests). |
+| 4a | Memo key context | Done | `stores/memo.py::compute_turn_memo_signature`, `compute_scoped_memo_signature` | MCP memo tools take optional `pipeline_id`/`model`/`provider`; unscoped keys are unchanged for existing hosts. |
 | 4b | Memo reuse bypasses gates | Done | `memo_ineligibility` used by MCP + run/stream | Behavior change: Python reuse now needs verification by default. |
 | 4c | Replacement keeps verification | Done | memo upsert SQL in all 3 stores | |
 | 4d | Post-turn batch bypasses checks | Done | `mcp/server.py::_validated_batch_chunk` | Batch path still does not noise-filter or create `raw_ref`. |
-| 4e | Fan-in merges before contradiction | Done | `consolidation.py::claim_polarity`, `_mergeable` | Polarity is a cue heuristic. Value conflicts ("Monday" vs "Friday") are still not detected. |
+| 4e | Fan-in merges before contradiction | Done | `consolidation.py::claim_polarity`, `same_claim_shape`, `_mergeable` | Polarity is a cue heuristic. Numeric value changes are never merged or deduped; non-numeric value conflicts ("Monday" vs "Friday") are still not detected. |
 | 5 | Provider cache/usage accounting | Done | `adapters/base.py::TokenUsage`, openai/anthropic/gemini | Cohere/Mistral/Ollama report no cache fields, so nothing to split there. |
 | 6 | Streaming usage + whisper acks | Done | `openai.py` `include_usage`; `_finish_turn` acks | Anthropic already read final usage; usage now resets per request. |
 | 7 | ContextPolicy runtime | Mostly done (PR #58 + identity on `NCPResponse`) | `context_policy.py`, `api.py` | `ncp_fetch`, decisions, memo and whisper reads ignore policy. The policy is **not** an authorization boundary (see Plan P0-A). |
-| 8 | Final response budgets / compact MCP mode | Missing | — | Next candidate: cap serialized `ncp_get_context` output, trim telemetry first, add `truncated` flag and opt-in `compact`. |
-| 9 | Stable prompt-cache prefixes | Partial | `encoder.py` puts `[NCP:BUDGET]` last; Anthropic caches the prefix | Not yet audited for timestamps or volatile fields earlier in the prefix, and no prefix-stability test. |
-| 10 | Cost-per-success / memo fast-path benchmarks | Missing | `benchmarks/task_success` exists | No benchmark reports memo false-hit rate or cost per verified success. |
+| 8 | Final response budgets / compact MCP mode | Done | `mcp/response_budget.py`, `Assembler.refit` | Streamed responses honor `compact` but not `response_max_tokens`. |
+| 9 | Stable prompt-cache prefixes | Done | Anthropic breakpoint before `[NCP:WHISPERS]`; `tests/test_prompt_prefix_stability.py` | Chunk `score` includes a recency term, shown to one decimal; stable across 50 min in the test, but it can tick over long gaps. |
+| 10 | Cost-per-success / memo fast-path benchmarks | Done | `benchmarks/memo_reuse` (CI gate) | Simulated provider and synthetic corpus; a live-provider run is still needed for real dollar figures. It also exposed the value-correction dedup bug, now fixed. |
 
 ## 2. Next-phase plan (P0–P2)
 
