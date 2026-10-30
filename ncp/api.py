@@ -10,6 +10,7 @@ from ncp.adapters.base import BaseAdapter
 from ncp.adapters.local import LocalAdapter
 from ncp.assembler import Assembler
 from ncp.config import NCPConfig, load_config
+from ncp.context_policy import resolve_context_policy
 from ncp.costs import calculate_cost
 from ncp.stores.base import BaseStore
 from ncp.stores.factory import create_store
@@ -69,19 +70,21 @@ def get_context(
     k: int | None = None,
     diversity_limit: int | None = None,
     max_tokens: int | None = None,
+    context_policy: str | None = None,
 ) -> str:
     """Assemble raw pidgin context for one agent turn."""
 
     resolved_config = config or _CONFIG or configure(cwd=Path.cwd())
     resolved_store = store or create_store(resolved_config)
-    assembler = Assembler(store=resolved_store, config=resolved_config)
+    policy = resolve_context_policy(resolved_config, context_policy)
+    assembler = Assembler(store=resolved_store, config=policy.config)
     return assembler.assemble(
         conscious=agent,
         budget=budget or BudgetContext(),
         query_text=query_text,
         k=k,
         diversity_limit=diversity_limit,
-        max_tokens=max_tokens,
+        max_tokens=policy.cap_max_tokens(max_tokens),
     ).context
 
 
@@ -210,6 +213,7 @@ def run(
     k: int | None = None,
     diversity_limit: int | None = None,
     max_tokens: int | None = None,
+    context_policy: str | None = None,
 ) -> NCPResponse:
     """Run one blocking local-runtime call through an adapter."""
 
@@ -217,7 +221,8 @@ def run(
     resolved_store = store or create_store(resolved_config)
     resolved_budget = budget or BudgetContext()
     resolved_adapter = adapter or LocalAdapter()
-    assembler = Assembler(store=resolved_store, config=resolved_config)
+    policy = resolve_context_policy(resolved_config, context_policy)
+    assembler = Assembler(store=resolved_store, config=policy.config)
 
     start = time.perf_counter()
     assembly = assembler.assemble(
@@ -227,7 +232,7 @@ def run(
         ctx_window=resolved_adapter.ctx_window,
         k=k,
         diversity_limit=diversity_limit,
-        max_tokens=max_tokens,
+        max_tokens=policy.cap_max_tokens(max_tokens),
     )
 
     memo_signature = _memo_signature(resolved_config, agent, turn)
@@ -276,6 +281,7 @@ def stream(
     k: int | None = None,
     diversity_limit: int | None = None,
     max_tokens: int | None = None,
+    context_policy: str | None = None,
 ):
     """Yield a streamed response through the adapter."""
 
@@ -283,7 +289,8 @@ def stream(
     resolved_store = store or create_store(resolved_config)
     resolved_budget = budget or BudgetContext()
     resolved_adapter = adapter or LocalAdapter()
-    assembler = Assembler(store=resolved_store, config=resolved_config)
+    policy = resolve_context_policy(resolved_config, context_policy)
+    assembler = Assembler(store=resolved_store, config=policy.config)
     assembly = assembler.assemble(
         conscious=agent,
         budget=resolved_budget,
@@ -291,7 +298,7 @@ def stream(
         ctx_window=resolved_adapter.ctx_window,
         k=k,
         diversity_limit=diversity_limit,
-        max_tokens=max_tokens,
+        max_tokens=policy.cap_max_tokens(max_tokens),
     )
     start = time.perf_counter()
 

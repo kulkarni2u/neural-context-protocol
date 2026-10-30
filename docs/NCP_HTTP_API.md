@@ -107,6 +107,14 @@ The decoded result contains:
   `ncp_record_outcome(turn_id=...)` credits the memory that informed the turn
 - `telemetry` — eviction counts, `fetch_budget_remaining`, and a `fetch_hint`
   when relevant context was evicted under the token budget
+- `context_policy` — only when the request named one: the applied policy's
+  `name`, `version`, `sha256` and `max_tokens_cap`, plus
+  `max_tokens_capped_from` when an explicit `max_tokens` was lowered to the cap
+
+Pass `"context_policy": "<name>"` to assemble this request under a
+`[context_policies.<name>]` entry (see `docs/NCP_CONTEXT_POLICY.md`). Unknown
+or invalid policies return a JSON-RPC error; omitting it keeps the deployment
+behavior unchanged.
 
 Conscious state (`recent`, `tried`, `failed`, `drift_score`, …) is hydrated
 server-side from the latest `ncp_post_turn` snapshot for this

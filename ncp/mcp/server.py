@@ -23,6 +23,7 @@ from ncp.assembler import Assembler
 from ncp.budget import BudgetSnapshot, evaluate_budget
 from ncp.chunker import filter_content
 from ncp.config import NCPConfig, load_config
+from ncp.context_policy import ContextPolicyError, resolve_context_policy
 from ncp.drift import EmbeddingAdapter, compute_drift
 from ncp.stores.base import BaseStore
 from ncp.stores.consolidation import reduce_candidates
@@ -102,7 +103,8 @@ MCP_TOOLS: list[dict[str, object]] = [
                 "stream": {"type": "boolean", "description": "If true, returns sections progressively as NDJSON (HTTP) or JSON-RPC notifications (stdio). Default false."},
                 "k": {"type": "integer", "description": "Number of subconscious chunks to retrieve. Overrides the default budget-pressure-based value (2 for critical, 4 otherwise)."},
                 "diversity_limit": {"type": "integer", "description": "Max chunks per author in retrieved results. Default 2. Set higher to allow more results from one author."},
-                "max_tokens": {"type": "integer", "description": "Optional estimated token ceiling for the assembled context block. Always honored as-is; when omitted and [budget].adaptive_budget_enabled is true, the ceiling is instead computed per-turn (see the response's budget_tokens block)."},
+                "max_tokens": {"type": "integer", "description": "Optional estimated token ceiling for the assembled context block. Honored as-is unless context_policy is set, in which case it is capped at [budget].max_tokens_per_call; when omitted and [budget].adaptive_budget_enabled is true, the ceiling is instead computed per-turn (see the response's budget_tokens block)."},
+                "context_policy": {"type": "string", "description": "Optional name of a [context_policies.<name>] entry. Its retrieval, budget and distillation overrides apply to this request only, and the response's context_policy block reports the name, version and sha256 applied. Unknown or invalid policies are rejected."},
                 "recent": {"type": "array", "items": {"type": "string"}, "description": "Optional recent refs overriding hydrated conscious state."},
                 "tried": {"type": "array", "items": {"type": "string"}, "description": "Optional attempted actions overriding hydrated conscious state."},
                 "failed": {"type": "array", "items": {"type": "string"}, "description": "Optional failed actions overriding hydrated conscious state."},
@@ -1035,9 +1037,6 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
     adaptive_budget_floor_tokens = config.adaptive_budget_floor_tokens if config is not None else 300
     adaptive_budget_ceiling_tokens = config.adaptive_budget_ceiling_tokens if config is not None else 2000
     default_context_token_budget = config.context_token_budget if config is not None else 840
-    # Token-efficiency: distillation (trim, don't drop, chunks that don't fit
-    # the budget), on by default -- same rationale as adaptive_budget above.
-    distillation_enabled = config.distillation_enabled if config is not None else False
     # CAP-T5: computed drift, opt-in (off by default -- legacy self-reported
     # drift_score is unchanged when disabled).
     drift_computed_enabled = config.drift_computed_enabled if config is not None else False
@@ -1119,7 +1118,15 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             session = sessions.get(session_id, FetchSession())
             return max(0, 3 - session.fetch_count)
 
-    def _context_telemetry(result: object, *, session_id: str) -> dict[str, object]:
+    def _context_telemetry(
+        result: object,
+        *,
+        session_id: str,
+        request_config: NCPConfig | None = None,
+    ) -> dict[str, object]:
+        # A selected context policy reports its own effective features; with
+        # no policy this is the deployment config, as before.
+        feature_config = request_config or config
         evicted_high_relevance = [
             {"chunk_id": chunk_id, "relevance": relevance}
             for chunk_id, relevance in getattr(result, "evicted_high_relevance", [])
@@ -1159,12 +1166,12 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             ],
             "fanin_dropped_malformed_count": getattr(result, "fanin_dropped_malformed_count", 0),
             "active_features": {
-                "distillation_enabled": distillation_enabled,
-                "adaptive_budget_enabled": adaptive_budget_enabled,
+                "distillation_enabled": feature_config.distillation_enabled if feature_config else False,
+                "adaptive_budget_enabled": feature_config.adaptive_budget_enabled if feature_config else False,
                 "memoization_enabled": config.memoization_enabled if config else False,
                 "drift_computed_enabled": drift_computed_enabled,
                 "rerank_enabled": config.rerank_enabled if config else False,
-                "reduce_fanin_enabled": config.reduce_fanin_enabled if config else False,
+                "reduce_fanin_enabled": feature_config.reduce_fanin_enabled if feature_config else False,
             },
         }
 
@@ -1197,6 +1204,7 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         budget: BudgetContext,
         search_text: str,
         budget_snapshot: BudgetSnapshot | None,
+        request_config: NCPConfig | None = None,
     ) -> tuple[int | None, dict[str, object] | None]:
         """CAP-C6: resolve the effective ``max_tokens`` for this call.
 
@@ -1209,9 +1217,23 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         An explicit caller ``max_tokens`` always wins: when present, no
         adaptive computation runs and the block (when the feature is on)
         simply echoes it back with ``reason_factors: {"explicit_override": True}``.
+
+        ``request_config`` is the config resolved for a selected context
+        policy; when given, its budget settings replace the deployment ones.
         """
 
-        if not adaptive_budget_enabled:
+        if request_config is None:
+            enabled = adaptive_budget_enabled
+            requested_tokens = default_context_token_budget
+            floor_tokens = adaptive_budget_floor_tokens
+            ceiling_tokens = adaptive_budget_ceiling_tokens
+        else:
+            enabled = request_config.adaptive_budget_enabled
+            requested_tokens = request_config.context_token_budget
+            floor_tokens = request_config.adaptive_budget_floor_tokens
+            ceiling_tokens = request_config.adaptive_budget_ceiling_tokens
+
+        if not enabled:
             return caller_max_tokens, None
 
         if caller_max_tokens is not None:
@@ -1222,9 +1244,9 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             }
 
         result: AdaptiveBudgetResult = compute_adaptive_budget(
-            requested_tokens=default_context_token_budget,
-            floor_tokens=adaptive_budget_floor_tokens,
-            ceiling_tokens=adaptive_budget_ceiling_tokens,
+            requested_tokens=requested_tokens,
+            floor_tokens=floor_tokens,
+            ceiling_tokens=ceiling_tokens,
             query_text=search_text,
             drift_score=conscious.drift_score,
             pressure=budget.pressure,
@@ -1322,7 +1344,15 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
                 "budget": budget_snapshot.to_dict(),
             }
 
-        assembler = Assembler(store=store, config=config)
+        # Context policy: resolved per request onto a detached config copy so
+        # one agent's policy never leaks into another agent's request. With no
+        # policy, ``policy.config`` is the deployment config itself.
+        policy_name = args.get("context_policy")
+        if policy_name is not None and config is None:
+            raise ContextPolicyError("context_policy requires a loaded NCP config")
+        policy = resolve_context_policy(config, policy_name) if config is not None else None
+        request_config = policy.config if policy is not None and policy.identity is not None else None
+        assembler = Assembler(store=store, config=request_config or config)
         stream = bool(args.get("stream", False))
         search_text = conscious.task + " " + conscious.slot
         try:
@@ -1337,6 +1367,10 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             caller_max_tokens: int | None = max(1, int(args["max_tokens"])) if "max_tokens" in args else None  # type: ignore[arg-type]
         except (ValueError, TypeError):
             caller_max_tokens = None
+        requested_max_tokens = caller_max_tokens
+        if policy is not None:
+            caller_max_tokens = policy.cap_max_tokens(caller_max_tokens)
+        policy_block = None if policy is None else policy.describe(requested_max_tokens=requested_max_tokens)
         # CAP-C5: optional bi-temporal point-in-time view.
         as_of_raw = args.get("as_of")
         as_of: float | None = None if as_of_raw is None else _parse_iso_timestamp(as_of_raw, field="as_of")
@@ -1348,6 +1382,7 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             budget=budget,
             search_text=search_text,
             budget_snapshot=budget_snapshot,
+            request_config=request_config,
         )
         if stream:
             stream_result = assembler.assemble(
@@ -1365,8 +1400,12 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
                 "session_id": session_id,
                 "pending_whisper_ids": stream_result.pending_whisper_ids,
                 "retrieved_chunk_ids": _retrieved_chunk_ids(stream_result),
-                "telemetry": _context_telemetry(stream_result, session_id=session_id),
+                "telemetry": _context_telemetry(
+                    stream_result, session_id=session_id, request_config=request_config
+                ),
             }
+            if policy_block is not None:
+                handler_result["context_policy"] = policy_block
             if budget_snapshot is not None:
                 handler_result["budget"] = budget_snapshot.to_dict()
             if tier_hints_enabled:
@@ -1395,8 +1434,10 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             "session_id": session_id,
             "pending_whisper_ids": result.pending_whisper_ids,
             "retrieved_chunk_ids": _retrieved_chunk_ids(result),
-            "telemetry": _context_telemetry(result, session_id=session_id),
+            "telemetry": _context_telemetry(result, session_id=session_id, request_config=request_config),
         }
+        if policy_block is not None:
+            response["context_policy"] = policy_block
         if budget_snapshot is not None:
             response["budget"] = budget_snapshot.to_dict()
         if tier_hints_enabled:

@@ -1,10 +1,13 @@
 """Named context policies and a pure configuration resolver.
 
-Foundation only: nothing in the runtime request paths selects or enforces a
-policy yet. ``resolve_context_policy`` turns a deployment ``NCPConfig`` plus an
-optional policy name into a detached effective ``NCPConfig`` and a stable
-identity. Policies may override only an explicit allowlist of context-assembly
-settings; every other key or section is rejected.
+``resolve_context_policy`` turns a deployment ``NCPConfig`` plus an optional
+policy name into a detached effective ``NCPConfig`` and a stable identity.
+Policies may override only an explicit allowlist of context-assembly settings;
+every other key or section is rejected.
+
+Context assembly (``ncp_get_context`` and ``ncp.api.get_context``/``run``/
+``stream``) selects a policy per request by name and assembles against the
+resolved config. No other read path consults a policy.
 """
 
 from __future__ import annotations
@@ -113,6 +116,30 @@ class ContextPolicyIdentity:
 class ResolvedContextPolicy:
     config: NCPConfig
     identity: ContextPolicyIdentity | None
+
+    def cap_max_tokens(self, max_tokens: int | None) -> int | None:
+        """Cap an explicit request budget at ``budget.max_tokens_per_call``.
+
+        Only a selected policy caps: with no policy an explicit ``max_tokens``
+        keeps its legacy as-is behavior.
+        """
+        if self.identity is None or max_tokens is None:
+            return max_tokens
+        return min(max_tokens, self.config.max_tokens_per_call)
+
+    def describe(self, *, requested_max_tokens: int | None = None) -> dict[str, Any] | None:
+        """Response block naming the applied policy; ``None`` when none was selected."""
+        if self.identity is None:
+            return None
+        block: dict[str, Any] = {
+            "name": self.identity.name,
+            "version": self.identity.version,
+            "sha256": self.identity.sha256,
+            "max_tokens_cap": self.config.max_tokens_per_call,
+        }
+        if requested_max_tokens is not None and requested_max_tokens > self.config.max_tokens_per_call:
+            block["max_tokens_capped_from"] = requested_max_tokens
+        return block
 
 
 def _describe(exc: ValidationError) -> str:
