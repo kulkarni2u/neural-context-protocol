@@ -4,6 +4,22 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Context policies in the request path** (`ncp/mcp/server.py`, `ncp/api.py`,
+  `ncp/context_policy.py`): `ncp_get_context` takes an optional
+  `context_policy` name, as do `ncp.api.get_context`, `run` and `stream`. The
+  named `[context_policies.<name>]` entry is resolved onto a per-request copy
+  of the config, which drives the Assembler, the adaptive token budget and the
+  `active_features` telemetry for that request only. With a policy selected,
+  an explicit `max_tokens` is capped at `budget.max_tokens_per_call`, and the
+  response carries a `context_policy` block (`name`, `version`, `sha256`,
+  `max_tokens_cap`, and `max_tokens_capped_from` when capped). Unknown or
+  invalid policies are rejected. Requests without `context_policy` are
+  unchanged. Other read paths (`ncp_fetch`, decisions, memoization, whispers)
+  do not consult policies.
+- `NCPConfig.max_tokens_per_call`.
+
 ## [1.7.0] - 2026-10-30
 
 ### Release scope

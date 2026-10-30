@@ -1,9 +1,10 @@
-# Context policies (foundation)
+# Context policies
 
-**Status: foundation only.** `ncp/context_policy.py` provides a validated registry of named
-context policies and a pure resolver. **Request selection and enforcement are not implemented
-by this slice**: `ncp/api.py`, the assembler, the MCP server and the stores do not call it, and
-no policy is selected automatically. Existing behavior is unchanged.
+`ncp/context_policy.py` provides a validated registry of named context policies and a pure
+resolver. Context assembly selects a policy per request by name: `ncp_get_context` takes a
+`context_policy` argument, and `ncp.api.get_context`, `run` and `stream` take a `context_policy`
+keyword. No policy is selected automatically, and requests that do not name one behave exactly as
+before.
 
 ## Configuration
 
@@ -122,21 +123,47 @@ reduce_fanin_overfetch = 8
 context_token_budget = 1200
 ```
 
-## Integration boundary (next slice)
+## Selecting a policy per request
 
-Selection on Python/MCP requests, request-local overlays in both the Assembler and MCP closures,
-capping explicit request budgets for selected policies, and any authorization claims are not
-part of this slice. Obligations for that integration:
+```bash
+curl -s http://127.0.0.1:4242/mcp -H 'Content-Type: application/json' -d '{
+  "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+  "params": {"name": "ncp_get_context", "arguments": {
+    "agent_id": "executor", "role": "build",
+    "task": "fix_payment_bug", "slot": "payment", "intent": "advance",
+    "context_policy": "balanced-v1"
+  }}}'
+```
 
-- Apply the overlay per request. Mutating the process-level cached config would leak one agent's
-  policy into other agents' requests.
-- Settings are captured in both the Assembler and the MCP server closures; applying the overlay to
-  only one is incomplete.
-- `budget.max_tokens_per_call` is not a universal runtime cap today, and an explicit MCP
-  `max_tokens` bypasses adaptive budgeting. Selected policies must cap explicit request budgets;
-  requests with no policy keep the current behavior.
-- Before any authorization claim, audit every read path: graph expansion, recent refs, hydration,
-  direct fetches, decision packets, memoization, skill-cache reads and whispers. A minimum-trust
-  gate is not the same as reweighting trust in ranking.
+```python
+from ncp import api
+
+context = api.get_context(agent=agent, context_policy="balanced-v1")
+```
+
+What a selected policy changes for that request only:
+
+- The policy is resolved onto a detached copy of the deployment config for each request. The
+  Assembler and the MCP server's adaptive budget and `active_features` telemetry all read that
+  copy, so one agent's policy never leaks into another agent's request or into the cached config.
+- An explicit `max_tokens` is capped at `budget.max_tokens_per_call`. Without a policy, an
+  explicit `max_tokens` is still honored as-is.
+- The `ncp_get_context` response (and the streamed `handler_result`) carries a `context_policy`
+  block: `name`, `version`, `sha256`, `max_tokens_cap`, and `max_tokens_capped_from` when the
+  request's `max_tokens` was lowered.
+
+Errors: an unknown name raises `UnknownContextPolicyError`, an invalid definition or an
+out-of-bounds resolved budget raises `ContextPolicyError` (both `ValueError`s; over MCP they are
+JSON-RPC errors with the sanitized message). Naming a policy on an MCP server running without a
+loaded config is rejected.
+
+## Not covered
+
+- Only context assembly consults a policy. `ncp_fetch`, decision packets, memoization,
+  skill-cache reads and whispers ignore it.
+- Policies tune retrieval; they are not an authorization, provenance or minimum-trust boundary.
+  Before any such claim, every read path above needs auditing, and a minimum-trust gate is not
+  the same as reweighting trust in ranking.
+- There is no deployment-wide default policy; each request must name one.
 - The policy hash identifies the policy definition, not effective deployment behavior; request
   explanations should eventually report both.

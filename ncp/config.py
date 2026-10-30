@@ -514,6 +514,10 @@ class NCPConfig:
         return int(self.values.get("budget", {}).get("context_token_budget", 840))
 
     @property
+    def max_tokens_per_call(self) -> int:
+        return int(self.values.get("budget", {}).get("max_tokens_per_call", 4000))
+
+    @property
     def chunk_cap_default(self) -> int:
         return int(self.values.get("budget", {}).get("chunk_cap_default", 4))
 
