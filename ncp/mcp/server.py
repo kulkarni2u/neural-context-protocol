@@ -20,6 +20,7 @@ from typing import BinaryIO, Sequence, get_args
 
 from ncp.adaptive_budget import AdaptiveBudgetResult, compute_adaptive_budget
 from ncp.assembler import Assembler, stored_evidence_ids
+from ncp.mcp.response_budget import compact_telemetry, context_sha256, fit_response
 from ncp.budget import BudgetSnapshot, evaluate_budget
 from ncp.chunker import filter_content
 from ncp.config import NCPConfig, load_config
@@ -104,6 +105,8 @@ MCP_TOOLS: list[dict[str, object]] = [
                 "k": {"type": "integer", "description": "Number of subconscious chunks to retrieve. Overrides the default budget-pressure-based value (2 for critical, 4 otherwise)."},
                 "diversity_limit": {"type": "integer", "description": "Max chunks per author in retrieved results. Default 2. Set higher to allow more results from one author."},
                 "max_tokens": {"type": "integer", "description": "Optional estimated token ceiling for the assembled context block. Honored as-is unless context_policy is set, in which case it is capped at [budget].max_tokens_per_call; when omitted and [budget].adaptive_budget_enabled is true, the ceiling is instead computed per-turn (see the response's budget_tokens block)."},
+                "compact": {"type": "boolean", "description": "Optional. Return compact telemetry (non-zero counts, flags and contradicting ids only), omit tier-hint factors, and add context_sha256. Evidence ids are unchanged. Default false."},
+                "response_max_tokens": {"type": "integer", "minimum": 1, "description": "Optional estimated token ceiling for the whole serialized response, not just the context. Optional diagnostics are dropped first, then the already-retrieved context is re-fitted smaller; retrieved_chunk_ids, pending_whisper_ids, session_id and the policy identity are always kept. When anything is cut the response carries a truncated block. Not applied to streamed responses."},
                 "context_policy": {"type": "string", "description": "Optional name of a [context_policies.<name>] entry. Its retrieval, budget and distillation overrides apply to this request only, and the response's context_policy block reports the name, version and sha256 applied. Unknown or invalid policies are rejected."},
                 "recent": {"type": "array", "items": {"type": "string"}, "description": "Optional recent refs overriding hydrated conscious state."},
                 "tried": {"type": "array", "items": {"type": "string"}, "description": "Optional attempted actions overriding hydrated conscious state."},
@@ -1353,6 +1356,14 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         )
 
     def _handle_get_context(args: dict[str, object]) -> object:
+        compact = args.get("compact", False)
+        if not isinstance(compact, bool):
+            raise ValueError("ncp_get_context 'compact' must be a boolean")
+        response_max_tokens: int | None = None
+        if args.get("response_max_tokens") is not None:
+            response_max_tokens = _int_arg(args, "response_max_tokens", 0)
+            if response_max_tokens < 1:
+                raise ValueError("ncp_get_context 'response_max_tokens' must be >= 1")
         session_id = _session_id_from_args(args)
         pipeline_id = args.get("pipeline_id")
         normalized_pipeline_id = None if pipeline_id is None else str(pipeline_id)
@@ -1456,6 +1467,8 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
                 handler_result["drift"] = drift_block
             if as_of is not None:
                 handler_result["as_of"] = as_of
+            if compact:
+                _compact_response(handler_result)
             return StreamResponse(
                 sections=sections,
                 handler_result=handler_result,
@@ -1488,7 +1501,26 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             response["drift"] = drift_block
         if as_of is not None:
             response["as_of"] = as_of
+        if compact:
+            _compact_response(response)
+        if response_max_tokens is not None:
+            def _refit(ceiling: int) -> dict[str, object]:
+                refitted = assembler.refit(result, budget=budget, max_tokens=ceiling, query_text=search_text)
+                return {
+                    "context": refitted.context,
+                    "pending_whisper_ids": refitted.pending_whisper_ids,
+                    "retrieved_chunk_ids": _retrieved_chunk_ids(refitted),
+                }
+
+            response = fit_response(response, response_max_tokens, reassemble=_refit)
         return response
+
+    def _compact_response(response: dict[str, object]) -> None:
+        telemetry = response.get("telemetry")
+        if isinstance(telemetry, dict):
+            response["telemetry"] = compact_telemetry(telemetry)
+        response.pop("factors", None)
+        response["context_sha256"] = context_sha256(str(response.get("context", "")))
 
     def _handle_write_memory(args: dict[str, object]) -> object:
         written_by = str(args.get("written_by", "agent"))

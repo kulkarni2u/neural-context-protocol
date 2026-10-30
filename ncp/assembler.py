@@ -450,6 +450,55 @@ class Assembler:
         sections.append(("budget_header", self.encoder._encode_budget(budget)))
         return sections
 
+    def refit(
+        self,
+        result: AssemblyResult,
+        *,
+        budget: BudgetContext,
+        max_tokens: int,
+        query_text: str,
+    ) -> AssemblyResult:
+        """Re-fit an existing result under a smaller ceiling, without store access.
+
+        Re-running ``assemble`` would retrieve again and bump retrieval counts
+        (calibration feedback) a second time; this only drops or distils the
+        chunks and whispers already chosen, then re-encodes.
+        """
+        chunks, whispers = self._fit_token_budget(
+            conscious=result.conscious,
+            budget=budget,
+            chunks=result.chunks,
+            whispers=result.whispers,
+            max_tokens=max(1, max_tokens),
+            query_text=query_text,
+        )
+        kept_ids = {chunk.chunk_id for chunk in chunks}
+        contradictions = [(a, b) for a, b in result.fanin_contradictions if a in kept_ids and b in kept_ids]
+        context = self.encoder.assemble(
+            conscious=result.conscious,
+            chunks=chunks,
+            whispers=whispers,
+            budget=budget,
+            contradiction_notes=contradictions or None,
+        )
+        kept_whisper_ids = {w.whisper_id for w in whispers}
+        return AssemblyResult(
+            context=self.middleware.post_assemble(context),
+            conscious=result.conscious,
+            chunks=chunks,
+            whispers=whispers,
+            pending_whisper_ids=[w for w in result.pending_whisper_ids if w in kept_whisper_ids],
+            evicted_high_relevance=result.evicted_high_relevance,
+            evicted_whispers=result.evicted_whispers,
+            evicted_chunk_count=result.evicted_chunk_count + len(result.chunks) - len(chunks),
+            evicted_whisper_count=result.evicted_whisper_count + len(result.whispers) - len(whispers),
+            retrieval_used_fallback=result.retrieval_used_fallback,
+            fanin_merged_count=result.fanin_merged_count,
+            fanin_contradictions=contradictions,
+            fanin_dropped_malformed_count=result.fanin_dropped_malformed_count,
+            evidence_sources={cid: src for cid, src in result.evidence_sources.items() if cid in kept_ids},
+        )
+
     def apply_post_middleware(self, text: str) -> str:
         return self.middleware.post_assemble(text)
 
