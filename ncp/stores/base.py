@@ -381,11 +381,14 @@ class BaseStore(ABC):
         estimated to save; when None, backends estimate it from the stored
         result via ``ncp.tokens.estimate_tokens``. Returns True on success.
 
-        Re-recording an existing ``signature`` is an upsert of the task/
-        content fields only: ``created_at``, ``hit_count``, ``last_hit_at``,
-        ``outcome``, and ``verified`` are preserved rather than reset, so a
-        memo doesn't lose its accumulated telemetry or review state just
-        because the same work was recorded again.
+        Re-recording an existing ``signature`` with the same
+        ``result_summary`` and ``chunk_ids`` preserves ``created_at``,
+        ``outcome`` and ``verified``, so recording the same work again does
+        not lose its review state. Re-recording *different* content is a
+        replacement: ``outcome``/``verified`` reset and ``created_at``
+        restarts, so a verification of the old result never vouches for the
+        new one and staleness is measured from the new result. ``hit_count``
+        and ``last_hit_at`` are telemetry and are kept either way.
 
         Backends that do not implement this return False.
         """

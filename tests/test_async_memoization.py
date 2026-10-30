@@ -58,7 +58,7 @@ def _make_store(**kwargs):
 
 @pytest.mark.anyio
 async def test_async_record_memo_upsert_preserves_counters_sql() -> None:
-    """The ON CONFLICT SET clause must not overwrite created_at/hit_count/outcome/verified."""
+    """hit_count is never reset; created_at/outcome/verified reset only on a content change."""
     store = _make_store()
 
     await store.async_record_memo("sig1", "task", ["c1"], "summary")
@@ -69,14 +69,12 @@ async def test_async_record_memo_upsert_preserves_counters_sql() -> None:
     upsert_sql = upsert_calls[0]
 
     set_clause = upsert_sql.split("DO UPDATE SET", 1)[1]
-    assert "created_at" not in set_clause, (
-        "re-record must not reset created_at; found it in SET clause"
-    )
     assert "hit_count" not in set_clause, (
         "re-record must not reset hit_count; found it in SET clause"
     )
-    assert "outcome" not in set_clause, "re-record must not reset outcome"
-    assert "verified" not in set_clause, "re-record must not reset verified"
+    # Review state is kept for an identical re-record and reset on replacement.
+    for column in ("created_at", "outcome", "verified"):
+        assert f"{column} = CASE WHEN me.result_summary IS NOT DISTINCT FROM EXCLUDED.result_summary" in set_clause
     # Content fields are still legitimately updated.
     assert "task" in set_clause
     assert "result_summary" in set_clause

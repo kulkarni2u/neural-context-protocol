@@ -297,10 +297,10 @@ def test_abandoned_stream_leaves_whispers_pending(tmp_path: Path) -> None:
     assert _pending(store) == ["wsp_billing_3"]
 
 
-def test_memo_hit_does_not_acknowledge_whispers(tmp_path: Path) -> None:
+def test_new_whisper_bypasses_memo_and_is_delivered(tmp_path: Path) -> None:
     project = tmp_path / "repo"
     (project / ".git").mkdir(parents=True)
-    config = NCPConfig(values={"memoization": {"enabled": True}}, project_root=project)
+    config = NCPConfig(values={"memoization": {"enabled": True, "allow_unverified": True}}, project_root=project)
     store = SQLiteStore(project / ".ncp" / "store.db", config=config)
     adapter = _UsageAdapter(None, "gpt-4o")
 
@@ -308,6 +308,9 @@ def test_memo_hit_does_not_acknowledge_whispers(tmp_path: Path) -> None:
     _queue_whisper(store, "wsp_billing_4")
     second = ncp.run(agent=_agent(), turn="go", adapter=adapter, store=store, config=config)
 
-    assert second.cost_source == "memoized"
-    assert second.evidence is not None and second.evidence.whisper_ids == []
-    assert _pending(store) == ["wsp_billing_4"]
+    # The pending whisper is part of the memo's dependency fingerprint, so the
+    # cached answer (which never saw it) is not reused.
+    assert len(adapter.contexts) == 2
+    assert second.cost_source != "memoized"
+    assert second.evidence is not None and second.evidence.whisper_ids == ["wsp_billing_4"]
+    assert _pending(store) == []

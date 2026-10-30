@@ -11,11 +11,11 @@ from ncp.adapters.base import BaseAdapter
 from ncp.adapters.local import LocalAdapter
 from ncp.assembler import Assembler, AssemblyResult
 from ncp.config import NCPConfig, load_config
-from ncp.context_policy import resolve_context_policy
+from ncp.context_policy import ResolvedContextPolicy, resolve_context_policy
 from ncp.costs import calculate_cost
 from ncp.stores.base import BaseStore
 from ncp.stores.factory import create_store
-from ncp.stores.memo import compute_memo_signature
+from ncp.stores.memo import compute_dependency_fingerprint, compute_turn_memo_signature, memo_ineligibility
 from ncp.tokens import estimate_tokens
 from ncp.types import (
     BudgetContext,
@@ -244,10 +244,8 @@ def run(
         max_tokens=policy.cap_max_tokens(max_tokens),
     )
 
-    memo_signature = _memo_signature(resolved_config, agent, turn)
-    memo = resolved_store.lookup_memo(memo_signature) if memo_signature else None
-    if not (memo and memo.get("result_summary")):
-        memo = None  # an empty memo row is a miss, not a reusable result
+    memo_signature = _memo_signature(resolved_config, agent, turn, resolved_adapter, assembly, policy)
+    memo = _usable_memo(resolved_store, resolved_config, memo_signature)
     if memo is not None:
         content = str(memo["result_summary"])
         response = _build_memo_response(agent=agent, adapter=resolved_adapter, memo=memo, start=start)
@@ -311,10 +309,8 @@ def stream(
     )
     start = time.perf_counter()
 
-    memo_signature = _memo_signature(resolved_config, agent, turn)
-    memo = resolved_store.lookup_memo(memo_signature) if memo_signature else None
-    if not (memo and memo.get("result_summary")):
-        memo = None  # an empty memo row is a miss, not a reusable result
+    memo_signature = _memo_signature(resolved_config, agent, turn, resolved_adapter, assembly, policy)
+    memo = _usable_memo(resolved_store, resolved_config, memo_signature)
     if memo is not None:
         # Memo hit: synthesize a single-chunk "stream" from the cached content
         # instead of calling the provider.
@@ -352,7 +348,11 @@ def stream(
     )
 
 
-def _attribute_evidence(assembly: AssemblyResult, memo: dict[str, object] | None) -> EvidenceAttribution:
+def _attribute_evidence(
+    assembly: AssemblyResult,
+    memo: dict[str, object] | None,
+    memo_signature: str | None = None,
+) -> EvidenceAttribution:
     """Evidence a run/stream turn rests on (see ``EvidenceAttribution``)."""
     if memo is not None:
         raw = memo.get("chunk_ids") or []
@@ -362,12 +362,13 @@ def _attribute_evidence(assembly: AssemblyResult, memo: dict[str, object] | None
             except ValueError:
                 raw = []
         memo_ids = [str(c) for c in raw] if isinstance(raw, list) else []
-        return EvidenceAttribution(presented=False, memo_chunk_ids=memo_ids)
+        return EvidenceAttribution(presented=False, memo_chunk_ids=memo_ids, memo_signature=memo_signature)
     return EvidenceAttribution(
         presented=True,
         chunk_ids=assembly.stored_evidence_ids(),
         sources=dict(assembly.evidence_sources),  # type: ignore[arg-type]
         whisper_ids=list(assembly.pending_whisper_ids),
+        memo_signature=memo_signature,
     )
 
 
@@ -392,7 +393,7 @@ def _finish_turn(
     policy_block: dict[str, object] | None = None,
 ) -> NCPResponse:
     """Shared run/stream tail: attribute evidence, memoize, and post the turn."""
-    evidence = _attribute_evidence(assembly, memo)
+    evidence = _attribute_evidence(assembly, memo, memo_signature)
     response = response.model_copy(update={"evidence": evidence, "context_policy": policy_block})
     if memo is None and memo_signature:
         assembler.store.record_memo(
@@ -415,20 +416,67 @@ def _finish_turn(
     return response
 
 
-def _memo_signature(config: NCPConfig, agent: ConsciousBlock, turn: str) -> str | None:
-    """CAP-C3 signature for this turn, or None when memoization is disabled.
+def _memo_signature(
+    config: NCPConfig,
+    agent: ConsciousBlock,
+    turn: str,
+    adapter: BaseAdapter,
+    assembly: AssemblyResult,
+    policy: ResolvedContextPolicy,
+) -> str | None:
+    """Canonical memo key for this turn, or None when memoization is disabled.
 
-    Deliberately excludes the fully assembled ``[NCP:...]`` context block:
-    recent-turn refs, whisper payloads, and live budget figures all change
-    from call to call, so keying on it would make an exact-match signature
-    almost never repeat. Instead this keys on the turn text plus the
-    agent's own stable identity/task/slot fields, which do repeat across
-    retries or repeated sub-task calls.
+    Keys on the agent's identity, pipeline, goal and constraints, the target
+    model/provider, and a fingerprint of the stored evidence, pending
+    whispers and context policy actually assembled -- so a memo is never
+    reused across pipelines or models, or after the evidence it was built
+    from changed. Volatile parts of the context (recent-turn refs, live
+    budget figures) are deliberately left out so retries of the same work
+    still repeat the key.
     """
     if not config.memoization_enabled:
         return None
-    stable_context = f"{agent.agent_id}|{agent.task}|{agent.slot}"
-    return compute_memo_signature(turn, stable_context)
+    stored = set(assembly.stored_evidence_ids())
+    fingerprint = compute_dependency_fingerprint(
+        evidence=[(c.chunk_id, c.content) for c in assembly.chunks if c.chunk_id in stored],
+        whisper_ids=[w.whisper_id for w in assembly.whispers],
+        policy_sha256=None if policy.identity is None else policy.identity.sha256,
+    )
+    return compute_turn_memo_signature(
+        turn=turn,
+        agent_id=agent.agent_id,
+        role=agent.role,
+        pipeline_id=agent.pipeline_id,
+        task=agent.task,
+        slot=agent.slot,
+        intent=agent.intent,
+        goal_version=agent.goal_version,
+        owns=agent.owns,
+        must_not=agent.must_not,
+        model=adapter.model_name,
+        provider=type(adapter).__name__,
+        dependency_fingerprint=fingerprint,
+    )
+
+
+def _usable_memo(store: BaseStore, config: NCPConfig, signature: str | None) -> dict[str, object] | None:
+    """The memo for ``signature`` if it passes the shared reuse gate, else None.
+
+    Uses the telemetry-neutral peek so a found-but-ineligible memo counts as
+    a miss, exactly like ``ncp_lookup_memo``.
+    """
+    if signature is None:
+        return None
+    memo = store.peek_memo(signature)
+    if memo is not None and memo_ineligibility(
+        memo,
+        min_outcome=config.memoization_min_outcome,
+        allow_unverified=config.memoization_allow_unverified,
+    ) is None:
+        store.record_memo_hit(signature)
+        return memo
+    store.record_memo_miss()
+    return None
 
 
 def _build_memo_response(

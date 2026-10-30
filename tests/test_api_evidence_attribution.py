@@ -49,7 +49,7 @@ def _agent() -> ConsciousBlock:
 def _store(tmp_path: Path, *, memo: bool = False) -> tuple[SQLiteStore, NCPConfig]:
     project = tmp_path / "repo"
     (project / ".git").mkdir(parents=True)
-    values = {"memoization": {"enabled": True}} if memo else {}
+    values = {"memoization": {"enabled": True, "allow_unverified": True}} if memo else {}
     config = NCPConfig(values=values, project_root=project)
     return SQLiteStore(project / ".ncp" / "store.db", config=config), config
 

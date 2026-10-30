@@ -1244,6 +1244,12 @@ class SQLiteStore(BaseStore):
                 VALUES (?, ?, ?, ?, 0.0, 0, ?, 0.0, 0, ?)
                 ON CONFLICT(signature) DO UPDATE SET
                     task = excluded.task,
+                    outcome = CASE WHEN result_summary IS excluded.result_summary
+                        AND chunk_ids = excluded.chunk_ids THEN outcome ELSE 0.0 END,
+                    verified = CASE WHEN result_summary IS excluded.result_summary
+                        AND chunk_ids = excluded.chunk_ids THEN verified ELSE 0 END,
+                    created_at = CASE WHEN result_summary IS excluded.result_summary
+                        AND chunk_ids = excluded.chunk_ids THEN created_at ELSE excluded.created_at END,
                     result_summary = excluded.result_summary,
                     chunk_ids = excluded.chunk_ids,
                     output_tokens_est = excluded.output_tokens_est

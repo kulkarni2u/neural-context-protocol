@@ -654,6 +654,10 @@ class EvidenceAttribution(NCPModel):
     # Whispers included in the request and therefore acknowledged. Empty on
     # a memo hit: nothing was shown to a model, so nothing is acknowledged.
     whisper_ids: list[str] = Field(default_factory=list)
+    # The turn's canonical memo key when memoization is enabled; pass it to
+    # store.update_memo_outcome(..., verified=True) once the result is
+    # verified so later identical turns may reuse it.
+    memo_signature: str | None = None
 
 
 class NCPResponse(NCPModel):

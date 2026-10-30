@@ -2183,7 +2183,7 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         return {"hits": int(stats.get("hits", 0)), "misses": int(stats.get("misses", 0))}
 
     def _handle_lookup_memo(args: dict[str, object]) -> object:
-        from ncp.stores.memo import compute_memo_signature
+        from ncp.stores.memo import compute_memo_signature, memo_ineligibility
         if config is not None and not config.memoization_enabled:
             return {
                 "recorded": False,
@@ -2206,13 +2206,12 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         cfg = config
         usable = False
         if memo is not None:
-            # Apply outcome and verified gating at the handler level
-            gated = False
-            if cfg is not None:
-                if float(memo.get("outcome", 0.0)) < cfg.memoization_min_outcome:
-                    gated = True
-                elif not cfg.memoization_allow_unverified and not bool(memo.get("verified", 0)):
-                    gated = True
+            gated = cfg is not None and memo_ineligibility(
+                memo,
+                min_outcome=cfg.memoization_min_outcome,
+                allow_unverified=cfg.memoization_allow_unverified,
+                require_result=False,
+            ) is not None
             if not gated:
                 usable = True
                 result = {"found": True, "memo": dict(memo)}

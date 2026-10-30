@@ -1678,12 +1678,18 @@ class PgvectorStore(BaseStore):
                 cursor.execute(
                     self._sql(
                         """
-                        INSERT INTO {schema}.{prefix}memo_entries
+                        INSERT INTO {schema}.{prefix}memo_entries AS me
                             (signature, task, result_summary, chunk_ids, outcome, verified,
                              created_at, last_hit_at, hit_count, output_tokens_est)
                         VALUES (%s, %s, %s, %s, 0.0, 0, %s, 0.0, 0, %s)
                         ON CONFLICT (signature) DO UPDATE SET
                             task = EXCLUDED.task,
+                            outcome = CASE WHEN me.result_summary IS NOT DISTINCT FROM EXCLUDED.result_summary
+                                AND me.chunk_ids = EXCLUDED.chunk_ids THEN me.outcome ELSE 0.0 END,
+                            verified = CASE WHEN me.result_summary IS NOT DISTINCT FROM EXCLUDED.result_summary
+                                AND me.chunk_ids = EXCLUDED.chunk_ids THEN me.verified ELSE 0 END,
+                            created_at = CASE WHEN me.result_summary IS NOT DISTINCT FROM EXCLUDED.result_summary
+                                AND me.chunk_ids = EXCLUDED.chunk_ids THEN me.created_at ELSE EXCLUDED.created_at END,
                             result_summary = EXCLUDED.result_summary,
                             chunk_ids = EXCLUDED.chunk_ids,
                             output_tokens_est = EXCLUDED.output_tokens_est
