@@ -24,6 +24,37 @@ def compute_memo_signature(task: str, context: str = "") -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+MCP_SCOPED_MEMO_SIGNATURE_VERSION = "ncp-mcp-memo-scoped/1"
+
+
+def compute_scoped_memo_signature(
+    task: str,
+    context: str = "",
+    *,
+    pipeline_id: str | None = None,
+    model: str | None = None,
+    provider: str | None = None,
+) -> str:
+    """``compute_memo_signature`` optionally narrowed to a pipeline/model/provider.
+
+    With no scope this is exactly ``compute_memo_signature(task, context)``,
+    so existing hosts' memo keys are unchanged. Any scope value switches to a
+    versioned key that also covers the scope, so a memo recorded for one
+    pipeline, model or provider is never served to another.
+    """
+    base = compute_memo_signature(task, context)
+    if pipeline_id is None and model is None and provider is None:
+        return base
+    payload = {
+        "v": MCP_SCOPED_MEMO_SIGNATURE_VERSION,
+        "base": base,
+        "pipeline_id": pipeline_id,
+        "model": model,
+        "provider": provider,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
 # Bump when the canonical turn-signature payload changes, so memos keyed by
 # an older layout can never collide with (and be served for) a new one.
 TURN_MEMO_SIGNATURE_VERSION = "ncp-turn-memo/2"

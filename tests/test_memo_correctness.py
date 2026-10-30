@@ -280,3 +280,51 @@ async def test_async_pgvector_memo_replacement_resets_review_state() -> None:
         assert (replaced["verified"], replaced["outcome"]) == (0, 0.0)
     finally:
         await store.close()
+
+
+# ── MCP memo scope ──────────────────────────────────────────────────────────
+
+
+def _mcp(handlers, name: str, args: dict) -> dict:
+    import json
+
+    from ncp.mcp.server import _handle_request
+
+    request = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name, "arguments": args}}
+    response = json.loads(_handle_request(request, handlers))
+    assert "error" not in response, response
+    return json.loads(response["result"]["content"][0]["text"])
+
+
+def _mcp_handlers(tmp_path: Path):
+    from ncp.mcp.server import make_handlers
+
+    store, config = _setup(tmp_path)
+    config.values["tools"] = {"profile": "full"}
+    return make_handlers(store, config=config)
+
+
+def test_unscoped_mcp_memo_key_is_unchanged() -> None:
+    from ncp.stores.memo import compute_memo_signature, compute_scoped_memo_signature
+
+    assert compute_scoped_memo_signature("task", "ctx") == compute_memo_signature("task", "ctx")
+    assert compute_scoped_memo_signature("task", "ctx", pipeline_id="p") != compute_memo_signature("task", "ctx")
+
+
+def test_scoped_mcp_memo_is_not_shared_across_scopes(tmp_path: Path) -> None:
+    handlers = _mcp_handlers(tmp_path)
+    base = {"task": "summarize retry policy", "context": "v1"}
+    scope_a = {**base, "pipeline_id": "pipe_a", "model": "model-a", "provider": "acme"}
+
+    recorded = _mcp(handlers, "ncp_record_memo", {**scope_a, "chunk_ids": [], "result_summary": "summary A"})
+    assert recorded["recorded"] is True
+    assert _mcp(handlers, "ncp_verify_memo", scope_a)["verified"] is True
+
+    assert _mcp(handlers, "ncp_lookup_memo", scope_a)["found"] is True
+    for other in (
+        base,
+        {**scope_a, "pipeline_id": "pipe_b"},
+        {**scope_a, "model": "model-b"},
+        {**scope_a, "provider": "other"},
+    ):
+        assert _mcp(handlers, "ncp_lookup_memo", other)["found"] is False, other

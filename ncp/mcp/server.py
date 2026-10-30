@@ -742,6 +742,16 @@ MCP_TOOLS: list[dict[str, object]] = [
                     "type": "string",
                     "description": "Explicit memo signature (overrides task+context hash)",
                 },
+                "pipeline_id": {
+                    "type": "string",
+                    "description": (
+                        "Optional scope: when any of pipeline_id/model/provider is set, the "
+                        "task+context signature also covers them, so the memo is only shared "
+                        "within that scope. Use the same values on record, lookup and verify."
+                    ),
+                },
+                "model": {"type": "string", "description": "Optional scope: model the memoized result came from."},
+                "provider": {"type": "string", "description": "Optional scope: provider the memoized result came from."},
             },
         },
     },
@@ -775,6 +785,16 @@ MCP_TOOLS: list[dict[str, object]] = [
                     "type": "string",
                     "description": "Explicit memo signature (overrides task+context hash)",
                 },
+                "pipeline_id": {
+                    "type": "string",
+                    "description": (
+                        "Optional scope: when any of pipeline_id/model/provider is set, the "
+                        "task+context signature also covers them, so the memo is only shared "
+                        "within that scope. Use the same values on record, lookup and verify."
+                    ),
+                },
+                "model": {"type": "string", "description": "Optional scope: model the memoized result came from."},
+                "provider": {"type": "string", "description": "Optional scope: provider the memoized result came from."},
                 "output_tokens_est": {
                     "type": "integer",
                     "description": (
@@ -822,6 +842,16 @@ MCP_TOOLS: list[dict[str, object]] = [
                     "type": "string",
                     "description": "Explicit memo signature (overrides task+context hash)",
                 },
+                "pipeline_id": {
+                    "type": "string",
+                    "description": (
+                        "Optional scope: when any of pipeline_id/model/provider is set, the "
+                        "task+context signature also covers them, so the memo is only shared "
+                        "within that scope. Use the same values on record, lookup and verify."
+                    ),
+                },
+                "model": {"type": "string", "description": "Optional scope: model the memoized result came from."},
+                "provider": {"type": "string", "description": "Optional scope: provider the memoized result came from."},
                 "outcome": {
                     "type": "number",
                     "description": "Outcome score for this memo (default 1.0 = confirmed good).",
@@ -2242,20 +2272,35 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             return None
         return {"hits": int(stats.get("hits", 0)), "misses": int(stats.get("misses", 0))}
 
+    def _memo_signature_from_args(args: dict[str, object]) -> str:
+        """Shared memo key for lookup/record/verify: explicit signature, else scoped task+context."""
+        from ncp.stores.memo import compute_scoped_memo_signature
+
+        explicit = args.get("signature")
+        if explicit is not None:
+            return str(explicit)
+
+        def _opt(key: str) -> str | None:
+            value = args.get(key)
+            return None if value is None else str(value)
+
+        return compute_scoped_memo_signature(
+            str(args.get("task", "")),
+            str(args.get("context", "")),
+            pipeline_id=_opt("pipeline_id"),
+            model=_opt("model"),
+            provider=_opt("provider"),
+        )
+
     def _handle_lookup_memo(args: dict[str, object]) -> object:
-        from ncp.stores.memo import compute_memo_signature, memo_ineligibility
+        from ncp.stores.memo import memo_ineligibility
         if config is not None and not config.memoization_enabled:
             return {
                 "recorded": False,
                 "disabled": True,
                 "reason": "memoization_disabled",
             }
-        sig = args.get("signature")
-        if sig is None:
-            task = str(args.get("task", ""))
-            context = str(args.get("context", ""))
-            sig = compute_memo_signature(task, context)
-        sig = str(sig)
+        sig = _memo_signature_from_args(args)
         # Use the telemetry-neutral peek here, not `store.lookup_memo` — the
         # latter unconditionally counts a hit as soon as a fresh row exists,
         # before the outcome/verified gating below runs. We only want to
@@ -2285,7 +2330,7 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         return result
 
     def _handle_record_memo(args: dict[str, object]) -> object:
-        from ncp.stores.memo import compute_memo_signature, validate_code_memo_ast
+        from ncp.stores.memo import validate_code_memo_ast
         if config is not None and not config.memoization_enabled:
             return {
                 "recorded": False,
@@ -2293,11 +2338,7 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
                 "reason": "memoization_disabled",
             }
         task = str(args.get("task", ""))
-        sig = args.get("signature")
-        if sig is None:
-            context = str(args.get("context", ""))
-            sig = compute_memo_signature(task, context)
-        sig = str(sig)
+        sig = _memo_signature_from_args(args)
         chunk_ids = [str(c) for c in list(args.get("chunk_ids", []) or [])]
         result_summary = args.get("result_summary")
         if result_summary is not None:
@@ -2326,19 +2367,13 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         return {"recorded": recorded, "signature": sig}
 
     def _handle_verify_memo(args: dict[str, object]) -> object:
-        from ncp.stores.memo import compute_memo_signature
         if config is not None and not config.memoization_enabled:
             return {
                 "verified": False,
                 "disabled": True,
                 "reason": "memoization_disabled",
             }
-        sig = args.get("signature")
-        if sig is None:
-            task = str(args.get("task", ""))
-            context = str(args.get("context", ""))
-            sig = compute_memo_signature(task, context)
-        sig = str(sig)
+        sig = _memo_signature_from_args(args)
         try:
             outcome = float(args.get("outcome", 1.0))
         except (TypeError, ValueError):
