@@ -453,6 +453,19 @@ MCP_TOOLS: list[dict[str, object]] = [
                                 "enum": ["prose", "json", "code", "table", "auto"],
                                 "description": "Optional declared content shape. Defaults to 'prose'.",
                             },
+                            "base_trust": {"type": "number", "description": "Optional explicit trust (0-1)."},
+                            "signature": {
+                                "type": "string",
+                                "description": (
+                                    "Optional authorship signature over (written_by | sha256(content) | "
+                                    "pipeline_id), verified exactly as in ncp_write_memory."
+                                ),
+                            },
+                            "evidence_id": {
+                                "type": "string",
+                                "description": "Optional id of an existing same-pipeline chunk grounding this claim.",
+                            },
+                            "caused_by": {"type": "string", "description": "Optional id of the chunk this one derives from."},
                         },
                         "required": ["content", "layer", "src"],
                     },
@@ -1652,6 +1665,60 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             result["dissent_recorded"] = store.record_dissent(str(ref), identity_id=from_agent)
         return result
 
+    def _validated_batch_chunk(
+        item: dict[str, object], *, conscious: ConsciousBlock
+    ) -> tuple[SubconsciousChunk, bool]:
+        """One ncp_post_turn memory chunk, held to ncp_write_memory's write checks.
+
+        Authorship is verified (and required under require_signatures),
+        high-trust claims are demoted unless grounded under
+        require_grounded_high_trust, and caused_by/evidence_id provenance is
+        kept. Returns the chunk and whether its trust was demoted.
+        """
+        content = str(item["content"])
+        written_by = str(item.get("written_by") or conscious.agent_id)
+        signature = item.get("signature")
+        verified = _verify_authorship(
+            store,
+            identity_id=written_by,
+            content=content,
+            pipeline_id=conscious.pipeline_id,
+            signature=None if signature is None else str(signature),
+        )
+        if require_signatures and not verified:
+            raise ValueError(
+                "ncp_post_turn rejected: require_signatures is enabled and authorship of a "
+                "memory_chunks item could not be verified (missing/invalid signature or "
+                "revoked identity); nothing was written."
+            )
+        # The batch path never noise-filters, so it never yields a raw_ref.
+        trust, demoted, _ = _grounded_trust_from_args(
+            item,
+            store=store,
+            require_grounded_high_trust=require_grounded_high_trust,
+            will_produce_raw_ref=False,
+            pipeline_id=conscious.pipeline_id,
+        )
+        chunk_kwargs: dict = {
+            "content": content,
+            "layer": str(item["layer"]),
+            "src": str(item["src"]),
+            "written_by": written_by,
+            "pipeline_id": conscious.pipeline_id,
+            "base_trust": trust,
+            "written_at_drift": conscious.drift_score,
+            "verified": verified,
+        }
+        if (chunk_id := item.get("chunk_id")):
+            chunk_kwargs["chunk_id"] = str(chunk_id)
+        if (chunk_type := item.get("chunk_type")) is not None:
+            chunk_kwargs["chunk_type"] = str(chunk_type)
+        if (caused_by := item.get("caused_by")) is not None:
+            chunk_kwargs["caused_by"] = str(caused_by)
+        if (evidence_id := item.get("evidence_id")) is not None:
+            chunk_kwargs["evidence_id"] = str(evidence_id)
+        return SubconsciousChunk(**chunk_kwargs), demoted
+
     def _handle_post_turn(args: dict[str, object]) -> object:
         conscious = _build_conscious_from_args(store, args)
         assembler = Assembler(store=store, config=config)
@@ -1671,27 +1738,18 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         if raw_retrieved is not None and not isinstance(raw_retrieved, list):
             raise ValueError("ncp_post_turn: 'retrieved_chunk_ids' must be an array of strings")
         retrieved_ids = [str(item) for item in (raw_retrieved or [])]
+        # Validate the whole batch before anything (including the turn record)
+        # is written: one rejected item rejects the call, so a mixed-validity
+        # batch can never half-persist.
         memory_chunks: list[SubconsciousChunk] = []
+        demoted_chunk_ids: list[str] = []
         for item in list(args.get("memory_chunks", []) or []):
             if not isinstance(item, dict):
                 raise ValueError("ncp_post_turn: memory_chunks items must be objects")
-            chunk_kwargs: dict = {
-                "content": str(item["content"]),
-                "layer": str(item["layer"]),
-                "src": str(item["src"]),
-                "written_by": str(item.get("written_by") or conscious.agent_id),
-                "pipeline_id": conscious.pipeline_id,
-                # Finding 1: derive base_trust/written_at_drift the same way
-                # _handle_write_memory does, so a chunk written through this
-                # batch path is not silently flattened to the bare defaults.
-                "base_trust": _trust_from_args(item),
-                "written_at_drift": conscious.drift_score,
-            }
-            if (chunk_id := item.get("chunk_id")):
-                chunk_kwargs["chunk_id"] = str(chunk_id)
-            if (chunk_type := item.get("chunk_type")) is not None:
-                chunk_kwargs["chunk_type"] = str(chunk_type)
-            memory_chunks.append(SubconsciousChunk(**chunk_kwargs))
+            chunk, demoted = _validated_batch_chunk(item, conscious=conscious)
+            memory_chunks.append(chunk)
+            if demoted:
+                demoted_chunk_ids.append(chunk.chunk_id)
         record = assembler.post_turn(
             conscious=conscious,
             response=response,
@@ -1705,6 +1763,8 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         # WI-007(a): surface dedup-suppressed memory writes to the host.
         if record.suppressed_chunk_ids:
             result["suppressed_chunk_ids"] = record.suppressed_chunk_ids
+        if demoted_chunk_ids:
+            result["trust_demoted_chunk_ids"] = demoted_chunk_ids
         # CAP-E2: reflect spend *after* this turn's cost was just logged above.
         budget_snapshot = _budget_snapshot(pipeline_id=conscious.pipeline_id)
         if budget_snapshot is not None:
