@@ -54,6 +54,7 @@ jobs:
         run: |
           python benchmarks/coding_pipeline/run.py --turns 40 | python -c "import json,sys; artifact=json.load(sys.stdin); summary=artifact['summary']; assert summary['pass'], summary; print('coding gate OK', summary['reduction_factor'])"
           python benchmarks/needle/run.py --turns 24 --needles 6 --budget 4 | python -c "import json,sys; artifact=json.load(sys.stdin); assert artifact['summary']['ncp_beats_sliding_window'], artifact['summary']; print('needle gate OK')"
+          python benchmarks/memo_reuse/run.py | python -c "import json,sys; artifact=json.load(sys.stdin); assert artifact['summary']['pass'], artifact['summary']; print('memo reuse gate OK', artifact['summary']['cost_per_verified_success_reduction'])"
 
       - name: Build artifacts
         run: python -m build
