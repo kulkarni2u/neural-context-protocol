@@ -4,6 +4,17 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-10-30
+
+### Release scope
+
+This minor release adds turn-to-chunk associations, per-chunk outcome
+consumption and the ContextPolicy foundation, plus calibration, consolidation
+and outcome correctness fixes. It is backward compatible. Postgres deployments
+must apply migrations `015_add_turn_chunks.sql` and
+`016_add_outcome_applications.sql` (SQLite tables are created idempotently).
+ContextPolicy is not yet wired into any request path.
+
 ### Added
 
 - **Context policy foundation** (`ncp/context_policy.py`): strictly validated
