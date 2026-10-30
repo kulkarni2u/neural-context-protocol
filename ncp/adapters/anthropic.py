@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from os import environ
 
-from ncp.adapters.base import BaseAdapter, NCPAdapterError, NCPAdapterTimeoutError, TokenUsage
+from ncp.adapters.base import BaseAdapter, NCPAdapterError, NCPAdapterTimeoutError, TokenUsage, _raw_usage
 
 # WI-10 (ncp/encoder.py) orders assembled context as stable blocks
 # ([NCP:CONSCIOUS], [NCP:SUBCONSCIOUS], [NCP:WHISPERS]) followed by the one
@@ -13,6 +13,10 @@ from ncp.adapters.base import BaseAdapter, NCPAdapterError, NCPAdapterTimeoutErr
 # breakpoint on the stable prefix lets the provider skip re-processing (and
 # re-billing at full price) everything before the volatile budget block.
 _BUDGET_MARKER = "[NCP:BUDGET]"
+# [NCP:WHISPERS] is per-turn too: whispers are drained and acknowledged each
+# turn and carry a relative age ("<1m", "5m") that changes with wall time.
+# When present it starts the volatile tail instead of [NCP:BUDGET].
+_WHISPERS_MARKER = "[NCP:WHISPERS]"
 
 
 class AnthropicAdapter(BaseAdapter):
@@ -45,6 +49,7 @@ class AnthropicAdapter(BaseAdapter):
         self._enable_prompt_caching = enable_prompt_caching
 
     def call(self, ncp_context: str, user_turn: str) -> str:
+        self.last_usage = None
         msg = self._run_provider_call(
             lambda: self._client.messages.create(
                 model=self._model,
@@ -76,7 +81,9 @@ class AnthropicAdapter(BaseAdapter):
     def _split_stable_prefix(ncp_context: str) -> list[dict[str, object]]:
         """Split into a cached stable-prefix block and an uncached volatile block.
 
-        The split point is the literal ``[NCP:BUDGET]`` marker, which
+        The split point is ``[NCP:WHISPERS]`` when present (whispers change
+        every turn and carry a wall-clock-relative age), otherwise the literal
+        ``[NCP:BUDGET]`` marker, which
         ``ncp/encoder.py``'s ``assemble_from_parts`` always appends last (the
         budget block is never omitted, even when other optional blocks are).
         Only the stable prefix gets ``cache_control`` -- the budget block
@@ -96,7 +103,9 @@ class AnthropicAdapter(BaseAdapter):
         caching that block.
         """
 
-        idx = ncp_context.find(_BUDGET_MARKER)
+        idx = ncp_context.find(_WHISPERS_MARKER)
+        if idx == -1:
+            idx = ncp_context.find(_BUDGET_MARKER)
         if idx == -1:
             return [{"type": "text", "text": ncp_context, "cache_control": {"type": "ephemeral"}}]
 
@@ -112,14 +121,17 @@ class AnthropicAdapter(BaseAdapter):
         usage = getattr(msg, "usage", None)
         if usage is None:
             return None
+        # Anthropic's input_tokens already excludes cache reads and writes.
         return TokenUsage(
             input_tokens=int(getattr(usage, "input_tokens", 0) or 0),
             output_tokens=int(getattr(usage, "output_tokens", 0) or 0),
             cache_read_tokens=int(getattr(usage, "cache_read_input_tokens", 0) or 0),
             cache_write_tokens=int(getattr(usage, "cache_creation_input_tokens", 0) or 0),
+            raw=_raw_usage(usage),
         )
 
     def stream(self, ncp_context: str, user_turn: str) -> Iterator[str]:
+        self.last_usage = None
         timeout_types = (self._anthropic.APITimeoutError, TimeoutError)
         stream_ctx = self._run_provider_call(
             lambda: self._client.messages.stream(

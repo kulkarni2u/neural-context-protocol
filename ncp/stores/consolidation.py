@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
@@ -104,7 +105,10 @@ def find_merge_candidates(
     """Return (authoritative_chunk, [chunks_to_merge_away]) pairs for a cluster.
 
     Uses a greedy union-find approach: once a chunk is absorbed into a group
-    it cannot be the authoritative chunk of another group.
+    it cannot be the authoritative chunk of another group. Pairs that are not
+    ``_mergeable`` (opposite claim polarity, or disjoint validity windows) are
+    never grouped however similar their wording, so a merge only ever joins
+    claims that say the same thing about the same time.
     """
     n = len(cluster)
     absorbed: set[str] = set()
@@ -116,6 +120,8 @@ def find_merge_candidates(
         group = [cluster[i]]
         for j in range(i + 1, n):
             if cluster[j].chunk_id in absorbed:
+                continue
+            if not _mergeable(cluster[i], cluster[j]):
                 continue
             sim = score_pair(cluster[i], cluster[j], n)
             if sim >= similarity_threshold:
@@ -169,6 +175,74 @@ _CONTRADICTION_CUES: tuple[str, ...] = (
 def _has_reversal_cue(content: str, cues: tuple[str, ...] = _CONTRADICTION_CUES) -> bool:
     lowered = content.lower()
     return any(cue in lowered for cue in cues)
+
+
+# _CONTRADICTION_CUES split by which way they point, so "already fixed" and
+# "still throws" -- both cues -- are recognised as opposite claims.
+_PERSISTENCE_CUES: tuple[str, ...] = (
+    "still throws",
+    "still fails",
+    "still broken",
+    "did not resolve",
+    "didn't resolve",
+    "does not resolve",
+    "not resolved",
+)
+_RESOLUTION_CUES: tuple[str, ...] = tuple(c for c in _CONTRADICTION_CUES if c not in _PERSISTENCE_CUES)
+_NEGATION_RE = re.compile(r"\b(?:not|never|cannot|\w+n't)\b")
+
+
+def claim_polarity(content: str) -> tuple[bool, bool, bool]:
+    """Deterministic (resolved, persists, negated) cue signature of a claim.
+
+    Two claims whose signatures differ may be opposite statements about the
+    same thing even when their wording is nearly identical ("X still
+    reproduces" / "X no longer reproduces", "retries on 429" / "does not
+    retry on 429"). A heuristic, not entailment.
+    """
+    lowered = content.lower()
+    return (
+        any(cue in lowered for cue in _RESOLUTION_CUES),
+        any(cue in lowered for cue in _PERSISTENCE_CUES),
+        _NEGATION_RE.search(lowered) is not None,
+    )
+
+
+_NUMBER_RE = re.compile(r"\d+(?:\.\d+)?")
+
+
+def claim_values(content: str) -> tuple[str, ...]:
+    """The numeric values a claim states, in order ("v2", "3 retries", "port 8080")."""
+    return tuple(_NUMBER_RE.findall(content))
+
+
+def same_claim_shape(a: str, b: str) -> bool:
+    """Whether two texts can be the same claim: equal numeric values and polarity.
+
+    Text similarity alone cannot tell "fact version v1" from "fact version
+    v2" or "retries 3 times" from "retries 5 times" -- a corrected value is a
+    one-character edit. Dedup, consolidation and fan-in merging all require
+    this before treating two texts as one.
+    """
+    return claim_values(a) == claim_values(b) and claim_polarity(a) == claim_polarity(b)
+
+
+def is_near_duplicate(a: str, b: str, *, threshold: float = 0.92) -> bool:
+    """Write-time dedup predicate shared by every store backend."""
+    return same_claim_shape(a, b) and SequenceMatcher(None, a, b).ratio() > threshold
+
+
+def _windows_overlap(a: SubconsciousChunk, b: SubconsciousChunk) -> bool:
+    """Whether two validity windows ([valid_from, valid_to), None = open) intersect."""
+    if a.valid_to is not None and b.valid_from is not None and a.valid_to <= b.valid_from:
+        return False
+    if b.valid_to is not None and a.valid_from is not None and b.valid_to <= a.valid_from:
+        return False
+    return True
+
+
+def _mergeable(a: SubconsciousChunk, b: SubconsciousChunk) -> bool:
+    return same_claim_shape(a.content, b.content) and _windows_overlap(a, b)
 
 
 @dataclass(slots=True)
@@ -242,13 +316,18 @@ def reduce_candidates(
         standing = [keeper for keeper, _ in merges] + [c for c in cluster if c.chunk_id not in absorbed_ids]
         kept.extend(standing)
 
+        # Contradiction-first: merging never joins opposite-polarity claims,
+        # so every such pair is still standing here -- including near-
+        # identical ones, which are the strongest contradiction signal.
+        # Claims about disjoint time windows are both kept, not flagged.
         for i in range(len(standing)):
             for j in range(i + 1, len(standing)):
                 left, right = standing[i], standing[j]
-                if _has_reversal_cue(left.content) == _has_reversal_cue(right.content):
+                if claim_polarity(left.content) == claim_polarity(right.content):
                     continue
-                sim = score_pair(left, right, len(cluster))
-                if contradict_floor <= sim < similarity_threshold:
+                if not _windows_overlap(left, right):
+                    continue
+                if score_pair(left, right, len(cluster)) >= contradict_floor:
                     contradictions.append((left.chunk_id, right.chunk_id))
 
     return ReduceResult(

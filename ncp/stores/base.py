@@ -33,6 +33,27 @@ def _validate_turn_chunk_relation(relation: str) -> str:
     return relation
 
 
+def merge_outcome_chunk_rows(*row_groups: Sequence[object]) -> list[str]:
+    """Normalize turn-resolution rows into an ordered, de-duplicated chunk-id list.
+
+    Each group is a sequence of rows from a ``SELECT chunk_id ...`` query, in
+    priority order (explicit ``turn_chunks`` links first, then the legacy
+    ``caused_by``/``conscious_hash`` match).  Rows may be mappings (async
+    psycopg dict rows, ``sqlite3.Row``) or positional tuples (sync psycopg),
+    so every backend resolves a turn to the same ids in the same order.
+    """
+    merged: dict[str, None] = {}
+    for rows in row_groups:
+        for row in rows:
+            if isinstance(row, (tuple, list)):
+                value = row[0]
+            else:
+                value = row["chunk_id"]  # type: ignore[index]
+            if value:
+                merged.setdefault(str(value), None)
+    return list(merged)
+
+
 class NCPStoreError(RuntimeError):
     """Base class for store-related failures."""
 
@@ -360,11 +381,14 @@ class BaseStore(ABC):
         estimated to save; when None, backends estimate it from the stored
         result via ``ncp.tokens.estimate_tokens``. Returns True on success.
 
-        Re-recording an existing ``signature`` is an upsert of the task/
-        content fields only: ``created_at``, ``hit_count``, ``last_hit_at``,
-        ``outcome``, and ``verified`` are preserved rather than reset, so a
-        memo doesn't lose its accumulated telemetry or review state just
-        because the same work was recorded again.
+        Re-recording an existing ``signature`` with the same
+        ``result_summary`` and ``chunk_ids`` preserves ``created_at``,
+        ``outcome`` and ``verified``, so recording the same work again does
+        not lose its review state. Re-recording *different* content is a
+        replacement: ``outcome``/``verified`` reset and ``created_at``
+        restarts, so a verification of the old result never vouches for the
+        new one and staleness is measured from the new result. ``hit_count``
+        and ``last_hit_at`` are telemetry and are kept either way.
 
         Backends that do not implement this return False.
         """

@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from hashlib import sha256
 import json
 import time
+from typing import Literal
 
 import anyio
 
@@ -23,6 +24,13 @@ from ncp.stores.consolidation import reduce_candidates
 from ncp.stores.retrieval import DEFAULT_RETRIEVAL_POLICY, apply_mmr_selection, build_lexical_candidates, normalize_query_terms
 from ncp.tokens import estimate_tokens
 from ncp.types import BudgetContext, ConsciousBlock, NCPResponse, SubconsciousChunk, TurnRecord, Whisper
+
+
+# How a delivered chunk reached the context. ``recent_ref`` and ``cold_start``
+# chunks are synthesized at assembly time and are not stored chunks, so they
+# are never linked to a turn as retrieved evidence.
+EvidenceSource = Literal["retrieval", "graph_expansion", "recent_ref", "cold_start"]
+_SYNTHETIC_EVIDENCE_SOURCES: frozenset[str] = frozenset({"recent_ref", "cold_start"})
 
 
 @dataclass(slots=True)
@@ -42,6 +50,38 @@ class AssemblyResult:
     fanin_merged_count: int = 0
     fanin_contradictions: list[tuple[str, str]] = field(default_factory=list)
     fanin_dropped_malformed_count: int = 0
+    # chunk_id -> EvidenceSource for every chunk in ``chunks`` (post-trim).
+    evidence_sources: dict[str, str] = field(default_factory=dict)
+
+    def stored_evidence_ids(self) -> list[str]:
+        """Ids of stored chunks actually present in ``context``, in context order.
+
+        Reflects filtering, fan-in reduction and budget trimming, so it is
+        exactly the evidence a model saw -- the set a turn-based outcome
+        should credit. Synthetic recent-ref and cold-start chunks are excluded.
+        """
+        return stored_evidence_ids(self.chunks, self.evidence_sources)
+
+
+def stored_evidence_ids(
+    chunks: list[SubconsciousChunk],
+    sources: dict[str, str] | None = None,
+) -> list[str]:
+    """Stored-chunk ids among ``chunks``, de-duplicated in order.
+
+    With ``sources`` the synthetic origins are excluded by origin; without
+    it (results that predate origin tracking) by their synthetic id prefix.
+    """
+    ids: dict[str, None] = {}
+    for chunk in chunks:
+        chunk_id = str(chunk.chunk_id)
+        if sources and chunk_id in sources:
+            if sources[chunk_id] in _SYNTHETIC_EVIDENCE_SOURCES:
+                continue
+        elif chunk_id.startswith(("recent_", "cold_")):
+            continue
+        ids.setdefault(chunk_id, None)
+    return list(ids)
 
 
 class Assembler:
@@ -125,6 +165,7 @@ class Assembler:
         int,
         list[tuple[str, str]],
         int,
+        dict[str, str],
     ]:
         conscious, budget = self.middleware.pre_assemble(conscious, budget)
         coherence_report = self.coherence.check(conscious)
@@ -149,10 +190,18 @@ class Assembler:
         # so callers don't mistake "frozen" trust/recency filler for a real
         # relevance-ranked result.
         retrieval_used_fallback = self._retrieval_fallback_count() > fallback_count_before
+        cold_started = not subconscious
         subconscious = self._cold_start_bootstrap(hydrated, subconscious)
+        origins: dict[str, str] = {}
         if self._edge_expansion:
             expanded = self._expand_edges([*recent_chunks, *subconscious], limit=chunk_cap, as_of=as_of)
+            origins.update((chunk.chunk_id, "graph_expansion") for chunk in expanded)
             subconscious = [*subconscious, *expanded]
+        direct_source = "cold_start" if cold_started else "retrieval"
+        for chunk in subconscious:
+            if chunk.chunk_id not in origins:
+                origins[chunk.chunk_id] = direct_source
+        origins.update((chunk.chunk_id, "recent_ref") for chunk in recent_chunks)
         # Superseded-fact suppression is independent of edge expansion -- it
         # must always run against whatever the current candidate set is, or a
         # retracted fact and its correction can both survive to the final
@@ -264,6 +313,7 @@ class Assembler:
             fanin_merged_count,
             surfaced_contradictions,
             fanin_dropped_malformed_count,
+            {chunk.chunk_id: origins.get(chunk.chunk_id, "retrieval") for chunk in combined_chunks},
         )
 
     def assemble(
@@ -291,6 +341,7 @@ class Assembler:
             fanin_merged_count,
             fanin_contradictions,
             fanin_dropped_malformed_count,
+            evidence_sources,
         ) = self._prepare_assembly(
             conscious=conscious,
             budget=budget,
@@ -327,6 +378,7 @@ class Assembler:
             fanin_merged_count=fanin_merged_count,
             fanin_contradictions=fanin_contradictions,
             fanin_dropped_malformed_count=fanin_dropped_malformed_count,
+            evidence_sources=evidence_sources,
         )
 
     def assemble_incremental(
@@ -352,7 +404,7 @@ class Assembler:
         Callers that use post_assemble middleware should apply it to the
         concatenated result: ``mw.post_assemble("\\n\\n".join(t for _, t in sections))``.
         """
-        hydrated, budget, combined_chunks, combined_whispers, _, _, _, _, _, _, _, _ = self._prepare_assembly(
+        hydrated, budget, combined_chunks, combined_whispers, *_ = self._prepare_assembly(
             conscious=conscious,
             budget=budget,
             query_text=query_text,
@@ -397,6 +449,55 @@ class Assembler:
 
         sections.append(("budget_header", self.encoder._encode_budget(budget)))
         return sections
+
+    def refit(
+        self,
+        result: AssemblyResult,
+        *,
+        budget: BudgetContext,
+        max_tokens: int,
+        query_text: str,
+    ) -> AssemblyResult:
+        """Re-fit an existing result under a smaller ceiling, without store access.
+
+        Re-running ``assemble`` would retrieve again and bump retrieval counts
+        (calibration feedback) a second time; this only drops or distils the
+        chunks and whispers already chosen, then re-encodes.
+        """
+        chunks, whispers = self._fit_token_budget(
+            conscious=result.conscious,
+            budget=budget,
+            chunks=result.chunks,
+            whispers=result.whispers,
+            max_tokens=max(1, max_tokens),
+            query_text=query_text,
+        )
+        kept_ids = {chunk.chunk_id for chunk in chunks}
+        contradictions = [(a, b) for a, b in result.fanin_contradictions if a in kept_ids and b in kept_ids]
+        context = self.encoder.assemble(
+            conscious=result.conscious,
+            chunks=chunks,
+            whispers=whispers,
+            budget=budget,
+            contradiction_notes=contradictions or None,
+        )
+        kept_whisper_ids = {w.whisper_id for w in whispers}
+        return AssemblyResult(
+            context=self.middleware.post_assemble(context),
+            conscious=result.conscious,
+            chunks=chunks,
+            whispers=whispers,
+            pending_whisper_ids=[w for w in result.pending_whisper_ids if w in kept_whisper_ids],
+            evicted_high_relevance=result.evicted_high_relevance,
+            evicted_whispers=result.evicted_whispers,
+            evicted_chunk_count=result.evicted_chunk_count + len(result.chunks) - len(chunks),
+            evicted_whisper_count=result.evicted_whisper_count + len(result.whispers) - len(whispers),
+            retrieval_used_fallback=result.retrieval_used_fallback,
+            fanin_merged_count=result.fanin_merged_count,
+            fanin_contradictions=contradictions,
+            fanin_dropped_malformed_count=result.fanin_dropped_malformed_count,
+            evidence_sources={cid: src for cid, src in result.evidence_sources.items() if cid in kept_ids},
+        )
 
     def apply_post_middleware(self, text: str) -> str:
         return self.middleware.post_assemble(text)

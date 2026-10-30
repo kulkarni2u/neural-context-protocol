@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from os import environ
 
-from ncp.adapters.base import BaseAdapter
+from ncp.adapters.base import BaseAdapter, TokenUsage
 
 _MODEL_WINDOWS: dict[str, int] = {
     "gpt-4o": 128000,
@@ -50,6 +50,7 @@ class OpenAIAdapter(BaseAdapter):
         return _MODEL_WINDOWS.get(self._model, 128000)
 
     def call(self, ncp_context: str, user_turn: str) -> str:
+        self.last_usage = None
         resp = self._run_provider_call(
             lambda: self._client.chat.completions.create(
                 model=self._model,
@@ -67,6 +68,9 @@ class OpenAIAdapter(BaseAdapter):
         return self._coerce_text(resp.choices[0].message.content, provider="OpenAI")
 
     def stream(self, ncp_context: str, user_turn: str) -> Iterator[str]:
+        # Reset first: a stream that fails or is abandoned must not leave the
+        # previous request's usage behind to be billed again.
+        self.last_usage = None
         stream = self._run_provider_call(
             lambda: self._client.chat.completions.create(
                 model=self._model,
@@ -76,10 +80,17 @@ class OpenAIAdapter(BaseAdapter):
                     {"role": "user", "content": user_turn},
                 ],
                 stream=True,
+                # The authoritative usage arrives on a final chunk with no choices.
+                stream_options={"include_usage": True},
             ),
             provider="OpenAI",
             timeout_types=(self._openai.APITimeoutError, TimeoutError),
         )
+        final_usage: TokenUsage | None = None
         for chunk in stream:
+            if getattr(chunk, "usage", None) is not None:
+                final_usage = self._usage_from_openai_shape(chunk)
             if chunk.choices and (delta := chunk.choices[0].delta.content):
                 yield delta
+        # Only a stream that ran to completion reports usage.
+        self.last_usage = final_usage

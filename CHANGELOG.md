@@ -19,6 +19,76 @@ All notable changes to Neural Context Protocol will be documented in this file.
   unchanged. Other read paths (`ncp_fetch`, decisions, memoization, whispers)
   do not consult policies.
 - `NCPConfig.max_tokens_per_call`.
+- **Evidence attribution on run/stream** (`ncp/api.py`, `ncp/assembler.py`,
+  `ncp/types.py`): `NCPResponse.evidence` (`EvidenceAttribution`) records the
+  stored chunk ids in the model-visible request, each delivered chunk's origin
+  (`retrieval` / `graph_expansion` / `recent_ref` / `cold_start`), the
+  acknowledged whisper ids, the turn's memo signature, and on a memo hit the
+  cached result's evidence (not presented, not credited).
+  `NCPResponse.context_policy`, `cache_write_tokens` and `reasoning_tokens`.
+- **Outcome aliases through consolidation**: durable `chunk_aliases`
+  (loser -> keeper, `equivalent_consolidation` only). Postgres deployments
+  must apply `017_add_chunk_aliases.sql`.
+- `ncp_post_turn` `memory_chunks` items accept `base_trust`, `signature`,
+  `evidence_id` and `caused_by`; the response lists `trust_demoted_chunk_ids`.
+- **Final response budgets and compact mode for `ncp_get_context`**:
+  `response_max_tokens` caps the whole serialized response, dropping optional
+  diagnostics first and then re-fitting the already-retrieved context (no
+  second retrieval). Evidence ids always match the returned context, and a
+  `truncated` block reports what was cut. `compact=true` returns signal-only
+  telemetry plus `context_sha256`. Both are opt-in.
+- `ncp_lookup_memo`/`ncp_record_memo`/`ncp_verify_memo` accept optional
+  `pipeline_id`, `model` and `provider`. When set, the memo key is scoped to
+  them; without them, keys are unchanged.
+- `AsyncPgvectorStore(redis_stream=...)`, matching `PgvectorStore`.
+- `benchmarks/memo_reuse`: cost per verified success and memo false-hit rate,
+  with a CI gate.
+
+### Changed
+
+- **Memo reuse in `ncp.run`/`ncp.stream` now honors
+  `[memoization].allow_unverified` and `min_outcome`**, like `ncp_lookup_memo`.
+  With the default `allow_unverified = false`, a memo is reused only after it
+  is verified (`store.update_memo_outcome(response.evidence.memo_signature,
+  1.0, verified=True)`). The memo key is now a canonical versioned signature
+  over agent, role, pipeline, task/slot/intent, goal version, constraints,
+  model, provider and a fingerprint of the evidence, pending whispers and
+  context policy. Existing Python-path memos will not be hit again.
+- Re-recording a memo with different content resets `outcome`/`verified` and
+  restarts `created_at`; identical re-records keep them.
+- Consolidation and fan-in never merge claims with opposite polarity
+  (resolution/persistence/negation cues) or disjoint validity windows;
+  fan-in flags opposite-polarity pairs as contradictions at any similarity
+  above `reduce_fanin_contradict_floor`.
+- Recording an outcome with an existing `outcome_id` is a no-op returning
+  `recorded: false` instead of raising.
+- The Anthropic prompt-cache breakpoint now sits before `[NCP:WHISPERS]` when
+  whispers are present, because whispers and their relative ages change
+  every turn.
+
+### Fixed
+
+- Async pgvector `record_outcome(turn_id=...)` raised `KeyError(0)` on dict
+  rows; all backends now share one row normalizer.
+- `ncp.run`/`ncp.stream` never linked the evidence they delivered, so
+  turn-based outcomes resolved to no chunks; they also never acknowledged the
+  whispers they delivered (now acknowledged only after a successful request).
+- Outcome feedback on a chunk that consolidation merged away was consumed
+  without crediting the surviving keeper.
+- OpenAI-shape and Gemini cached input was billed at both the input and
+  cache-read price; Anthropic cache-write tokens were never priced; OpenAI
+  streaming reported no usage, and adapters could re-bill a previous call's
+  stale `last_usage`.
+- `ncp_post_turn` `memory_chunks` bypassed `require_signatures`,
+  `require_grounded_high_trust` and provenance; the whole batch is now
+  validated before anything is written.
+- Concurrent writing calibrations on pgvector (sync or async) double-counted
+  outcomes and retrieval counts into reputation; they are now serialized
+  with a transaction-scoped advisory lock.
+- Write-time dedup dropped corrections that changed only a value or flipped
+  polarity ("v1" -> "v2", "3 retries" -> "5 retries"), so the following
+  supersede failed and stale values kept being served. Consolidation and
+  fan-in no longer merge such pairs either.
 
 ## [1.7.0] - 2026-10-30
 

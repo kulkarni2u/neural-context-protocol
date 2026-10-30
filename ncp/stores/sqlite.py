@@ -5,7 +5,6 @@ from __future__ import annotations
 from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import replace as dataclass_replace
-from difflib import SequenceMatcher
 import json
 import logging
 from pathlib import Path
@@ -13,14 +12,27 @@ import sqlite3
 import time
 
 from ncp.config import NCPConfig
-from ncp.stores.base import BaseStore, NCPStoreUnavailableError, _validate_turn_chunk_relation
+from ncp.stores.base import (
+    BaseStore,
+    NCPStoreUnavailableError,
+    _validate_turn_chunk_relation,
+    merge_outcome_chunk_rows,
+)
 from ncp.stores.calibration import (
+    EQUIVALENT_CONSOLIDATION,
+    MAX_ALIAS_DEPTH,
     FeedbackRow,
     ReputationUpdate,
     compute_feedback_updates,
     rollup_reputation,
+    validate_chunk_alias,
 )
-from ncp.stores.consolidation import cluster_by_tags, find_merge_candidates, split_current_and_historical
+from ncp.stores.consolidation import (
+    cluster_by_tags,
+    find_merge_candidates,
+    is_near_duplicate,
+    split_current_and_historical,
+)
 from ncp.stores.graph import (
     backfill_edges_for_chunk,
     infer_edges_for_chunk,
@@ -255,6 +267,14 @@ CREATE TABLE IF NOT EXISTS outcome_applications (
     PRIMARY KEY (outcome_id, chunk_id)
 );
 
+CREATE TABLE IF NOT EXISTS chunk_aliases (
+    alias_id TEXT PRIMARY KEY,
+    target_id TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    pipeline_id TEXT,
+    created_at REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS decisions (
     decision_id TEXT PRIMARY KEY,
     schema_id TEXT NOT NULL,
@@ -446,6 +466,7 @@ class SQLiteStore(BaseStore):
                 "CREATE INDEX IF NOT EXISTS idx_decisions_pipeline ON decisions(pipeline_id, created_at)",
                 "CREATE TABLE IF NOT EXISTS turn_chunks (turn_id TEXT NOT NULL, chunk_id TEXT NOT NULL, relation TEXT NOT NULL, created_at REAL NOT NULL, PRIMARY KEY (turn_id, chunk_id, relation))",
                 "CREATE TABLE IF NOT EXISTS outcome_applications (outcome_id TEXT NOT NULL, chunk_id TEXT NOT NULL, applied_at REAL NOT NULL, PRIMARY KEY (outcome_id, chunk_id))",
+                "CREATE TABLE IF NOT EXISTS chunk_aliases (alias_id TEXT PRIMARY KEY, target_id TEXT NOT NULL, reason TEXT NOT NULL, pipeline_id TEXT, created_at REAL NOT NULL)",
                 "INSERT INTO chunks_fts(chunks_fts) VALUES ('rebuild')",
             ):
                 try:
@@ -1124,10 +1145,10 @@ class SQLiteStore(BaseStore):
                 ).fetchall()
                 # Explicit links first, then the legacy caused_by/conscious_hash
                 # match; de-duplicated, order-stable.
-                chunk_ids = list(dict.fromkeys(str(r["chunk_id"]) for r in [*linked, *legacy]))
-            connection.execute(
+                chunk_ids = merge_outcome_chunk_rows(linked, legacy)
+            cursor = connection.execute(
                 """
-                INSERT INTO outcomes (outcome_id, turn_id, chunk_ids, success, weight, note, created_at, consumed)
+                INSERT OR IGNORE INTO outcomes (outcome_id, turn_id, chunk_ids, success, weight, note, created_at, consumed)
                 VALUES (?, ?, ?, ?, ?, ?, ?, 0)
                 """,
                 (
@@ -1140,7 +1161,8 @@ class SQLiteStore(BaseStore):
                     outcome.created_at,
                 ),
             )
-            return True
+            # A replayed outcome_id is a no-op so host retries record exactly once.
+            return cursor.rowcount > 0
 
     def get_outcome(self, outcome_id: str) -> OutcomeRecord | None:
         with self._connect() as connection:
@@ -1226,6 +1248,12 @@ class SQLiteStore(BaseStore):
                 VALUES (?, ?, ?, ?, 0.0, 0, ?, 0.0, 0, ?)
                 ON CONFLICT(signature) DO UPDATE SET
                     task = excluded.task,
+                    outcome = CASE WHEN result_summary IS excluded.result_summary
+                        AND chunk_ids = excluded.chunk_ids THEN outcome ELSE 0.0 END,
+                    verified = CASE WHEN result_summary IS excluded.result_summary
+                        AND chunk_ids = excluded.chunk_ids THEN verified ELSE 0 END,
+                    created_at = CASE WHEN result_summary IS excluded.result_summary
+                        AND chunk_ids = excluded.chunk_ids THEN created_at ELSE excluded.created_at END,
                     result_summary = excluded.result_summary,
                     chunk_ids = excluded.chunk_ids,
                     output_tokens_est = excluded.output_tokens_est
@@ -1344,6 +1372,31 @@ class SQLiteStore(BaseStore):
             ).fetchall():
                 pairs.add((str(row["outcome_id"]), str(row["chunk_id"])))
         return pairs
+
+    def _load_chunk_aliases(
+        self, connection: sqlite3.Connection, chunk_ids: Sequence[str]
+    ) -> dict[str, str]:
+        """Equivalent-consolidation aliases reachable from ``chunk_ids`` (loser -> keeper)."""
+        aliases: dict[str, str] = {}
+        frontier = list(dict.fromkeys(chunk_ids))
+        for _ in range(MAX_ALIAS_DEPTH):
+            if not frontier:
+                break
+            found: list[str] = []
+            for start in range(0, len(frontier), _IN_BATCH):
+                batch = frontier[start:start + _IN_BATCH]
+                placeholders = ",".join("?" * len(batch))
+                for row in connection.execute(
+                    f"SELECT alias_id, target_id FROM chunk_aliases WHERE alias_id IN ({placeholders})"
+                    " AND reason = ?",
+                    [*batch, EQUIVALENT_CONSOLIDATION],
+                ).fetchall():
+                    alias_id, target_id = str(row["alias_id"]), str(row["target_id"])
+                    if alias_id not in aliases:
+                        aliases[alias_id] = target_id
+                        found.append(target_id)
+            frontier = [cid for cid in dict.fromkeys(found) if cid not in aliases]
+        return aliases
 
     def _calibratable_chunk_ids(
         self, connection: sqlite3.Connection, chunk_ids: Sequence[str]
@@ -2109,6 +2162,14 @@ class SQLiteStore(BaseStore):
                                 " VALUES (?, ?, ?, ?)",
                                 (loser_id, keeper.chunk_id, time.time(), time.time() + 86400),
                             )
+                            # Durable (unlike the expiring tombstone): lets outcome
+                            # feedback recorded against the loser credit the keeper.
+                            validate_chunk_alias(loser_id, keeper.chunk_id, EQUIVALENT_CONSOLIDATION)
+                            connection.execute(
+                                "INSERT OR REPLACE INTO chunk_aliases"
+                                " (alias_id, target_id, reason, pipeline_id, created_at) VALUES (?, ?, ?, ?, ?)",
+                                (loser_id, keeper.chunk_id, EQUIVALENT_CONSOLIDATION, keeper.pipeline_id, time.time()),
+                            )
                         connection.execute(
                             "UPDATE chunks SET generation = ?, supersedes = ? WHERE chunk_id = ?",
                             (new_gen, supersedes_json, keeper.chunk_id),
@@ -2273,6 +2334,7 @@ class SQLiteStore(BaseStore):
                     outcome_evidence = None
                     if outcomes:
                         from ncp.stores.calibration import (
+                            apply_outcome_aliases,
                             compute_outcome_evidence,
                             scope_outcomes_to_rows,
                             settled_outcome_ids,
@@ -2280,6 +2342,12 @@ class SQLiteStore(BaseStore):
                         prior_pairs = self._load_outcome_applications(
                             connection, [o.outcome_id for o in outcomes]
                         )
+                        outcomes, prior_pairs, alias_audit = apply_outcome_aliases(
+                            outcomes,
+                            self._load_chunk_aliases(connection, [cid for o in outcomes for cid in o.chunk_ids]),
+                            prior_pairs,
+                        )
+                        report.change_log.extend(alias_audit)
                         scoped = scope_outcomes_to_rows(
                             outcomes, {r.chunk_id for r in feedback_rows}, prior_pairs
                         )
@@ -3803,11 +3871,7 @@ class SQLiteStore(BaseStore):
             """,
             (chunk.zone, chunk.layer, chunk.pipeline_id, chunk.chunk_id, max(0, int(limit))),
         ).fetchall()
-        for row in rows:
-            similarity = SequenceMatcher(None, chunk.content, str(row["content"])).ratio()
-            if similarity > 0.92:
-                return True
-        return False
+        return any(is_near_duplicate(chunk.content, str(row["content"])) for row in rows)
 
     def _soft_gc(self, connection: sqlite3.Connection) -> None:
         now = time.time()

@@ -19,7 +19,8 @@ from pathlib import Path, PurePosixPath
 from typing import BinaryIO, Sequence, get_args
 
 from ncp.adaptive_budget import AdaptiveBudgetResult, compute_adaptive_budget
-from ncp.assembler import Assembler
+from ncp.assembler import Assembler, stored_evidence_ids
+from ncp.mcp.response_budget import compact_telemetry, context_sha256, fit_response
 from ncp.budget import BudgetSnapshot, evaluate_budget
 from ncp.chunker import filter_content
 from ncp.config import NCPConfig, load_config
@@ -104,6 +105,8 @@ MCP_TOOLS: list[dict[str, object]] = [
                 "k": {"type": "integer", "description": "Number of subconscious chunks to retrieve. Overrides the default budget-pressure-based value (2 for critical, 4 otherwise)."},
                 "diversity_limit": {"type": "integer", "description": "Max chunks per author in retrieved results. Default 2. Set higher to allow more results from one author."},
                 "max_tokens": {"type": "integer", "description": "Optional estimated token ceiling for the assembled context block. Honored as-is unless context_policy is set, in which case it is capped at [budget].max_tokens_per_call; when omitted and [budget].adaptive_budget_enabled is true, the ceiling is instead computed per-turn (see the response's budget_tokens block)."},
+                "compact": {"type": "boolean", "description": "Optional. Return compact telemetry (non-zero counts, flags and contradicting ids only), omit tier-hint factors, and add context_sha256. Evidence ids are unchanged. Default false."},
+                "response_max_tokens": {"type": "integer", "minimum": 1, "description": "Optional estimated token ceiling for the whole serialized response, not just the context. Optional diagnostics are dropped first, then the already-retrieved context is re-fitted smaller; retrieved_chunk_ids, pending_whisper_ids, session_id and the policy identity are always kept. When anything is cut the response carries a truncated block. Not applied to streamed responses."},
                 "context_policy": {"type": "string", "description": "Optional name of a [context_policies.<name>] entry. Its retrieval, budget and distillation overrides apply to this request only, and the response's context_policy block reports the name, version and sha256 applied. Unknown or invalid policies are rejected."},
                 "recent": {"type": "array", "items": {"type": "string"}, "description": "Optional recent refs overriding hydrated conscious state."},
                 "tried": {"type": "array", "items": {"type": "string"}, "description": "Optional attempted actions overriding hydrated conscious state."},
@@ -453,6 +456,19 @@ MCP_TOOLS: list[dict[str, object]] = [
                                 "enum": ["prose", "json", "code", "table", "auto"],
                                 "description": "Optional declared content shape. Defaults to 'prose'.",
                             },
+                            "base_trust": {"type": "number", "description": "Optional explicit trust (0-1)."},
+                            "signature": {
+                                "type": "string",
+                                "description": (
+                                    "Optional authorship signature over (written_by | sha256(content) | "
+                                    "pipeline_id), verified exactly as in ncp_write_memory."
+                                ),
+                            },
+                            "evidence_id": {
+                                "type": "string",
+                                "description": "Optional id of an existing same-pipeline chunk grounding this claim.",
+                            },
+                            "caused_by": {"type": "string", "description": "Optional id of the chunk this one derives from."},
                         },
                         "required": ["content", "layer", "src"],
                     },
@@ -729,6 +745,16 @@ MCP_TOOLS: list[dict[str, object]] = [
                     "type": "string",
                     "description": "Explicit memo signature (overrides task+context hash)",
                 },
+                "pipeline_id": {
+                    "type": "string",
+                    "description": (
+                        "Optional scope: when any of pipeline_id/model/provider is set, the "
+                        "task+context signature also covers them, so the memo is only shared "
+                        "within that scope. Use the same values on record, lookup and verify."
+                    ),
+                },
+                "model": {"type": "string", "description": "Optional scope: model the memoized result came from."},
+                "provider": {"type": "string", "description": "Optional scope: provider the memoized result came from."},
             },
         },
     },
@@ -762,6 +788,16 @@ MCP_TOOLS: list[dict[str, object]] = [
                     "type": "string",
                     "description": "Explicit memo signature (overrides task+context hash)",
                 },
+                "pipeline_id": {
+                    "type": "string",
+                    "description": (
+                        "Optional scope: when any of pipeline_id/model/provider is set, the "
+                        "task+context signature also covers them, so the memo is only shared "
+                        "within that scope. Use the same values on record, lookup and verify."
+                    ),
+                },
+                "model": {"type": "string", "description": "Optional scope: model the memoized result came from."},
+                "provider": {"type": "string", "description": "Optional scope: provider the memoized result came from."},
                 "output_tokens_est": {
                     "type": "integer",
                     "description": (
@@ -809,6 +845,16 @@ MCP_TOOLS: list[dict[str, object]] = [
                     "type": "string",
                     "description": "Explicit memo signature (overrides task+context hash)",
                 },
+                "pipeline_id": {
+                    "type": "string",
+                    "description": (
+                        "Optional scope: when any of pipeline_id/model/provider is set, the "
+                        "task+context signature also covers them, so the memo is only shared "
+                        "within that scope. Use the same values on record, lookup and verify."
+                    ),
+                },
+                "model": {"type": "string", "description": "Optional scope: model the memoized result came from."},
+                "provider": {"type": "string", "description": "Optional scope: provider the memoized result came from."},
                 "outcome": {
                     "type": "number",
                     "description": "Outcome score for this memo (default 1.0 = confirmed good).",
@@ -1302,17 +1348,22 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
 
     def _retrieved_chunk_ids(result: object) -> list[str]:
         """Ids of real stored chunks assembled into the context, for round-tripping
-        into ncp_post_turn(retrieved_chunk_ids=...). Synthetic recent-ref chunks
-        (``recent_<turn_id>``) are not stored chunks and are excluded."""
-        ids: list[str] = []
-        for chunk in getattr(result, "chunks", []) or []:
-            chunk_id = str(chunk.chunk_id)
-            if chunk_id.startswith("recent_") or chunk_id in ids:
-                continue
-            ids.append(chunk_id)
-        return ids
+        into ncp_post_turn(retrieved_chunk_ids=...). Synthetic recent-ref and
+        cold-start chunks are not stored chunks and are excluded."""
+        return stored_evidence_ids(
+            list(getattr(result, "chunks", []) or []),
+            getattr(result, "evidence_sources", None),
+        )
 
     def _handle_get_context(args: dict[str, object]) -> object:
+        compact = args.get("compact", False)
+        if not isinstance(compact, bool):
+            raise ValueError("ncp_get_context 'compact' must be a boolean")
+        response_max_tokens: int | None = None
+        if args.get("response_max_tokens") is not None:
+            response_max_tokens = _int_arg(args, "response_max_tokens", 0)
+            if response_max_tokens < 1:
+                raise ValueError("ncp_get_context 'response_max_tokens' must be >= 1")
         session_id = _session_id_from_args(args)
         pipeline_id = args.get("pipeline_id")
         normalized_pipeline_id = None if pipeline_id is None else str(pipeline_id)
@@ -1416,6 +1467,8 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
                 handler_result["drift"] = drift_block
             if as_of is not None:
                 handler_result["as_of"] = as_of
+            if compact:
+                _compact_response(handler_result)
             return StreamResponse(
                 sections=sections,
                 handler_result=handler_result,
@@ -1448,7 +1501,26 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             response["drift"] = drift_block
         if as_of is not None:
             response["as_of"] = as_of
+        if compact:
+            _compact_response(response)
+        if response_max_tokens is not None:
+            def _refit(ceiling: int) -> dict[str, object]:
+                refitted = assembler.refit(result, budget=budget, max_tokens=ceiling, query_text=search_text)
+                return {
+                    "context": refitted.context,
+                    "pending_whisper_ids": refitted.pending_whisper_ids,
+                    "retrieved_chunk_ids": _retrieved_chunk_ids(refitted),
+                }
+
+            response = fit_response(response, response_max_tokens, reassemble=_refit)
         return response
+
+    def _compact_response(response: dict[str, object]) -> None:
+        telemetry = response.get("telemetry")
+        if isinstance(telemetry, dict):
+            response["telemetry"] = compact_telemetry(telemetry)
+        response.pop("factors", None)
+        response["context_sha256"] = context_sha256(str(response.get("context", "")))
 
     def _handle_write_memory(args: dict[str, object]) -> object:
         written_by = str(args.get("written_by", "agent"))
@@ -1655,6 +1727,60 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             result["dissent_recorded"] = store.record_dissent(str(ref), identity_id=from_agent)
         return result
 
+    def _validated_batch_chunk(
+        item: dict[str, object], *, conscious: ConsciousBlock
+    ) -> tuple[SubconsciousChunk, bool]:
+        """One ncp_post_turn memory chunk, held to ncp_write_memory's write checks.
+
+        Authorship is verified (and required under require_signatures),
+        high-trust claims are demoted unless grounded under
+        require_grounded_high_trust, and caused_by/evidence_id provenance is
+        kept. Returns the chunk and whether its trust was demoted.
+        """
+        content = str(item["content"])
+        written_by = str(item.get("written_by") or conscious.agent_id)
+        signature = item.get("signature")
+        verified = _verify_authorship(
+            store,
+            identity_id=written_by,
+            content=content,
+            pipeline_id=conscious.pipeline_id,
+            signature=None if signature is None else str(signature),
+        )
+        if require_signatures and not verified:
+            raise ValueError(
+                "ncp_post_turn rejected: require_signatures is enabled and authorship of a "
+                "memory_chunks item could not be verified (missing/invalid signature or "
+                "revoked identity); nothing was written."
+            )
+        # The batch path never noise-filters, so it never yields a raw_ref.
+        trust, demoted, _ = _grounded_trust_from_args(
+            item,
+            store=store,
+            require_grounded_high_trust=require_grounded_high_trust,
+            will_produce_raw_ref=False,
+            pipeline_id=conscious.pipeline_id,
+        )
+        chunk_kwargs: dict = {
+            "content": content,
+            "layer": str(item["layer"]),
+            "src": str(item["src"]),
+            "written_by": written_by,
+            "pipeline_id": conscious.pipeline_id,
+            "base_trust": trust,
+            "written_at_drift": conscious.drift_score,
+            "verified": verified,
+        }
+        if (chunk_id := item.get("chunk_id")):
+            chunk_kwargs["chunk_id"] = str(chunk_id)
+        if (chunk_type := item.get("chunk_type")) is not None:
+            chunk_kwargs["chunk_type"] = str(chunk_type)
+        if (caused_by := item.get("caused_by")) is not None:
+            chunk_kwargs["caused_by"] = str(caused_by)
+        if (evidence_id := item.get("evidence_id")) is not None:
+            chunk_kwargs["evidence_id"] = str(evidence_id)
+        return SubconsciousChunk(**chunk_kwargs), demoted
+
     def _handle_post_turn(args: dict[str, object]) -> object:
         conscious = _build_conscious_from_args(store, args)
         assembler = Assembler(store=store, config=config)
@@ -1674,27 +1800,18 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         if raw_retrieved is not None and not isinstance(raw_retrieved, list):
             raise ValueError("ncp_post_turn: 'retrieved_chunk_ids' must be an array of strings")
         retrieved_ids = [str(item) for item in (raw_retrieved or [])]
+        # Validate the whole batch before anything (including the turn record)
+        # is written: one rejected item rejects the call, so a mixed-validity
+        # batch can never half-persist.
         memory_chunks: list[SubconsciousChunk] = []
+        demoted_chunk_ids: list[str] = []
         for item in list(args.get("memory_chunks", []) or []):
             if not isinstance(item, dict):
                 raise ValueError("ncp_post_turn: memory_chunks items must be objects")
-            chunk_kwargs: dict = {
-                "content": str(item["content"]),
-                "layer": str(item["layer"]),
-                "src": str(item["src"]),
-                "written_by": str(item.get("written_by") or conscious.agent_id),
-                "pipeline_id": conscious.pipeline_id,
-                # Finding 1: derive base_trust/written_at_drift the same way
-                # _handle_write_memory does, so a chunk written through this
-                # batch path is not silently flattened to the bare defaults.
-                "base_trust": _trust_from_args(item),
-                "written_at_drift": conscious.drift_score,
-            }
-            if (chunk_id := item.get("chunk_id")):
-                chunk_kwargs["chunk_id"] = str(chunk_id)
-            if (chunk_type := item.get("chunk_type")) is not None:
-                chunk_kwargs["chunk_type"] = str(chunk_type)
-            memory_chunks.append(SubconsciousChunk(**chunk_kwargs))
+            chunk, demoted = _validated_batch_chunk(item, conscious=conscious)
+            memory_chunks.append(chunk)
+            if demoted:
+                demoted_chunk_ids.append(chunk.chunk_id)
         record = assembler.post_turn(
             conscious=conscious,
             response=response,
@@ -1708,6 +1825,8 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         # WI-007(a): surface dedup-suppressed memory writes to the host.
         if record.suppressed_chunk_ids:
             result["suppressed_chunk_ids"] = record.suppressed_chunk_ids
+        if demoted_chunk_ids:
+            result["trust_demoted_chunk_ids"] = demoted_chunk_ids
         # CAP-E2: reflect spend *after* this turn's cost was just logged above.
         budget_snapshot = _budget_snapshot(pipeline_id=conscious.pipeline_id)
         if budget_snapshot is not None:
@@ -2185,20 +2304,35 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             return None
         return {"hits": int(stats.get("hits", 0)), "misses": int(stats.get("misses", 0))}
 
+    def _memo_signature_from_args(args: dict[str, object]) -> str:
+        """Shared memo key for lookup/record/verify: explicit signature, else scoped task+context."""
+        from ncp.stores.memo import compute_scoped_memo_signature
+
+        explicit = args.get("signature")
+        if explicit is not None:
+            return str(explicit)
+
+        def _opt(key: str) -> str | None:
+            value = args.get(key)
+            return None if value is None else str(value)
+
+        return compute_scoped_memo_signature(
+            str(args.get("task", "")),
+            str(args.get("context", "")),
+            pipeline_id=_opt("pipeline_id"),
+            model=_opt("model"),
+            provider=_opt("provider"),
+        )
+
     def _handle_lookup_memo(args: dict[str, object]) -> object:
-        from ncp.stores.memo import compute_memo_signature
+        from ncp.stores.memo import memo_ineligibility
         if config is not None and not config.memoization_enabled:
             return {
                 "recorded": False,
                 "disabled": True,
                 "reason": "memoization_disabled",
             }
-        sig = args.get("signature")
-        if sig is None:
-            task = str(args.get("task", ""))
-            context = str(args.get("context", ""))
-            sig = compute_memo_signature(task, context)
-        sig = str(sig)
+        sig = _memo_signature_from_args(args)
         # Use the telemetry-neutral peek here, not `store.lookup_memo` — the
         # latter unconditionally counts a hit as soon as a fresh row exists,
         # before the outcome/verified gating below runs. We only want to
@@ -2209,13 +2343,12 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         cfg = config
         usable = False
         if memo is not None:
-            # Apply outcome and verified gating at the handler level
-            gated = False
-            if cfg is not None:
-                if float(memo.get("outcome", 0.0)) < cfg.memoization_min_outcome:
-                    gated = True
-                elif not cfg.memoization_allow_unverified and not bool(memo.get("verified", 0)):
-                    gated = True
+            gated = cfg is not None and memo_ineligibility(
+                memo,
+                min_outcome=cfg.memoization_min_outcome,
+                allow_unverified=cfg.memoization_allow_unverified,
+                require_result=False,
+            ) is not None
             if not gated:
                 usable = True
                 result = {"found": True, "memo": dict(memo)}
@@ -2229,7 +2362,7 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         return result
 
     def _handle_record_memo(args: dict[str, object]) -> object:
-        from ncp.stores.memo import compute_memo_signature, validate_code_memo_ast
+        from ncp.stores.memo import validate_code_memo_ast
         if config is not None and not config.memoization_enabled:
             return {
                 "recorded": False,
@@ -2237,11 +2370,7 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
                 "reason": "memoization_disabled",
             }
         task = str(args.get("task", ""))
-        sig = args.get("signature")
-        if sig is None:
-            context = str(args.get("context", ""))
-            sig = compute_memo_signature(task, context)
-        sig = str(sig)
+        sig = _memo_signature_from_args(args)
         chunk_ids = [str(c) for c in list(args.get("chunk_ids", []) or [])]
         result_summary = args.get("result_summary")
         if result_summary is not None:
@@ -2270,19 +2399,13 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         return {"recorded": recorded, "signature": sig}
 
     def _handle_verify_memo(args: dict[str, object]) -> object:
-        from ncp.stores.memo import compute_memo_signature
         if config is not None and not config.memoization_enabled:
             return {
                 "verified": False,
                 "disabled": True,
                 "reason": "memoization_disabled",
             }
-        sig = args.get("signature")
-        if sig is None:
-            task = str(args.get("task", ""))
-            context = str(args.get("context", ""))
-            sig = compute_memo_signature(task, context)
-        sig = str(sig)
+        sig = _memo_signature_from_args(args)
         try:
             outcome = float(args.get("outcome", 1.0))
         except (TypeError, ValueError):

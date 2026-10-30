@@ -20,14 +20,18 @@ import time
 from collections.abc import Sequence
 from contextlib import asynccontextmanager
 from dataclasses import replace as dataclass_replace
-from difflib import SequenceMatcher
 from typing import Any, AsyncIterator
 
 import anyio
 import structlog
 
 from ncp.config import NCPConfig
-from ncp.stores.base import BaseStore, NCPStoreUnavailableError, _validate_turn_chunk_relation
+from ncp.stores.base import (
+    BaseStore,
+    NCPStoreUnavailableError,
+    _validate_turn_chunk_relation,
+    merge_outcome_chunk_rows,
+)
 from ncp.stores.bitemporal import collect_successor_ids, filter_bitemporal
 from ncp.stores.graph import (
     backfill_edges_for_chunk,
@@ -40,6 +44,7 @@ from ncp.stores.pgvector import (
     PGVECTOR_SCHEMA_TEMPLATE,
     PgvectorStore,
     _validate_identifier,
+    calibration_lock_key,
 )
 from ncp.stores.redis_coordination import AsyncRedisCoordination
 from ncp.stores.retrieval import (
@@ -51,12 +56,20 @@ from ncp.stores.retrieval import (
     score_vector_distance,
 )
 from ncp.stores.calibration import (
+    EQUIVALENT_CONSOLIDATION,
+    MAX_ALIAS_DEPTH,
     FeedbackRow,
     ReputationUpdate,
     compute_feedback_updates,
     rollup_reputation,
+    validate_chunk_alias,
 )
-from ncp.stores.consolidation import cluster_by_tags, find_merge_candidates, split_current_and_historical
+from ncp.stores.consolidation import (
+    cluster_by_tags,
+    find_merge_candidates,
+    is_near_duplicate,
+    split_current_and_historical,
+)
 from ncp.tokens import estimate_tokens
 from ncp.types import (
     CalibrationReport,
@@ -97,6 +110,7 @@ class AsyncPgvectorStore(BaseStore):
         gc_threshold: int = 400,
         max_working_chunks_per_pipeline: int = 0,
         redis_url: str | None = None,
+        redis_stream: str = "ncp:whispers",
         coordination: AsyncRedisCoordination | None = None,
         embedding_adapter: object | None = None,
         ivfflat_probes: int = 10,
@@ -126,7 +140,7 @@ class AsyncPgvectorStore(BaseStore):
         self._apool: Any = None
         self._init_lock = anyio.Lock()
         self._acoordination: AsyncRedisCoordination | None = coordination or (
-            AsyncRedisCoordination(redis_url) if redis_url else None
+            AsyncRedisCoordination(redis_url, stream=redis_stream) if redis_url else None
         )
 
         if open_pool:
@@ -605,7 +619,7 @@ class AsyncPgvectorStore(BaseStore):
             description = cur.description
         rows = [self._normalize_row(r, description) for r in raw_rows]
         for row in rows:
-            if SequenceMatcher(None, chunk.content, str(row["content"])).ratio() > 0.92:
+            if is_near_duplicate(chunk.content, str(row["content"])):
                 return True
         return False
 
@@ -1827,13 +1841,14 @@ class AsyncPgvectorStore(BaseStore):
                     )
                     legacy_rows = await self._afetchall(cur)
                     # Explicit links first, then legacy match; de-duplicated.
-                    chunk_ids = list(dict.fromkeys(str(r[0]) for r in [*linked_rows, *legacy_rows]))
+                    chunk_ids = merge_outcome_chunk_rows(linked_rows, legacy_rows)
             async with conn.cursor() as cur:
                 await cur.execute(
                     self._sql(
                         "INSERT INTO {schema}.{prefix}outcomes"
                         " (outcome_id, turn_id, chunk_ids, success, weight, note, created_at, consumed)"
                         " VALUES (%s, %s, %s, %s, %s, %s, %s, 0)"
+                        " ON CONFLICT (outcome_id) DO NOTHING"
                     ),
                     (
                         outcome.outcome_id,
@@ -1955,12 +1970,18 @@ class AsyncPgvectorStore(BaseStore):
                 await cur.execute(
                     self._sql(
                         """
-                        INSERT INTO {schema}.{prefix}memo_entries
+                        INSERT INTO {schema}.{prefix}memo_entries AS me
                             (signature, task, result_summary, chunk_ids, outcome, verified,
                              created_at, last_hit_at, hit_count, output_tokens_est)
                         VALUES (%s, %s, %s, %s, 0.0, 0, %s, 0.0, 0, %s)
                         ON CONFLICT (signature) DO UPDATE SET
                             task = EXCLUDED.task,
+                            outcome = CASE WHEN me.result_summary IS NOT DISTINCT FROM EXCLUDED.result_summary
+                                AND me.chunk_ids = EXCLUDED.chunk_ids THEN me.outcome ELSE 0.0 END,
+                            verified = CASE WHEN me.result_summary IS NOT DISTINCT FROM EXCLUDED.result_summary
+                                AND me.chunk_ids = EXCLUDED.chunk_ids THEN me.verified ELSE 0 END,
+                            created_at = CASE WHEN me.result_summary IS NOT DISTINCT FROM EXCLUDED.result_summary
+                                AND me.chunk_ids = EXCLUDED.chunk_ids THEN me.created_at ELSE EXCLUDED.created_at END,
                             result_summary = EXCLUDED.result_summary,
                             chunk_ids = EXCLUDED.chunk_ids,
                             output_tokens_est = EXCLUDED.output_tokens_est
@@ -2134,6 +2155,34 @@ class AsyncPgvectorStore(BaseStore):
             for row in rows:
                 pairs.add((str(row["outcome_id"]), str(row["chunk_id"])))
         return pairs
+
+    async def _aload_chunk_aliases(self, conn: Any, chunk_ids: Sequence[str]) -> dict[str, str]:
+        """Equivalent-consolidation aliases reachable from ``chunk_ids`` (loser -> keeper)."""
+        aliases: dict[str, str] = {}
+        frontier = list(dict.fromkeys(chunk_ids))
+        for _ in range(MAX_ALIAS_DEPTH):
+            if not frontier:
+                break
+            found: list[str] = []
+            for start in range(0, len(frontier), _IN_BATCH):
+                batch = frontier[start:start + _IN_BATCH]
+                placeholders = ",".join(["%s"] * len(batch))
+                async with conn.cursor() as cursor:
+                    await cursor.execute(
+                        self._sql(
+                            "SELECT alias_id, target_id FROM {schema}.{prefix}chunk_aliases"
+                            f" WHERE alias_id IN ({placeholders}) AND reason = %s"
+                        ),
+                        (*batch, EQUIVALENT_CONSOLIDATION),
+                    )
+                    rows = await self._afetchall(cursor)
+                for row in rows:
+                    alias_id, target_id = str(row["alias_id"]), str(row["target_id"])
+                    if alias_id not in aliases:
+                        aliases[alias_id] = target_id
+                        found.append(target_id)
+            frontier = [cid for cid in dict.fromkeys(found) if cid not in aliases]
+        return aliases
 
     async def _acalibratable_chunk_ids(
         self, conn: Any, chunk_ids: Sequence[str]
@@ -2756,6 +2805,20 @@ class AsyncPgvectorStore(BaseStore):
                                     ),
                                     (loser_id, keeper.chunk_id, time.time(), time.time() + 86400),
                                 )
+                                # Durable (unlike the expiring tombstone): lets outcome
+                                # feedback recorded against the loser credit the keeper.
+                                validate_chunk_alias(loser_id, keeper.chunk_id, EQUIVALENT_CONSOLIDATION)
+                                await cur.execute(
+                                    self._sql(
+                                        "INSERT INTO {schema}.{prefix}chunk_aliases"
+                                        " (alias_id, target_id, reason, pipeline_id, created_at)"
+                                        " VALUES (%s, %s, %s, %s, %s)"
+                                        " ON CONFLICT (alias_id) DO UPDATE SET target_id = EXCLUDED.target_id,"
+                                        " reason = EXCLUDED.reason, pipeline_id = EXCLUDED.pipeline_id,"
+                                        " created_at = EXCLUDED.created_at"
+                                    ),
+                                    (loser_id, keeper.chunk_id, EQUIVALENT_CONSOLIDATION, keeper.pipeline_id, time.time()),
+                                )
                             supersedes_json = json.dumps(loser_ids)
                             new_gen = keeper.generation + 1
                             await cur.execute(
@@ -2867,6 +2930,14 @@ class AsyncPgvectorStore(BaseStore):
         cutoff_age = recency_half_life_seconds
         async with self._aconnect() as conn:
             async with conn.cursor() as cur:
+                if not dry_run:
+                    # Same lock as PgvectorStore.calibrate: serializes writing
+                    # passes (sync or async) so outcomes and retrieval counts
+                    # are never double-counted into reputation.
+                    await cur.execute(
+                        "SELECT pg_advisory_xact_lock(%s)",
+                        (calibration_lock_key(self.schema, self.table_prefix),),
+                    )
                 if pipeline_id is not None:
                     await cur.execute(
                         self._sql(
@@ -2961,6 +3032,7 @@ class AsyncPgvectorStore(BaseStore):
                 outcomes = await self._aload_unconsumed_outcomes(conn)
                 if outcomes:
                     from ncp.stores.calibration import (
+                        apply_outcome_aliases,
                         compute_outcome_evidence,
                         scope_outcomes_to_rows,
                         settled_outcome_ids,
@@ -2968,6 +3040,12 @@ class AsyncPgvectorStore(BaseStore):
                     prior_pairs = await self._aload_outcome_applications(
                         conn, [o.outcome_id for o in outcomes]
                     )
+                    outcomes, prior_pairs, alias_audit = apply_outcome_aliases(
+                        outcomes,
+                        await self._aload_chunk_aliases(conn, [cid for o in outcomes for cid in o.chunk_ids]),
+                        prior_pairs,
+                    )
+                    report.change_log.extend(alias_audit)
                     scoped = scope_outcomes_to_rows(
                         outcomes, {r.chunk_id for r in feedback_rows}, prior_pairs
                     )

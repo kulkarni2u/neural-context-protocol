@@ -2,21 +2,30 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import time
 from uuid import uuid4
 
 from ncp.adapters.base import BaseAdapter
 from ncp.adapters.local import LocalAdapter
-from ncp.assembler import Assembler
+from ncp.assembler import Assembler, AssemblyResult
 from ncp.config import NCPConfig, load_config
-from ncp.context_policy import resolve_context_policy
+from ncp.context_policy import ResolvedContextPolicy, resolve_context_policy
 from ncp.costs import calculate_cost
 from ncp.stores.base import BaseStore
 from ncp.stores.factory import create_store
-from ncp.stores.memo import compute_memo_signature
+from ncp.stores.memo import compute_dependency_fingerprint, compute_turn_memo_signature, memo_ineligibility
 from ncp.tokens import estimate_tokens
-from ncp.types import BudgetContext, ConsciousBlock, DecisionRecord, NCPResponse, SubconsciousChunk, Whisper
+from ncp.types import (
+    BudgetContext,
+    ConsciousBlock,
+    DecisionRecord,
+    EvidenceAttribution,
+    NCPResponse,
+    SubconsciousChunk,
+    Whisper,
+)
 
 _CONFIG: NCPConfig | None = None
 
@@ -235,12 +244,13 @@ def run(
         max_tokens=policy.cap_max_tokens(max_tokens),
     )
 
-    memo_signature = _memo_signature(resolved_config, agent, turn)
-    memo = resolved_store.lookup_memo(memo_signature) if memo_signature else None
-    if memo and memo.get("result_summary"):
+    memo_signature = _memo_signature(resolved_config, agent, turn, resolved_adapter, assembly, policy)
+    memo = _usable_memo(resolved_store, resolved_config, memo_signature)
+    if memo is not None:
         content = str(memo["result_summary"])
         response = _build_memo_response(agent=agent, adapter=resolved_adapter, memo=memo, start=start)
     else:
+        _reset_usage(resolved_adapter)
         content = resolved_adapter.call(assembly.context, turn)
         response = _build_response(
             agent=agent,
@@ -251,20 +261,17 @@ def run(
             start=start,
             config=resolved_config,
         )
-        if memo_signature:
-            resolved_store.record_memo(
-                signature=memo_signature,
-                task=turn,
-                chunk_ids=[],
-                result_summary=content,
-                output_tokens_est=response.output_tokens,
-            )
 
-    assembler.post_turn(
-        conscious=agent,
+    response = _finish_turn(
+        assembler=assembler,
+        assembly=assembly,
+        agent=agent,
+        turn=turn,
+        content=content,
         response=response,
-        result_summary=content.splitlines()[0] if content else "",
-        result_full=content,
+        memo=memo,
+        memo_signature=memo_signature,
+        policy_block=policy.describe(requested_max_tokens=max_tokens),
     )
     return response
 
@@ -302,9 +309,9 @@ def stream(
     )
     start = time.perf_counter()
 
-    memo_signature = _memo_signature(resolved_config, agent, turn)
-    memo = resolved_store.lookup_memo(memo_signature) if memo_signature else None
-    if memo and memo.get("result_summary"):
+    memo_signature = _memo_signature(resolved_config, agent, turn, resolved_adapter, assembly, policy)
+    memo = _usable_memo(resolved_store, resolved_config, memo_signature)
+    if memo is not None:
         # Memo hit: synthesize a single-chunk "stream" from the cached content
         # instead of calling the provider.
         content = str(memo["result_summary"])
@@ -312,6 +319,7 @@ def stream(
         response = _build_memo_response(agent=agent, adapter=resolved_adapter, memo=memo, start=start)
     else:
         chunks: list[str] = []
+        _reset_usage(resolved_adapter)
         for chunk in resolved_adapter.stream(assembly.context, turn):
             chunks.append(chunk)
             yield chunk
@@ -326,37 +334,149 @@ def stream(
             start=start,
             config=resolved_config,
         )
-        if memo_signature:
-            resolved_store.record_memo(
-                signature=memo_signature,
-                task=turn,
-                chunk_ids=[],
-                result_summary=content,
-                output_tokens_est=response.output_tokens,
-            )
 
+    _finish_turn(
+        assembler=assembler,
+        assembly=assembly,
+        agent=agent,
+        turn=turn,
+        content=content,
+        response=response,
+        memo=memo,
+        memo_signature=memo_signature,
+        policy_block=policy.describe(requested_max_tokens=max_tokens),
+    )
+
+
+def _attribute_evidence(
+    assembly: AssemblyResult,
+    memo: dict[str, object] | None,
+    memo_signature: str | None = None,
+) -> EvidenceAttribution:
+    """Evidence a run/stream turn rests on (see ``EvidenceAttribution``)."""
+    if memo is not None:
+        raw = memo.get("chunk_ids") or []
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except ValueError:
+                raw = []
+        memo_ids = [str(c) for c in raw] if isinstance(raw, list) else []
+        return EvidenceAttribution(presented=False, memo_chunk_ids=memo_ids, memo_signature=memo_signature)
+    return EvidenceAttribution(
+        presented=True,
+        chunk_ids=assembly.stored_evidence_ids(),
+        sources=dict(assembly.evidence_sources),  # type: ignore[arg-type]
+        whisper_ids=list(assembly.pending_whisper_ids),
+        memo_signature=memo_signature,
+    )
+
+
+def _reset_usage(adapter: BaseAdapter) -> None:
+    """Clear usage left by a previous request so it is never billed twice."""
+    try:
+        adapter.last_usage = None
+    except AttributeError:
+        pass
+
+
+def _finish_turn(
+    *,
+    assembler: Assembler,
+    assembly: AssemblyResult,
+    agent: ConsciousBlock,
+    turn: str,
+    content: str,
+    response: NCPResponse,
+    memo: dict[str, object] | None,
+    memo_signature: str | None,
+    policy_block: dict[str, object] | None = None,
+) -> NCPResponse:
+    """Shared run/stream tail: attribute evidence, memoize, and post the turn."""
+    evidence = _attribute_evidence(assembly, memo, memo_signature)
+    response = response.model_copy(update={"evidence": evidence, "context_policy": policy_block})
+    if memo is None and memo_signature:
+        assembler.store.record_memo(
+            signature=memo_signature,
+            task=turn,
+            chunk_ids=evidence.chunk_ids,
+            result_summary=content,
+            output_tokens_est=response.output_tokens,
+        )
     assembler.post_turn(
         conscious=agent,
         response=response,
         result_summary=content.splitlines()[0] if content else "",
         result_full=content,
+        retrieved_chunk_ids=evidence.chunk_ids or None,
+        # Reached only after the adapter returned (or the stream completed),
+        # so a failed or abandoned request leaves its whispers pending.
+        ack_whisper_ids=evidence.whisper_ids or None,
     )
+    return response
 
 
-def _memo_signature(config: NCPConfig, agent: ConsciousBlock, turn: str) -> str | None:
-    """CAP-C3 signature for this turn, or None when memoization is disabled.
+def _memo_signature(
+    config: NCPConfig,
+    agent: ConsciousBlock,
+    turn: str,
+    adapter: BaseAdapter,
+    assembly: AssemblyResult,
+    policy: ResolvedContextPolicy,
+) -> str | None:
+    """Canonical memo key for this turn, or None when memoization is disabled.
 
-    Deliberately excludes the fully assembled ``[NCP:...]`` context block:
-    recent-turn refs, whisper payloads, and live budget figures all change
-    from call to call, so keying on it would make an exact-match signature
-    almost never repeat. Instead this keys on the turn text plus the
-    agent's own stable identity/task/slot fields, which do repeat across
-    retries or repeated sub-task calls.
+    Keys on the agent's identity, pipeline, goal and constraints, the target
+    model/provider, and a fingerprint of the stored evidence, pending
+    whispers and context policy actually assembled -- so a memo is never
+    reused across pipelines or models, or after the evidence it was built
+    from changed. Volatile parts of the context (recent-turn refs, live
+    budget figures) are deliberately left out so retries of the same work
+    still repeat the key.
     """
     if not config.memoization_enabled:
         return None
-    stable_context = f"{agent.agent_id}|{agent.task}|{agent.slot}"
-    return compute_memo_signature(turn, stable_context)
+    stored = set(assembly.stored_evidence_ids())
+    fingerprint = compute_dependency_fingerprint(
+        evidence=[(c.chunk_id, c.content) for c in assembly.chunks if c.chunk_id in stored],
+        whisper_ids=[w.whisper_id for w in assembly.whispers],
+        policy_sha256=None if policy.identity is None else policy.identity.sha256,
+    )
+    return compute_turn_memo_signature(
+        turn=turn,
+        agent_id=agent.agent_id,
+        role=agent.role,
+        pipeline_id=agent.pipeline_id,
+        task=agent.task,
+        slot=agent.slot,
+        intent=agent.intent,
+        goal_version=agent.goal_version,
+        owns=agent.owns,
+        must_not=agent.must_not,
+        model=adapter.model_name,
+        provider=type(adapter).__name__,
+        dependency_fingerprint=fingerprint,
+    )
+
+
+def _usable_memo(store: BaseStore, config: NCPConfig, signature: str | None) -> dict[str, object] | None:
+    """The memo for ``signature`` if it passes the shared reuse gate, else None.
+
+    Uses the telemetry-neutral peek so a found-but-ineligible memo counts as
+    a miss, exactly like ``ncp_lookup_memo``.
+    """
+    if signature is None:
+        return None
+    memo = store.peek_memo(signature)
+    if memo is not None and memo_ineligibility(
+        memo,
+        min_outcome=config.memoization_min_outcome,
+        allow_unverified=config.memoization_allow_unverified,
+    ) is None:
+        store.record_memo_hit(signature)
+        return memo
+    store.record_memo_miss()
+    return None
 
 
 def _build_memo_response(
@@ -400,6 +520,8 @@ def _build_response(
         input_tokens = usage.input_tokens
         output_tokens = usage.output_tokens
         cache_read_tokens = usage.cache_read_tokens
+        cache_write_tokens = usage.cache_write_tokens
+        reasoning_tokens = usage.reasoning_tokens
         cost_source = "measured"
         pricing = config.pricing if config is not None else None
         try:
@@ -408,6 +530,7 @@ def _build_response(
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 cache_read_tokens=cache_read_tokens,
+                cache_write_tokens=cache_write_tokens,
                 pricing=pricing,
             ).total_cost_usd
         except KeyError:
@@ -419,6 +542,8 @@ def _build_response(
         input_tokens = estimate_tokens(context + "\n" + turn)
         output_tokens = estimate_tokens(content)
         cache_read_tokens = 0
+        cache_write_tokens = 0
+        reasoning_tokens = 0
         cost_usd = 0.0
         cost_source = "estimated"
 
@@ -427,6 +552,8 @@ def _build_response(
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         cache_read_tokens=cache_read_tokens,
+        cache_write_tokens=cache_write_tokens,
+        reasoning_tokens=reasoning_tokens,
         cost_usd=cost_usd,
         model=model,
         pipeline_id=agent.pipeline_id,

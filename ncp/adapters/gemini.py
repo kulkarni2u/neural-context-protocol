@@ -32,6 +32,7 @@ class GeminiAdapter(BaseAdapter):
         self._timeout = timeout
 
     def call(self, ncp_context: str, user_turn: str) -> str:
+        self.last_usage = None
         prompt = f"{ncp_context}\n\n{user_turn}"
         resp = self._run_provider_call(
             lambda: self._client.models.generate_content(
@@ -48,8 +49,14 @@ class GeminiAdapter(BaseAdapter):
         usage = getattr(resp, "usage_metadata", None)
         if usage is None:
             return None
+        # prompt_token_count includes cached content; thinking tokens are
+        # reported apart from candidates but billed at the output price.
+        prompt = int(getattr(usage, "prompt_token_count", 0) or 0)
+        cached = min(max(0, int(getattr(usage, "cached_content_token_count", 0) or 0)), prompt)
+        thoughts = int(getattr(usage, "thoughts_token_count", 0) or 0)
         return TokenUsage(
-            input_tokens=int(getattr(usage, "prompt_token_count", 0) or 0),
-            output_tokens=int(getattr(usage, "candidates_token_count", 0) or 0),
-            cache_read_tokens=int(getattr(usage, "cached_content_token_count", 0) or 0),
+            input_tokens=prompt - cached,
+            output_tokens=int(getattr(usage, "candidates_token_count", 0) or 0) + thoughts,
+            cache_read_tokens=cached,
+            reasoning_tokens=thoughts,
         )

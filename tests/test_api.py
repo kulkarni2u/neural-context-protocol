@@ -248,7 +248,7 @@ def _memo_agent() -> object:
 def test_run_skips_second_provider_call_on_memo_hit(tmp_path: Path) -> None:
     project = tmp_path / "repo"
     (project / ".git").mkdir(parents=True)
-    config = NCPConfig(values={"memoization": {"enabled": True}}, project_root=project)
+    config = NCPConfig(values={"memoization": {"enabled": True, "allow_unverified": True}}, project_root=project)
     store = SQLiteStore(project / ".ncp" / "store.db", config=config)
     adapter = _CountingAdapter()
 
@@ -294,7 +294,7 @@ def test_run_does_not_memoize_when_disabled(tmp_path: Path) -> None:
 def test_stream_skips_second_provider_call_on_memo_hit(tmp_path: Path) -> None:
     project = tmp_path / "repo"
     (project / ".git").mkdir(parents=True)
-    config = NCPConfig(values={"memoization": {"enabled": True}}, project_root=project)
+    config = NCPConfig(values={"memoization": {"enabled": True, "allow_unverified": True}}, project_root=project)
     store = SQLiteStore(project / ".ncp" / "store.db", config=config)
     adapter = _CountingAdapter()
 

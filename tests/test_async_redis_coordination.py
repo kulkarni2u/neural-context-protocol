@@ -103,6 +103,16 @@ def test_async_pgvector_store_with_redis_url_gets_async_coordination() -> None:
     assert isinstance(store._acoordination, AsyncRedisCoordination)
 
 
+def test_async_pgvector_store_redis_stream_matches_sync_store_option() -> None:
+    """redis_stream namespaces the async store's whisper keys, as on PgvectorStore."""
+    pool = _make_async_pool()
+    default = _make_store(pool, redis_url="redis://localhost:6379")
+    named = _make_store(pool, redis_url="redis://localhost:6379", redis_stream="ncp:tenant_a:whispers")
+    assert default._acoordination.stream == "ncp:whispers"
+    assert named._acoordination.stream == "ncp:tenant_a:whispers"
+    assert named._acoordination.whisper_index_prefix == "ncp:tenant_a:whispers:target"
+
+
 def test_async_pgvector_store_no_redis_url_has_none_coordination() -> None:
     """AsyncPgvectorStore without redis_url must have _acoordination = None."""
     pool = _make_async_pool()

@@ -555,12 +555,32 @@ def test_ncp_verify_memo_disabled_by_config(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Fix 2: re-recording a memo must preserve hit_count/created_at/outcome/
-# verified, not reset them (SQLite previously used INSERT OR REPLACE).
+# Fix 2: re-recording a memo must preserve hit_count, and preserve
+# created_at/outcome/verified for the *same* content (SQLite previously used
+# INSERT OR REPLACE). Replacing the content resets the review state.
 # ---------------------------------------------------------------------------
 
 
-def test_rerecord_memo_preserves_hit_count_and_created_at(tmp_path: Path) -> None:
+def test_rerecord_same_memo_preserves_review_state(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "store.db")
+    sig = compute_memo_signature("rerecord_same_task")
+    store.record_memo(sig, "rerecord_same_task", ["c1"], "same result")
+    store.lookup_memo(sig)
+    store.update_memo_outcome(sig, 0.75, verified=True)
+    before = store.peek_memo(sig)
+    assert before is not None
+
+    assert store.record_memo(sig, "rerecord_same_task", ["c1"], "same result") is True
+
+    after = store.peek_memo(sig)
+    assert after is not None
+    assert after["hit_count"] == 1
+    assert after["created_at"] == before["created_at"]
+    assert after["outcome"] == 0.75
+    assert after["verified"] == 1
+
+
+def test_rerecord_replaced_memo_resets_review_state(tmp_path: Path) -> None:
     store = SQLiteStore(tmp_path / "store.db")
     sig = compute_memo_signature("rerecord_task")
     store.record_memo(sig, "rerecord_task", ["c1"], "first result")
@@ -575,16 +595,18 @@ def test_rerecord_memo_preserves_hit_count_and_created_at(tmp_path: Path) -> Non
     assert before["hit_count"] == 2
     original_created_at = before["created_at"]
 
-    # Re-record the same signature with updated task content.
+    # Re-record the same signature with replaced content.
     recorded = store.record_memo(sig, "rerecord_task", ["c1", "c2"], "second result")
     assert recorded is True
 
     after = store.peek_memo(sig)
     assert after is not None
     assert after["hit_count"] == 2, "re-record must not reset hit_count"
-    assert after["created_at"] == original_created_at, "re-record must not reset created_at"
-    assert after["outcome"] == 0.75, "re-record must not reset outcome"
-    assert after["verified"] == 1, "re-record must not reset verified"
+    # The old verification must not vouch for the new result, and staleness
+    # restarts from the replacement.
+    assert after["created_at"] >= original_created_at
+    assert after["outcome"] == 0.0
+    assert after["verified"] == 0
     # Content fields are still updated by the upsert.
     assert after["result_summary"] == "second result"
     assert json.loads(after["chunk_ids"]) == ["c1", "c2"]
