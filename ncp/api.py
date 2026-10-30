@@ -252,6 +252,7 @@ def run(
         content = str(memo["result_summary"])
         response = _build_memo_response(agent=agent, adapter=resolved_adapter, memo=memo, start=start)
     else:
+        _reset_usage(resolved_adapter)
         content = resolved_adapter.call(assembly.context, turn)
         response = _build_response(
             agent=agent,
@@ -321,6 +322,7 @@ def stream(
         response = _build_memo_response(agent=agent, adapter=resolved_adapter, memo=memo, start=start)
     else:
         chunks: list[str] = []
+        _reset_usage(resolved_adapter)
         for chunk in resolved_adapter.stream(assembly.context, turn):
             chunks.append(chunk)
             yield chunk
@@ -363,7 +365,16 @@ def _attribute_evidence(assembly: AssemblyResult, memo: dict[str, object] | None
         presented=True,
         chunk_ids=assembly.stored_evidence_ids(),
         sources=dict(assembly.evidence_sources),  # type: ignore[arg-type]
+        whisper_ids=list(assembly.pending_whisper_ids),
     )
+
+
+def _reset_usage(adapter: BaseAdapter) -> None:
+    """Clear usage left by a previous request so it is never billed twice."""
+    try:
+        adapter.last_usage = None
+    except AttributeError:
+        pass
 
 
 def _finish_turn(
@@ -394,6 +405,9 @@ def _finish_turn(
         result_summary=content.splitlines()[0] if content else "",
         result_full=content,
         retrieved_chunk_ids=evidence.chunk_ids or None,
+        # Reached only after the adapter returned (or the stream completed),
+        # so a failed or abandoned request leaves its whispers pending.
+        ack_whisper_ids=evidence.whisper_ids or None,
     )
     return response
 
@@ -455,6 +469,8 @@ def _build_response(
         input_tokens = usage.input_tokens
         output_tokens = usage.output_tokens
         cache_read_tokens = usage.cache_read_tokens
+        cache_write_tokens = usage.cache_write_tokens
+        reasoning_tokens = usage.reasoning_tokens
         cost_source = "measured"
         pricing = config.pricing if config is not None else None
         try:
@@ -463,6 +479,7 @@ def _build_response(
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 cache_read_tokens=cache_read_tokens,
+                cache_write_tokens=cache_write_tokens,
                 pricing=pricing,
             ).total_cost_usd
         except KeyError:
@@ -474,6 +491,8 @@ def _build_response(
         input_tokens = estimate_tokens(context + "\n" + turn)
         output_tokens = estimate_tokens(content)
         cache_read_tokens = 0
+        cache_write_tokens = 0
+        reasoning_tokens = 0
         cost_usd = 0.0
         cost_source = "estimated"
 
@@ -482,6 +501,8 @@ def _build_response(
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         cache_read_tokens=cache_read_tokens,
+        cache_write_tokens=cache_write_tokens,
+        reasoning_tokens=reasoning_tokens,
         cost_usd=cost_usd,
         model=model,
         pipeline_id=agent.pipeline_id,

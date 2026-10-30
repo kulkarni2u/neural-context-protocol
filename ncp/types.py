@@ -651,6 +651,9 @@ class EvidenceAttribution(NCPModel):
         default_factory=dict
     )
     memo_chunk_ids: list[str] = Field(default_factory=list)
+    # Whispers included in the request and therefore acknowledged. Empty on
+    # a memo hit: nothing was shown to a model, so nothing is acknowledged.
+    whisper_ids: list[str] = Field(default_factory=list)
 
 
 class NCPResponse(NCPModel):
@@ -660,6 +663,10 @@ class NCPResponse(NCPModel):
     input_tokens: int
     output_tokens: int
     cache_read_tokens: int = 0
+    # Disjoint from input_tokens/cache_read_tokens (see TokenUsage).
+    cache_write_tokens: int = 0
+    # Part of output_tokens spent on hidden reasoning; informational.
+    reasoning_tokens: int = 0
     cost_usd: float
     model: str
     pipeline_id: str | None = None

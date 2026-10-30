@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from os import environ
 
-from ncp.adapters.base import BaseAdapter, NCPAdapterError, NCPAdapterTimeoutError, TokenUsage
+from ncp.adapters.base import BaseAdapter, NCPAdapterError, NCPAdapterTimeoutError, TokenUsage, _raw_usage
 
 # WI-10 (ncp/encoder.py) orders assembled context as stable blocks
 # ([NCP:CONSCIOUS], [NCP:SUBCONSCIOUS], [NCP:WHISPERS]) followed by the one
@@ -45,6 +45,7 @@ class AnthropicAdapter(BaseAdapter):
         self._enable_prompt_caching = enable_prompt_caching
 
     def call(self, ncp_context: str, user_turn: str) -> str:
+        self.last_usage = None
         msg = self._run_provider_call(
             lambda: self._client.messages.create(
                 model=self._model,
@@ -112,14 +113,17 @@ class AnthropicAdapter(BaseAdapter):
         usage = getattr(msg, "usage", None)
         if usage is None:
             return None
+        # Anthropic's input_tokens already excludes cache reads and writes.
         return TokenUsage(
             input_tokens=int(getattr(usage, "input_tokens", 0) or 0),
             output_tokens=int(getattr(usage, "output_tokens", 0) or 0),
             cache_read_tokens=int(getattr(usage, "cache_read_input_tokens", 0) or 0),
             cache_write_tokens=int(getattr(usage, "cache_creation_input_tokens", 0) or 0),
+            raw=_raw_usage(usage),
         )
 
     def stream(self, ncp_context: str, user_turn: str) -> Iterator[str]:
+        self.last_usage = None
         timeout_types = (self._anthropic.APITimeoutError, TimeoutError)
         stream_ctx = self._run_provider_call(
             lambda: self._client.messages.stream(

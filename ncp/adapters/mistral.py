@@ -32,6 +32,7 @@ class MistralAdapter(BaseAdapter):
         self._max_tokens = max_tokens
 
     def call(self, ncp_context: str, user_turn: str) -> str:
+        self.last_usage = None
         resp = self._run_provider_call(
             lambda: self._client.chat.complete(
                 model=self._model,
