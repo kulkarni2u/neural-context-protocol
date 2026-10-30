@@ -13,6 +13,10 @@ from ncp.adapters.base import BaseAdapter, NCPAdapterError, NCPAdapterTimeoutErr
 # breakpoint on the stable prefix lets the provider skip re-processing (and
 # re-billing at full price) everything before the volatile budget block.
 _BUDGET_MARKER = "[NCP:BUDGET]"
+# [NCP:WHISPERS] is per-turn too: whispers are drained and acknowledged each
+# turn and carry a relative age ("<1m", "5m") that changes with wall time.
+# When present it starts the volatile tail instead of [NCP:BUDGET].
+_WHISPERS_MARKER = "[NCP:WHISPERS]"
 
 
 class AnthropicAdapter(BaseAdapter):
@@ -77,7 +81,9 @@ class AnthropicAdapter(BaseAdapter):
     def _split_stable_prefix(ncp_context: str) -> list[dict[str, object]]:
         """Split into a cached stable-prefix block and an uncached volatile block.
 
-        The split point is the literal ``[NCP:BUDGET]`` marker, which
+        The split point is ``[NCP:WHISPERS]`` when present (whispers change
+        every turn and carry a wall-clock-relative age), otherwise the literal
+        ``[NCP:BUDGET]`` marker, which
         ``ncp/encoder.py``'s ``assemble_from_parts`` always appends last (the
         budget block is never omitted, even when other optional blocks are).
         Only the stable prefix gets ``cache_control`` -- the budget block
@@ -97,7 +103,9 @@ class AnthropicAdapter(BaseAdapter):
         caching that block.
         """
 
-        idx = ncp_context.find(_BUDGET_MARKER)
+        idx = ncp_context.find(_WHISPERS_MARKER)
+        if idx == -1:
+            idx = ncp_context.find(_BUDGET_MARKER)
         if idx == -1:
             return [{"type": "text", "text": ncp_context, "cache_control": {"type": "ephemeral"}}]
 
