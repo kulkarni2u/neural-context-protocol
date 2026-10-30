@@ -231,6 +231,84 @@ def scope_outcomes_to_rows(
     return scoped
 
 
+# The only merge whose loser may hand its outcome feedback to the survivor:
+# consolidation found the two chunks equivalent. Supersession, contradiction
+# and every other edge deliberately have no alias -- their feedback must not
+# transfer.
+EQUIVALENT_CONSOLIDATION = "equivalent_consolidation"
+CHUNK_ALIAS_REASONS: frozenset[str] = frozenset({EQUIVALENT_CONSOLIDATION})
+MAX_ALIAS_DEPTH = 32
+
+
+def validate_chunk_alias(alias_id: str, target_id: str, reason: str) -> None:
+    """Reject aliases that could transfer feedback outside an equivalent merge."""
+    if reason not in CHUNK_ALIAS_REASONS:
+        raise ValueError(f"invalid chunk alias reason {reason!r}; expected one of {sorted(CHUNK_ALIAS_REASONS)}")
+    if not alias_id or not target_id or alias_id == target_id:
+        raise ValueError("a chunk alias needs two distinct, non-empty chunk ids")
+
+
+def resolve_chunk_alias(chunk_id: str, aliases: dict[str, str]) -> str:
+    """Follow ``aliases`` (loser -> keeper) to the surviving chunk id.
+
+    Chains from repeated consolidation are followed; a cycle or an
+    over-deep chain resolves to the last id reached rather than looping.
+    """
+    seen = {chunk_id}
+    current = chunk_id
+    for _ in range(MAX_ALIAS_DEPTH):
+        target = aliases.get(current)
+        if target is None or target in seen:
+            break
+        seen.add(target)
+        current = target
+    return current
+
+
+def apply_outcome_aliases(
+    outcomes: list[OutcomeRecord],
+    aliases: dict[str, str],
+    applied_pairs: "set[tuple[str, str]]",
+) -> tuple[list[OutcomeRecord], set[tuple[str, str]], list[dict]]:
+    """Map outcome chunk ids to their effective (post-consolidation) ids.
+
+    Returns ``(effective_outcomes, effective_applied_pairs, audit)``:
+
+    - each outcome's ids resolved through ``aliases`` and de-duplicated, so
+      several merged losers credit their keeper once per outcome;
+    - ``applied_pairs`` extended with the effective id of every pair already
+      applied to a loser, so evidence a loser received before the merge is
+      never re-applied to its keeper;
+    - one audit entry per remapped id, keeping original and effective ids.
+
+    The stored outcome rows are not modified; only calibration sees the
+    effective ids.
+    """
+    if not aliases:
+        return outcomes, set(applied_pairs), []
+    effective_pairs = set(applied_pairs)
+    effective_pairs.update(
+        (oid, resolve_chunk_alias(cid, aliases)) for oid, cid in applied_pairs
+    )
+    audit: list[dict] = []
+    effective: list[OutcomeRecord] = []
+    for out in outcomes:
+        ids: dict[str, None] = {}
+        for cid in out.chunk_ids:
+            target = resolve_chunk_alias(cid, aliases)
+            if target != cid:
+                audit.append({
+                    "reason": "outcome_alias",
+                    "outcome_id": out.outcome_id,
+                    "original_chunk_id": cid,
+                    "effective_chunk_id": target,
+                })
+            ids.setdefault(target, None)
+        resolved = list(ids)
+        effective.append(out if resolved == out.chunk_ids else out.model_copy(update={"chunk_ids": resolved}))
+    return effective, effective_pairs, audit
+
+
 def settled_outcome_ids(
     outcomes: list[OutcomeRecord],
     applied_pairs: "set[tuple[str, str]]",
