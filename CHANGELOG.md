@@ -19,6 +19,54 @@ All notable changes to Neural Context Protocol will be documented in this file.
   unchanged. Other read paths (`ncp_fetch`, decisions, memoization, whispers)
   do not consult policies.
 - `NCPConfig.max_tokens_per_call`.
+- **Evidence attribution on run/stream** (`ncp/api.py`, `ncp/assembler.py`,
+  `ncp/types.py`): `NCPResponse.evidence` (`EvidenceAttribution`) records the
+  stored chunk ids in the model-visible request, each delivered chunk's origin
+  (`retrieval` / `graph_expansion` / `recent_ref` / `cold_start`), the
+  acknowledged whisper ids, the turn's memo signature, and on a memo hit the
+  cached result's evidence (not presented, not credited).
+  `NCPResponse.context_policy`, `cache_write_tokens` and `reasoning_tokens`.
+- **Outcome aliases through consolidation**: durable `chunk_aliases`
+  (loser -> keeper, `equivalent_consolidation` only). Postgres deployments
+  must apply `017_add_chunk_aliases.sql`.
+- `ncp_post_turn` `memory_chunks` items accept `base_trust`, `signature`,
+  `evidence_id` and `caused_by`; the response lists `trust_demoted_chunk_ids`.
+
+### Changed
+
+- **Memo reuse in `ncp.run`/`ncp.stream` now honors
+  `[memoization].allow_unverified` and `min_outcome`**, like `ncp_lookup_memo`.
+  With the default `allow_unverified = false`, a memo is reused only after it
+  is verified (`store.update_memo_outcome(response.evidence.memo_signature,
+  1.0, verified=True)`). The memo key is now a canonical versioned signature
+  over agent, role, pipeline, task/slot/intent, goal version, constraints,
+  model, provider and a fingerprint of the evidence, pending whispers and
+  context policy. Existing Python-path memos will not be hit again.
+- Re-recording a memo with different content resets `outcome`/`verified` and
+  restarts `created_at`; identical re-records keep them.
+- Consolidation and fan-in never merge claims with opposite polarity
+  (resolution/persistence/negation cues) or disjoint validity windows;
+  fan-in flags opposite-polarity pairs as contradictions at any similarity
+  above `reduce_fanin_contradict_floor`.
+- Recording an outcome with an existing `outcome_id` is a no-op returning
+  `recorded: false` instead of raising.
+
+### Fixed
+
+- Async pgvector `record_outcome(turn_id=...)` raised `KeyError(0)` on dict
+  rows; all backends now share one row normalizer.
+- `ncp.run`/`ncp.stream` never linked the evidence they delivered, so
+  turn-based outcomes resolved to no chunks; they also never acknowledged the
+  whispers they delivered (now acknowledged only after a successful request).
+- Outcome feedback on a chunk that consolidation merged away was consumed
+  without crediting the surviving keeper.
+- OpenAI-shape and Gemini cached input was billed at both the input and
+  cache-read price; Anthropic cache-write tokens were never priced; OpenAI
+  streaming reported no usage, and adapters could re-bill a previous call's
+  stale `last_usage`.
+- `ncp_post_turn` `memory_chunks` bypassed `require_signatures`,
+  `require_grounded_high_trust` and provenance; the whole batch is now
+  validated before anything is written.
 
 ## [1.7.0] - 2026-10-30
 
