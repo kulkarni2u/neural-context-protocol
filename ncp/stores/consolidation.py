@@ -208,6 +208,30 @@ def claim_polarity(content: str) -> tuple[bool, bool, bool]:
     )
 
 
+_NUMBER_RE = re.compile(r"\d+(?:\.\d+)?")
+
+
+def claim_values(content: str) -> tuple[str, ...]:
+    """The numeric values a claim states, in order ("v2", "3 retries", "port 8080")."""
+    return tuple(_NUMBER_RE.findall(content))
+
+
+def same_claim_shape(a: str, b: str) -> bool:
+    """Whether two texts can be the same claim: equal numeric values and polarity.
+
+    Text similarity alone cannot tell "fact version v1" from "fact version
+    v2" or "retries 3 times" from "retries 5 times" -- a corrected value is a
+    one-character edit. Dedup, consolidation and fan-in merging all require
+    this before treating two texts as one.
+    """
+    return claim_values(a) == claim_values(b) and claim_polarity(a) == claim_polarity(b)
+
+
+def is_near_duplicate(a: str, b: str, *, threshold: float = 0.92) -> bool:
+    """Write-time dedup predicate shared by every store backend."""
+    return same_claim_shape(a, b) and SequenceMatcher(None, a, b).ratio() > threshold
+
+
 def _windows_overlap(a: SubconsciousChunk, b: SubconsciousChunk) -> bool:
     """Whether two validity windows ([valid_from, valid_to), None = open) intersect."""
     if a.valid_to is not None and b.valid_from is not None and a.valid_to <= b.valid_from:
@@ -218,7 +242,7 @@ def _windows_overlap(a: SubconsciousChunk, b: SubconsciousChunk) -> bool:
 
 
 def _mergeable(a: SubconsciousChunk, b: SubconsciousChunk) -> bool:
-    return claim_polarity(a.content) == claim_polarity(b.content) and _windows_overlap(a, b)
+    return same_claim_shape(a.content, b.content) and _windows_overlap(a, b)
 
 
 @dataclass(slots=True)

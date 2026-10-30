@@ -5,7 +5,6 @@ from __future__ import annotations
 from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import replace as dataclass_replace
-from difflib import SequenceMatcher
 import json
 import logging
 from pathlib import Path
@@ -28,7 +27,12 @@ from ncp.stores.calibration import (
     rollup_reputation,
     validate_chunk_alias,
 )
-from ncp.stores.consolidation import cluster_by_tags, find_merge_candidates, split_current_and_historical
+from ncp.stores.consolidation import (
+    cluster_by_tags,
+    find_merge_candidates,
+    is_near_duplicate,
+    split_current_and_historical,
+)
 from ncp.stores.graph import (
     backfill_edges_for_chunk,
     infer_edges_for_chunk,
@@ -3867,11 +3871,7 @@ class SQLiteStore(BaseStore):
             """,
             (chunk.zone, chunk.layer, chunk.pipeline_id, chunk.chunk_id, max(0, int(limit))),
         ).fetchall()
-        for row in rows:
-            similarity = SequenceMatcher(None, chunk.content, str(row["content"])).ratio()
-            if similarity > 0.92:
-                return True
-        return False
+        return any(is_near_duplicate(chunk.content, str(row["content"])) for row in rows)
 
     def _soft_gc(self, connection: sqlite3.Connection) -> None:
         now = time.time()

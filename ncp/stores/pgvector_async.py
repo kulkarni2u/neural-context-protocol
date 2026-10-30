@@ -20,7 +20,6 @@ import time
 from collections.abc import Sequence
 from contextlib import asynccontextmanager
 from dataclasses import replace as dataclass_replace
-from difflib import SequenceMatcher
 from typing import Any, AsyncIterator
 
 import anyio
@@ -65,7 +64,12 @@ from ncp.stores.calibration import (
     rollup_reputation,
     validate_chunk_alias,
 )
-from ncp.stores.consolidation import cluster_by_tags, find_merge_candidates, split_current_and_historical
+from ncp.stores.consolidation import (
+    cluster_by_tags,
+    find_merge_candidates,
+    is_near_duplicate,
+    split_current_and_historical,
+)
 from ncp.tokens import estimate_tokens
 from ncp.types import (
     CalibrationReport,
@@ -615,7 +619,7 @@ class AsyncPgvectorStore(BaseStore):
             description = cur.description
         rows = [self._normalize_row(r, description) for r in raw_rows]
         for row in rows:
-            if SequenceMatcher(None, chunk.content, str(row["content"])).ratio() > 0.92:
+            if is_near_duplicate(chunk.content, str(row["content"])):
                 return True
         return False
 
