@@ -33,6 +33,9 @@ def _pgvector_store() -> PgvectorStore:
         schema=schema,
         table_prefix="it_",
         redis_url=os.getenv("NCP_REDIS_URL", "redis://127.0.0.1:6379/0"),
+        # Redis is shared across runs; a per-store stream keeps whisper counts
+        # from leaking between runs the way the per-run schema isolates tables.
+        redis_stream=f"ncp:it:{schema}:whispers",
     )
 
 

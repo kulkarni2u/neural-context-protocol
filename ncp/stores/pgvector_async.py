@@ -106,6 +106,7 @@ class AsyncPgvectorStore(BaseStore):
         gc_threshold: int = 400,
         max_working_chunks_per_pipeline: int = 0,
         redis_url: str | None = None,
+        redis_stream: str = "ncp:whispers",
         coordination: AsyncRedisCoordination | None = None,
         embedding_adapter: object | None = None,
         ivfflat_probes: int = 10,
@@ -135,7 +136,7 @@ class AsyncPgvectorStore(BaseStore):
         self._apool: Any = None
         self._init_lock = anyio.Lock()
         self._acoordination: AsyncRedisCoordination | None = coordination or (
-            AsyncRedisCoordination(redis_url) if redis_url else None
+            AsyncRedisCoordination(redis_url, stream=redis_stream) if redis_url else None
         )
 
         if open_pool:
