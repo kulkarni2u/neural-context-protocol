@@ -679,6 +679,9 @@ class NCPResponse(NCPModel):
     cost_source: Literal["measured", "estimated", "memoized"] = "measured"
     # Set by ncp.run/ncp.stream; None for responses built elsewhere.
     evidence: EvidenceAttribution | None = None
+    # The selected context policy's identity (name/version/sha256/cap), the
+    # same block ncp_get_context returns; None when no policy was selected.
+    context_policy: dict[str, Any] | None = None
 
     @field_validator("model", "turn_id")
     @classmethod

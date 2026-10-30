@@ -273,6 +273,7 @@ def run(
         response=response,
         memo=memo,
         memo_signature=memo_signature,
+        policy_block=policy.describe(requested_max_tokens=max_tokens),
     )
     return response
 
@@ -347,6 +348,7 @@ def stream(
         response=response,
         memo=memo,
         memo_signature=memo_signature,
+        policy_block=policy.describe(requested_max_tokens=max_tokens),
     )
 
 
@@ -387,10 +389,11 @@ def _finish_turn(
     response: NCPResponse,
     memo: dict[str, object] | None,
     memo_signature: str | None,
+    policy_block: dict[str, object] | None = None,
 ) -> NCPResponse:
     """Shared run/stream tail: attribute evidence, memoize, and post the turn."""
     evidence = _attribute_evidence(assembly, memo)
-    response = response.model_copy(update={"evidence": evidence})
+    response = response.model_copy(update={"evidence": evidence, "context_policy": policy_block})
     if memo is None and memo_signature:
         assembler.store.record_memo(
             signature=memo_signature,

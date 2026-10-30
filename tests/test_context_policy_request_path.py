@@ -248,3 +248,29 @@ class TestPythonApi:
 
         with pytest.raises(UnknownContextPolicyError):
             api.get_context(agent=agent, store=store, config=_config(tmp_path), context_policy="missing-v9")
+
+
+class TestRunStreamPolicyAudit:
+    def test_run_response_carries_policy_identity(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "ncp.db")
+        _seed(store)
+        config = _config(tmp_path)
+        agent = api.agent(id="builder", role="build", task="policy", slot="context", intent="test")
+        expected = resolve_context_policy(config, "tight-v1").describe(requested_max_tokens=5000)
+
+        response = api.run(
+            agent=agent, turn="policy context", store=store, config=config,
+            max_tokens=5000, context_policy="tight-v1",
+        )
+
+        assert response.context_policy == expected
+        assert response.context_policy is not None
+        assert response.context_policy["max_tokens_capped_from"] == 5000
+
+    def test_run_without_policy_has_no_block(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "ncp.db")
+        agent = api.agent(id="builder", role="build", task="policy", slot="context", intent="test")
+
+        response = api.run(agent=agent, turn="policy context", store=store, config=_config(tmp_path))
+
+        assert response.context_policy is None
