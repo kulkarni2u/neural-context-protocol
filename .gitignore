@@ -37,3 +37,6 @@ docs/NCP_R2_STORAGE.md
 docs/superpowers/
 consolidation-review-response.json
 .worktrees/
+
+# Local Redis snapshot (e.g. from running the integration tests)
+dump.rdb
