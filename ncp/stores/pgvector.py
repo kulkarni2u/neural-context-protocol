@@ -7,9 +7,11 @@ from contextlib import contextmanager
 from dataclasses import replace as dataclass_replace
 from difflib import SequenceMatcher
 import atexit
+import hashlib
 import json
 import logging
 import math
+import struct
 from pathlib import Path
 from typing import Any
 import time
@@ -55,6 +57,12 @@ from ncp.types import CalibrationReport, ChunkEdge, ConsolidationReport, Conscio
 logger = logging.getLogger("ncp")
 
 _IN_BATCH = 500  # ids per IN (...) query
+
+
+def calibration_lock_key(schema: str, table_prefix: str) -> int:
+    """Signed 64-bit pg advisory-lock key for calibration on one schema/prefix."""
+    digest = hashlib.sha256(f"{schema}.{table_prefix}calibrate".encode()).digest()
+    return struct.unpack(">q", digest[:8])[0]
 
 
 PGVECTOR_SCHEMA_TEMPLATE = """
@@ -2639,6 +2647,13 @@ class PgvectorStore(BaseStore):
             with self._connect() as connection:
                 cursor = connection.cursor()
                 try:
+                    if not dry_run:
+                        # Serialize writing calibrations per store: two concurrent
+                        # passes would both read the same unapplied outcomes and
+                        # retrieval counts and double-count them into reputation.
+                        # Released at commit; taken before any read so the pass
+                        # sees the previous pass's committed state.
+                        cursor.execute("SELECT pg_advisory_xact_lock(%s)", (self._calibration_lock_key(),))
                     if pipeline_id is not None:
                         cursor.execute(
                             self._sql(
@@ -3170,6 +3185,10 @@ class PgvectorStore(BaseStore):
             for row in rows:
                 pairs.add((str(row["outcome_id"]), str(row["chunk_id"])))
         return pairs
+
+    def _calibration_lock_key(self) -> int:
+        """Advisory-lock key shared by sync and async stores on the same schema/prefix."""
+        return calibration_lock_key(self.schema, self.table_prefix)
 
     def _load_chunk_aliases(self, connection: Any, chunk_ids: Sequence[str]) -> dict[str, str]:
         """Equivalent-consolidation aliases reachable from ``chunk_ids`` (loser -> keeper)."""

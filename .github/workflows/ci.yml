@@ -113,4 +113,6 @@ jobs:
           tests/test_retrieval_feedback.py
           tests/test_outcome_turn_resolution.py
           tests/test_outcome_consolidation_alias.py
+          tests/test_calibration_concurrency.py
+          tests/test_memo_correctness.py
           tests/test_async_redis_coordination.py

@@ -45,6 +45,7 @@ from ncp.stores.pgvector import (
     PGVECTOR_SCHEMA_TEMPLATE,
     PgvectorStore,
     _validate_identifier,
+    calibration_lock_key,
 )
 from ncp.stores.redis_coordination import AsyncRedisCoordination
 from ncp.stores.retrieval import (
@@ -2924,6 +2925,14 @@ class AsyncPgvectorStore(BaseStore):
         cutoff_age = recency_half_life_seconds
         async with self._aconnect() as conn:
             async with conn.cursor() as cur:
+                if not dry_run:
+                    # Same lock as PgvectorStore.calibrate: serializes writing
+                    # passes (sync or async) so outcomes and retrieval counts
+                    # are never double-counted into reputation.
+                    await cur.execute(
+                        "SELECT pg_advisory_xact_lock(%s)",
+                        (calibration_lock_key(self.schema, self.table_prefix),),
+                    )
                 if pipeline_id is not None:
                     await cur.execute(
                         self._sql(
