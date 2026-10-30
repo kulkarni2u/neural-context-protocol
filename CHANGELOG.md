@@ -4,6 +4,20 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [Unreleased]
 
+## [1.7.1] - 2026-10-30
+
+### Release scope
+
+This release wires context policies into the request path, closes the
+pending-handoff correctness gaps (outcome attribution, memo reuse, provider
+cost accounting, post-turn write checks, fan-in and dedup), and adds opt-in
+response budgets and a memo-reuse benchmark. New request options are opt-in.
+Postgres deployments must apply `017_add_chunk_aliases.sql` (SQLite creates
+the table idempotently). Read **Changed** before upgrading: `ncp.run`/`ncp.stream`
+now reuse a memo only after it is verified (unless
+`[memoization].allow_unverified = true`), existing Python-path memo keys will
+not match, and dedup/merging are stricter about changed values.
+
 ### Added
 
 - **Context policies in the request path** (`ncp/mcp/server.py`, `ncp/api.py`,

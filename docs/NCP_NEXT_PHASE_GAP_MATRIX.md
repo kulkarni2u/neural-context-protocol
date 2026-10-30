@@ -1,12 +1,11 @@
 # NCP Next-Phase Gap Matrix
 
-Assessment of current `main` (post-v1.7.0, PR #58) plus branch
-`claude/pending-handoff-fixes` against two inputs:
+Assessment of NCP v1.7.1 (PRs #58 and #59) against two inputs:
 
 - **Handoff** — *NCP Pending Implementation Handoff* (reviewed commit `570872a`).
 - **Plan** — *NCP Next-Phase Implementation Recommendations* (v1.7+).
 
-Status: **Done** (on this branch, tested) · **Partial** · **Missing**.
+Status: **Done** (in v1.7.1, tested) · **Partial** · **Missing**.
 
 ## 1. Pending-handoff items
 
