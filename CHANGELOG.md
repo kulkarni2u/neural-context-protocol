@@ -27,6 +27,19 @@ All notable changes to Neural Context Protocol will be documented in this file.
   are never repeated). Frames stay payload-free; `task` events remain
   in-process-only.
 
+- **Postgres parity for the cross-pipeline overview** (`ncp/stores/overview_sql.py`,
+  `ncp/stores/pgvector.py`, `ncp/stores/pgvector_async.py`,
+  `ncp/stores/redis_coordination.py`): `PgvectorStore.overview_rows` and
+  `AsyncPgvectorStore.async_overview_rows` are now native grouped SQL with the
+  same semantics as SQLite (pipelines discovered from chunks, turns, decisions
+  and tasks; real `dissent_24h`; no 50-task cap). Inbox counts and the newest
+  `result` whisper come from Redis by peeking only. `RedisCoordination` and
+  `AsyncRedisCoordination` gain a read-only `scan_whispers`, and the async class
+  a public `peek_whispers`. SQLite's overview now also counts decisions as
+  pipeline activity. Verified live on Postgres 16 with pgvector (full
+  `_init_db`, migration 017 to 018, SQLite/Postgres row parity); live tests
+  run when `NCP_TASKS_PG_DSN` (and `NCP_TASKS_REDIS_URL`) are set.
+
 - **Request/reply whisper threads** (`ncp/types.py`, `ncp/stores/sqlite.py`,
   `ncp/stores/redis_coordination.py`, `ncp/encoder.py`, `ncp/mcp/server.py`):
   first step of the router coordination primitives

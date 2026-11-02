@@ -568,6 +568,14 @@ Deviations from, and details beyond, the text above:
   but unused until capability D.
 - **`ncp_overview`** (§5.3 mentions it) does not exist yet; lazy expiry there
   is for PR 4.
+- **Verified on real pgvector.** Migration 018 and the template were first
+  exercised on a plain Postgres 16 without the `vector` extension. They have
+  since been run on Postgres 16 with pgvector 0.6.0: a store using its normal
+  `_init_db` (the whole template, including `CREATE EXTENSION vector`) creates
+  every table; `MigrationRunner` applies 001 to 017, then 018, and the
+  resulting `tasks` columns, defaults and indexes equal a fresh template
+  install; the live ledger tests pass against both. See
+  `tests/test_overview_postgres.py::TestRealPgvectorSchema`.
 
 ---
 
@@ -636,15 +644,28 @@ Deviations from, and details beyond, the text above:
   `[tasks].enabled` and `[tasks].stale_open_seconds` without the store reading
   config. The `BaseStore` default composes public methods
   (`ncp/stores/overview_facts.py::generic_overview_rows`); SQLite overrides it
-  with grouped SQL (one query per fact, joined in Python). There is no native
-  sync Postgres implementation: it uses the default, which finds pipelines via
-  `viz_data()['pipeline_summary']` (chunk-bearing only unless `pipelines` is
-  given), caps task lists at 50 per status, has no `list_whispers`/`list_turns`
-  (so `last_result` falls back to failed tasks and turns do not feed
-  `last_activity`), and reports `dissent_24h = 0`. The async Postgres store
-  overrides `async_overview_rows` with the same degradation plus no inbox
-  (the Redis layer has no async peek). The Postgres paths are untested against
-  a live server.
+  with grouped SQL (one query per fact, joined in Python). The sync
+  (`PgvectorStore.overview_rows`) and async (`AsyncPgvectorStore.async_overview_rows`)
+  Postgres stores have native implementations that share their statements and
+  row assembly in `ncp/stores/overview_sql.py` (as `task_sql.py` does for the
+  ledger) and mirror SQLite's windowing, 60s expiring-claim window, `updated_at`
+  stale-open rule and `pipeline_id` drift key. Pipelines are discovered from
+  the union of chunks, turns, decisions and tasks (SQLite now includes
+  decisions too, so a decision-only pipeline appears on both). Whispers live in
+  Redis, so the inbox counts, the newest unexpired `result` and whisper
+  activity come from `coordination` by peeking only (`peek_whispers`, plus the
+  new read-only `scan_whispers` on `RedisCoordination` and
+  `AsyncRedisCoordination`; the async class also gained a public
+  `peek_whispers`). Nothing is acknowledged or deleted. A pipeline that has
+  only queued whispers appears (as on SQLite), and without Redis (or if it is
+  unreachable) the inbox is empty and `last_result` falls back to failed
+  tasks. `dissent_24h` is real (joined to the dissent log). The generic
+  `BaseStore` default remains for third-party stores and keeps its documented
+  limits (chunk-bearing pipelines only, 50 tasks per status, `dissent_24h = 0`).
+  Verified live against Postgres 16 with pgvector 0.6.0: SQLite and Postgres
+  return identical rows for the same fixture, and the async store matches the
+  sync one (`tests/test_overview_postgres.py`, gated on `NCP_TASKS_PG_DSN`
+  and, for whisper facts, `NCP_TASKS_REDIS_URL`).
 - **Drift key.** The spec said `drift_history` is keyed by
   `pipeline_id:viewer`. The only writer (`CoherenceChecker._log_drift_history`)
   logs `session_id = pipeline_id`, so `drift` reads the newest row for

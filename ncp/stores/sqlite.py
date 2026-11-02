@@ -3844,6 +3844,7 @@ class SQLiteStore(BaseStore):
             "SELECT pipeline_id, MAX(created_at) AS ts FROM chunks WHERE pipeline_id IS NOT NULL GROUP BY pipeline_id"
             " UNION ALL SELECT pipeline_id, MAX(created_at) FROM whispers WHERE pipeline_id IS NOT NULL GROUP BY pipeline_id"
             " UNION ALL SELECT pipeline_id, MAX(created_at) FROM turn_records WHERE pipeline_id IS NOT NULL GROUP BY pipeline_id"
+            " UNION ALL SELECT pipeline_id, MAX(created_at) FROM decisions WHERE pipeline_id IS NOT NULL GROUP BY pipeline_id"
         )
         if include_tasks:
             activity_sql += " UNION ALL SELECT pipeline_id, MAX(updated_at) FROM tasks GROUP BY pipeline_id"

@@ -19,6 +19,7 @@ from uuid import uuid4
 from ncp.config import NCPConfig
 from ncp.stores.base import (
     BaseStore,
+    NCPStoreError,
     NCPStoreUnavailableError,
     _validate_turn_chunk_relation,
     merge_outcome_chunk_rows,
@@ -57,7 +58,8 @@ from ncp.stores.retrieval import (
     score_vector_distance,
 )
 from ncp.tokens import estimate_tokens
-from ncp.stores import task_sql
+from ncp.stores import overview_sql, task_sql
+from ncp.stores.overview_facts import INBOX_MIN_CONFIDENCE, inbox_counts, live_whispers, newest_results, whisper_activity
 from ncp.types import CalibrationReport, ChunkEdge, ConsolidationReport, ConsciousBlock, DecisionRecord, NCPResponse, OutcomeRecord, SubconsciousChunk, TaskOpResult, TaskRecord, TaskStatus, TurnRecord, Whisper
 
 logger = logging.getLogger("ncp")
@@ -3105,6 +3107,81 @@ class PgvectorStore(BaseStore):
 
         report.duration_seconds = time.monotonic() - started
         return report
+
+    def overview_rows(
+        self,
+        *,
+        pipelines: Sequence[str] | None = None,
+        pipeline_prefix: str | None = None,
+        since: float | None = None,
+        viewer: str | None = None,
+        now: float | None = None,
+        include_tasks: bool = True,
+        stale_open_seconds: float = 1800.0,
+    ) -> list[dict[str, Any]]:
+        """Grouped-SQL cross-pipeline overview facts (mirrors ``SQLiteStore.overview_rows``).
+
+        Pipelines are discovered from chunks, turns, decisions and tasks, plus
+        queued whispers when Redis coordination is configured. The viewer's
+        inbox and the newest queued ``result`` whisper are read from Redis by
+        peeking only; if Redis is absent or unreachable those facts are empty.
+        """
+        now = time.time() if now is None else float(now)
+        cutoff = None if since is None else now - float(since)
+        wanted = None if pipelines is None else set(pipelines)
+        if include_tasks:
+            try:
+                self.expire_task_leases(None, now)
+            except NCPStoreError:
+                include_tasks = False
+
+        queued: list[Whisper] = []
+        if self.coordination is not None:
+            try:
+                queued = live_whispers(self.coordination.scan_whispers(), now)
+            except Exception:
+                queued = []
+
+        stmts = overview_sql.statements(
+            now=now, cutoff=cutoff, include_tasks=include_tasks, stale_open_seconds=stale_open_seconds
+        )
+        facts: dict[str, list[dict[str, Any]]] = {}
+        with self._connect() as connection:
+            cursor = connection.cursor()
+            try:
+                for name, (sql, params) in stmts.items():
+                    cursor.execute(self._sql(sql), params)
+                    facts[name] = self._fetchall(cursor)
+            finally:
+                self._close_cursor(cursor)
+
+        activity = overview_sql.select_pipelines(
+            facts["activity"],
+            whisper_activity(queued),
+            wanted=wanted,
+            prefix=pipeline_prefix,
+            cutoff=cutoff,
+        )
+        if not activity:
+            return []
+        inbox: dict[str, dict[str, int]] = {}
+        if viewer and self.coordination is not None:
+            for pid in activity:
+                try:
+                    peeked = self.coordination.peek_whispers(
+                        agent_id=viewer, pipeline_id=pid, max_items=200, min_confidence=INBOX_MIN_CONFIDENCE
+                    )
+                    inbox[pid] = inbox_counts(live_whispers(peeked, now))
+                except Exception:
+                    inbox[pid] = {}
+        return overview_sql.build_rows(
+            activity,
+            facts,
+            include_tasks=include_tasks,
+            viewer=viewer,
+            inbox=inbox,
+            result_whisper=newest_results(queued),
+        )
 
     def viz_data(self, *, pipeline_id: str | None = None) -> dict[str, object]:
         """Return structured data for the operator viz view."""

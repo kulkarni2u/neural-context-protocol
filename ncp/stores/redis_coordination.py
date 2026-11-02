@@ -156,6 +156,25 @@ class RedisCoordination:
         )
         return ordered[:max_items]
 
+    def scan_whispers(self, *, whisper_type: str | None = None) -> list[Whisper]:
+        """Every queued whisper regardless of target, newest first. Read-only.
+
+        Never acknowledges, drops or rewrites anything (unlike ``peek_whispers``
+        this does not even prune dangling index entries). Used by the overview
+        for newest-``result`` and activity facts; expired payloads are already
+        gone from Redis, so callers only need to apply their own ``ttl_seconds``
+        check when they want to be strict.
+        """
+        client = self._client_or_raise()
+        ids = self._iter_whisper_ids(client)
+        found: list[Whisper] = []
+        for payload in self._hgetall_many(client, [self._payload_key(i) for i in ids]):
+            whisper = self._whisper_from_payload(payload)
+            if whisper is not None and (whisper_type is None or whisper.whisper_type == whisper_type):
+                found.append(whisper)
+        found.sort(key=lambda w: (-w.created_at, w.whisper_id))
+        return found
+
     def acknowledge_whispers(self, whisper_ids: list[str], *, agent_id: str | None = None) -> int:
         if not whisper_ids:
             return 0
@@ -491,6 +510,37 @@ class AsyncRedisCoordination:
         )
         await self._async_acknowledge_whispers([w.whisper_id for w in whispers], agent_id=agent_id)
         return whispers
+
+    async def peek_whispers(
+        self,
+        *,
+        agent_id: str,
+        pipeline_id: str | None = None,
+        max_items: int = 3,
+        min_confidence: float = 0.60,
+    ) -> list[Whisper]:
+        """Return deliverable whispers for ``agent_id`` without acknowledging them.
+
+        Async mirror of ``RedisCoordination.peek_whispers``: same target,
+        delivery, pipeline and confidence filtering and the same ordering.
+        """
+        return await self._async_peek_whispers(
+            agent_id=agent_id,
+            pipeline_id=pipeline_id,
+            max_items=max_items,
+            min_confidence=min_confidence,
+        )
+
+    async def scan_whispers(self, *, whisper_type: str | None = None) -> list[Whisper]:
+        """Async mirror of ``RedisCoordination.scan_whispers`` (read-only, newest first)."""
+        client = await self._aclient_or_raise()
+        found: list[Whisper] = []
+        for whisper_id in await self._async_iter_whisper_ids(client):
+            whisper = await self._async_load_whisper(client, whisper_id)
+            if whisper is not None and (whisper_type is None or whisper.whisper_type == whisper_type):
+                found.append(whisper)
+        found.sort(key=lambda w: (-w.created_at, w.whisper_id))
+        return found
 
     async def _async_peek_whispers(
         self,

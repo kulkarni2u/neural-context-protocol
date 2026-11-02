@@ -34,7 +34,8 @@ from ncp.stores.base import (
     _validate_turn_chunk_relation,
     merge_outcome_chunk_rows,
 )
-from ncp.stores import task_sql
+from ncp.stores import overview_sql, task_sql
+from ncp.stores.overview_facts import INBOX_MIN_CONFIDENCE, inbox_counts, live_whispers, newest_results, whisper_activity
 from ncp.stores.bitemporal import collect_successor_ids, filter_bitemporal
 from ncp.stores.graph import (
     backfill_edges_for_chunk,
@@ -1448,81 +1449,66 @@ class AsyncPgvectorStore(BaseStore):
         include_tasks: bool = True,
         stale_open_seconds: float = 1800.0,
     ) -> list[dict[str, Any]]:
-        """Cross-pipeline overview facts composed from this store's async methods.
+        """Grouped-SQL cross-pipeline overview facts via native async I/O.
 
-        Degraded relative to SQLite: pipelines come from chunk activity
-        (``async_viz_data``) or the explicit ``pipelines`` list, the inbox and
-        newest ``result`` whisper are not read (the Redis coordination layer has
-        no async peek), and ``dissent_24h`` is 0. Tasks, the newest decision
-        and drift are populated.
+        Same semantics as ``PgvectorStore.overview_rows`` (shared statements in
+        ``ncp/stores/overview_sql.py``): the viewer's inbox and the newest
+        queued ``result`` whisper come from ``AsyncRedisCoordination`` by
+        peeking only, and are empty without Redis.
         """
-        from ncp.stores.overview_facts import (
-            OVERVIEW_TASK_STATUSES,
-            decision_fields,
-            latest_drift,
-            pick_last_result,
-            task_summary,
-            wanted_pipeline,
-        )
-
         now = time.time() if now is None else float(now)
         cutoff = None if since is None else now - float(since)
         wanted = None if pipelines is None else set(pipelines)
-        activity: dict[str, float] = dict.fromkeys(wanted or (), 0.0)
-        viz = await self.async_viz_data()
-        for item in viz.get("pipeline_summary", []):  # type: ignore[attr-defined]
-            pid = str(item["pipeline_id"])
-            activity[pid] = max(activity.get(pid, 0.0), float(item.get("last_activity") or 0.0))
-        try:
-            drift_timeline = list((await self.async_trust_drift_data()).get("drift_timeline", []))  # type: ignore[call-overload]
-        except Exception:
-            drift_timeline = []
-
-        tasks_ok = include_tasks
-        rows: list[dict[str, Any]] = []
-        for pid in sorted(activity):
-            if not wanted_pipeline(pid, wanted, pipeline_prefix):
-                continue
-            last = activity[pid]
-            row: dict[str, Any] = {"pipeline_id": pid}
-            failed_task: tuple[str, float] | None = None
-            if tasks_ok:
-                try:
-                    await self.async_expire_task_leases(pid, now)
-                    task_rows: list[TaskRecord] = []
-                    for status in OVERVIEW_TASK_STATUSES:
-                        task_rows.extend(await self.async_list_tasks(pipeline_id=pid, status=status, limit=50, now=now))  # type: ignore[arg-type]
-                except NCPStoreError:
-                    tasks_ok = False
-                else:
-                    if task_rows:
-                        last = max(last, max(t.updated_at for t in task_rows))
-                    row.update(
-                        task_summary(task_rows, now=now, stale_open_seconds=stale_open_seconds, terminal_cutoff=cutoff)
-                    )
-                    failed = [t for t in task_rows if t.status == "failed"]
-                    if failed:
-                        newest = max(failed, key=lambda t: t.updated_at)
-                        failed_task = (newest.error or "", newest.updated_at)
-            if cutoff is not None and last < cutoff:
-                continue
-            row["last_activity"] = last
-            row["inbox"] = {}
-            row["last_result"] = pick_last_result(None, failed_task)
+        if include_tasks:
             try:
-                decisions = await self.async_query_decisions(pipeline_id=pid, k=1)
+                await self.async_expire_task_leases(None, now)
+            except NCPStoreError:
+                include_tasks = False
+
+        queued: list[Whisper] = []
+        if self._acoordination is not None:
+            try:
+                queued = live_whispers(await self._acoordination.scan_whispers(), now)
             except Exception:
-                decisions = []
-            row["last_decision"] = decision_fields(decisions[0]) if decisions else None
-            row["drift"] = latest_drift(drift_timeline, pid, viewer)
-            row["dissent_24h"] = 0
-            rows.append(row)
-        if not tasks_ok:
-            for row in rows:
-                for key in ("tasks", "expiring_claims", "stale_open"):
-                    row.pop(key, None)
-        rows.sort(key=lambda r: (-r["last_activity"], r["pipeline_id"]))
-        return rows
+                queued = []
+
+        stmts = overview_sql.statements(
+            now=now, cutoff=cutoff, include_tasks=include_tasks, stale_open_seconds=stale_open_seconds
+        )
+        facts: dict[str, list[dict[str, Any]]] = {}
+        async with self._aconnect() as conn:
+            async with conn.cursor() as cur:
+                for name, (sql, params) in stmts.items():
+                    await cur.execute(self._sql(sql), params)
+                    facts[name] = await self._afetchall(cur)
+
+        activity = overview_sql.select_pipelines(
+            facts["activity"],
+            whisper_activity(queued),
+            wanted=wanted,
+            prefix=pipeline_prefix,
+            cutoff=cutoff,
+        )
+        if not activity:
+            return []
+        inbox: dict[str, dict[str, int]] = {}
+        if viewer and self._acoordination is not None:
+            for pid in activity:
+                try:
+                    peeked = await self._acoordination.peek_whispers(
+                        agent_id=viewer, pipeline_id=pid, max_items=200, min_confidence=INBOX_MIN_CONFIDENCE
+                    )
+                    inbox[pid] = inbox_counts(live_whispers(peeked, now))
+                except Exception:
+                    inbox[pid] = {}
+        return overview_sql.build_rows(
+            activity,
+            facts,
+            include_tasks=include_tasks,
+            viewer=viewer,
+            inbox=inbox,
+            result_whisper=newest_results(queued),
+        )
 
     async def async_get_whisper(self, whisper_id: str) -> Whisper | None:
         """Look up a queued whisper via native async Redis coordination."""

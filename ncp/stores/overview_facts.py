@@ -287,3 +287,36 @@ def generic_overview_rows(
                 row.pop(key, None)
     rows.sort(key=lambda r: (-r["last_activity"], r["pipeline_id"]))
     return rows
+
+
+def live_whispers(whispers: Sequence[Any], now: float) -> list[Any]:
+    """Whispers still inside their TTL (Redis keeps payloads a few seconds longer)."""
+
+    return [w for w in whispers if w.created_at + w.ttl_seconds > now]
+
+
+def whisper_activity(whispers: Sequence[Any]) -> dict[str, float]:
+    """Newest ``created_at`` per pipeline over queued whispers (null pipelines ignored)."""
+
+    best: dict[str, float] = {}
+    for w in whispers:
+        if w.pipeline_id is not None:
+            best[w.pipeline_id] = max(best.get(w.pipeline_id, 0.0), float(w.created_at))
+    return best
+
+
+def newest_results(whispers: Sequence[Any]) -> dict[str, tuple[str, str, float]]:
+    """Newest queued ``result`` whisper per pipeline as ``(status, summary, at)``."""
+
+    newest: dict[str, Any] = {}
+    for w in whispers:
+        if w.whisper_type != "result" or w.pipeline_id is None:
+            continue
+        cur = newest.get(w.pipeline_id)
+        if cur is None or w.created_at > cur.created_at:
+            newest[w.pipeline_id] = w
+    out: dict[str, tuple[str, str, float]] = {}
+    for pid, w in newest.items():
+        status, text = parse_result_payload(str(w.payload))
+        out[pid] = (status, text, float(w.created_at))
+    return out
