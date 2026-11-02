@@ -504,8 +504,10 @@ Deviations from, and details beyond, the text above:
   publish, so `ncp_task` calls `expire_task_leases` (and rings `created_by`
   for each row now `failed`) before `claim`, `get`, `list` and owner actions.
   The store also runs expiry inside those operations, so state is correct for
-  direct library callers, but a library caller that lets the store expire a
-  task on its own does not get a doorbell. A rare race where another thread's
+  direct library callers. The `ncp.api` task functions share the same service
+  (`ncp/tasks.py`) and therefore ring the doorbell on expiry too; only code
+  that calls the store directly and lets it expire a task on its own gets no
+  doorbell. A rare race where another thread's
   internal expiry wins the transition before the tool layer's explicit call
   can also skip the doorbell; the state is still correct and a `get`/`list`
   shows it.
@@ -517,9 +519,12 @@ Deviations from, and details beyond, the text above:
   requires the task's `pipeline_id` to equal the whisper's, and rejects
   `progress`/`result` carrying `task_id` when `[tasks].enabled = false` or the
   store raises "task ledger not supported". Other whisper types may carry
-  `task_id` without the check. `ncp.api.emit` does not perform the owner
-  check (only the MCP tool does); `ncp.api` wrappers for the ledger were not
-  added in this PR.
+  `task_id` without the check. `ncp.api.emit` applies the same owner
+  check as the tool (shared `check_task_owner` in `ncp/tasks.py`), and
+  `ncp.api` exposes `create_task`, `claim_task`, `heartbeat_task`,
+  `release_task`, `complete_task`, `cancel_task`, `get_task` and `list_tasks`
+  over the same service. They need a synchronous store; the async store keeps
+  only its `async_*` task methods.
 - **Progress coalescing** now keys on `(pipeline_id, from_agent, target,
   thread_id, task_id)`, so task-only progress for different tasks does not
   replace each other. SQLite matches with `IS`, so a null `thread_id` or

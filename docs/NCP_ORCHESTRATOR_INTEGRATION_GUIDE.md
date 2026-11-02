@@ -114,6 +114,14 @@ The mapping to MCP tools is one-to-one: `Assembler.assemble()` ↔
 `ncp_get_context`, `Assembler.post_turn()` ↔ `ncp_post_turn`,
 `store.emit_whisper()` ↔ `ncp_emit_whisper`.
 
+With `[tasks].enabled = true`, the task ledger is also available in-process
+through `ncp.api`: `create_task`, `claim_task`, `heartbeat_task`,
+`release_task`, `complete_task`, `cancel_task`, `get_task` and `list_tasks`
+return the same dicts as `ncp_task`. `ncp.api.emit` enforces the same
+task-owner check as `ncp_emit_whisper`, so a `progress`/`result` whisper
+carrying a `task_id` is rejected unless it comes from the claiming owner.
+These functions need a synchronous store (not `AsyncPgvectorStore`).
+
 ---
 
 ## 3. Map your framework's concepts onto NCP identity

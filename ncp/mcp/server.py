@@ -41,9 +41,9 @@ from ncp.notify import (
     eligible_whispers,
     emit_and_notify,
     get_process_notifier,
-    notify_task,
 )
 from ncp.stores.base import BaseStore, NCPStoreError
+from ncp.tasks import TaskService, TaskSettings
 from ncp.stores.consolidation import reduce_candidates
 from ncp.stores.factory import create_store
 from ncp.tiering import compute_tier_signal
@@ -64,10 +64,7 @@ from ncp.types import (
     LEGACY_SCHEMA_ID,
     NCPResponse,
     OutcomeRecord,
-    ProgressPayload,
-    ResultPayload,
     SubconsciousChunk,
-    TaskRecord,
     THREAD_REPLY_WHISPER_TYPES,
     Whisper,
     normalize_whisper_payload,
@@ -1311,10 +1308,8 @@ def make_handlers(
         notifier = InProcessNotifier() if config is None else get_process_notifier(config, store=store)
     notify_max_wait = config.notify_max_wait_seconds if config is not None else 60.0
     tasks_enabled = config.tasks_enabled if config is not None else False
-    task_max_lease = config.tasks_max_lease_seconds if config is not None else 3600.0
-    task_default_lease = config.tasks_default_lease_seconds if config is not None else 300.0
-    task_default_attempts = config.tasks_default_max_attempts if config is not None else 3
     task_stale_open = config.tasks_stale_open_seconds if config is not None else 1800.0
+    task_service = TaskService(store, notifier, TaskSettings.from_config(config), log=_err)
     sessions: dict[str, FetchSession] = {}
     sessions_lock = threading.Lock()
     coordination = getattr(store, "coordination", None)
@@ -1930,47 +1925,7 @@ def make_handlers(
     # Task ledger (coordination primitives C)
 
     def _require_tasks() -> None:
-        if not tasks_enabled:
-            raise ValueError("ncp_task is disabled: set [tasks].enabled = true")
-
-    def _check_task_owner(whisper: Whisper) -> None:
-        """Reject a task-linked progress/result unless it comes from the claiming owner."""
-        if not tasks_enabled:
-            raise ValueError(
-                f"{whisper.whisper_type} whispers cannot carry task_id: the task ledger is "
-                "disabled ([tasks].enabled = false)"
-            )
-        try:
-            task = store.get_task(str(whisper.task_id))
-        except NCPStoreError as exc:
-            raise ValueError(
-                f"{whisper.whisper_type} whispers cannot carry task_id: {exc}"
-            ) from exc
-        if task is None:
-            raise ValueError(f"unknown task_id {whisper.task_id!r}")
-        if task.pipeline_id != whisper.pipeline_id:
-            raise ValueError(f"task_id {task.task_id!r} belongs to a different pipeline")
-        if task.status != "claimed" or task.owner != whisper.from_agent:
-            raise ValueError(
-                f"{whisper.whisper_type} rejected: only the current owner of a claimed task "
-                f"may report on task_id {task.task_id!r}"
-            )
-
-    def _expire_and_notify(pipeline_id: str | None = None) -> None:
-        """Lazy lease expiry; a task that fails by expiry rings its creator."""
-        for expired in store.expire_task_leases(pipeline_id):
-            if expired.status == "failed":
-                notify_task(notifier, expired, target=expired.created_by)
-
-    def _task_lease(args: dict[str, object]) -> float:
-        raw = args.get("lease_seconds")
-        try:
-            lease = task_default_lease if raw is None else float(raw)
-        except (TypeError, ValueError):
-            lease = task_default_lease
-        if lease != lease:  # NaN
-            lease = task_default_lease
-        return min(max(lease, 1.0), task_max_lease)
+        task_service.require_enabled("ncp_task")
 
     def _task_req(args: dict[str, object], name: str) -> str:
         value = args.get(name)
@@ -1982,34 +1937,6 @@ def make_handlers(
         value = args.get(name)
         return None if value is None else str(value)
 
-    def _task_whisper(
-        task: TaskRecord,
-        *,
-        from_agent: str,
-        whisper_type: str,
-        payload: object,
-        confidence: float = 1.0,
-    ) -> Whisper:
-        whisper = Whisper(
-            from_agent=from_agent,
-            target=task.created_by,
-            whisper_type=whisper_type,  # type: ignore[arg-type]
-            payload=payload,
-            confidence=confidence,
-            pipeline_id=task.pipeline_id,
-            ttl_seconds=default_whisper_ttl,
-            in_reply_to=task.origin_whisper_id,
-            task_id=task.task_id,
-        )
-        return resolve_whisper_thread(
-            whisper,
-            None if whisper.in_reply_to is None else store.get_whisper(whisper.in_reply_to),
-        )
-
-    def _lost(result: object) -> dict[str, object]:
-        reason = getattr(result, "reason", None) or "lease_lost"
-        return {"ok": False, "reason": reason}
-
     def _handle_task(args: dict[str, object]) -> object:
         _require_tasks()
         action = str(args.get("action", ""))
@@ -2017,106 +1944,51 @@ def make_handlers(
             agent_id = _task_req(args, "agent_id")
             pipeline_id = _task_req(args, "pipeline_id")
             assign_to = _task_opt(args, "assign_to")
-            origin = None
-            request = None
-            task = TaskRecord(
+            slot = _task_req(args, "slot")
+            title = _task_req(args, "title")
+            raw_attempts = args.get("max_attempts")
+            return task_service.create(
+                agent_id=agent_id,
                 pipeline_id=pipeline_id,
-                slot=_task_req(args, "slot"),
-                title=_task_req(args, "title"),
-                created_by=agent_id,
-                max_attempts=int(args.get("max_attempts") or task_default_attempts),
+                slot=slot,
+                title=title,
+                max_attempts=int(raw_attempts) if raw_attempts else None,
                 dedupe_key=_task_opt(args, "dedupe_key"),
                 parent_task_id=_task_opt(args, "parent_task_id"),
+                assign_to=assign_to,
             )
-            if assign_to is not None:
-                request = Whisper(
-                    from_agent=agent_id,
-                    target=assign_to,
-                    whisper_type="request",
-                    payload={"ask": task.title},
-                    confidence=1.0,
-                    pipeline_id=pipeline_id,
-                    ttl_seconds=default_whisper_ttl,
-                    task_id=task.task_id,
-                )
-                origin = request.whisper_id
-                task = task.model_copy(update={"origin_whisper_id": origin})
-            stored, created = store.create_task(task)
-            response: dict[str, object] = {"created": created, "task": stored.public_dict()}
-            if created and request is not None:
-                try:
-                    emit_and_notify(store, notifier, resolve_whisper_thread(request))
-                    response["assigned"] = True
-                    response["whisper_id"] = request.whisper_id
-                except Exception as exc:  # the task exists; report instead of failing a retry
-                    _err(f"ncp_task create: assign_to request failed: {exc}")
-                    response["assigned"] = False
-            return response
 
         if action == "claim":
-            agent_id = _task_req(args, "agent_id")
-            task_id = _task_opt(args, "task_id")
-            pipeline_id = _task_opt(args, "pipeline_id")
-            if task_id is None and pipeline_id is None:
-                raise ValueError("ncp_task claim requires task_id or pipeline_id")
-            _expire_and_notify(pipeline_id)
-            claimed = store.claim_task(
-                agent_id=agent_id,
-                task_id=task_id,
-                pipeline_id=pipeline_id,
+            return task_service.claim(
+                agent_id=_task_req(args, "agent_id"),
+                task_id=_task_opt(args, "task_id"),
+                pipeline_id=_task_opt(args, "pipeline_id"),
                 slot=_task_opt(args, "slot"),
-                lease_seconds=_task_lease(args),
+                lease_seconds=args.get("lease_seconds"),
             )
-            if claimed is None:
-                return {"claimed": False}
-            return {
-                "claimed": True,
-                "task": claimed.public_dict(),
-                "lease_token": claimed.lease_token,
-            }
 
         if action == "heartbeat":
             task_id = _task_req(args, "task_id")
             token = _task_req(args, "lease_token")
-            progress = args.get("progress")
-            progress_payload = None
-            if progress is not None:
-                if not isinstance(progress, dict):
-                    raise ValueError("progress must be an object")
-                progress_payload = ProgressPayload.model_validate(progress)
-            _expire_and_notify(_task_opt(args, "pipeline_id"))
-            result = store.heartbeat_task(
-                task_id,
-                token,
-                lease_seconds=_task_lease(args),
+            return task_service.heartbeat(
+                task_id=task_id,
+                lease_token=token,
+                lease_seconds=args.get("lease_seconds"),
                 checkpoint_chunk_id=_task_opt(args, "checkpoint_chunk_id"),
+                progress=args.get("progress"),
+                pipeline_id=_task_opt(args, "pipeline_id"),
+                agent_id=_task_opt(args, "agent_id"),
             )
-            if not result.ok or result.task is None:
-                return _lost(result)
-            response = {"ok": True, "task": result.task.public_dict()}
-            if progress_payload is not None:
-                whisper = _task_whisper(
-                    result.task,
-                    from_agent=result.task.owner or _task_opt(args, "agent_id") or "unknown",
-                    whisper_type="progress",
-                    payload=progress_payload.model_dump(),
-                    confidence=0.9,
-                )
-                emit_and_notify(store, notifier, whisper)
-                response["whisper_id"] = whisper.whisper_id
-            return response
 
         if action == "release":
             task_id = _task_req(args, "task_id")
             token = _task_req(args, "lease_token")
-            _expire_and_notify(_task_opt(args, "pipeline_id"))
-            result = store.release_task(task_id, token, error=_task_opt(args, "error"))
-            if not result.ok or result.task is None:
-                return _lost(result)
-            if result.task.status == "failed":
-                # Attempts exhausted: the release became a failure the creator must hear about.
-                notify_task(notifier, result.task, target=result.task.created_by)
-            return {"ok": True, "task": result.task.public_dict()}
+            return task_service.release(
+                task_id=task_id,
+                lease_token=token,
+                error=_task_opt(args, "error"),
+                pipeline_id=_task_opt(args, "pipeline_id"),
+            )
 
         if action == "complete":
             task_id = _task_req(args, "task_id")
@@ -2125,78 +1997,41 @@ def make_handlers(
             if status not in ("done", "failed"):
                 raise ValueError("complete status must be 'done' or 'failed'")
             summary = _task_req(args, "summary")
-            raw_chunks = args.get("result_chunk_ids") or []
-            if not isinstance(raw_chunks, list):
-                raise ValueError("result_chunk_ids must be a list")
-            turn_id = _task_opt(args, "turn_id")
-            # Validate the result payload before mutating, so a bad summary
-            # cannot leave a completed task with no result whisper.
-            result_payload = ResultPayload(
-                status="succeeded" if status == "done" else "failed",
+            return task_service.complete(
+                task_id=task_id,
+                lease_token=token,
                 summary=summary,
-                result_chunk_ids=[str(c) for c in raw_chunks],
-                turn_id=turn_id,
+                status=status,
+                result_chunk_ids=args.get("result_chunk_ids"),
+                turn_id=_task_opt(args, "turn_id"),
+                pipeline_id=_task_opt(args, "pipeline_id"),
+                agent_id=_task_opt(args, "agent_id"),
             )
-            _expire_and_notify(_task_opt(args, "pipeline_id"))
-            result = store.complete_task(
-                task_id,
-                token,
-                status=status,  # type: ignore[arg-type]
-                summary=summary,
-                result_chunk_ids=result_payload.result_chunk_ids,
-                turn_id=turn_id,
-            )
-            if not result.ok or result.task is None:
-                return _lost(result)
-            whisper = _task_whisper(
-                result.task,
-                from_agent=result.task.owner or _task_opt(args, "agent_id") or "unknown",
-                whisper_type="result",
-                payload=result_payload.model_dump(),
-            )
-            emit_and_notify(store, notifier, whisper)
-            return {
-                "ok": True,
-                "task": result.task.public_dict(),
-                "whisper_id": whisper.whisper_id,
-                "result_turn_id": turn_id,
-            }
 
         if action == "cancel":
             agent_id = _task_req(args, "agent_id")
             task_id = _task_req(args, "task_id")
-            _expire_and_notify(_task_opt(args, "pipeline_id"))
-            result = store.cancel_task(task_id, agent_id, reason=_task_opt(args, "reason"))
-            if not result.ok or result.task is None:
-                return _lost(result)
-            if result.previous_status == "claimed" and result.previous_owner:
-                notify_task(
-                    notifier, result.task, target=result.previous_owner, from_agent=agent_id
-                )
-            return {"ok": True, "task": result.task.public_dict()}
+            return task_service.cancel(
+                agent_id=agent_id,
+                task_id=task_id,
+                reason=_task_opt(args, "reason"),
+                pipeline_id=_task_opt(args, "pipeline_id"),
+            )
 
         if action == "get":
-            _expire_and_notify(_task_opt(args, "pipeline_id"))
-            found = store.get_task(_task_req(args, "task_id"))
-            if found is None:
-                return {"found": False, "task": None}
-            return {"found": True, "task": found.public_dict()}
+            return task_service.get(
+                task_id=_task_req(args, "task_id"), pipeline_id=_task_opt(args, "pipeline_id")
+            )
 
         if action == "list":
             pipeline_id = _task_req(args, "pipeline_id")
-            status = _task_opt(args, "status")
-            if status is not None and status not in ("open", "claimed", "done", "failed", "cancelled"):
-                raise ValueError(f"invalid task status filter {status!r}")
-            limit = min(50, max(1, _int_arg(args, "limit", 20)))
-            _expire_and_notify(pipeline_id)
-            tasks = store.list_tasks(
+            return task_service.list(
                 pipeline_id=pipeline_id,
-                status=status,  # type: ignore[arg-type]
+                status=_task_opt(args, "status"),
                 slot=_task_opt(args, "slot"),
                 owner=_task_opt(args, "owner"),
-                limit=limit,
+                limit=_int_arg(args, "limit", 20),
             )
-            return {"tasks": [t.public_dict() for t in tasks], "count": len(tasks)}
 
         raise ValueError(f"unknown ncp_task action {action!r}")
 
@@ -2276,7 +2111,7 @@ def make_handlers(
             # Expire leases here (not only inside the store) so a task that
             # fails by expiry rings its creator, exactly as ncp_task does.
             try:
-                _expire_and_notify()
+                task_service.expire_and_notify()
             except NCPStoreError:
                 pass  # store without ledger support: overview omits task fields
         return build_overview(
@@ -2323,7 +2158,7 @@ def make_handlers(
             task_id=None if task_id is None else str(task_id),
         )
         if whisper.task_id is not None and whisper_type in THREAD_REPLY_WHISPER_TYPES:
-            _check_task_owner(whisper)
+            task_service.check_task_owner(whisper)
         whisper = resolve_whisper_thread(
             whisper,
             None if whisper.in_reply_to is None else store.get_whisper(whisper.in_reply_to),

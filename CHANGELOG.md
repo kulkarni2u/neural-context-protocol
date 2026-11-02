@@ -6,6 +6,16 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ### Added
 
+- **Task ledger library API** (`ncp/tasks.py`, `ncp/api.py`,
+  `ncp/mcp/server.py`): the `ncp_task` action logic, lazy lease expiry with its
+  doorbell and the whisper `task_id` owner check move into a shared
+  `TaskService`, so `ncp.api` gains `create_task`, `claim_task`,
+  `heartbeat_task`, `release_task`, `complete_task`, `cancel_task`, `get_task`
+  and `list_tasks` with results identical to the tool. `ncp.api.emit` now
+  rejects a `progress`/`result` whisper carrying a `task_id` unless it comes
+  from the claiming owner, closing the gap where library callers skipped the
+  check. Task functions need a synchronous store and `[tasks].enabled = true`.
+
 - **Request/reply whisper threads** (`ncp/types.py`, `ncp/stores/sqlite.py`,
   `ncp/stores/redis_coordination.py`, `ncp/encoder.py`, `ncp/mcp/server.py`):
   first step of the router coordination primitives
