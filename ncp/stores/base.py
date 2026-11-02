@@ -944,6 +944,47 @@ class BaseStore(ABC):
         - whisper_queue: {total, by_type: {type: count}}
         """
 
+    def overview_rows(
+        self,
+        *,
+        pipelines: Sequence[str] | None = None,
+        pipeline_prefix: str | None = None,
+        since: float | None = None,
+        viewer: str | None = None,
+        now: float | None = None,
+        include_tasks: bool = True,
+        stale_open_seconds: float = 1800.0,
+    ) -> list[dict[str, Any]]:
+        """Per-pipeline raw facts for the cross-pipeline overview (read-only).
+
+        ``since`` is a window in seconds: only pipelines whose newest
+        chunk/whisper/turn/task activity is within it are returned. Rows with
+        a null ``pipeline_id`` are ignored. ``viewer``'s inbox is peeked, never
+        drained or acknowledged. Task fields are omitted when ``include_tasks``
+        is false or the ledger is unsupported. See ``ncp.stores.overview_facts``
+        for the row shape.
+
+        This default composes public methods and works on every backend, less
+        efficiently and with the caveats documented on
+        ``generic_overview_rows``. SQLite overrides it with grouped SQL.
+        """
+        from ncp.stores.overview_facts import generic_overview_rows
+
+        return generic_overview_rows(
+            self,
+            pipelines=pipelines,
+            pipeline_prefix=pipeline_prefix,
+            since=since,
+            viewer=viewer,
+            now=now,
+            include_tasks=include_tasks,
+            stale_open_seconds=stale_open_seconds,
+        )
+
+    async def async_overview_rows(self, **kwargs: Any) -> list[dict[str, Any]]:
+        """Async counterpart of :meth:`overview_rows` (thread-pool by default)."""
+        return await anyio.to_thread.run_sync(partial(self.overview_rows, **kwargs))
+
     # ------------------------------------------------------------------
     # Async Counterpart Surface
 

@@ -10,11 +10,13 @@ import logging
 from pathlib import Path
 import sqlite3
 import time
+from typing import Any
 from uuid import uuid4
 
 from ncp.config import NCPConfig
 from ncp.stores.base import (
     BaseStore,
+    NCPStoreError,
     NCPStoreUnavailableError,
     _validate_turn_chunk_relation,
     merge_outcome_chunk_rows,
@@ -49,6 +51,17 @@ from ncp.stores.retrieval import (
     normalize_query_terms,
     normalize_result_limit,
     score_trust_recency_candidate,
+)
+from ncp.stores.overview_facts import (
+    DISSENT_WINDOW_SECONDS,
+    EXPIRING_CLAIM_SECONDS,
+    INBOX_MIN_CONFIDENCE,
+    OVERVIEW_TASK_STATUSES,
+    choice_text,
+    latest_drift,
+    parse_result_payload,
+    pick_last_result,
+    wanted_pipeline,
 )
 from ncp.tokens import estimate_tokens
 from ncp.types import (
@@ -3805,6 +3818,155 @@ class SQLiteStore(BaseStore):
             "feedback_summary": feedback_summary,
             "drift_timeline": drift_timeline,
         }
+
+    def overview_rows(
+        self,
+        *,
+        pipelines: Sequence[str] | None = None,
+        pipeline_prefix: str | None = None,
+        since: float | None = None,
+        viewer: str | None = None,
+        now: float | None = None,
+        include_tasks: bool = True,
+        stale_open_seconds: float = 1800.0,
+    ) -> list[dict[str, Any]]:
+        """Grouped-SQL implementation of the cross-pipeline overview facts."""
+        now = time.time() if now is None else float(now)
+        cutoff = None if since is None else now - float(since)
+        wanted = None if pipelines is None else set(pipelines)
+        if include_tasks:
+            try:
+                self.expire_task_leases(None, now)
+            except NCPStoreError:
+                include_tasks = False
+
+        activity_sql = (
+            "SELECT pipeline_id, MAX(created_at) AS ts FROM chunks WHERE pipeline_id IS NOT NULL GROUP BY pipeline_id"
+            " UNION ALL SELECT pipeline_id, MAX(created_at) FROM whispers WHERE pipeline_id IS NOT NULL GROUP BY pipeline_id"
+            " UNION ALL SELECT pipeline_id, MAX(created_at) FROM turn_records WHERE pipeline_id IS NOT NULL GROUP BY pipeline_id"
+        )
+        if include_tasks:
+            activity_sql += " UNION ALL SELECT pipeline_id, MAX(updated_at) FROM tasks GROUP BY pipeline_id"
+
+        with self._connect() as connection:
+            activity: dict[str, float] = {}
+            for r in connection.execute(
+                f"SELECT pipeline_id, MAX(ts) AS ts FROM ({activity_sql}) GROUP BY pipeline_id"
+            ).fetchall():
+                pid = str(r["pipeline_id"])
+                ts = float(r["ts"])
+                if cutoff is not None and ts < cutoff:
+                    continue
+                if wanted_pipeline(pid, wanted, pipeline_prefix):
+                    activity[pid] = ts
+            if not activity:
+                return []
+
+            task_counts: dict[str, dict[str, int]] = {}
+            expiring: dict[str, int] = {}
+            stale: dict[str, int] = {}
+            failed_task: dict[str, tuple[str, float]] = {}
+            if include_tasks:
+                terminal_floor = -1.0e18 if cutoff is None else cutoff
+                for r in connection.execute(
+                    "SELECT pipeline_id, status, COUNT(*) AS n FROM tasks"
+                    " WHERE status IN ('open', 'claimed') OR updated_at >= ?"
+                    " GROUP BY pipeline_id, status",
+                    (terminal_floor,),
+                ).fetchall():
+                    counts = task_counts.setdefault(str(r["pipeline_id"]), dict.fromkeys(OVERVIEW_TASK_STATUSES, 0))
+                    counts[str(r["status"])] = int(r["n"])
+                for r in connection.execute(
+                    "SELECT pipeline_id, COUNT(*) AS n FROM tasks"
+                    " WHERE status = 'claimed' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?"
+                    " GROUP BY pipeline_id",
+                    (now + EXPIRING_CLAIM_SECONDS,),
+                ).fetchall():
+                    expiring[str(r["pipeline_id"])] = int(r["n"])
+                if stale_open_seconds > 0:
+                    for r in connection.execute(
+                        "SELECT pipeline_id, COUNT(*) AS n FROM tasks"
+                        " WHERE status = 'open' AND updated_at <= ? GROUP BY pipeline_id",
+                        (now - stale_open_seconds,),
+                    ).fetchall():
+                        stale[str(r["pipeline_id"])] = int(r["n"])
+                for r in connection.execute(
+                    "SELECT t.pipeline_id, t.error, t.updated_at FROM tasks t JOIN ("
+                    " SELECT pipeline_id, MAX(updated_at) AS mu FROM tasks WHERE status = 'failed' GROUP BY pipeline_id"
+                    ") m ON t.pipeline_id = m.pipeline_id AND t.updated_at = m.mu AND t.status = 'failed'"
+                ).fetchall():
+                    failed_task[str(r["pipeline_id"])] = (str(r["error"] or ""), float(r["updated_at"]))
+
+            inbox: dict[str, dict[str, int]] = {}
+            if viewer:
+                exempt = sorted(CONFIDENCE_EXEMPT_WHISPER_TYPES)
+                marks = ",".join("?" for _ in exempt)
+                for r in connection.execute(
+                    "SELECT pipeline_id, whisper_type, COUNT(*) AS n FROM whispers"
+                    " WHERE pipeline_id IS NOT NULL AND expires_at > ? AND target IN (?, '*')"
+                    " AND NOT (target = '*' AND EXISTS (SELECT 1 FROM whisper_deliveries d"
+                    "   WHERE d.whisper_id = whispers.whisper_id AND d.agent_id = ?))"
+                    f" AND (whisper_type IN ({marks}) OR confidence >= ?)"
+                    " GROUP BY pipeline_id, whisper_type",
+                    [now, viewer, viewer, *exempt, INBOX_MIN_CONFIDENCE],
+                ).fetchall():
+                    inbox.setdefault(str(r["pipeline_id"]), {})[str(r["whisper_type"])] = int(r["n"])
+
+            result_whisper: dict[str, tuple[str, str, float]] = {}
+            for r in connection.execute(
+                "SELECT w.pipeline_id, w.payload, w.created_at FROM whispers w JOIN ("
+                " SELECT pipeline_id, MAX(created_at) AS mc FROM whispers"
+                " WHERE whisper_type = 'result' AND expires_at > ? AND pipeline_id IS NOT NULL GROUP BY pipeline_id"
+                ") m ON w.pipeline_id = m.pipeline_id AND w.created_at = m.mc AND w.whisper_type = 'result'",
+                (now,),
+            ).fetchall():
+                status, text = parse_result_payload(str(r["payload"]))
+                result_whisper[str(r["pipeline_id"])] = (status, text, float(r["created_at"]))
+
+            decisions: dict[str, dict[str, str]] = {}
+            for r in connection.execute(
+                "SELECT d.pipeline_id, d.schema_id, d.choice FROM decisions d JOIN ("
+                " SELECT pipeline_id, MAX(created_at) AS mc FROM decisions"
+                " WHERE pipeline_id IS NOT NULL GROUP BY pipeline_id"
+                ") m ON d.pipeline_id = m.pipeline_id AND d.created_at = m.mc"
+            ).fetchall():
+                decisions[str(r["pipeline_id"])] = {
+                    "schema_id": str(r["schema_id"]),
+                    "choice": choice_text(r["choice"]),
+                }
+
+            drift_timeline = [
+                {"session_id": str(r["session_id"]), "drift_score": float(r["drift_score"]), "ts": float(r["ts"])}
+                for r in connection.execute(
+                    "SELECT d.session_id, d.drift_score, d.ts FROM drift_history d JOIN ("
+                    " SELECT session_id, MAX(ts) AS mt FROM drift_history GROUP BY session_id"
+                    ") m ON d.session_id = m.session_id AND d.ts = m.mt"
+                ).fetchall()
+            ]
+
+            dissent: dict[str, int] = {}
+            for r in connection.execute(
+                "SELECT c.pipeline_id, COUNT(*) AS n FROM dissent_log dl JOIN chunks c ON c.chunk_id = dl.chunk_id"
+                " WHERE dl.created_at >= ? AND c.pipeline_id IS NOT NULL GROUP BY c.pipeline_id",
+                (now - DISSENT_WINDOW_SECONDS,),
+            ).fetchall():
+                dissent[str(r["pipeline_id"])] = int(r["n"])
+
+        rows: list[dict[str, Any]] = []
+        for pid, ts in activity.items():
+            row: dict[str, Any] = {"pipeline_id": pid, "last_activity": ts}
+            if include_tasks:
+                row["tasks"] = task_counts.get(pid) or dict.fromkeys(OVERVIEW_TASK_STATUSES, 0)
+                row["expiring_claims"] = expiring.get(pid, 0)
+                row["stale_open"] = stale.get(pid, 0)
+            row["inbox"] = inbox.get(pid, {})
+            row["last_result"] = pick_last_result(result_whisper.get(pid), failed_task.get(pid))
+            row["last_decision"] = decisions.get(pid)
+            row["drift"] = latest_drift(drift_timeline, pid, viewer)
+            row["dissent_24h"] = dissent.get(pid, 0)
+            rows.append(row)
+        rows.sort(key=lambda r: (-r["last_activity"], r["pipeline_id"]))
+        return rows
 
     def viz_data(self, *, pipeline_id: str | None = None) -> dict[str, object]:
         """Return structured data for the operator viz view."""

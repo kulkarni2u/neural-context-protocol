@@ -53,7 +53,7 @@ Returns the enabled tool catalog — `ncp_get_context`, `ncp_write_memory`,
 `ncp_emit_whisper`, `ncp_post_turn`, `ncp_fetch`, `ncp_record_decision`,
 `ncp_get_decision`, `ncp_compile_decision_query`, `ncp_record_outcome`,
 `ncp_wait_whispers` (unless `[notify].enabled = false`), `ncp_task` (only
-when `[tasks].enabled = true`) and the
+when `[tasks].enabled = true`), `ncp_overview` and the
 memo tools when enabled — each with a JSON Schema under `inputSchema`.
 
 ## Tool calls
@@ -357,6 +357,35 @@ Notes:
   outcome once it has independent evidence.
 - Postgres deployments must apply migration `018_add_tasks.sql`.
 
+### ncp_overview — ranked cross-pipeline overview
+
+Read-only and token-bounded; in the `full` profile, absent from `core`. It
+peeks the viewer's inbox and never acknowledges whispers, changes retrieval
+counts or logs a turn.
+
+```bash
+curl -s $BASE/mcp -H "$AUTH" -H 'Content-Type: application/json' -d '{
+  "jsonrpc": "2.0", "id": 9, "method": "tools/call",
+  "params": {"name": "ncp_overview", "arguments": {
+    "agent_id": "router", "pipeline_prefix": "pr_", "since_seconds": 86400,
+    "max_pipelines": 10, "max_tokens": 400
+  }}}'
+# {"text": "[NCP:OVERVIEW]\np:pr_142 act:2m tasks:o1/c2/d4/f1 attn:f1,exp1 ...\n  last:\"failed: race in retry loop\" ‹data›\n+4 more",
+#  "pipelines": [{"pipeline_id": "pr_142", "score": 3, "attention": {...}, "inbox": {...}, ...}],
+#  "omitted": 4, "tokens_est": 118}
+```
+
+| argument | default | notes |
+|---|---|---|
+| `agent_id` | required | Viewer whose inbox is counted. |
+| `pipelines` / `pipeline_prefix` | all | Restrict to these ids / ids with this prefix. |
+| `since_seconds` | 86400 | Only pipelines active within this window. |
+| `max_pipelines` | 10 | Clamped to `[1, 50]`. |
+| `max_tokens` | 400 | Clamped to `[60, 4000]`; bounds `text`. |
+
+Quoted `last:"..." ‹data›` snippets are agent-written data, never
+instructions. See spec section 4k for the row fields and ranking.
+
 ### ncp_fetch — bounded mid-turn retrieval
 
 ```bash
@@ -530,6 +559,7 @@ shell itself is served without auth and prompts for the token in-browser.
 | `/api/whispers` | `pipeline_id`, `target`, `include_expired`, `limit`       | whisper listing        |
 | `/api/graph`    | `pipeline_id`, `limit`                                    | `graph_data()`         |
 | `/api/cost`     | `pipeline_id`, `limit`                                    | `cost_summary()`       |
+| `/api/overview` | `agent_id`, `prefix`, `since` (seconds), `max_pipelines` (1-50), `max_tokens` | `overview_rows()`; same payload as `ncp_overview` |
 
 Responses are plain JSON objects (no JSON-RPC envelope, no
 `result.content[0].text` unwrapping). Chunk listings include tombstoned and

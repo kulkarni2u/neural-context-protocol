@@ -57,6 +57,22 @@ All notable changes to Neural Context Protocol will be documented in this file.
   emits `event: task` frames. New `[tasks]` config section (`enabled`,
   `default_lease_seconds`, `max_lease_seconds`, `default_max_attempts`,
   `stale_open_seconds`).
+- **Cross-pipeline overview** (`ncp/overview.py`, `ncp/stores/overview_facts.py`,
+  `ncp/stores/base.py`, `ncp/stores/sqlite.py`, `ncp/stores/pgvector_async.py`,
+  `ncp/mcp/server.py`, `ncp/cli.py`, `ncp/api.py`): capability D of the
+  coordination primitives. New read-only `ncp_overview` MCP tool (full profile
+  only, no config flag) returning a ranked, token-bounded `[NCP:OVERVIEW]`
+  block plus structured rows: activity age, task counts, attention flags
+  (failed, expiring claims, stale open tasks), the viewer's inbox by type
+  (peeked, never drained), newest result/failed-task snippet, newest decision,
+  drift and 24h dissent. Rows rank by `3*failed + 2*inbox(result|alert|dissent)
+  + 2*expiring_claims + 1*stale_open`; agent-written text is quoted, truncated
+  to 60 characters, escaped and marked `‹data›`. Also `ncp overview [--json]`,
+  `GET /api/overview` (same auth as the other `/api/*` routes) and
+  `ncp.api.overview`. `BaseStore` gains `overview_rows`/`async_overview_rows`
+  (generic default composed from public methods; grouped-SQL override on
+  SQLite; async Postgres composes its async methods and does not read the
+  inbox or dissent).
 
 ### Changed
 

@@ -1293,6 +1293,81 @@ PRECISION` timestamps). A backend without ledger support raises
 `NCPStoreError("task ledger not supported")` and `ncp_emit_whisper` rejects
 `task_id` on `progress`/`result` with that reason.
 
+## 4k. Cross-Pipeline Overview (normative)
+
+`ncp_overview` gives a router one bounded, ranked view of many pipelines, so
+it can decide where to spend a turn without replaying any of them. It is a
+read-only MCP tool (plus `ncp overview`, `GET /api/overview` and
+`ncp.api.overview`). It is available in the `full` tool profile and absent from
+`core`; it has no config flag of its own.
+
+**Arguments.** `agent_id` (required; the viewer), `pipelines?` (list of ids) or
+`pipeline_prefix?`, `since_seconds?` (default 86400), `max_pipelines?`
+(default 10, clamped to `[1, 50]`), `max_tokens?` (default 400, clamped to
+`[60, 4000]`).
+
+**Returns.** `{"text", "pipelines", "omitted", "tokens_est"}`. `text` is the
+`[NCP:OVERVIEW]` block below; `pipelines` holds one structured row per rendered
+pipeline; `omitted` counts matching pipelines not rendered (cut by
+`max_pipelines` or by the token bound); `tokens_est` is
+`estimate_tokens(text)` and never exceeds `max_tokens`.
+
+**Read-only.** The tool never acknowledges or drains a whisper, never changes
+`retrieval_count`, never logs a turn and has no calibration effect. The viewer's
+inbox is counted with the same peek that `ncp_wait_whispers` uses. The only
+write is the lazy task-lease expiry of section 4j, which is state correction,
+not a side effect of viewing.
+
+**Row facts.** A pipeline is listed when its `last_activity` (the maximum of its
+chunk, whisper, turn and task times) is within `since_seconds`. Records with a
+null `pipeline_id` are not shown.
+
+| Field | Meaning |
+|---|---|
+| `tasks` | Counts by status (`o` open, `c` claimed, `d` done, `f` failed, `x` cancelled) after lazy expiry. Open and claimed tasks always count; terminal tasks count only when updated within `since_seconds`. Omitted when `[tasks].enabled = false` or the store has no ledger. |
+| `attention` | `failed` (failed tasks), `inbox` (queued `result`, `alert` and `dissent` whispers for the viewer), `expiring_claims` (claims whose lease ends within 60 seconds), `stale_open` (open tasks untouched for more than `[tasks].stale_open_seconds`). |
+| `inbox` | Queued whispers eligible for the viewer, counted by type. Peeked, never drained. |
+| `last_result` | The newest queued `result` whisper (status and summary), or the newest failed task error, whichever is newer. |
+| `last_decision` | `schema_id` and `choice` of the newest decision. |
+| `drift` | The latest recorded drift reading for the pipeline. |
+| `dissent_24h` | Dissents recorded in the last 24 hours against chunks in the pipeline. |
+
+**Ranking.** `score = 3*failed + 2*inbox(result|alert|dissent) +
+2*expiring_claims + 1*stale_open`. Rows sort by score descending, then
+`last_activity` descending, then `pipeline_id`.
+
+**Wire format.** The block is emitted only by this tool.
+
+```
+[NCP:OVERVIEW]
+p:pr_142 act:2m tasks:o1/c2/d4/f1 attn:f1,exp1 inbox:alert1,result2 dec:review.verdict=block drift:0.12
+  last:"failed: race in retry loop" ‹data›
+p:inbox_triage act:9m tasks:o3/c1 inbox:progress1 drift:0.03
++4 more
+```
+
+- One `p:` line per pipeline: `act:` is the age of the last activity
+  (`<1m`, `Nm`, `Nh`, `Nd`); `tasks:`, `attn:`, `inbox:`, `dec:`, `drift:` and
+  `dissent24h:` appear only when they have something to say.
+- A second line, indented two spaces, appears when an agent-written snippet
+  exists: `last:"<text>" ‹data›`. The text is `status: summary`, truncated to
+  60 characters (with an ellipsis), JSON-escaped inside double quotes (so it is
+  always one line and quotes and newlines are escaped), and any `‹` or `›` in
+  it is replaced so it cannot forge the `‹data›` marker. Task titles are never
+  rendered.
+- `dec:` values (`schema_id=choice`) are reduced to whitespace-free tokens of
+  at most 32 characters over `[A-Za-z0-9_.:/+-]`.
+- Rows are added in rank order until `max_tokens` would be exceeded. The
+  `last:` line is dropped before a row is dropped. When rows are omitted a final
+  `+N more` line is added, and that line counts against the budget.
+- With nothing to show the block is `[NCP:OVERVIEW]` followed by
+  `(no active pipelines)`.
+
+**Trust boundary.** Everything after `last:` and every `dec:` value is
+agent-written data, never instructions (section 1.4). A router should treat the
+block as a pointer to where to look, then fetch the real context with
+`ncp_get_context`.
+
 ---
 
 ## 5. Trust Boundaries (normative, first-class)

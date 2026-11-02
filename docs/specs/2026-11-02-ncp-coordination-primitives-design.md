@@ -599,6 +599,72 @@ Any agent-written text is quoted, truncated to 60 characters and marked
 - `/api/overview` on the existing read-only UI, plus a UI panel.
 - `ncp.api.overview(…)` in the library API.
 
+### 6.5 Implementation notes (PR 4)
+
+Deviations from, and details beyond, the text above:
+
+- **Store seam.** `BaseStore.overview_rows(*, pipelines, pipeline_prefix,
+  since, viewer, now, include_tasks, stale_open_seconds)` returns raw facts;
+  ranking and rendering live in `ncp/overview.py`. `include_tasks` and
+  `stale_open_seconds` are extra keywords so the tool layer can pass
+  `[tasks].enabled` and `[tasks].stale_open_seconds` without the store reading
+  config. The `BaseStore` default composes public methods
+  (`ncp/stores/overview_facts.py::generic_overview_rows`); SQLite overrides it
+  with grouped SQL (one query per fact, joined in Python). There is no native
+  sync Postgres implementation: it uses the default, which finds pipelines via
+  `viz_data()['pipeline_summary']` (chunk-bearing only unless `pipelines` is
+  given), caps task lists at 50 per status, has no `list_whispers`/`list_turns`
+  (so `last_result` falls back to failed tasks and turns do not feed
+  `last_activity`), and reports `dissent_24h = 0`. The async Postgres store
+  overrides `async_overview_rows` with the same degradation plus no inbox
+  (the Redis layer has no async peek). The Postgres paths are untested against
+  a live server.
+- **Drift key.** The spec said `drift_history` is keyed by
+  `pipeline_id:viewer`. The only writer (`CoherenceChecker._log_drift_history`)
+  logs `session_id = pipeline_id`, so `drift` reads the newest row for
+  `pipeline_id` and also accepts `pipeline_id:viewer` if a future writer
+  produces it. Drift is therefore pipeline-wide, not per viewer.
+- **Expiring claims** use a fixed window: `lease_expires_at - now <= 60`
+  seconds, not 20% of each lease. With the default 300s lease the two agree,
+  and a fixed window keeps the SQL grouped.
+- **Stale open** compares `now - updated_at` (not `created_at`), so a task
+  released back to `open` is stale only after it has sat unclaimed. A
+  `stale_open_seconds` of 0 disables the flag.
+- **Failed counts are windowed.** `open` and `claimed` tasks always count, but
+  `done`, `failed` and `cancelled` count only when updated within
+  `since_seconds`; otherwise one old failure would pin a pipeline to the top
+  forever. The windowing applies to the `tasks` counts and therefore to
+  `attention.failed`.
+- **`last_result`** is the newer of the newest queued `result` whisper (any
+  target, unexpired) and the newest failed task's `error`. Whispers are
+  deleted when acknowledged, so a result the router has already received is
+  no longer shown; the failed-task error then stands in. Task titles are
+  never rendered.
+- **Inbox** counts the viewer's eligible whispers by type with the same
+  filter as `peek_whispers` (own target or broadcast not yet delivered,
+  unexpired, confidence >= 0.60 unless the type is exempt). It is not capped
+  at the peek's `max_items`.
+- **Lazy expiry** runs `expire_task_leases` over all pipelines when the ledger
+  is enabled, so the overview does the state correction a `get`/`list` would.
+  Unlike the tool layer for `ncp_task`, it does not publish doorbells for tasks
+  that fail by expiry here.
+- **Rendering.** Added tokens beyond the §6.3 example: `stale<N>` in `attn:`,
+  `x<N>` (cancelled) in `tasks:`, `dissent24h:<N>`. `dec:` values are reduced
+  to inert tokens (<= 32 chars each) instead of being quoted. The `last:` line
+  holds `status: summary`, truncated to 60 characters in total, JSON-escaped,
+  with any `‹`/`›` replaced. If a row does not fit, its `last:` line is
+  dropped before the row is. An empty result renders
+  `(no active pipelines)`.
+- **Surfaces.** `ncp overview` accepts `--json` (and `--json-output` like the
+  other commands), `--pipeline` (repeatable) and `--since` as seconds or
+  `30m`/`24h`/`2d`. `GET /api/overview` takes `agent_id`, `prefix`, `since`
+  (seconds), `max_pipelines` and `max_tokens`. No UI panel was added: the UI
+  has per-view pages but no small extension point for a summary panel, so the
+  endpoint is exposed without one.
+- **Gating.** `ncp_overview` has no config flag. It is not in
+  `CORE_TOOL_NAMES`, so it is available in the `full` profile and absent from
+  `core`. With `[tasks].enabled = false` the task fields are omitted.
+
 ---
 
 ## 7. Delivery plan
@@ -666,6 +732,11 @@ worker:
 3. **Overview scope without `pipeline_id` discipline.** Chunks written with
    no pipeline are invisible to the overview. Should it show a synthetic
    `(unscoped)` row, or omit them silently?
+   **Resolved (PR 4):** omit them silently. Rows with a null `pipeline_id`
+   (chunks, whispers, turns) are ignored, because an `(unscoped)` row could
+   not be followed up with `ncp_get_context(pipeline_id=...)` and would sit
+   permanently near the top in deployments that never set a pipeline. Operators
+   who need that view can use `ncp status` or `/api/chunks`.
 4. **Ledger authorization.** Should task mutations be gated by the planned
    P0-A access policy (allowed pipelines per agent) once it lands, rather
    than by a separate mechanism?

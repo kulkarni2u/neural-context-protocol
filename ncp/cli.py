@@ -1417,6 +1417,66 @@ def emit_command(
     console.print("Whisper emitted.")
 
 
+def _parse_duration_seconds(value: str) -> float:
+    """Parse ``90``, ``90s``, ``30m``, ``24h`` or ``2d`` into seconds."""
+
+    text = value.strip().lower()
+    scale = {"s": 1.0, "m": 60.0, "h": 3600.0, "d": 86400.0}
+    try:
+        if text and text[-1] in scale:
+            return float(text[:-1]) * scale[text[-1]]
+        return float(text)
+    except ValueError:
+        raise click.BadParameter(f"expected seconds or a number with s/m/h/d suffix, got {value!r}") from None
+
+
+@main.command("overview")
+@click.option("--agent-id", default="router", show_default=True, help="Viewer whose inbox is counted (peeked, never drained).")
+@click.option("--prefix", default=None, help="Only pipeline ids starting with this.")
+@click.option("--pipeline", "pipelines", multiple=True, help="Only this pipeline id (repeatable).")
+@click.option("--since", default="24h", show_default=True, help="Activity window: seconds, or 30m / 24h / 2d.")
+@click.option("--max-pipelines", default=10, show_default=True, type=click.IntRange(1, 50))
+@click.option("--max-tokens", default=400, show_default=True, type=click.IntRange(60, 4000))
+@click.option("--json", "--json-output", "json_output", is_flag=True, help="Emit machine-readable JSON.")
+@click.option("--cwd", type=click.Path(path_type=Path), default=Path.cwd)
+def overview_command(
+    *,
+    agent_id: str,
+    prefix: str | None,
+    pipelines: tuple[str, ...],
+    since: str,
+    max_pipelines: int,
+    max_tokens: int,
+    json_output: bool,
+    cwd: Path,
+) -> None:
+    """Show a ranked, token-bounded overview of recent pipeline activity (read-only)."""
+
+    from ncp.api import overview as api_overview
+
+    since_seconds = _parse_duration_seconds(since)
+    try:
+        config = ncp.configure(cwd=cwd)
+        store = _resolve_reporting_store(config, "overview", "overview_rows")
+        result = api_overview(
+            agent_id=agent_id,
+            pipelines=list(pipelines) or None,
+            prefix=prefix,
+            since_seconds=since_seconds,
+            max_pipelines=max_pipelines,
+            max_tokens=max_tokens,
+            store=store,
+            config=config,
+        )
+    except NCPStoreUnavailableError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    if json_output:
+        click.echo(json.dumps(result, indent=2, sort_keys=True))
+        return
+    click.echo(result["text"])
+
+
 @main.command("viz")
 @click.option("--cwd", type=click.Path(path_type=Path), default=Path.cwd)
 @click.option("--pipeline-id", default=None, help="Optional pipeline scope filter.")

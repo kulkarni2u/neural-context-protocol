@@ -15,6 +15,8 @@ from ncp.assembler import Assembler, AssemblyResult
 from ncp.config import NCPConfig, load_config
 from ncp.context_policy import ResolvedContextPolicy, resolve_context_policy
 from ncp.costs import calculate_cost
+from ncp.overview import DEFAULT_MAX_PIPELINES, DEFAULT_MAX_TOKENS, DEFAULT_SINCE_SECONDS
+from ncp.overview import overview as _build_overview
 from ncp.notify import Subscription, eligible_whispers, emit_and_notify, get_process_notifier
 from ncp.stores.base import BaseStore
 from ncp.stores.factory import create_store
@@ -255,6 +257,42 @@ def wait_whispers(
             if found or remaining <= 0:
                 return found
             sub.poll(remaining)
+
+
+def overview(
+    *,
+    agent_id: str | None = None,
+    pipelines: Sequence[str] | None = None,
+    prefix: str | None = None,
+    since_seconds: float | None = DEFAULT_SINCE_SECONDS,
+    max_pipelines: int = DEFAULT_MAX_PIPELINES,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+    store: BaseStore | None = None,
+    config: NCPConfig | None = None,
+) -> dict[str, object]:
+    """Ranked, token-bounded cross-pipeline overview (read-only).
+
+    Returns ``{"text", "pipelines", "omitted", "tokens_est"}``. ``agent_id``
+    is the viewer whose inbox is counted (peeked, never drained). Task fields
+    are omitted unless ``[tasks].enabled``.
+    """
+
+    from ncp.overview import clamp_limits
+
+    resolved_config = config or _CONFIG or configure(cwd=Path.cwd())
+    resolved_store = store or create_store(resolved_config)
+    max_pipelines, max_tokens = clamp_limits(max_pipelines, max_tokens)
+    return _build_overview(
+        resolved_store,
+        viewer=agent_id,
+        pipelines=pipelines,
+        pipeline_prefix=prefix,
+        since_seconds=since_seconds,
+        max_pipelines=max_pipelines,
+        max_tokens=max_tokens,
+        include_tasks=resolved_config.tasks_enabled,
+        stale_open_seconds=resolved_config.tasks_stale_open_seconds,
+    )
 
 
 def subscribe(

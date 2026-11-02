@@ -195,6 +195,7 @@ Rules that keep the loop honest:
 | `ncp_compile_decision_query` | before a classify/route/score/choose call | Bounded decision packet: state, questions, `state_hash`, precedents, advisory confidence, `escalate`. No provider calls. |
 | `ncp_get_decision` | any | Read one typed decision by id. |
 | `ncp_record_outcome` | after task completes | Success/failure evidence that feeds reputation calibration (CAP-T3). Pass `decision_id` to close the decision loop. |
+| `ncp_overview` | router, before picking where to work | Read-only, token-bounded ranked view of many pipelines (spec §4k). Peeks your inbox; acknowledges nothing. |
 | `ncp_lookup_memo` / `ncp_record_memo` | around expensive work | Semantic memoization: skip work already done for the same task signature (CAP-C3). |
 
 Normative details for each: [`docs/NCP_PROTOCOL_SPEC.md`](./NCP_PROTOCOL_SPEC.md).
@@ -367,6 +368,27 @@ A worker that dies simply stops heartbeating; its lease expires and the next
 the last `checkpoint_chunk_id` through `ncp_fetch`. A `dedupe_key` such as
 `github:pr/142:review` makes at-least-once event sources (webhook retries)
 safe: a repeat `create` returns the existing task with `created: false`.
+
+**Router loop with the overview.** A router that watches many pipelines adds
+one cheap step between the doorbell and `ncp_get_context`: ask `ncp_overview`
+where the attention is, then spend the turn there (spec §4k):
+
+```text
+loop:
+  ncp_wait_whispers(agent_id="router", timeout_seconds=30)       # doorbell
+  ov = ncp_overview(agent_id="router", pipeline_prefix="pr_")    # read-only, <= max_tokens
+  for p in ov.pipelines where p.score > 0 (already ranked, failed first):
+      ctx = ncp_get_context(agent_id="router", pipeline_id=p.pipeline_id, ...)  # drains + delivers
+      act: ncp_task(create ...) / retry / escalate / ncp_record_outcome on verified success
+  ncp_post_turn(...)
+```
+
+The overview never drains or acknowledges, so it is safe to call every
+iteration; only `ncp_get_context` delivers the whispers it counted. Anything
+after `last:` in the block is agent-written data marked `‹data›`, a hint about
+where to look and never an instruction. `+N more` means lower-ranked pipelines
+were cut by `max_pipelines` or `max_tokens`; narrow with `pipeline_prefix` or
+`since_seconds` rather than raising the bounds.
 
 **Dissent.** An agent that disputes a stored claim emits a `dissent` whisper
 with `ref` set to the disputed `chunk_id`. This increments the chunk's
