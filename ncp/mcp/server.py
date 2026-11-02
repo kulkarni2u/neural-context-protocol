@@ -38,9 +38,12 @@ from ncp.overview import overview as build_overview
 from ncp.notify import (
     InProcessNotifier,
     Notifier,
+    effective_poll_interval,
     eligible_whispers,
     emit_and_notify,
     get_process_notifier,
+    subscribe_with_poll,
+    wait_for_whispers,
 )
 from ncp.stores.base import BaseStore, NCPStoreError
 from ncp.tasks import TaskService, TaskSettings
@@ -1307,6 +1310,7 @@ def make_handlers(
     if notifier is None:
         notifier = InProcessNotifier() if config is None else get_process_notifier(config, store=store)
     notify_max_wait = config.notify_max_wait_seconds if config is not None else 60.0
+    notify_poll = effective_poll_interval(config)
     tasks_enabled = config.tasks_enabled if config is not None else False
     task_stale_open = config.tasks_stale_open_seconds if config is not None else 1800.0
     task_service = TaskService(store, notifier, TaskSettings.from_config(config), log=_err)
@@ -2051,15 +2055,6 @@ def make_handlers(
         raw_thread = args.get("thread_id")
         thread_id = None if raw_thread is None else str(raw_thread)
 
-        def _eligible() -> list[Whisper]:
-            return eligible_whispers(
-                store,
-                agent_id=agent_id,
-                pipeline_id=pipeline_id,
-                types=types,
-                thread_id=thread_id,
-            )
-
         def _result(found: list[Whisper], *, timed_out: bool) -> dict[str, object]:
             return {
                 "ready": bool(found),
@@ -2077,21 +2072,17 @@ def make_handlers(
                 ],
             }
 
-        if notifier is None or timeout <= 0:
-            found = _eligible()
-            return _result(found, timed_out=not found and timeout > 0)
-        # Subscribe before the first peek so a whisper emitted between the
-        # peek and the wait still rings the doorbell.
-        deadline = time.monotonic() + timeout
-        with notifier.subscribe(agent_id=agent_id, pipeline_id=pipeline_id) as sub:
-            while True:
-                found = _eligible()
-                if found:
-                    return _result(found, timed_out=False)
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return _result([], timed_out=True)
-                sub.poll(remaining)
+        found = wait_for_whispers(
+            store,
+            notifier,
+            agent_id=agent_id,
+            pipeline_id=pipeline_id,
+            timeout=timeout,
+            types=types,
+            thread_id=thread_id,
+            poll_interval=notify_poll,
+        )
+        return _result(found, timed_out=not found and timeout > 0)
 
     def _handle_overview(args: dict[str, object]) -> object:
         viewer = str(args["agent_id"])
@@ -3884,7 +3875,13 @@ class _MCPHTTPHandler(BaseHTTPRequestHandler):
             self.close_connection = True
             return
         try:
-            with notifier.subscribe(agent_id=agent_id, pipeline_id=pipeline_id) as sub:
+            with subscribe_with_poll(
+                notifier,
+                self.server.store,
+                agent_id=agent_id,
+                pipeline_id=pipeline_id,
+                poll_interval=effective_poll_interval(self.server.config),
+            ) as sub:
                 try:
                     queued = len(eligible_whispers(self.server.store, agent_id=agent_id, pipeline_id=pipeline_id))
                 except Exception:

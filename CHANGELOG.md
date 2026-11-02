@@ -16,6 +16,17 @@ All notable changes to Neural Context Protocol will be documented in this file.
   from the claiming owner, closing the gap where library callers skipped the
   check. Task functions need a synchronous store and `[tasks].enabled = true`.
 
+- **Cross-process whisper wake-ups without Redis** (`ncp/notify.py`,
+  `ncp/api.py`, `ncp/mcp/server.py`, `ncp/config.py`): new
+  `[notify] poll_interval_seconds` (default 2.0, `0` disables, minimum 0.25;
+  off with the Redis backend). `ncp_wait_whispers` and `api.wait_whispers`
+  now share `ncp.notify.wait_for_whispers` and re-peek the store every
+  interval, and `GET /events` and `api.subscribe` use a shared
+  `PollingSubscription` that announces eligible whispers written by other
+  processes once per connection (queued-at-connect and doorbell-announced ids
+  are never repeated). Frames stay payload-free; `task` events remain
+  in-process-only.
+
 - **Request/reply whisper threads** (`ncp/types.py`, `ncp/stores/sqlite.py`,
   `ncp/stores/redis_coordination.py`, `ncp/encoder.py`, `ncp/mcp/server.py`):
   first step of the router coordination primitives

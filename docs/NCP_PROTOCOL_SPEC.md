@@ -1179,10 +1179,23 @@ required (`400` otherwise). The first frame is `event: ready` with
 client disconnect.
 
 **Backends.** `[notify] backend = auto | memory | redis`. `memory` is an
-in-process notifier (wake-ups stay inside one process). `redis` publishes on
+in-process notifier (the doorbell stays inside one process; see the poll fallback below). `redis` publishes on
 `{stream}:notify:{pipeline_id or '_'}:{target}` (`*` for broadcast). `auto`
 selects Redis when Redis carries whispers (the `pgvector` store), otherwise
 in-process. stdio has no push channel; use `ncp_wait_whispers`.
+
+**Poll fallback (cross-process, in-process backend only).** The in-process
+doorbell cannot see a whisper written by another process on the same SQLite
+database. While waiting, `ncp_wait_whispers` therefore re-peeks the store at
+least every `[notify].poll_interval_seconds` (default 2.0; `0` disables; values
+below 0.25 are raised to 0.25), and `GET /events` peeks at the same cadence and
+emits an `event: whisper` frame for each eligible whisper id not yet announced
+on that connection. Whispers already queued when the connection opened are
+counted in `ready.queued` and never re-announced, and an id announced by the
+doorbell is not repeated. Frames remain payload-free. A foreign write is
+therefore noticed within about one interval; an in-process write still wakes
+immediately. The fallback is off when the effective backend is Redis. `event:
+task` frames are not polled and stay in-process-only.
 
 ## 4j. Task Ledger (normative)
 
@@ -1813,6 +1826,7 @@ enabled = true
 backend = "auto"         # auto | memory | redis
 max_subscribers = 64     # concurrent GET /events streams
 max_wait_seconds = 60    # ceiling for ncp_wait_whispers
+poll_interval_seconds = 2.0  # in-process backend only: re-peek the store so other processes' whispers are found; 0 = off, min 0.25
 
 [tasks]                  # leased task ledger (ncp_task), see section 4j
 enabled = false          # opt-in; ncp_task hidden when false or tools.profile = "core"

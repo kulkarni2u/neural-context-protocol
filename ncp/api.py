@@ -17,7 +17,15 @@ from ncp.context_policy import ResolvedContextPolicy, resolve_context_policy
 from ncp.costs import calculate_cost
 from ncp.overview import DEFAULT_MAX_PIPELINES, DEFAULT_MAX_TOKENS, DEFAULT_SINCE_SECONDS
 from ncp.overview import overview as _build_overview
-from ncp.notify import Subscription, eligible_whispers, emit_and_notify, get_process_notifier
+from ncp.notify import (
+    Subscription,
+    effective_poll_interval,
+    emit_and_notify,
+    get_process_notifier,
+    polling_enabled,
+    subscribe_with_poll,
+    wait_for_whispers,
+)
 from ncp.stores.base import BaseStore
 from ncp.stores.factory import create_store
 from ncp.tasks import TaskService, TaskSettings, check_task_owner
@@ -249,23 +257,16 @@ def wait_whispers(
     resolved_config = config or _CONFIG or configure(cwd=Path.cwd())
     resolved_store = store or create_store(resolved_config)
     notifier = get_process_notifier(resolved_config, store=resolved_store)
-    type_set = set(types) if types else None
-    deadline = time.monotonic() + min(max(0.0, timeout), resolved_config.notify_max_wait_seconds)
-
-    def _peek() -> list[Whisper]:
-        return eligible_whispers(
-            resolved_store, agent_id=agent_id, pipeline_id=pipeline_id, types=type_set, thread_id=thread_id
-        )
-
-    if notifier is None:
-        return _peek()
-    with notifier.subscribe(agent_id=agent_id, pipeline_id=pipeline_id) as sub:
-        while True:
-            found = _peek()
-            remaining = deadline - time.monotonic()
-            if found or remaining <= 0:
-                return found
-            sub.poll(remaining)
+    return wait_for_whispers(
+        resolved_store,
+        notifier,
+        agent_id=agent_id,
+        pipeline_id=pipeline_id,
+        timeout=min(max(0.0, timeout), resolved_config.notify_max_wait_seconds),
+        types=set(types) if types else None,
+        thread_id=thread_id,
+        poll_interval=effective_poll_interval(resolved_config),
+    )
 
 
 def _task_service(store: BaseStore | None, config: NCPConfig | None) -> TaskService:
@@ -522,13 +523,27 @@ def subscribe(
 
     Use as ``with subscribe(agent_id=...) as sub: for event in sub: ...`` or
     ``sub.poll(timeout)``. Raises ``RuntimeError`` when ``[notify]`` is disabled.
+
+    With the in-process notifier and ``[notify].poll_interval_seconds > 0`` the
+    subscription also re-peeks the store, so whispers written by another
+    process are announced too (whispers already queued at subscribe time are
+    not). ``task`` events stay in-process-only.
     """
 
     resolved_config = config or _CONFIG or configure(cwd=Path.cwd())
     notifier = get_process_notifier(resolved_config, store=store)
     if notifier is None:
         raise RuntimeError("Push delivery is disabled ([notify].enabled = false).")
-    return notifier.subscribe(agent_id=agent_id, pipeline_id=pipeline_id)
+    interval = effective_poll_interval(resolved_config)
+    if not polling_enabled(notifier, interval):
+        return notifier.subscribe(agent_id=agent_id, pipeline_id=pipeline_id)
+    return subscribe_with_poll(
+        notifier,
+        store or create_store(resolved_config),
+        agent_id=agent_id,
+        pipeline_id=pipeline_id,
+        poll_interval=interval,
+    )
 
 
 def run(

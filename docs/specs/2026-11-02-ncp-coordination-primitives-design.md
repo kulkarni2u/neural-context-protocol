@@ -210,7 +210,7 @@ class Notifier(Protocol):
 
 | Implementation | When | Mechanism |
 |---|---|---|
-| `InProcessNotifier` | SQLite, single `ncp serve` | A `threading.Condition` and a small ring buffer per `(pipeline_id, agent_id)`. Broadcast `*` wakes every subscriber in that pipeline. |
+| `InProcessNotifier` | SQLite | A `threading.Condition` and a small ring buffer per `(pipeline_id, agent_id)`. Broadcast `*` wakes every subscriber in that pipeline. The doorbell stays inside one process; a store-poll fallback (section 4.3.1) covers writers in other processes. |
 | `RedisNotifier` | pgvector + Redis, or several `ncp serve` processes | Redis pub/sub on `{stream}:notify:{pipeline_id}:{target}` (`*` for broadcast). Reuses `RedisCoordination`'s client factory. |
 
 Selection: `[notify] backend = "auto"` picks Redis when a Redis URL is
@@ -287,6 +287,27 @@ Where the shipped code differs from the sketch above:
 - `task_id` was omitted from events and from `ncp_wait_whispers` rows until
   capability C; both now carry it (null when absent).
 - `ncp_wait_whispers` with `timeout_seconds: 0` reports `timed_out: false`.
+- **Cross-process wake-ups on SQLite (poll fallback).** The in-process doorbell
+  never sees a whisper written by another process (a second `ncp serve`, or a
+  script using `ncp.api` or the store directly on the same `.ncp` database).
+  `[notify] poll_interval_seconds` (default 2.0, `0` disables, floor 0.25)
+  closes the gap without Redis. It applies only when the effective backend is
+  in-process; with Redis it is off. Latency for a foreign write is bounded by
+  the interval, and an in-process doorbell still wakes immediately.
+  - `ncp_wait_whispers` and `api.wait_whispers` share one loop,
+    `ncp.notify.wait_for_whispers`: `sub.poll(min(remaining, interval))`, then
+    a fresh `eligible_whispers` peek.
+  - `GET /events` and `api.subscribe` share `ncp.notify.PollingSubscription`
+    (via `subscribe_with_poll`). Every interval it peeks and emits a `whisper`
+    event (`NotifyEvent.from_whisper`, no payload) for each eligible id not yet
+    announced on that connection. The announced set is bounded (1024 ids),
+    seeded with whispers already queued at connect (covered by the `ready`
+    frame's `queued` count), and records ids announced by the doorbell.
+  - `task` events stay in-process-only: they have no queue to peek, so a task
+    state change made by another process is not announced. Clients catch up
+    through `ncp_task` reads.
+  - Cost: one bounded peek (`max_items` 200) per interval per waiter or
+    connection.
 
 ### 4.4 Library API
 

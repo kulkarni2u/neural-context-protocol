@@ -298,6 +298,14 @@ they carry no title or summary. Concurrent streams are capped by
 `Retry-After`. Reconnect and call `ncp_wait_whispers` with
 `timeout_seconds: 0` to catch up on anything missed.
 
+**Cross-process latency.** With the default in-process notifier, a whisper
+written by a different process (another `ncp serve`, or a script on the same
+database) does not ring the doorbell. `ncp_wait_whispers` and `/events` find it
+by re-peeking the store every `[notify].poll_interval_seconds` (default 2.0,
+`0` disables, minimum 0.25), so latency for such a write is up to about one
+interval; same-process writes are still immediate. The fallback is off with the
+Redis backend, and `event: task` frames are in-process-only.
+
 ### ncp_task — leased task ledger
 
 Opt-in (`[tasks].enabled = true`), absent from the `core` profile. One tool,

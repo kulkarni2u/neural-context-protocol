@@ -686,3 +686,134 @@ class TestCreateNotifier:
         config = load_config(cwd=tmp_path)
         config.values["store"]["type"] = "pgvector"
         assert isinstance(create_notifier(config, client_factory=lambda _u: _FakeRedis()), RedisNotifier)
+
+
+# ---------------------------------------------------------------------------
+# Cross-process wake-ups: SQLite poll fallback
+
+
+def _poll_config(tmp_path: Path, interval: float) -> Any:
+    config = load_config(cwd=tmp_path)
+    config.values["notify"]["poll_interval_seconds"] = interval
+    return config
+
+
+def _foreign_emit_later(db_path: Path, whisper: Whisper, delay: float = 0.3) -> threading.Thread:
+    """Write through a second store on the same file, with no shared notifier."""
+
+    def _run() -> None:
+        time.sleep(delay)
+        SQLiteStore(db_path).emit_whisper(whisper)
+
+    thread = threading.Thread(target=_run)
+    thread.start()
+    return thread
+
+
+class TestCrossProcessPolling:
+    def test_tool_wakes_within_interval(self, store: SQLiteStore, tmp_path: Path) -> None:
+        handlers = make_handlers(store, config=_poll_config(tmp_path, 0.25), notifier=InProcessNotifier())
+        whisper = _whisper()
+        thread = _foreign_emit_later(store.path, whisper)
+        start = time.monotonic()
+        result = _wait(handlers, agent_id="router", pipeline_id=PIPE, timeout_seconds=5)
+        elapsed = time.monotonic() - start
+        thread.join()
+        assert elapsed < 2.0
+        assert result["ready"] is True and result["timed_out"] is False
+        assert [w["whisper_id"] for w in result["whispers"]] == [whisper.whisper_id]
+        assert "check the build" not in json.dumps(result)
+
+    def test_interval_zero_keeps_old_behaviour(self, store: SQLiteStore, tmp_path: Path) -> None:
+        handlers = make_handlers(store, config=_poll_config(tmp_path, 0), notifier=InProcessNotifier())
+        thread = _foreign_emit_later(store.path, _whisper(), delay=0.2)
+        start = time.monotonic()
+        result = _wait(handlers, agent_id="router", pipeline_id=PIPE, timeout_seconds=1.0)
+        elapsed = time.monotonic() - start
+        thread.join()
+        assert elapsed >= 0.9  # slept to the deadline; found only at the final peek
+        assert result["ready"] is True
+
+    def test_api_wait_whispers_wakes_within_interval(self, store: SQLiteStore, tmp_path: Path) -> None:
+        config = _poll_config(tmp_path, 0.25)
+        whisper = _whisper()
+        thread = _foreign_emit_later(store.path, whisper)
+        start = time.monotonic()
+        found = api.wait_whispers(agent_id="router", pipeline_id=PIPE, timeout=5, store=store, config=config)
+        elapsed = time.monotonic() - start
+        thread.join()
+        assert elapsed < 2.0
+        assert [w.whisper_id for w in found] == [whisper.whisper_id]
+
+    def test_api_subscribe_announces_foreign_write_once(self, store: SQLiteStore, tmp_path: Path) -> None:
+        config = _poll_config(tmp_path, 0.25)
+        store.emit_whisper(_whisper(payload="queued before"))
+        foreign = _whisper(payload="secret foreign payload")
+        with api.subscribe(agent_id="router", pipeline_id=PIPE, config=config, store=store) as sub:
+            thread = _foreign_emit_later(store.path, foreign, delay=0.1)
+            events: list[NotifyEvent] = []
+            deadline = time.monotonic() + 3
+            while not events and time.monotonic() < deadline:
+                events = sub.poll(0.5)
+            thread.join()
+            again = sub.poll(0.6)  # a later scan must not repeat it
+        assert [e.whisper_id for e in events] == [foreign.whisper_id]
+        assert again == []
+        assert "secret foreign payload" not in json.dumps([e.to_dict() for e in events])
+
+    def test_polling_off_for_redis_backend(self, tmp_path: Path) -> None:
+        from ncp.notify import effective_poll_interval, polling_enabled
+
+        config = _poll_config(tmp_path, 2.0)
+        assert effective_poll_interval(config) == 2.0
+        assert polling_enabled(InProcessNotifier(), effective_poll_interval(config))
+        config.values["notify"]["backend"] = "redis"
+        assert effective_poll_interval(config) == 0.0
+        config.values["notify"]["backend"] = "auto"
+        config.values["store"]["type"] = "pgvector"
+        assert effective_poll_interval(config) == 0.0
+        redis_notifier = RedisNotifier("redis://x", client_factory=lambda _u: _FakeRedis())
+        assert not polling_enabled(redis_notifier, 2.0)
+
+    def test_interval_clamped_to_floor(self, tmp_path: Path) -> None:
+        assert _poll_config(tmp_path, 0.01).notify_poll_interval_seconds == 0.25
+        assert _poll_config(tmp_path, 0).notify_poll_interval_seconds == 0.0
+        assert _poll_config(tmp_path, -3).notify_poll_interval_seconds == 0.0
+        assert load_config(cwd=tmp_path).notify_poll_interval_seconds == 2.0
+
+    def test_events_stream_foreign_write_no_duplicates(self, tmp_path: Path) -> None:
+        with _Server(tmp_path) as srv:
+            srv.server.config.values["notify"]["poll_interval_seconds"] = 0.25
+            db_path = srv.server.store.path
+            srv.server.store.emit_whisper(_whisper(payload="queued at connect"))
+            resp = srv.get(f"/events?agent_id=router&pipeline_id={PIPE}")
+            event, data = _read_frame(resp)
+            assert event == "ready" and json.loads(data) == {"queued": 1}
+
+            bell = _whisper(payload="rung by doorbell")
+            emit_and_notify(srv.server.store, srv.server.notifier, bell)
+            foreign = _whisper(payload="written by another process")
+            thread = _foreign_emit_later(db_path, foreign, delay=0.2)
+
+            frames: list[tuple[str, str]] = []
+            while len(frames) < 2:
+                event, data = _read_frame(resp)
+                if event == "whisper":
+                    frames.append((event, data))
+            thread.join()
+            ids = [json.loads(d)["whisper_id"] for _, d in frames]
+            assert ids == [bell.whisper_id, foreign.whisper_id]
+            for _, d in frames:
+                assert "payload" not in json.loads(d)
+                assert "another process" not in d and "doorbell" not in d and "at connect" not in d
+
+            # Further scan cycles re-announce nothing: the queued-at-connect,
+            # doorbell and polled ids are all in the announced set.
+            time.sleep(0.8)
+            srv.server.store.emit_whisper(_whisper(target="someone_else"))
+            emit_and_notify(srv.server.store, srv.server.notifier, _whisper(payload="last"))
+            event, data = _read_frame(resp)
+            while event != "whisper":
+                event, data = _read_frame(resp)
+            last = json.loads(data)
+            assert last["whisper_id"] not in ids

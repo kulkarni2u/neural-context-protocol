@@ -80,6 +80,9 @@ DEFAULT_CONFIG = {
         "backend": "auto",  # auto | memory | redis
         "max_subscribers": 64,
         "max_wait_seconds": 60,
+        # In-process (memory) backend only: re-peek the store at least this
+        # often so a whisper written by another process is noticed. 0 disables.
+        "poll_interval_seconds": 2.0,
     },
     "tasks": {
         # Coordination primitives C: leased task ledger (ncp_task). Opt-in.
@@ -629,6 +632,17 @@ class NCPConfig:
     @property
     def notify_max_wait_seconds(self) -> float:
         return max(0.0, float(self.values.get("notify", {}).get("max_wait_seconds", 60)))
+
+    @property
+    def notify_poll_interval_seconds(self) -> float:
+        """Configured store re-peek interval: 0 (off) or at least 0.25 seconds."""
+        try:
+            raw = float(self.values.get("notify", {}).get("poll_interval_seconds", 2.0))
+        except (TypeError, ValueError):
+            return 2.0
+        if raw != raw or raw <= 0:
+            return 0.0
+        return max(0.25, raw)
 
     @property
     def tasks_enabled(self) -> bool:

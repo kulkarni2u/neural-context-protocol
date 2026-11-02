@@ -33,6 +33,9 @@ logger = logging.getLogger(__name__)
 # (Assembler._peek_whispers); the doorbell mirrors it.
 WHISPER_MIN_CONFIDENCE = 0.60
 _RING_SIZE = 256
+DEFAULT_POLL_INTERVAL = 2.0
+MIN_POLL_INTERVAL = 0.25
+_MAX_ANNOUNCED = 1024
 
 
 class NotifyEvent(NCPModel):
@@ -316,6 +319,30 @@ class RedisNotifier:
             return sub.poll(timeout)
 
 
+def uses_redis(config: NCPConfig) -> bool:
+    """True when the effective ``[notify]`` backend is Redis pub/sub."""
+
+    backend = config.notify_backend
+    if backend == "auto":
+        store_type = str(config.values.get("store", {}).get("type", "sqlite"))
+        return store_type == "pgvector" and bool(config.redis_url)
+    return backend == "redis"
+
+
+def effective_poll_interval(config: NCPConfig | None) -> float:
+    """Store re-peek interval in seconds; 0 when polling is off.
+
+    Polling only makes sense for the in-process (memory) backend, where the
+    doorbell cannot cross processes. With Redis it is always off.
+    """
+
+    if config is None:
+        return DEFAULT_POLL_INTERVAL
+    if uses_redis(config):
+        return 0.0
+    return config.notify_poll_interval_seconds
+
+
 def create_notifier(
     config: NCPConfig,
     *,
@@ -329,15 +356,7 @@ def create_notifier(
     presence of a URL cannot be the signal for a SQLite deployment.
     """
 
-    backend = config.notify_backend
-    if backend == "auto":
-        store_type = str(config.values.get("store", {}).get("type", "sqlite"))
-        use_redis = store_type == "pgvector" and bool(config.redis_url)
-    elif backend == "redis":
-        use_redis = True
-    else:
-        use_redis = False
-    if not use_redis:
+    if not uses_redis(config):
         return InProcessNotifier()
     factory = client_factory
     coordination = getattr(store, "coordination", None)
@@ -362,6 +381,148 @@ def get_process_notifier(config: NCPConfig, *, store: BaseStore | None = None) -
             notifier = create_notifier(config, store=store)
             _PROCESS_NOTIFIERS[key] = notifier
         return notifier
+
+
+def polling_enabled(notifier: Notifier | None, poll_interval: float) -> bool:
+    """Poll fallback applies only to an in-process notifier with a positive interval."""
+
+    return notifier is not None and poll_interval > 0 and isinstance(notifier, InProcessNotifier)
+
+
+def wait_for_whispers(
+    store: BaseStore,
+    notifier: Notifier | None,
+    *,
+    agent_id: str,
+    pipeline_id: str | None,
+    timeout: float,
+    types: set[str] | None = None,
+    thread_id: str | None = None,
+    poll_interval: float = 0.0,
+) -> list[Whisper]:
+    """Peek, then wait for the doorbell up to ``timeout``; peek only, never drain.
+
+    Subscribes before the first peek so a whisper emitted in between still
+    rings. With ``poll_interval > 0`` (in-process notifier) each wait is capped
+    at the interval and followed by a fresh peek, so a whisper written by
+    another process, which never rings this doorbell, is found within about
+    one interval. Returns ``[]`` on timeout.
+    """
+
+    def _peek() -> list[Whisper]:
+        return eligible_whispers(store, agent_id=agent_id, pipeline_id=pipeline_id, types=types, thread_id=thread_id)
+
+    if notifier is None or timeout <= 0:
+        return _peek()
+    interval = max(MIN_POLL_INTERVAL, poll_interval) if polling_enabled(notifier, poll_interval) else 0.0
+    deadline = time.monotonic() + timeout
+    with notifier.subscribe(agent_id=agent_id, pipeline_id=pipeline_id) as sub:
+        while True:
+            found = _peek()
+            remaining = deadline - time.monotonic()
+            if found or remaining <= 0:
+                return found
+            sub.poll(min(remaining, interval) if interval > 0 else remaining)
+
+
+class PollingSubscription:
+    """Subscription wrapper that adds a store-peek fallback for foreign writers.
+
+    Doorbell events pass through. Every ``interval`` seconds the store is peeked
+    and a ``whisper`` event (via ``NotifyEvent.from_whisper``, no payload) is
+    synthesised for each eligible whisper id not yet announced on this
+    subscription. The announced set is seeded with whispers already queued at
+    creation, so they are not re-announced, and ids announced by the doorbell
+    are recorded so they are never repeated. ``task`` events are never polled:
+    they remain in-process-only.
+    """
+
+    def __init__(
+        self,
+        inner: Subscription,
+        store: BaseStore,
+        *,
+        agent_id: str,
+        pipeline_id: str | None,
+        interval: float,
+    ) -> None:
+        self._inner = inner
+        self._store = store
+        self.agent_id = agent_id
+        self.pipeline_id = pipeline_id
+        self._interval = max(MIN_POLL_INTERVAL, interval)
+        self._announced: dict[str, None] = {}
+        self._closed = False
+        try:
+            for w in self._peek():
+                self._mark(w.whisper_id)
+        except Exception:
+            logger.debug("poll seed peek failed", exc_info=True)
+        self._next_scan = time.monotonic() + self._interval
+
+    def _peek(self) -> list[Whisper]:
+        return eligible_whispers(self._store, agent_id=self.agent_id, pipeline_id=self.pipeline_id)
+
+    def _mark(self, whisper_id: str) -> bool:
+        """Record an id; False when it was already announced."""
+        if whisper_id in self._announced:
+            return False
+        self._announced[whisper_id] = None
+        while len(self._announced) > _MAX_ANNOUNCED:
+            self._announced.pop(next(iter(self._announced)))
+        return True
+
+    def _scan(self) -> list[NotifyEvent]:
+        self._next_scan = time.monotonic() + self._interval
+        try:
+            found = self._peek()
+        except Exception:
+            logger.debug("poll peek failed", exc_info=True)
+            return []
+        return [NotifyEvent.from_whisper(w) for w in found if self._mark(w.whisper_id)]
+
+    def poll(self, timeout: float) -> list[NotifyEvent]:
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            now = time.monotonic()
+            chunk = max(0.0, min(deadline - now, self._next_scan - now))
+            events: list[NotifyEvent] = []
+            for event in self._inner.poll(chunk):
+                if event.whisper_id is None or self._mark(event.whisper_id):
+                    events.append(event)
+            if time.monotonic() >= self._next_scan:
+                events.extend(self._scan())
+            if events or self._closed or time.monotonic() >= deadline:
+                return events
+
+    def close(self) -> None:
+        self._closed = True
+
+    def __iter__(self) -> Iterator[NotifyEvent]:
+        while not self._closed:
+            yield from self.poll(1.0)
+
+
+@contextmanager
+def subscribe_with_poll(
+    notifier: Notifier,
+    store: BaseStore,
+    *,
+    agent_id: str,
+    pipeline_id: str | None,
+    poll_interval: float,
+) -> Iterator[Subscription]:
+    """``notifier.subscribe`` plus the poll fallback when it applies (else the plain sub)."""
+
+    with notifier.subscribe(agent_id=agent_id, pipeline_id=pipeline_id) as sub:
+        if not polling_enabled(notifier, poll_interval):
+            yield sub
+            return
+        wrapped = PollingSubscription(sub, store, agent_id=agent_id, pipeline_id=pipeline_id, interval=poll_interval)
+        try:
+            yield wrapped
+        finally:
+            wrapped.close()
 
 
 def emit_and_notify(store: BaseStore, notifier: Notifier | None, whisper: Whisper) -> None:
