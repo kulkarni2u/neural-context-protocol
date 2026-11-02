@@ -4,6 +4,22 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [Unreleased]
 
+## [1.8.0] - 2026-11-02
+
+### Release scope
+
+This release adds router coordination primitives, so one long-lived router
+agent can coordinate many workers over the bus: request/reply whisper threads
+(`progress`/`result`), push delivery (`ncp_wait_whispers`, `GET /events`), an
+opt-in task ledger with leased, fenced claims (`ncp_task`, plus `ncp.api`
+task functions), and a ranked cross-pipeline overview (`ncp_overview`,
+`ncp overview`, `GET /api/overview`). NCP still does not schedule work: it
+records claims and rings payload-free doorbells. The new tools are outside
+the `core` profile and `[tasks]` is off by default. Postgres deployments must
+apply `018_add_tasks.sql` before enabling `[tasks]`. Read **Changed** before
+upgrading: newly emitted `share`/`request` whispers show an `id:` token in
+`[NCP:WHISPERS]`, and `ncp.api.emit` now enforces the task owner check.
+
 ### Added
 
 - **Request/reply whisper threads** (`ncp/types.py`, `ncp/stores/sqlite.py`,
