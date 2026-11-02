@@ -50,6 +50,7 @@ from ncp.types import (
     SubconsciousChunk,
     Whisper,
     normalize_whisper_payload,
+    resolve_whisper_thread,
 )
 
 from ncp.version import __version__
@@ -237,7 +238,7 @@ MCP_TOOLS: list[dict[str, object]] = [
             "properties": {
                 "from": {"type": "string", "description": "Sending agent ID"},
                 "target": {"type": "string", "description": "Receiving agent ID or '*' for pipeline broadcast"},
-                "type": {"type": "string", "enum": ["nudge", "alert", "share", "request", "dissent", "world_check", "consolidation_ready"]},
+                "type": {"type": "string", "enum": ["nudge", "alert", "share", "request", "dissent", "world_check", "consolidation_ready", "progress", "result"]},
                 "payload": {
                     "oneOf": [
                         {"type": "string"},
@@ -247,8 +248,9 @@ MCP_TOOLS: list[dict[str, object]] = [
                         "Whisper message (max 600 normalized chars). Structured-v1 objects "
                         "are recommended and type-validated: share/request use HandoffPayload; "
                         "dissent uses DissentPayload; alert and world_check use their named "
-                        "payloads. Legacy strings remain accepted; plain share/request/dissent "
-                        "text is wrapped into the required shape."
+                        "payloads; progress uses ProgressPayload and result uses ResultPayload "
+                        "(structured only). Legacy strings remain accepted; plain "
+                        "share/request/dissent text is wrapped into the required shape."
                     ),
                 },
                 "confidence": {"type": "number", "description": "Confidence 0.0-1.0"},
@@ -260,6 +262,22 @@ MCP_TOOLS: list[dict[str, object]] = [
                         "Optional chunk_id this whisper refers to. For a dissent whisper, set this "
                         "to the disputed chunk_id: it debits that chunk's trust and propagates the "
                         "penalty along its caused_by edge during feedback calibration."
+                    ),
+                },
+                "in_reply_to": {
+                    "type": "string",
+                    "description": (
+                        "Optional whisper_id this whisper answers (shown as id: in the "
+                        "receiver's [NCP:WHISPERS] entry). The reply joins that whisper's "
+                        "thread. progress/result whispers require in_reply_to or thread_id."
+                    ),
+                },
+                "thread_id": {
+                    "type": "string",
+                    "description": (
+                        "Optional explicit thread key. Defaults: the parent's thread for a "
+                        "reply, the whisper's own id for share/request. Unsigned routing "
+                        "metadata: signatures cover only the payload."
                     ),
                 },
                 "signature": {
@@ -373,6 +391,59 @@ MCP_TOOLS: list[dict[str, object]] = [
                                             "anchor_intent",
                                             "detected_drift",
                                         ],
+                                    },
+                                ],
+                            },
+                        },
+                    },
+                },
+                {
+                    "if": {
+                        "properties": {"type": {"enum": ["progress"]}},
+                        "required": ["type"],
+                    },
+                    "then": {
+                        "properties": {
+                            "payload": {
+                                "oneOf": [
+                                    {
+                                        "type": "object",
+                                        "title": "ProgressPayload",
+                                        "properties": {
+                                            "status": {"enum": ["working", "blocked", "waiting"]},
+                                            "pct": {"type": ["integer", "null"], "minimum": 0, "maximum": 100},
+                                            "note": {"type": ["string", "null"], "maxLength": 200},
+                                        },
+                                        "required": ["status"],
+                                    },
+                                ],
+                            },
+                        },
+                    },
+                },
+                {
+                    "if": {
+                        "properties": {"type": {"enum": ["result"]}},
+                        "required": ["type"],
+                    },
+                    "then": {
+                        "properties": {
+                            "payload": {
+                                "oneOf": [
+                                    {
+                                        "type": "object",
+                                        "title": "ResultPayload",
+                                        "properties": {
+                                            "status": {"enum": ["succeeded", "failed", "partial", "declined"]},
+                                            "summary": {"type": "string", "maxLength": 300},
+                                            "result_chunk_ids": {
+                                                "type": "array",
+                                                "items": {"type": "string"},
+                                                "maxItems": 10,
+                                            },
+                                            "turn_id": {"type": ["string", "null"]},
+                                        },
+                                        "required": ["status", "summary"],
                                     },
                                 ],
                             },
@@ -1689,6 +1760,8 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         from_agent = str(args["from"])
         pipeline_id = args.get("pipeline_id")
         signature = args.get("signature")
+        in_reply_to = args.get("in_reply_to")
+        thread_id = args.get("thread_id")
         whisper = Whisper(
             from_agent=from_agent,
             target=str(args["target"]),
@@ -1699,6 +1772,12 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             ttl_seconds=ttl_seconds,
             ref=None if ref is None else str(ref),
             verified=False,
+            in_reply_to=None if in_reply_to is None else str(in_reply_to),
+            thread_id=None if thread_id is None else str(thread_id),
+        )
+        whisper = resolve_whisper_thread(
+            whisper,
+            None if whisper.in_reply_to is None else store.get_whisper(whisper.in_reply_to),
         )
         # Signatures cover the exact normalized payload value that is stored.
         verified = _verify_authorship(
@@ -1717,8 +1796,11 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         store.emit_whisper(whisper)
         result: dict[str, object] = {
             "emitted": True,
+            "whisper_id": whisper.whisper_id,
             "payload_format": payload_format,
         }
+        if whisper.thread_id is not None:
+            result["thread_id"] = whisper.thread_id
         if signature is not None:
             result["verified"] = verified
         if whisper_type == "dissent" and ref:

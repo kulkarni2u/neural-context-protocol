@@ -526,6 +526,14 @@ class BaseStore(ABC):
     def whisper_pending(self, whisper_id: str) -> bool:
         """Return True if the whisper is still queued and not yet expired."""
 
+    def get_whisper(self, whisper_id: str) -> Whisper | None:
+        """Return a still-queued whisper by id, or None.
+
+        Used to resolve reply threads. Backends without lookup support return
+        None, which makes a reply fall back to ``thread_id = in_reply_to``.
+        """
+        return None
+
     # ------------------------------------------------------------------
     # Turn / cost / conscious logging
 
@@ -840,6 +848,10 @@ class BaseStore(ABC):
     async def async_emit_whisper(self, whisper: Whisper) -> None:
         """Asynchronously persist a whisper using thread pool."""
         await anyio.to_thread.run_sync(self.emit_whisper, whisper)
+
+    async def async_get_whisper(self, whisper_id: str) -> Whisper | None:
+        """Asynchronously look up a queued whisper using thread pool."""
+        return await anyio.to_thread.run_sync(self.get_whisper, whisper_id)
 
     async def async_record_dissent(self, chunk_id: str, *, identity_id: str | None = None) -> bool:
         """Asynchronously record a dissent against a chunk using thread pool."""

@@ -41,6 +41,11 @@ transcripts or stuffing prompts.
 - Send a bounded, directed signal with `ncp_emit_whisper` (handoff, dissent,
   drift report). Do not forward full history.
 - Acknowledge consumed whispers via `ncp_post_turn` (`pending_whisper_ids`).
+- To answer a `share`/`request` (its entry shows `id:<whisper_id>`), emit a
+  `progress` (`{"status", "pct"?, "note"?}`) or `result`
+  (`{"status", "summary", "result_chunk_ids"?, "turn_id"?}`) whisper with
+  `in_reply_to` set to that id. Put durable detail in memory and reference it
+  from `result_chunk_ids`.
 - Prefer a **structured-v1** object payload over a free-text string —
   legacy string payloads remain compatible, but typed objects give the
   receiving agent fields instead of a string to parse. NCP validates and

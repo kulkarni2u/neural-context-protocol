@@ -1892,6 +1892,11 @@ class PgvectorStore(BaseStore):
             min_confidence=min_confidence,
         )
 
+    def get_whisper(self, whisper_id: str) -> Whisper | None:
+        if self.coordination is None:
+            return None
+        return self.coordination.get_whisper(whisper_id)
+
     def acknowledge_whispers(self, whisper_ids: Sequence[str], *, agent_id: str | None = None) -> int:
         if self.coordination is None:
             raise NCPStoreUnavailableError(

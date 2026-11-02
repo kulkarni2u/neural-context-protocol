@@ -334,6 +334,7 @@ class TestSignedAuthorship:
         )
 
         result = _content(resp)
+        assert result.pop("whisper_id").startswith("wsp_")
         assert result == {
             "emitted": True,
             "payload_format": "legacy",
@@ -403,7 +404,9 @@ class TestSignedAuthorship:
             handlers,
         )
 
-        assert _content(verified) == {
+        verified_result = _content(verified)
+        assert verified_result.pop("whisper_id").startswith("wsp_")
+        assert verified_result == {
             "emitted": True,
             "payload_format": "legacy",
             "verified": True,

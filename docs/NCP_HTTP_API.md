@@ -208,12 +208,40 @@ the required JSON shape server-side. Dissent remains non-broadcast: a
   HandoffPayload (`ask`, optional `files` and `slice`); `dissent` requires a
   DissentPayload (`issue`, optional `alternatives`); `alert` requires
   `alert_code` and `description`; `world_check` requires `anchor_intent` and
-  `detected_drift`. An object whose shape does not match its `type` is rejected.
+  `detected_drift`; `progress` requires a ProgressPayload (`status`, optional
+  `pct` and `note`) and `result` a ResultPayload (`status`, `summary`, optional
+  `result_chunk_ids` and `turn_id`). `progress`/`result` accept structured
+  payloads only. An object whose shape does not match its `type` is rejected.
 
 Structured-v1 values are stored as sorted, compact JSON. A successful response
-includes `payload_format` (`"legacy"` or `"structured-v1"`). If `signature` is
-provided, the response also includes `verified`; signatures cover the exact
-normalized payload that is stored, rather than the input object's key order.
+includes `whisper_id` and `payload_format` (`"legacy"` or `"structured-v1"`),
+plus `thread_id` when the whisper is threaded. If `signature` is provided, the
+response also includes `verified`; signatures cover the exact normalized
+payload that is stored, rather than the input object's key order.
+
+**Request/reply threads.** A `share`/`request` opens a thread keyed by its own
+`whisper_id`; the receiver sees it as `id:<whisper_id>` in its
+`[NCP:WHISPERS]` entry. Reply with `progress`/`result` and `in_reply_to` set to
+that id:
+
+```bash
+curl -s $BASE/mcp -H "$AUTH" -H 'Content-Type: application/json' -d '{
+  "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+  "params": {"name": "ncp_emit_whisper", "arguments": {
+    "from": "reviewer", "target": "executor", "type": "result",
+    "payload": {"status": "failed", "summary": "race in retry loop",
+                "result_chunk_ids": ["sub_9c1"]},
+    "confidence": 0.8, "pipeline_id": "pipe_demo", "in_reply_to": "wsp_3f2a"
+  }}}'
+```
+
+`progress`/`result` require `in_reply_to` or `thread_id` and cannot target
+`"*"`. A reply joins its parent's thread if the parent is still queued and
+otherwise uses `thread_id = in_reply_to`, so replying after acknowledging the
+request is fine. A newer `progress` on the same thread from the same sender
+replaces the older undelivered one. `result` is delivered regardless of
+`min_confidence` and ordered right after `alert`. `in_reply_to`/`thread_id`
+are unsigned routing metadata.
 
 ### ncp_fetch — bounded mid-turn retrieval
 

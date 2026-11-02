@@ -110,8 +110,8 @@ meant to *point* at durable memory, not hold it. This matches the
 
 | Type | Confidence filter | Broadcast `*` | Linkage required | Ordering |
 |---|---|---|---|---|
-| `progress` | yes (`min_confidence`) | prohibited | `in_reply_to` or `task_id` | after `alert` |
-| `result` | **no** (like `world_check`) | prohibited | `in_reply_to` or `task_id` | right after `alert` |
+| `progress` | yes (`min_confidence`) | prohibited | `in_reply_to` or `thread_id` (or `task_id` after C) | after `alert` |
+| `result` | **no** (like `world_check`) | prohibited | `in_reply_to` or `thread_id` (or `task_id` after C) | right after `alert` |
 
 - **Progress coalescing.** When a `progress` whisper is emitted, any
   undelivered `progress` whisper with the same
@@ -123,21 +123,29 @@ meant to *point* at durable memory, not hold it. This matches the
 
 ### 3.4 Rendering
 
-In the `[NCP:WHISPERS]` entry header, `re:` and `th:` tokens appear only
-when the fields are set:
+A receiver can only reply if it can see the id it is replying to, and today
+the whisper id never appears in the context text. So a threaded whisper's
+`[NCP:WHISPERS]` header gains:
+
+- `id:<whisper_id>`, always, for a threaded whisper.
+- `re:<in_reply_to>`, when set.
+- `th:<thread_id>`, only when it differs from both `id` and `re`.
 
 ```
-wsp from:reviewer to:router t:result c:0.9 age:<1m re:wsp_3f2a th:wsp_3f2a
+wsp from:router to:reviewer t:request c:0.9 age:<1m id:wsp_3f2a
+wsp from:reviewer to:router t:result c:0.9 age:<1m id:wsp_7b10 re:wsp_3f2a
 ```
 
-Existing whispers render byte-for-byte as before. A golden test guards this.
+Unthreaded whispers, including every whisper stored before this change,
+render byte-for-byte as before. Newly emitted `share`/`request` whispers are
+threaded, so they show `id:`. A test guards both cases.
 
 ### 3.5 Storage
 
 | Backend | Change |
 |---|---|
 | SQLite | `ALTER TABLE whispers ADD COLUMN in_reply_to TEXT`, `ADD COLUMN thread_id TEXT`, and `CREATE INDEX idx_whispers_thread ON whispers(pipeline_id, thread_id)`. Added through the existing idempotent `ALTER` list in `sqlite.py`. |
-| pgvector (sync and async) | Whispers live in Redis (`RedisCoordination`), so there is no SQL migration. The payload hash stores `model_dump()`, so the new fields flow through once they are on the model. Coalescing needs a small Lua script, or `WATCH`/`MULTI`, keyed by thread. |
+| pgvector (sync and async) | Whispers live in Redis (`RedisCoordination` / `AsyncRedisCoordination`), so there is no SQL migration. The payload hash gains `in_reply_to` and `thread_id`. Coalescing scans the target's index and deletes matching older progress entries. This is best-effort under concurrency: two simultaneous emits can both survive, costing one extra queue entry. A Lua script can make it atomic later if needed. |
 
 ### 3.6 Tool surface
 

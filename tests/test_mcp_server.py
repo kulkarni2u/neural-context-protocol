@@ -313,6 +313,8 @@ class TestToolsList:
             ("dissent",): ["string", "DissentPayload"],
             ("alert",): ["string", "AlertPayload"],
             ("world_check",): ["string", "WorldCheckPayload"],
+            ("progress",): ["ProgressPayload"],
+            ("result",): ["ResultPayload"],
             ("nudge", "consolidation_ready"): ["string"],
         }
 

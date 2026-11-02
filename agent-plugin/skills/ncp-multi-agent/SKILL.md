@@ -22,7 +22,17 @@ pipeline broadcast), not a transcript. Required: `from`, `target`, `type`,
 | `dissent`              | Disagreement with a specific chunk | `{"issue": "...", "alternatives"?: [...]}` |
 | `alert`                | Something needs attention now | `{"alert_code": "...", "description": "..."}` |
 | `world_check`          | Report detected drift from the stated intent | `{"anchor_intent": "...", "detected_drift": 0.0-1.0}` |
+| `progress`             | Report status on a request you're working (reply only) | `{"status": "working"\|"blocked"\|"waiting", "pct"?: 0-100, "note"?: "..."}` |
+| `result`               | Report the outcome of a request (reply only) | `{"status": "succeeded"\|"failed"\|"partial"\|"declined", "summary": "...", "result_chunk_ids"?: [...], "turn_id"?: "..."}` |
 | `nudge` / `consolidation_ready` | Lightweight signal, plain string payload | string |
+
+Replying on a thread: a `share`/`request` entry in `[NCP:WHISPERS]` carries
+`id:<whisper_id>`. Answer it with `progress`/`result` and set
+`in_reply_to` to that id (both types require `in_reply_to` or `thread_id`
+and cannot broadcast). Repeated `progress` on the same thread replaces the
+older undelivered one, and `result` is always delivered regardless of
+confidence. Keep `summary` to the distilled finding and put durable detail in
+memory (`ncp_write_memory`), referenced via `result_chunk_ids`.
 
 Whisper hygiene:
 

@@ -59,8 +59,10 @@ from ncp.types import (
     DecisionRecord,
     OutcomeRecord,
     SubconsciousChunk,
+    CONFIDENCE_EXEMPT_WHISPER_TYPES,
     TurnRecord,
     Whisper,
+    resolve_whisper_thread,
 )
 
 logger = logging.getLogger("ncp")
@@ -146,7 +148,9 @@ CREATE TABLE IF NOT EXISTS whispers (
     dissent_target TEXT,
     verified INTEGER DEFAULT 0,
     created_at REAL NOT NULL,
-    expires_at REAL NOT NULL
+    expires_at REAL NOT NULL,
+    in_reply_to TEXT,
+    thread_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS whisper_deliveries (
@@ -447,6 +451,9 @@ class SQLiteStore(BaseStore):
                 "ALTER TABLE cost_log ADD COLUMN cost_source TEXT NOT NULL DEFAULT 'measured'",  # CAP-E1
                 "ALTER TABLE chunks ADD COLUMN verified INTEGER DEFAULT 0",  # CAP-T1/WI-013
                 "ALTER TABLE whispers ADD COLUMN verified INTEGER DEFAULT 0",  # CAP-T1/WI-013
+                "ALTER TABLE whispers ADD COLUMN in_reply_to TEXT",  # coordination A
+                "ALTER TABLE whispers ADD COLUMN thread_id TEXT",  # coordination A
+                "CREATE INDEX IF NOT EXISTS idx_whispers_thread ON whispers(pipeline_id, thread_id)",
                 "ALTER TABLE chunks ADD COLUMN embedding BLOB",  # CAP-C4
                 "ALTER TABLE memo_entries ADD COLUMN output_tokens_est INTEGER NOT NULL DEFAULT 0",  # S4.1 memo telemetry
                 "ALTER TABLE chunks ADD COLUMN valid_from REAL",  # CAP-C5
@@ -1695,16 +1702,52 @@ class SQLiteStore(BaseStore):
 
         return {"nodes": nodes, "edges": edges}
 
+    def get_whisper(self, whisper_id: str) -> Whisper | None:
+        now = time.time()
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM whispers WHERE whisper_id = ? AND expires_at > ?",
+                (whisper_id, now),
+            ).fetchone()
+        return None if row is None else self._row_to_whisper(row)
+
     def emit_whisper(self, whisper: Whisper) -> None:
         whisper = Whisper.model_validate(whisper.model_dump())
         with self._connect() as connection:
             self._soft_gc(connection)
+            if whisper.thread_id is None and whisper.in_reply_to is not None:
+                parent_row = connection.execute(
+                    "SELECT * FROM whispers WHERE whisper_id = ?",
+                    (whisper.in_reply_to,),
+                ).fetchone()
+                parent = None if parent_row is None else self._row_to_whisper(parent_row)
+                whisper = resolve_whisper_thread(whisper, parent)
+            else:
+                whisper = resolve_whisper_thread(whisper)
+            if whisper.whisper_type == "progress":
+                # Coalesce: a newer progress report on the same thread
+                # replaces any still-undelivered older one.
+                connection.execute(
+                    """
+                    DELETE FROM whispers
+                    WHERE whisper_type = 'progress' AND from_agent = ? AND target = ?
+                      AND thread_id = ? AND pipeline_id IS ? AND whisper_id != ?
+                    """,
+                    (
+                        whisper.from_agent,
+                        whisper.target,
+                        whisper.thread_id,
+                        whisper.pipeline_id,
+                        whisper.whisper_id,
+                    ),
+                )
             connection.execute(
                 """
                 INSERT OR REPLACE INTO whispers (
                     whisper_id, pipeline_id, from_agent, target, whisper_type,
-                    payload, confidence, ref, dissent_target, verified, created_at, expires_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    payload, confidence, ref, dissent_target, verified, created_at, expires_at,
+                    in_reply_to, thread_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     whisper.whisper_id,
@@ -1719,6 +1762,8 @@ class SQLiteStore(BaseStore):
                     1 if whisper.verified else 0,
                     whisper.created_at,
                     whisper.created_at + whisper.ttl_seconds,
+                    whisper.in_reply_to,
+                    whisper.thread_id,
                 ),
             )
 
@@ -2621,7 +2666,7 @@ class SQLiteStore(BaseStore):
             costs = connection.execute("SELECT COALESCE(SUM(cost_usd), 0.0) AS total FROM cost_log").fetchone()["total"]
             below_conf = connection.execute(
                 "SELECT COUNT(*) AS count FROM whispers"
-                " WHERE expires_at > ? AND whisper_type NOT IN ('alert', 'world_check') AND confidence < 0.60",
+                " WHERE expires_at > ? AND whisper_type NOT IN ('alert', 'world_check', 'result') AND confidence < 0.60",
                 (now,),
             ).fetchone()["count"]
         return {
@@ -2658,7 +2703,7 @@ class SQLiteStore(BaseStore):
                 "whispers_below_min_confidence": int(
                     connection.execute(
                         "SELECT COUNT(*) AS count FROM whispers"
-                        " WHERE expires_at > ? AND whisper_type NOT IN ('alert', 'world_check')"
+                        " WHERE expires_at > ? AND whisper_type NOT IN ('alert', 'world_check', 'result')"
                         " AND confidence < 0.60"
                         + (" AND pipeline_id = ?" if pipeline_id is not None else ""),
                         (time.time(), pipeline_id) if pipeline_id is not None else (time.time(),),
@@ -3015,7 +3060,8 @@ class SQLiteStore(BaseStore):
             rows = connection.execute(
                 f"""
                 SELECT whisper_id, pipeline_id, from_agent, target, whisper_type,
-                       payload, confidence, ref, created_at, expires_at
+                       payload, confidence, ref, created_at, expires_at,
+                       in_reply_to, thread_id
                 FROM whispers
                 {where}
                 ORDER BY created_at DESC
@@ -3736,6 +3782,8 @@ class SQLiteStore(BaseStore):
             ttl_seconds=ttl_seconds,
             pipeline_id=row["pipeline_id"],
             verified=bool(row["verified"]) if "verified" in row.keys() and row["verified"] is not None else False,
+            in_reply_to=row["in_reply_to"] if "in_reply_to" in row.keys() else None,
+            thread_id=row["thread_id"] if "thread_id" in row.keys() else None,
         )
 
     def _select_whispers(
@@ -3762,7 +3810,7 @@ class SQLiteStore(BaseStore):
             f"""
             SELECT * FROM whispers
             WHERE {' AND '.join(clauses)}
-            ORDER BY CASE WHEN whisper_type = 'alert' THEN 0 ELSE 1 END, created_at ASC
+            ORDER BY CASE whisper_type WHEN 'alert' THEN 0 WHEN 'result' THEN 1 ELSE 2 END, created_at ASC
             """,
             params,
         ).fetchall()
@@ -3770,7 +3818,7 @@ class SQLiteStore(BaseStore):
         selected: list[Whisper] = []
         for row in rows:
             whisper = self._row_to_whisper(row)
-            if whisper.whisper_type not in {"alert", "world_check"} and whisper.confidence < min_confidence:
+            if whisper.whisper_type not in CONFIDENCE_EXEMPT_WHISPER_TYPES and whisper.confidence < min_confidence:
                 continue
             selected.append(whisper)
             if len(selected) >= max_items:

@@ -1431,6 +1431,12 @@ class AsyncPgvectorStore(BaseStore):
             "whisper_queue": whisper_queue,
         }
 
+    async def async_get_whisper(self, whisper_id: str) -> Whisper | None:
+        """Look up a queued whisper via native async Redis coordination."""
+        if self._acoordination is None:
+            return None
+        return await self._acoordination.get_whisper(whisper_id)
+
     async def async_emit_whisper(self, whisper: Whisper) -> None:
         """Emit whisper via native async Redis coordination (no thread shim)."""
         if self._acoordination is None:

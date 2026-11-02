@@ -194,7 +194,8 @@ Required fields:
   from_agent      str
   target          str         agent_id or "*" — scoped to pipeline_id
   whisper_type    Literal     nudge|alert|share|request|dissent|
-                              world_check|consolidation_ready
+                              world_check|consolidation_ready|sensor|
+                              progress|result
   payload         str         max 600 chars (~120 tok)
   confidence      float       0.0-1.0
 
@@ -205,13 +206,34 @@ Optional fields:
   ttl_seconds     int = 1800
   pipeline_id     str?
   dissent_target  str?        explicit target for dissent routing
+  in_reply_to     str?        whisper_id this whisper answers (unsigned)
+  thread_id       str?        conversation key (unsigned; resolved on emit)
 
 Routing rules:
   alert:  injected first, regardless of confidence threshold
+  result: injected right after alerts, regardless of confidence threshold
   dissent: target must be specific agent_id — broadcast prohibited
+  progress/result: target must be specific agent_id — broadcast prohibited;
+                   in_reply_to or thread_id required
   world_check: injected regardless of confidence threshold
-  nudge/share/request: filtered at min_confidence (default 0.60)
+  nudge/share/request/progress: filtered at min_confidence (default 0.60)
   broadcast (*): scoped to pipeline_id — cannot cross pipelines
+
+Thread resolution on emit (idempotent):
+  1. explicit thread_id is kept
+  2. in_reply_to set: parent's thread_id (or parent whisper_id) if the parent
+     is still queued; otherwise thread_id = in_reply_to (acknowledged parents
+     are deleted, so replies after ack MUST still be accepted)
+  3. share/request: thread_id = own whisper_id
+  otherwise unthreaded
+
+Progress coalescing: emitting a progress whisper deletes any queued progress
+whisper with the same (pipeline_id, from_agent, target, thread_id). Best-effort
+under concurrency on the Redis backend.
+
+Wire rendering: a threaded whisper's [NCP:WHISPERS] header gains
+`id:<whisper_id>`, `re:<in_reply_to>` when set, and `th:<thread_id>` only when
+it differs from both. Unthreaded whispers render unchanged.
 ```
 
 `ncp_emit_whisper` accepts either a legacy string or a `structured-v1` object.
@@ -219,8 +241,12 @@ Structured-v1 is the recommended representation: `share` and `request` use
 `HandoffPayload` (`ask`, optional `files` and `slice`), `dissent` uses
 `DissentPayload` (`issue`, optional `alternatives`), `alert` uses
 `AlertPayload` (`alert_code`, `description`), and `world_check` uses
-`WorldCheckPayload` (`anchor_intent`, `detected_drift`). The object shape MUST
-match its whisper type; in particular, dissent stays type-validated and is
+`WorldCheckPayload` (`anchor_intent`, `detected_drift`), `progress` uses
+`ProgressPayload` (`status`: working|blocked|waiting, optional `pct` 0-100 and
+`note` ≤ 200 chars) and `result` uses `ResultPayload` (`status`:
+succeeded|failed|partial|declined, `summary` ≤ 300 chars, optional
+`result_chunk_ids` ≤ 10 and `turn_id`). `progress` and `result` accept
+structured payloads only. The object shape MUST match its whisper type; in particular, dissent stays type-validated and is
 never broadcast.
 
 Strings remain supported for the current major version. This includes the

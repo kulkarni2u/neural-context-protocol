@@ -4,6 +4,38 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Request/reply whisper threads** (`ncp/types.py`, `ncp/stores/sqlite.py`,
+  `ncp/stores/redis_coordination.py`, `ncp/encoder.py`, `ncp/mcp/server.py`):
+  first step of the router coordination primitives
+  (`docs/specs/2026-11-02-ncp-coordination-primitives-design.md`, capability
+  A). Whispers gain optional `in_reply_to` and `thread_id`. A `share`/`request`
+  opens a thread keyed by its own `whisper_id`; a reply joins its parent's
+  thread, or uses `in_reply_to` as the thread key when the parent was already
+  acknowledged. New whisper types `progress` (`ProgressPayload`) and `result`
+  (`ResultPayload`) are reply-only: they require `in_reply_to` or `thread_id`
+  and cannot broadcast. A newer `progress` on a thread replaces the older
+  undelivered one, and `result` skips the confidence filter and is delivered
+  right after alerts. `ncp_emit_whisper` takes `in_reply_to`/`thread_id` and
+  now returns `whisper_id` (and `thread_id` when threaded). Stores gain
+  `get_whisper`/`async_get_whisper`.
+
+### Changed
+
+- Threaded whispers render `id:`, `re:` and (when it adds information) `th:`
+  tokens in their `[NCP:WHISPERS]` header, so a receiver can reply. Newly
+  emitted `share`/`request` whispers are threaded and therefore show `id:`;
+  unthreaded whispers render byte-for-byte as before.
+
+### Upgrade notes
+
+- SQLite adds `whispers.in_reply_to`, `whispers.thread_id` and
+  `idx_whispers_thread` idempotently on open. Postgres needs no migration:
+  whispers live in Redis, whose hashes gain the two fields.
+- `in_reply_to`/`thread_id` are unsigned routing metadata; authorship
+  signatures still cover only the payload.
+
 ## [1.7.1] - 2026-10-30
 
 ### Release scope

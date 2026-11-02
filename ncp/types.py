@@ -34,7 +34,26 @@ WhisperType = Literal[
     "world_check",
     "consolidation_ready",
     "sensor",
+    "progress",
+    "result",
 ]
+# Coordination primitives (docs/specs/2026-11-02-ncp-coordination-primitives-design.md, A):
+# a request/share whisper opens a thread keyed by its own whisper_id; progress/result
+# whispers report back on a thread and must carry linkage.
+THREAD_OPENING_WHISPER_TYPES: frozenset[str] = frozenset({"request", "share"})
+THREAD_REPLY_WHISPER_TYPES: frozenset[str] = frozenset({"progress", "result"})
+# Whisper types delivered regardless of the min_confidence filter.
+CONFIDENCE_EXEMPT_WHISPER_TYPES: frozenset[str] = frozenset({"alert", "world_check", "result"})
+
+
+def whisper_delivery_rank(whisper_type: str) -> int:
+    """Delivery ordering bucket: alerts first, then results, then everything else."""
+
+    if whisper_type == "alert":
+        return 0
+    if whisper_type == "result":
+        return 1
+    return 2
 # Graph engineering: closed set of typed relationships between chunks.
 # src <type> dst reads "src <type> dst" (e.g. src caused_by dst = dst is the
 # parent/cause of src). Legacy caused_by/supersedes scalar columns remain
@@ -394,12 +413,81 @@ class WorldCheckPayload(NCPModel):
     detected_drift: float
 
 
+class ProgressPayload(NCPModel):
+    """Structured payload for progress whispers (a worker reporting on a thread)."""
+
+    status: Literal["working", "blocked", "waiting"]
+    pct: int | None = None
+    note: str | None = None
+
+    @field_validator("pct")
+    @classmethod
+    def _pct_in_range(cls, value: int | None) -> int | None:
+        if value is not None and not 0 <= value <= 100:
+            raise ValueError("pct must be between 0 and 100")
+        return value
+
+    @field_validator("note")
+    @classmethod
+    def _note_bounded(cls, value: str | None) -> str | None:
+        if value is not None and len(value) > 200:
+            raise ValueError("note must be <= 200 characters")
+        return value
+
+
+class ResultPayload(NCPModel):
+    """Structured payload for result whispers.
+
+    The summary is the distilled finding; durable detail belongs in memory
+    chunks referenced by ``result_chunk_ids``.
+    """
+
+    status: Literal["succeeded", "failed", "partial", "declined"]
+    summary: str
+    result_chunk_ids: list[str] = Field(default_factory=list)
+    turn_id: str | None = None
+
+    @field_validator("summary")
+    @classmethod
+    def _summary_bounded(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("summary must not be empty")
+        if len(value) > 300:
+            raise ValueError("summary must be <= 300 characters")
+        return value
+
+    @field_validator("result_chunk_ids")
+    @classmethod
+    def _chunk_ids_bounded(cls, value: list[str]) -> list[str]:
+        if len(value) > 10:
+            raise ValueError("result_chunk_ids must have at most 10 entries")
+        for chunk_id in value:
+            _validate_no_spaces(chunk_id, "result_chunk_ids")
+        return value
+
+    @field_validator("turn_id")
+    @classmethod
+    def _turn_id_no_spaces(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        return _validate_no_spaces(value, "turn_id")
+
+
 WhisperPayloadFormat = Literal["legacy", "structured-v1"]
+
+WhisperPayloadModel = (
+    type[HandoffPayload]
+    | type[DissentPayload]
+    | type[AlertPayload]
+    | type[WorldCheckPayload]
+    | type[ProgressPayload]
+    | type[ResultPayload]
+)
 
 
 def _whisper_payload_model(
     whisper_type: WhisperType,
-) -> type[HandoffPayload] | type[DissentPayload] | type[AlertPayload] | type[WorldCheckPayload] | None:
+) -> WhisperPayloadModel | None:
     if whisper_type in {"share", "request"}:
         return HandoffPayload
     if whisper_type == "dissent":
@@ -408,6 +496,10 @@ def _whisper_payload_model(
         return AlertPayload
     if whisper_type == "world_check":
         return WorldCheckPayload
+    if whisper_type == "progress":
+        return ProgressPayload
+    if whisper_type == "result":
+        return ResultPayload
     return None
 
 
@@ -490,6 +582,10 @@ class Whisper(NCPModel):
     dissent_target: str | None = None
     # CAP-T1/WI-013: authorship verification status (see SubconsciousChunk).
     verified: bool = False
+    # Coordination primitives A: request/reply linkage. Unsigned routing
+    # metadata -- authorship signatures still cover only the payload.
+    in_reply_to: str | None = None
+    thread_id: str | None = None
 
     @field_validator("from_agent", "target", "whisper_id")
     @classmethod
@@ -497,7 +593,7 @@ class Whisper(NCPModel):
         field_name = getattr(info, "field_name", "field")
         return _validate_no_spaces(value, field_name)
 
-    @field_validator("ref", "pipeline_id", "dissent_target")
+    @field_validator("ref", "pipeline_id", "dissent_target", "in_reply_to", "thread_id")
     @classmethod
     def _optional_whisper_no_spaces(cls, value: str | None, info: object) -> str | None:
         if value is None:
@@ -530,6 +626,13 @@ class Whisper(NCPModel):
     def _validate_whisper_and_payload(self) -> Self:
         if self.whisper_type == "dissent" and self.target == "*":
             raise ValueError("dissent whispers cannot target '*'")
+        if self.whisper_type in THREAD_REPLY_WHISPER_TYPES:
+            if self.target == "*":
+                raise ValueError(f"{self.whisper_type} whispers cannot target '*'")
+            if self.in_reply_to is None and self.thread_id is None:
+                raise ValueError(
+                    f"{self.whisper_type} whispers require in_reply_to or thread_id"
+                )
 
         raw_payload = self.payload
         parsed = None
@@ -578,6 +681,35 @@ class Whisper(NCPModel):
             raise ValueError("payload must be <= 600 characters")
 
         return self
+
+
+def resolve_whisper_thread(whisper: Whisper, parent: Whisper | None = None) -> Whisper:
+    """Fill ``thread_id`` on a whisper about to be emitted.
+
+    Rules (idempotent, so emitting an already-resolved whisper is a no-op):
+
+    1. An explicit ``thread_id`` is kept.
+    2. A reply (``in_reply_to`` set) joins its parent's thread when the parent
+       is still queued; otherwise -- the parent was already acknowledged and
+       deleted -- the thread is keyed by ``in_reply_to`` itself.
+    3. A ``request``/``share`` opens a thread keyed by its own ``whisper_id``.
+
+    Other whispers stay unthreaded. The returned whisper is a copy.
+    """
+
+    if whisper.thread_id is not None:
+        return whisper
+    thread_id: str | None = None
+    if whisper.in_reply_to is not None:
+        if parent is not None and parent.whisper_id == whisper.in_reply_to:
+            thread_id = parent.thread_id or parent.whisper_id
+        else:
+            thread_id = whisper.in_reply_to
+    elif whisper.whisper_type in THREAD_OPENING_WHISPER_TYPES:
+        thread_id = whisper.whisper_id
+    if thread_id is None:
+        return whisper
+    return whisper.model_copy(update={"thread_id": thread_id})
 
 
 
