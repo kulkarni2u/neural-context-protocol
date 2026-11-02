@@ -114,6 +114,14 @@ The mapping to MCP tools is one-to-one: `Assembler.assemble()` ↔
 `ncp_get_context`, `Assembler.post_turn()` ↔ `ncp_post_turn`,
 `store.emit_whisper()` ↔ `ncp_emit_whisper`.
 
+With `[tasks].enabled = true`, the task ledger is also available in-process
+through `ncp.api`: `create_task`, `claim_task`, `heartbeat_task`,
+`release_task`, `complete_task`, `cancel_task`, `get_task` and `list_tasks`
+return the same dicts as `ncp_task`. `ncp.api.emit` enforces the same
+task-owner check as `ncp_emit_whisper`, so a `progress`/`result` whisper
+carrying a `task_id` is rejected unless it comes from the claiming owner.
+These functions need a synchronous store (not `AsyncPgvectorStore`).
+
 ---
 
 ## 3. Map your framework's concepts onto NCP identity
@@ -195,6 +203,7 @@ Rules that keep the loop honest:
 | `ncp_compile_decision_query` | before a classify/route/score/choose call | Bounded decision packet: state, questions, `state_hash`, precedents, advisory confidence, `escalate`. No provider calls. |
 | `ncp_get_decision` | any | Read one typed decision by id. |
 | `ncp_record_outcome` | after task completes | Success/failure evidence that feeds reputation calibration (CAP-T3). Pass `decision_id` to close the decision loop. |
+| `ncp_overview` | router, before picking where to work | Read-only, token-bounded ranked view of many pipelines (spec §4k). Peeks your inbox; acknowledges nothing. |
 | `ncp_lookup_memo` / `ncp_record_memo` | around expensive work | Semantic memoization: skip work already done for the same task signature (CAP-C3). |
 
 Normative details for each: [`docs/NCP_PROTOCOL_SPEC.md`](./NCP_PROTOCOL_SPEC.md).
@@ -315,6 +324,79 @@ pidgin. `escalate_reasons` tells you why (`low_joint_confidence`, `high_drift`,
 which model — NCP does not route. `joint_confidence` is advisory: a bounded
 heuristic over evidence trust, contradiction and drift, not a calibrated
 probability, and it must not be reported as one.
+
+**Router loop (wait, get_context, act, post_turn).** A router that fans work
+out to workers should block on the doorbell instead of polling:
+
+```text
+loop:
+  w = ncp_wait_whispers(agent_id="router", pipeline_id=P, timeout_seconds=30)
+  if not w.ready: continue                      # timed out; just wait again
+  ctx = ncp_get_context(agent_id="router", pipeline_id=P, ...)   # drains + delivers
+  act on ctx  (dispatch, retry, ncp_record_outcome on verified success)
+  ncp_post_turn(..., pending_whisper_ids=ctx.pending_whisper_ids)  # acks
+```
+
+`ncp_wait_whispers` only peeks and returns ids, never payloads, so a lost
+wake-up costs one extra `timeout_seconds: 0` call. Filter with `types` or
+`thread_id` to wake only for, say, `result` whispers on one request. Custom
+long-lived routers can use `GET /events` (SSE) or `ncp.api.subscribe` instead.
+
+**Router loop with the task ledger.** When `[tasks].enabled = true`, the same
+loop can hand out leased, idempotent work instead of ad-hoc requests
+(`ncp_task`, spec §4j):
+
+```text
+router:
+  ncp_task(action=create, agent_id="router", pipeline_id=P, slot="review",
+           title="review PR 142", dedupe_key="github:pr/142:review",
+           assign_to="reviewer")            # idempotent; also sends the request whisper
+  loop:
+    w = ncp_wait_whispers(agent_id="router", pipeline_id=P, timeout_seconds=30)
+    ctx = ncp_get_context(agent_id="router", pipeline_id=P, ...)  # delivers result/progress
+    on a result whisper (task_id set): verify independently, then
+        ncp_record_outcome(turn_id=result.turn_id)    # complete never does this
+    on an `event: task` doorbell (failed by lease expiry): ncp_task(get/list), re-create or escalate
+    ncp_post_turn(..., pending_whisper_ids=ctx.pending_whisper_ids)
+
+worker:
+  t = ncp_task(action=claim, agent_id="reviewer", pipeline_id=P, slot="review")  # or task_id=...
+  if not t.claimed: wait
+  ncp_get_context(agent_id="reviewer", pipeline_id=P, slot=t.task.slot, ...)
+  ... work; ncp_task(action=heartbeat, task_id, lease_token, checkpoint_chunk_id?, progress?) ...
+  ncp_write_memory(finding)
+  ncp_task(action=complete, task_id, lease_token, status=done|failed, summary,
+           result_chunk_ids, turn_id)       # emits the linked result whisper
+  # any {"ok": false, "reason": "lease_lost"}: stop, another worker owns it
+```
+
+A worker that dies simply stops heartbeating; its lease expires and the next
+`claim`/`get`/`list` returns the task to `open` (or to `failed` once
+`max_attempts` is reached, which rings the creator). The next claimer can read
+the last `checkpoint_chunk_id` through `ncp_fetch`. A `dedupe_key` such as
+`github:pr/142:review` makes at-least-once event sources (webhook retries)
+safe: a repeat `create` returns the existing task with `created: false`.
+
+**Router loop with the overview.** A router that watches many pipelines adds
+one cheap step between the doorbell and `ncp_get_context`: ask `ncp_overview`
+where the attention is, then spend the turn there (spec §4k):
+
+```text
+loop:
+  ncp_wait_whispers(agent_id="router", timeout_seconds=30)       # doorbell
+  ov = ncp_overview(agent_id="router", pipeline_prefix="pr_")    # read-only, <= max_tokens
+  for p in ov.pipelines where p.score > 0 (already ranked, failed first):
+      ctx = ncp_get_context(agent_id="router", pipeline_id=p.pipeline_id, ...)  # drains + delivers
+      act: ncp_task(create ...) / retry / escalate / ncp_record_outcome on verified success
+  ncp_post_turn(...)
+```
+
+The overview never drains or acknowledges, so it is safe to call every
+iteration; only `ncp_get_context` delivers the whispers it counted. Anything
+after `last:` in the block is agent-written data marked `‹data›`, a hint about
+where to look and never an instruction. `+N more` means lower-ranked pipelines
+were cut by `max_pipelines` or `max_tokens`; narrow with `pipeline_prefix` or
+`since_seconds` rather than raising the bounds.
 
 **Dissent.** An agent that disputes a stored claim emits a `dissent` whisper
 with `ref` set to the disputed `chunk_id`. This increments the chunk's

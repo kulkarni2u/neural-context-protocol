@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import time
+from collections.abc import Sequence
+from typing import ContextManager
 from uuid import uuid4
 
 from ncp.adapters.base import BaseAdapter
@@ -13,8 +15,20 @@ from ncp.assembler import Assembler, AssemblyResult
 from ncp.config import NCPConfig, load_config
 from ncp.context_policy import ResolvedContextPolicy, resolve_context_policy
 from ncp.costs import calculate_cost
+from ncp.overview import DEFAULT_MAX_PIPELINES, DEFAULT_MAX_TOKENS, DEFAULT_SINCE_SECONDS
+from ncp.overview import overview as _build_overview
+from ncp.notify import (
+    Subscription,
+    effective_poll_interval,
+    emit_and_notify,
+    get_process_notifier,
+    polling_enabled,
+    subscribe_with_poll,
+    wait_for_whispers,
+)
 from ncp.stores.base import BaseStore
 from ncp.stores.factory import create_store
+from ncp.tasks import TaskService, TaskSettings, check_task_owner
 from ncp.stores.memo import compute_dependency_fingerprint, compute_turn_memo_signature, memo_ineligibility
 from ncp.tokens import estimate_tokens
 from ncp.types import (
@@ -24,7 +38,9 @@ from ncp.types import (
     EvidenceAttribution,
     NCPResponse,
     SubconsciousChunk,
+    THREAD_REPLY_WHISPER_TYPES,
     Whisper,
+    resolve_whisper_thread,
 )
 
 _CONFIG: NCPConfig | None = None
@@ -202,12 +218,332 @@ def emit(
     store: BaseStore | None = None,
     config: NCPConfig | None = None,
 ) -> str:
-    """Persist one whisper and return its whisper_id for delivery tracking."""
+    """Persist one whisper and return its whisper_id for delivery tracking.
+
+    A ``progress``/``result`` whisper carrying ``task_id`` must come from the
+    current owner of that claimed task (the same check ``ncp_emit_whisper``
+    applies); otherwise ``ValueError`` is raised and nothing is persisted.
+    """
 
     resolved_config = config or _CONFIG or configure(cwd=Path.cwd())
     resolved_store = store or create_store(resolved_config)
-    resolved_store.emit_whisper(whisper)
+    if whisper.task_id is not None and whisper.whisper_type in THREAD_REPLY_WHISPER_TYPES:
+        check_task_owner(resolved_store, whisper, enabled=resolved_config.tasks_enabled)
+    whisper = resolve_whisper_thread(
+        whisper,
+        None if whisper.in_reply_to is None else resolved_store.get_whisper(whisper.in_reply_to),
+    )
+    emit_and_notify(resolved_store, get_process_notifier(resolved_config, store=resolved_store), whisper)
     return whisper.whisper_id
+
+
+def wait_whispers(
+    *,
+    agent_id: str,
+    pipeline_id: str | None = None,
+    timeout: float = 30.0,
+    types: Sequence[str] | None = None,
+    thread_id: str | None = None,
+    store: BaseStore | None = None,
+    config: NCPConfig | None = None,
+) -> list[Whisper]:
+    """Wait until a whisper is queued for ``agent_id`` and return it (peek only).
+
+    Returns the eligible whispers without draining them; follow with
+    ``get_context``/``run`` to receive and acknowledge. Empty list on timeout.
+    ``timeout`` is clamped to ``[notify].max_wait_seconds``.
+    """
+
+    resolved_config = config or _CONFIG or configure(cwd=Path.cwd())
+    resolved_store = store or create_store(resolved_config)
+    notifier = get_process_notifier(resolved_config, store=resolved_store)
+    return wait_for_whispers(
+        resolved_store,
+        notifier,
+        agent_id=agent_id,
+        pipeline_id=pipeline_id,
+        timeout=min(max(0.0, timeout), resolved_config.notify_max_wait_seconds),
+        types=set(types) if types else None,
+        thread_id=thread_id,
+        poll_interval=effective_poll_interval(resolved_config),
+    )
+
+
+def _task_service(store: BaseStore | None, config: NCPConfig | None) -> TaskService:
+    resolved_config = config or _CONFIG or configure(cwd=Path.cwd())
+    service = TaskService(
+        store or create_store(resolved_config),
+        None,
+        TaskSettings.from_config(resolved_config),
+    )
+    service.require_enabled("the task ledger")
+    # Use the process notifier, as emit() does (it needs the resolved store).
+    service.notifier = get_process_notifier(resolved_config, store=service.store)
+    return service
+
+
+def create_task(
+    *,
+    agent_id: str,
+    pipeline_id: str,
+    slot: str,
+    title: str,
+    assign_to: str | None = None,
+    max_attempts: int | None = None,
+    dedupe_key: str | None = None,
+    parent_task_id: str | None = None,
+    store: BaseStore | None = None,
+    config: NCPConfig | None = None,
+) -> dict[str, object]:
+    """Create a ledger task (same result dict as ``ncp_task`` action ``create``).
+
+    ``assign_to`` also emits a ``request`` whisper linked to the task. Needs a
+    synchronous store (``AsyncPgvectorStore`` has only ``async_*`` task
+    methods). Raises ``ValueError`` when ``[tasks].enabled`` is false.
+    """
+
+    return _task_service(store, config).create(
+        agent_id=agent_id,
+        pipeline_id=pipeline_id,
+        slot=slot,
+        title=title,
+        max_attempts=max_attempts,
+        dedupe_key=dedupe_key,
+        parent_task_id=parent_task_id,
+        assign_to=assign_to,
+    )
+
+
+def claim_task(
+    *,
+    agent_id: str,
+    task_id: str | None = None,
+    pipeline_id: str | None = None,
+    slot: str | None = None,
+    lease_seconds: float | None = None,
+    store: BaseStore | None = None,
+    config: NCPConfig | None = None,
+) -> dict[str, object]:
+    """Claim a task by id or the next open one in a pipeline; returns the ``lease_token``.
+
+    The lease token is returned only here. Needs a synchronous store. Raises
+    ``ValueError`` when ``[tasks].enabled`` is false.
+    """
+
+    return _task_service(store, config).claim(
+        agent_id=agent_id,
+        task_id=task_id,
+        pipeline_id=pipeline_id,
+        slot=slot,
+        lease_seconds=lease_seconds,
+    )
+
+
+def heartbeat_task(
+    *,
+    task_id: str,
+    lease_token: str,
+    lease_seconds: float | None = None,
+    checkpoint_chunk_id: str | None = None,
+    progress: dict[str, object] | None = None,
+    pipeline_id: str | None = None,
+    agent_id: str | None = None,
+    store: BaseStore | None = None,
+    config: NCPConfig | None = None,
+) -> dict[str, object]:
+    """Extend a lease; an optional ``progress`` payload emits a coalesced progress whisper.
+
+    Needs a synchronous store. Raises ``ValueError`` when ``[tasks].enabled``
+    is false.
+    """
+
+    return _task_service(store, config).heartbeat(
+        task_id=task_id,
+        lease_token=lease_token,
+        lease_seconds=lease_seconds,
+        checkpoint_chunk_id=checkpoint_chunk_id,
+        progress=progress,
+        pipeline_id=pipeline_id,
+        agent_id=agent_id,
+    )
+
+
+def release_task(
+    *,
+    task_id: str,
+    lease_token: str,
+    error: str | None = None,
+    pipeline_id: str | None = None,
+    store: BaseStore | None = None,
+    config: NCPConfig | None = None,
+) -> dict[str, object]:
+    """Give a claimed task back (it fails once attempts are exhausted).
+
+    Needs a synchronous store. Raises ``ValueError`` when ``[tasks].enabled``
+    is false.
+    """
+
+    return _task_service(store, config).release(
+        task_id=task_id, lease_token=lease_token, error=error, pipeline_id=pipeline_id
+    )
+
+
+def complete_task(
+    *,
+    task_id: str,
+    lease_token: str,
+    summary: str,
+    status: str = "done",
+    result_chunk_ids: Sequence[str] | None = None,
+    turn_id: str | None = None,
+    pipeline_id: str | None = None,
+    agent_id: str | None = None,
+    store: BaseStore | None = None,
+    config: NCPConfig | None = None,
+) -> dict[str, object]:
+    """Finish a task (``status`` ``done`` or ``failed``) and emit the linked ``result`` whisper.
+
+    Never records an outcome (use ``ncp_record_outcome`` separately). Needs a
+    synchronous store. Raises ``ValueError`` when ``[tasks].enabled`` is false.
+    """
+
+    return _task_service(store, config).complete(
+        task_id=task_id,
+        lease_token=lease_token,
+        summary=summary,
+        status=status,
+        result_chunk_ids=None if result_chunk_ids is None else list(result_chunk_ids),
+        turn_id=turn_id,
+        pipeline_id=pipeline_id,
+        agent_id=agent_id,
+    )
+
+
+def cancel_task(
+    *,
+    agent_id: str,
+    task_id: str,
+    reason: str | None = None,
+    pipeline_id: str | None = None,
+    store: BaseStore | None = None,
+    config: NCPConfig | None = None,
+) -> dict[str, object]:
+    """Cancel a task (creator only); a claimed owner is rung via the doorbell.
+
+    Needs a synchronous store. Raises ``ValueError`` when ``[tasks].enabled``
+    is false.
+    """
+
+    return _task_service(store, config).cancel(
+        agent_id=agent_id, task_id=task_id, reason=reason, pipeline_id=pipeline_id
+    )
+
+
+def get_task(
+    *,
+    task_id: str,
+    pipeline_id: str | None = None,
+    store: BaseStore | None = None,
+    config: NCPConfig | None = None,
+) -> dict[str, object]:
+    """Fetch one task (public fields, never the lease token).
+
+    Needs a synchronous store. Raises ``ValueError`` when ``[tasks].enabled``
+    is false.
+    """
+
+    return _task_service(store, config).get(task_id=task_id, pipeline_id=pipeline_id)
+
+
+def list_tasks(
+    *,
+    pipeline_id: str,
+    status: str | None = None,
+    slot: str | None = None,
+    owner: str | None = None,
+    limit: int = 20,
+    store: BaseStore | None = None,
+    config: NCPConfig | None = None,
+) -> dict[str, object]:
+    """List a pipeline's tasks (``limit`` clamped to 1..50).
+
+    Needs a synchronous store. Raises ``ValueError`` when ``[tasks].enabled``
+    is false.
+    """
+
+    return _task_service(store, config).list(
+        pipeline_id=pipeline_id, status=status, slot=slot, owner=owner, limit=limit
+    )
+
+
+def overview(
+    *,
+    agent_id: str | None = None,
+    pipelines: Sequence[str] | None = None,
+    prefix: str | None = None,
+    since_seconds: float | None = DEFAULT_SINCE_SECONDS,
+    max_pipelines: int = DEFAULT_MAX_PIPELINES,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+    store: BaseStore | None = None,
+    config: NCPConfig | None = None,
+) -> dict[str, object]:
+    """Ranked, token-bounded cross-pipeline overview (read-only).
+
+    Returns ``{"text", "pipelines", "omitted", "tokens_est"}``. ``agent_id``
+    is the viewer whose inbox is counted (peeked, never drained). Task fields
+    are omitted unless ``[tasks].enabled``.
+    """
+
+    from ncp.overview import clamp_limits
+
+    resolved_config = config or _CONFIG or configure(cwd=Path.cwd())
+    resolved_store = store or create_store(resolved_config)
+    max_pipelines, max_tokens = clamp_limits(max_pipelines, max_tokens)
+    return _build_overview(
+        resolved_store,
+        viewer=agent_id,
+        pipelines=pipelines,
+        pipeline_prefix=prefix,
+        since_seconds=since_seconds,
+        max_pipelines=max_pipelines,
+        max_tokens=max_tokens,
+        include_tasks=resolved_config.tasks_enabled,
+        stale_open_seconds=resolved_config.tasks_stale_open_seconds,
+    )
+
+
+def subscribe(
+    *,
+    agent_id: str,
+    pipeline_id: str | None = None,
+    config: NCPConfig | None = None,
+    store: BaseStore | None = None,
+) -> ContextManager[Subscription]:
+    """Subscribe to doorbell events (no payloads) for in-process orchestrators.
+
+    Use as ``with subscribe(agent_id=...) as sub: for event in sub: ...`` or
+    ``sub.poll(timeout)``. Raises ``RuntimeError`` when ``[notify]`` is disabled.
+
+    With the in-process notifier and ``[notify].poll_interval_seconds > 0`` the
+    subscription also re-peeks the store, so whispers written by another
+    process are announced too (whispers already queued at subscribe time are
+    not). ``task`` events stay in-process-only.
+    """
+
+    resolved_config = config or _CONFIG or configure(cwd=Path.cwd())
+    notifier = get_process_notifier(resolved_config, store=store)
+    if notifier is None:
+        raise RuntimeError("Push delivery is disabled ([notify].enabled = false).")
+    interval = effective_poll_interval(resolved_config)
+    if not polling_enabled(notifier, interval):
+        return notifier.subscribe(agent_id=agent_id, pipeline_id=pipeline_id)
+    return subscribe_with_poll(
+        notifier,
+        store or create_store(resolved_config),
+        agent_id=agent_id,
+        pipeline_id=pipeline_id,
+        poll_interval=interval,
+    )
 
 
 def run(

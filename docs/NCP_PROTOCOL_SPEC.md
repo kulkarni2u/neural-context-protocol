@@ -194,7 +194,8 @@ Required fields:
   from_agent      str
   target          str         agent_id or "*" — scoped to pipeline_id
   whisper_type    Literal     nudge|alert|share|request|dissent|
-                              world_check|consolidation_ready
+                              world_check|consolidation_ready|sensor|
+                              progress|result
   payload         str         max 600 chars (~120 tok)
   confidence      float       0.0-1.0
 
@@ -205,13 +206,44 @@ Optional fields:
   ttl_seconds     int = 1800
   pipeline_id     str?
   dissent_target  str?        explicit target for dissent routing
+  in_reply_to     str?        whisper_id this whisper answers (unsigned)
+  thread_id       str?        conversation key (unsigned; resolved on emit)
+  task_id         str?        task-ledger task this whisper reports on (unsigned)
 
 Routing rules:
   alert:  injected first, regardless of confidence threshold
+  result: injected right after alerts, regardless of confidence threshold
   dissent: target must be specific agent_id — broadcast prohibited
+  progress/result: target must be specific agent_id — broadcast prohibited;
+                   in_reply_to, thread_id or task_id required
   world_check: injected regardless of confidence threshold
-  nudge/share/request: filtered at min_confidence (default 0.60)
+  nudge/share/request/progress: filtered at min_confidence (default 0.60)
   broadcast (*): scoped to pipeline_id — cannot cross pipelines
+
+Thread resolution on emit (idempotent):
+  1. explicit thread_id is kept
+  2. in_reply_to set: parent's thread_id (or parent whisper_id) if the parent
+     is still queued; otherwise thread_id = in_reply_to (acknowledged parents
+     are deleted, so replies after ack MUST still be accepted)
+  3. share/request: thread_id = own whisper_id
+  otherwise unthreaded
+
+Progress coalescing: emitting a progress whisper deletes any queued progress
+whisper with the same (pipeline_id, from_agent, target, thread_id, task_id).
+Best-effort under concurrency on the Redis backend.
+
+Task link: `progress`/`result` may carry `task_id` instead of
+`in_reply_to`/`thread_id`. When such a whisper arrives through
+`ncp_emit_whisper`, the server requires the task ledger to be enabled
+(section 4j), `from` to equal the task's current owner, the task to be
+`claimed`, and the whisper's `pipeline_id` to match the task's. Other whisper
+types may carry `task_id` without the check.
+
+Wire rendering: a threaded whisper's [NCP:WHISPERS] header gains
+`id:<whisper_id>`, `re:<in_reply_to>` when set, and `th:<thread_id>` only when
+it differs from both. A whisper with `task_id` also gains `task:<task_id>`
+(and `id:` if not already shown). Unthreaded, task-less whispers render
+unchanged.
 ```
 
 `ncp_emit_whisper` accepts either a legacy string or a `structured-v1` object.
@@ -219,8 +251,12 @@ Structured-v1 is the recommended representation: `share` and `request` use
 `HandoffPayload` (`ask`, optional `files` and `slice`), `dissent` uses
 `DissentPayload` (`issue`, optional `alternatives`), `alert` uses
 `AlertPayload` (`alert_code`, `description`), and `world_check` uses
-`WorldCheckPayload` (`anchor_intent`, `detected_drift`). The object shape MUST
-match its whisper type; in particular, dissent stays type-validated and is
+`WorldCheckPayload` (`anchor_intent`, `detected_drift`), `progress` uses
+`ProgressPayload` (`status`: working|blocked|waiting, optional `pct` 0-100 and
+`note` ≤ 200 chars) and `result` uses `ResultPayload` (`status`:
+succeeded|failed|partial|declined, `summary` ≤ 300 chars, optional
+`result_chunk_ids` ≤ 10 and `turn_id`). `progress` and `result` accept
+structured payloads only. The object shape MUST match its whisper type; in particular, dissent stays type-validated and is
 never broadcast.
 
 Strings remain supported for the current major version. This includes the
@@ -1081,6 +1117,270 @@ install and a migrated install converge. An existing database opens without
 error and loses nothing.
 ```
 
+## 4i. Push Delivery (normative)
+
+Push delivery lets an agent or orchestrator learn that a whisper is queued
+without polling. It is a **doorbell, not a delivery**.
+
+**Doorbell semantics.**
+
+- A notification never contains the whisper payload or any chunk content.
+- The whisper queue and `ncp_get_context` remain the only way to deliver and
+  acknowledge whispers. Reputation gating, confidence filtering, caps and
+  acknowledgement therefore live in exactly one place, and the
+  prompt-injection posture of §1.4 and §5.1 is unchanged.
+- Losing a notification is harmless: a client that reconnects calls
+  `ncp_wait_whispers` with `timeout_seconds: 0` and continues.
+- A notification may occasionally ring for a whisper that `ncp_get_context`
+  later filters out. At publish time only the confidence rule is applied (a
+  whisper below `0.60` does not ring unless its type is `alert`,
+  `world_check` or `result`); the reputation gate is not, because it needs a
+  store read.
+
+**Publish point.** A notification is published only after the store accepted
+the whisper, with the `thread_id` resolved. A notifier failure is logged and
+never fails the emit.
+
+**Event schema.** One JSON object, with no other fields:
+
+```json
+{"event": "whisper", "whisper_id": "wsp_…", "type": "result",
+ "from": "reviewer", "target": "router", "pipeline_id": "pr_142",
+ "thread_id": "wsp_3f2a", "task_id": "tsk_9c1d2e3f4a5b", "status": null,
+ "created_at": 1793500000.0}
+```
+
+`pipeline_id`, `thread_id` and `task_id` are `null` when absent. A second
+event kind, `"event": "task"`, is defined in section 4j; it has the same
+fields with `whisper_id` null and `status` set. An event matches a
+subscriber `(agent_id, pipeline_id)` when `target == agent_id` or
+`target == "*"`, the pipeline ids are equal (`null` matches `null` only), and
+the subscriber is not the sender of a broadcast.
+
+**`ncp_wait_whispers`.** Arguments: `agent_id` (required), `pipeline_id`,
+`timeout_seconds` (clamped to `0..[notify].max_wait_seconds`, default 30),
+`types` (array filter) and `thread_id` (filter). It peeks the queue first and
+returns immediately when something is eligible; otherwise it waits for the
+doorbell up to the timeout and peeks again. It never drains or acknowledges.
+Result: `{"ready": bool, "timed_out": bool, "whispers": [{"whisper_id",
+"type", "from", "thread_id", "in_reply_to", "task_id"}]}`; no payloads.
+`timeout_seconds: 0` is a non-blocking check (`timed_out` is `false`). The
+tool is not in the `core` profile and is hidden when `[notify].enabled` is
+`false`.
+
+**`GET /events?agent_id=…&pipeline_id=…`** (HTTP transport only). Server-sent
+events with the same bearer auth and CORS rules as `/mcp`. `agent_id` is
+required (`400` otherwise). The first frame is `event: ready` with
+`{"queued": <count of currently eligible whispers>}`; then `event: whisper`
+(and, for the task ledger, `event: task`) frames carry the event above, and `: keepalive` comment frames are sent every
+`keepalive_seconds`. Concurrent streams are capped by
+`[notify].max_subscribers` (default 64); above the cap the server answers
+`503` with a `Retry-After` header. The stream ends on server shutdown or
+client disconnect.
+
+**Backends.** `[notify] backend = auto | memory | redis`. `memory` is an
+in-process notifier (the doorbell stays inside one process; see the poll fallback below). `redis` publishes on
+`{stream}:notify:{pipeline_id or '_'}:{target}` (`*` for broadcast). `auto`
+selects Redis when Redis carries whispers (the `pgvector` store), otherwise
+in-process. stdio has no push channel; use `ncp_wait_whispers`.
+
+**Poll fallback (cross-process, in-process backend only).** The in-process
+doorbell cannot see a whisper written by another process on the same SQLite
+database. While waiting, `ncp_wait_whispers` therefore re-peeks the store at
+least every `[notify].poll_interval_seconds` (default 2.0; `0` disables; values
+below 0.25 are raised to 0.25), and `GET /events` peeks at the same cadence and
+emits an `event: whisper` frame for each eligible whisper id not yet announced
+on that connection. Whispers already queued when the connection opened are
+counted in `ready.queued` and never re-announced, and an id announced by the
+doorbell is not repeated. Frames remain payload-free. A foreign write is
+therefore noticed within about one interval; an in-process write still wakes
+immediately. The fallback is off when the effective backend is Redis. `event:
+task` frames are not polled and stay in-process-only.
+
+## 4j. Task Ledger (normative)
+
+The task ledger gives a router durable, leased units of work that workers
+claim, heartbeat and complete. It is opt-in (`[tasks].enabled = true`) and
+exposed as the single MCP tool `ncp_task`. Tasks are durable state, not
+coordination state: SQLite and Postgres (sync and async) store them; Redis
+does not.
+
+**Record (`TaskRecord`).**
+
+```
+task_id             str         "tsk_<12hex>"
+pipeline_id         str         required; tasks are always pipeline-scoped
+slot                str         matches the worker's get_context slot
+title               str         <= 200 chars; agent-written DATA
+status              Literal     open|claimed|done|failed|cancelled
+created_by          str         agent_id; receives result/failure notifications
+owner               str?        current claimer (kept on done/failed)
+lease_token         str?        fencing token, rotated on every claim
+lease_expires_at    float?      heartbeat_at float? attempt int>=0 max_attempts int>=1
+dedupe_key          str?        unique per (pipeline_id, dedupe_key)
+parent_task_id      str?        origin_whisper_id str?   checkpoint_chunk_id str?
+result_chunk_ids    list[str]   <= 10 ids
+result_turn_id      str?        error str? (<= 300 chars)
+version             int         incremented on every mutation
+created_at          float       updated_at float
+```
+
+All id fields contain no whitespace. `done`, `failed` and `cancelled` are
+terminal.
+
+**State machine.**
+
+- `create` makes an `open` task. A repeated `(pipeline_id, dedupe_key)`
+  returns the existing task with `created: false` (a partial unique index
+  enforces this; the key survives terminal states).
+- `claim` moves `open` to `claimed`, rotates `lease_token` (uuid hex), sets
+  `owner` and `lease_expires_at = now + lease`, and increments `attempt`. It
+  claims a given `task_id`, or the oldest open task for `pipeline_id` and an
+  optional `slot`. A task whose `attempt` has reached `max_attempts` is never
+  claimed.
+- `heartbeat` extends the lease and may record `checkpoint_chunk_id`.
+- `release` returns `claimed` to `open`; the attempt still counts. If
+  `attempt >= max_attempts` the task becomes `failed`
+  (`error = "max_attempts_exhausted"` unless an `error` is given).
+- `complete(status = done|failed)` is terminal. For `failed` the summary is
+  stored (truncated to 300 chars) in `error`.
+- `cancel` is allowed only for `created_by`, from `open` or `claimed`.
+
+**Fencing.** `heartbeat`, `release` and `complete` must present the current
+`lease_token` while the lease is unexpired (`lease_expires_at >= now`).
+Otherwise the call returns `{"ok": false, "reason": "lease_lost"}`, not an
+error, and the worker must stop. `cancel` by a non-creator returns
+`reason: "not_allowed"`, of a finished task `reason: "terminal"`, and an
+unknown task `reason: "not_found"`.
+
+**Lazy expiry.** There is no reaper. `claim`, `get`, `list` and every owner
+mutation first move expired claims (`status = 'claimed' AND lease_expires_at <
+now`) back to `open`, or to `failed` with `error = "lease_expired"` when
+`attempt >= max_attempts`, incrementing `version`. `expire_task_leases` returns
+the rows it transitioned.
+
+**Atomic claim.** SQLite uses `BEGIN IMMEDIATE` and a conditional `UPDATE`
+(with `RETURNING` on SQLite 3.35+, otherwise `UPDATE` followed by a `SELECT`
+by the new token in the same transaction). Postgres uses a subquery with
+`FOR UPDATE SKIP LOCKED`, so concurrent claimers never block each other or
+claim the same task. Lease seconds are clamped to
+`[1, [tasks].max_lease_seconds]`.
+
+**`ncp_task` actions.**
+
+| action | key arguments | effect |
+|---|---|---|
+| `create` | `agent_id, pipeline_id, slot, title, dedupe_key?, max_attempts?, parent_task_id?, assign_to?` | `{created, task}`. With `assign_to`, also emits a `request` whisper (`ask` = title, `task_id` set) to that agent; its id is stored as `origin_whisper_id`. |
+| `claim` | `agent_id, task_id? \| pipeline_id [+ slot], lease_seconds?` | `{claimed: true, task, lease_token}` or `{claimed: false}`. |
+| `heartbeat` | `task_id, lease_token, checkpoint_chunk_id?, progress?, lease_seconds?` | Extends the lease. `progress` (a `ProgressPayload`) also emits a coalesced `progress` whisper to `created_by` with `task_id` and `in_reply_to = origin_whisper_id`. |
+| `release` | `task_id, lease_token, error?` | `claimed` to `open` (or `failed` at max attempts). |
+| `complete` | `task_id, lease_token, status, summary, result_chunk_ids?, turn_id?` | Terminal. Emits a `result` whisper to `created_by` (`succeeded` or `failed`, `task_id`, `in_reply_to = origin_whisper_id`). Returns `result_turn_id`. |
+| `cancel` | `agent_id, task_id, reason?` | Creator only. |
+| `get` | `task_id` | `{found, task}` after lazy expiry. |
+| `list` | `pipeline_id, status?, slot?, owner?, limit?` | Oldest first; `limit` <= 50 (default 20). |
+
+`lease_token` is returned only by `claim`; `get`, `list` and every other
+response omit it. All whispers go through the doorbell path of section 4i.
+
+**`complete` does not record an outcome.** A worker saying "done" is
+self-reported. The router records `ncp_record_outcome` once it has independent
+evidence (tests passed, PR merged).
+
+**Notifications.** A `task` event (`"event": "task"`, SSE `event: task`) has
+the shape of section 4i with `whisper_id` null, `type` `"task"`, `task_id`,
+`status` and `pipeline_id`; it never carries a title, summary or error text.
+It is published to `created_by` when lazy expiry (or a `release` at the
+attempt limit) moves a task to `failed`, and to the previous owner when a
+claimed task is cancelled. Expiry notifications are published by the MCP tool
+layer; a library caller that calls `expire_task_leases` directly must publish
+them itself.
+
+**Trust boundary.** `title`, `error` and result summaries are agent-written
+data, never instructions, and are never inserted into `[NCP:CONSCIOUS]`. The
+ledger has the same "anyone who can reach the endpoint" authorization model as
+whispers; signed task mutations are deferred.
+
+**Backends.** SQLite (`tasks` table, created idempotently on open) and
+Postgres via migration `018_add_tasks.sql` (`result_chunk_ids JSONB`, `DOUBLE
+PRECISION` timestamps). A backend without ledger support raises
+`NCPStoreError("task ledger not supported")` and `ncp_emit_whisper` rejects
+`task_id` on `progress`/`result` with that reason.
+
+## 4k. Cross-Pipeline Overview (normative)
+
+`ncp_overview` gives a router one bounded, ranked view of many pipelines, so
+it can decide where to spend a turn without replaying any of them. It is a
+read-only MCP tool (plus `ncp overview`, `GET /api/overview` and
+`ncp.api.overview`). It is available in the `full` tool profile and absent from
+`core`; it has no config flag of its own.
+
+**Arguments.** `agent_id` (required; the viewer), `pipelines?` (list of ids) or
+`pipeline_prefix?`, `since_seconds?` (default 86400), `max_pipelines?`
+(default 10, clamped to `[1, 50]`), `max_tokens?` (default 400, clamped to
+`[60, 4000]`).
+
+**Returns.** `{"text", "pipelines", "omitted", "tokens_est"}`. `text` is the
+`[NCP:OVERVIEW]` block below; `pipelines` holds one structured row per rendered
+pipeline; `omitted` counts matching pipelines not rendered (cut by
+`max_pipelines` or by the token bound); `tokens_est` is
+`estimate_tokens(text)` and never exceeds `max_tokens`.
+
+**Read-only.** The tool never acknowledges or drains a whisper, never changes
+`retrieval_count`, never logs a turn and has no calibration effect. The viewer's
+inbox is counted with the same peek that `ncp_wait_whispers` uses. The only
+write is the lazy task-lease expiry of section 4j, which is state correction,
+not a side effect of viewing.
+
+**Row facts.** A pipeline is listed when its `last_activity` (the maximum of its
+chunk, whisper, turn and task times) is within `since_seconds`. Records with a
+null `pipeline_id` are not shown.
+
+| Field | Meaning |
+|---|---|
+| `tasks` | Counts by status (`o` open, `c` claimed, `d` done, `f` failed, `x` cancelled) after lazy expiry. Open and claimed tasks always count; terminal tasks count only when updated within `since_seconds`. Omitted when `[tasks].enabled = false` or the store has no ledger. |
+| `attention` | `failed` (failed tasks), `inbox` (queued `result`, `alert` and `dissent` whispers for the viewer), `expiring_claims` (claims whose lease ends within 60 seconds), `stale_open` (open tasks untouched for more than `[tasks].stale_open_seconds`). |
+| `inbox` | Queued whispers eligible for the viewer, counted by type. Peeked, never drained. |
+| `last_result` | The newest queued `result` whisper (status and summary), or the newest failed task error, whichever is newer. |
+| `last_decision` | `schema_id` and `choice` of the newest decision. |
+| `drift` | The latest recorded drift reading for the pipeline. |
+| `dissent_24h` | Dissents recorded in the last 24 hours against chunks in the pipeline. |
+
+**Ranking.** `score = 3*failed + 2*inbox(result|alert|dissent) +
+2*expiring_claims + 1*stale_open`. Rows sort by score descending, then
+`last_activity` descending, then `pipeline_id`.
+
+**Wire format.** The block is emitted only by this tool.
+
+```
+[NCP:OVERVIEW]
+p:pr_142 act:2m tasks:o1/c2/d4/f1 attn:f1,exp1 inbox:alert1,result2 dec:review.verdict=block drift:0.12
+  last:"failed: race in retry loop" ‹data›
+p:inbox_triage act:9m tasks:o3/c1 inbox:progress1 drift:0.03
++4 more
+```
+
+- One `p:` line per pipeline: `act:` is the age of the last activity
+  (`<1m`, `Nm`, `Nh`, `Nd`); `tasks:`, `attn:`, `inbox:`, `dec:`, `drift:` and
+  `dissent24h:` appear only when they have something to say.
+- A second line, indented two spaces, appears when an agent-written snippet
+  exists: `last:"<text>" ‹data›`. The text is `status: summary`, truncated to
+  60 characters (with an ellipsis), JSON-escaped inside double quotes (so it is
+  always one line and quotes and newlines are escaped), and any `‹` or `›` in
+  it is replaced so it cannot forge the `‹data›` marker. Task titles are never
+  rendered.
+- `dec:` values (`schema_id=choice`) are reduced to whitespace-free tokens of
+  at most 32 characters over `[A-Za-z0-9_.:/+-]`.
+- Rows are added in rank order until `max_tokens` would be exceeded. The
+  `last:` line is dropped before a row is dropped. When rows are omitted a final
+  `+N more` line is added, and that line counts against the budget.
+- With nothing to show the block is `[NCP:OVERVIEW]` followed by
+  `(no active pipelines)`.
+
+**Trust boundary.** Everything after `last:` and every `dec:` value is
+agent-written data, never instructions (section 1.4). A router should treat the
+block as a pointer to where to look, then fetch the real context with
+`ncp_get_context`.
+
 ---
 
 ## 5. Trust Boundaries (normative, first-class)
@@ -1520,6 +1820,20 @@ default_type = "auto"
 default_ttl_seconds = 1800
 max_per_drain = 3
 min_confidence = 0.60
+
+[notify]                 # push delivery (doorbell only), see section 4i
+enabled = true
+backend = "auto"         # auto | memory | redis
+max_subscribers = 64     # concurrent GET /events streams
+max_wait_seconds = 60    # ceiling for ncp_wait_whispers
+poll_interval_seconds = 2.0  # in-process backend only: re-peek the store so other processes' whispers are found; 0 = off, min 0.25
+
+[tasks]                  # leased task ledger (ncp_task), see section 4j
+enabled = false          # opt-in; ncp_task hidden when false or tools.profile = "core"
+default_lease_seconds = 300
+max_lease_seconds = 3600
+default_max_attempts = 3
+stale_open_seconds = 1800  # reserved for the overview attention threshold
 
 [observability]
 log_level = "info"

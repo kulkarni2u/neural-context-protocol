@@ -41,6 +41,19 @@ transcripts or stuffing prompts.
 - Send a bounded, directed signal with `ncp_emit_whisper` (handoff, dissent,
   drift report). Do not forward full history.
 - Acknowledge consumed whispers via `ncp_post_turn` (`pending_whisper_ids`).
+- To answer a `share`/`request` (its entry shows `id:<whisper_id>`), emit a
+  `progress` (`{"status", "pct"?, "note"?}`) or `result`
+  (`{"status", "summary", "result_chunk_ids"?, "turn_id"?}`) whisper with
+  `in_reply_to` set to that id. Put durable detail in memory and reference it
+  from `result_chunk_ids`.
+- If `ncp_task` is available (`[tasks].enabled = true`), a worker takes leased
+  work with `ncp_task`: `claim` (keep the `lease_token`) -> `ncp_get_context`
+  for the task's slot -> `heartbeat` before the lease expires (optionally with
+  `checkpoint_chunk_id`/`progress`) -> `ncp_write_memory` the finding ->
+  `complete` (`status`, `summary`, `result_chunk_ids`, `turn_id`), which emits
+  the linked `result` whisper. On `{"ok": false, "reason": "lease_lost"}` stop
+  at once. `complete` does not record an outcome; the router does that after
+  independent verification.
 - Prefer a **structured-v1** object payload over a free-text string —
   legacy string payloads remain compatible, but typed objects give the
   receiving agent fields instead of a string to parse. NCP validates and

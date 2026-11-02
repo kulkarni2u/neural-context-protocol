@@ -9,7 +9,27 @@ from typing import Any
 import anyio
 
 from ncp.stores.base import NCPStoreUnavailableError
-from ncp.types import Whisper
+from ncp.types import (
+    CONFIDENCE_EXEMPT_WHISPER_TYPES,
+    Whisper,
+    resolve_whisper_thread,
+    whisper_delivery_rank,
+)
+
+
+def _is_superseded_progress(payload: dict[str, str], newer: Whisper) -> bool:
+    """True when a stored whisper hash is an older progress report on ``newer``'s thread."""
+
+    if not payload:
+        return False
+    return (
+        payload.get("whisper_type") == "progress"
+        and payload.get("from_agent") == newer.from_agent
+        and payload.get("target") == newer.target
+        and (payload.get("thread_id") or None) == newer.thread_id
+        and (payload.get("task_id") or None) == newer.task_id
+        and (payload.get("pipeline_id") or None) == newer.pipeline_id
+    )
 
 
 def _default_redis_factory(url: str) -> Any:
@@ -53,9 +73,21 @@ class RedisCoordination:
     def whisper_delivery_prefix(self) -> str:
         return f"{self.stream}:delivered"
 
+    def get_whisper(self, whisper_id: str) -> Whisper | None:
+        client = self._client_or_raise()
+        return self._load_whisper(client, whisper_id)
+
     def emit_whisper(self, whisper: Whisper) -> None:
         client = self._client_or_raise()
         whisper = Whisper.model_validate(whisper.model_dump())
+        parent = (
+            self._load_whisper(client, whisper.in_reply_to)
+            if whisper.thread_id is None and whisper.in_reply_to is not None
+            else None
+        )
+        whisper = resolve_whisper_thread(whisper, parent)
+        if whisper.whisper_type == "progress":
+            self._coalesce_progress(client, whisper)
         payload_key = self._payload_key(whisper.whisper_id)
         index_key = self._target_index_key(whisper.target)
         expires_at = whisper.created_at + whisper.ttl_seconds
@@ -74,6 +106,9 @@ class RedisCoordination:
                 "ttl_seconds": str(whisper.ttl_seconds),
                 "expires_at": str(expires_at),
                 "dissent_target": whisper.dissent_target or "",
+                "in_reply_to": whisper.in_reply_to or "",
+                "thread_id": whisper.thread_id or "",
+                "task_id": whisper.task_id or "",
             },
         )
         client.expire(payload_key, whisper.ttl_seconds + 5)
@@ -111,15 +146,34 @@ class RedisCoordination:
                         continue
                 elif whisper.pipeline_id != pipeline_id:
                     continue
-                if whisper.whisper_type not in {"alert", "world_check"} and whisper.confidence < min_confidence:
+                if whisper.whisper_type not in CONFIDENCE_EXEMPT_WHISPER_TYPES and whisper.confidence < min_confidence:
                     continue
                 loaded[whisper_id] = whisper
 
         ordered = sorted(
             loaded.values(),
-            key=lambda whisper: (0 if whisper.whisper_type == "alert" else 1, whisper.created_at),
+            key=lambda whisper: (whisper_delivery_rank(whisper.whisper_type), whisper.created_at),
         )
         return ordered[:max_items]
+
+    def scan_whispers(self, *, whisper_type: str | None = None) -> list[Whisper]:
+        """Every queued whisper regardless of target, newest first. Read-only.
+
+        Never acknowledges, drops or rewrites anything (unlike ``peek_whispers``
+        this does not even prune dangling index entries). Used by the overview
+        for newest-``result`` and activity facts; expired payloads are already
+        gone from Redis, so callers only need to apply their own ``ttl_seconds``
+        check when they want to be strict.
+        """
+        client = self._client_or_raise()
+        ids = self._iter_whisper_ids(client)
+        found: list[Whisper] = []
+        for payload in self._hgetall_many(client, [self._payload_key(i) for i in ids]):
+            whisper = self._whisper_from_payload(payload)
+            if whisper is not None and (whisper_type is None or whisper.whisper_type == whisper_type):
+                found.append(whisper)
+        found.sort(key=lambda w: (-w.created_at, w.whisper_id))
+        return found
 
     def acknowledge_whispers(self, whisper_ids: list[str], *, agent_id: str | None = None) -> int:
         if not whisper_ids:
@@ -241,6 +295,22 @@ class RedisCoordination:
     def _is_delivered(self, client: Any, whisper_id: str, agent_id: str) -> bool:
         return agent_id in client.hgetall(self._delivery_key(whisper_id))
 
+    def _coalesce_progress(self, client: Any, whisper: Whisper) -> None:
+        """Drop still-queued older progress whispers on the same thread.
+
+        Best-effort (read-then-delete, not a single atomic step): two
+        concurrent progress emits may both survive, which costs one extra
+        queue entry and nothing else.
+        """
+
+        index_key = self._target_index_key(whisper.target)
+        indexed_ids = [str(whisper_id) for whisper_id in client.zrange(index_key, 0, -1)]
+        payloads = self._hgetall_many(client, [self._payload_key(whisper_id) for whisper_id in indexed_ids])
+        for whisper_id, payload in zip(indexed_ids, payloads, strict=True):
+            if whisper_id != whisper.whisper_id and _is_superseded_progress(payload, whisper):
+                client.zrem(index_key, whisper_id)
+                client.delete(self._payload_key(whisper_id))
+
     def _load_whisper(self, client: Any, whisper_id: str) -> Whisper | None:
         payload = client.hgetall(self._payload_key(whisper_id))
         return self._whisper_from_payload(payload)
@@ -270,6 +340,9 @@ class RedisCoordination:
             created_at=float(payload["created_at"]),
             ttl_seconds=int(payload.get("ttl_seconds", 1800)),
             dissent_target=str(payload.get("dissent_target") or "") or None,
+            in_reply_to=str(payload.get("in_reply_to") or "") or None,
+            thread_id=str(payload.get("thread_id") or "") or None,
+            task_id=str(payload.get("task_id") or "") or None,
         )
         return whisper
 
@@ -380,9 +453,21 @@ class AsyncRedisCoordination:
             f"Redis coordination unavailable at {self.url} after {attempts} attempts: {last_exc}"
         ) from last_exc
 
+    async def get_whisper(self, whisper_id: str) -> Whisper | None:
+        client = await self._aclient_or_raise()
+        return await self._async_load_whisper(client, whisper_id)
+
     async def emit_whisper(self, whisper: Whisper) -> None:
         client = await self._aclient_or_raise()
         whisper = Whisper.model_validate(whisper.model_dump())
+        parent = (
+            await self._async_load_whisper(client, whisper.in_reply_to)
+            if whisper.thread_id is None and whisper.in_reply_to is not None
+            else None
+        )
+        whisper = resolve_whisper_thread(whisper, parent)
+        if whisper.whisper_type == "progress":
+            await self._async_coalesce_progress(client, whisper)
         payload_key = self._payload_key(whisper.whisper_id)
         index_key = self._target_index_key(whisper.target)
         expires_at = whisper.created_at + whisper.ttl_seconds
@@ -401,6 +486,9 @@ class AsyncRedisCoordination:
                 "ttl_seconds": str(whisper.ttl_seconds),
                 "expires_at": str(expires_at),
                 "dissent_target": whisper.dissent_target or "",
+                "in_reply_to": whisper.in_reply_to or "",
+                "thread_id": whisper.thread_id or "",
+                "task_id": whisper.task_id or "",
             },
         )
         await client.expire(payload_key, whisper.ttl_seconds + 5)
@@ -422,6 +510,37 @@ class AsyncRedisCoordination:
         )
         await self._async_acknowledge_whispers([w.whisper_id for w in whispers], agent_id=agent_id)
         return whispers
+
+    async def peek_whispers(
+        self,
+        *,
+        agent_id: str,
+        pipeline_id: str | None = None,
+        max_items: int = 3,
+        min_confidence: float = 0.60,
+    ) -> list[Whisper]:
+        """Return deliverable whispers for ``agent_id`` without acknowledging them.
+
+        Async mirror of ``RedisCoordination.peek_whispers``: same target,
+        delivery, pipeline and confidence filtering and the same ordering.
+        """
+        return await self._async_peek_whispers(
+            agent_id=agent_id,
+            pipeline_id=pipeline_id,
+            max_items=max_items,
+            min_confidence=min_confidence,
+        )
+
+    async def scan_whispers(self, *, whisper_type: str | None = None) -> list[Whisper]:
+        """Async mirror of ``RedisCoordination.scan_whispers`` (read-only, newest first)."""
+        client = await self._aclient_or_raise()
+        found: list[Whisper] = []
+        for whisper_id in await self._async_iter_whisper_ids(client):
+            whisper = await self._async_load_whisper(client, whisper_id)
+            if whisper is not None and (whisper_type is None or whisper.whisper_type == whisper_type):
+                found.append(whisper)
+        found.sort(key=lambda w: (-w.created_at, w.whisper_id))
+        return found
 
     async def _async_peek_whispers(
         self,
@@ -448,12 +567,12 @@ class AsyncRedisCoordination:
                         continue
                 elif whisper.pipeline_id != pipeline_id:
                     continue
-                if whisper.whisper_type not in {"alert", "world_check"} and whisper.confidence < min_confidence:
+                if whisper.whisper_type not in CONFIDENCE_EXEMPT_WHISPER_TYPES and whisper.confidence < min_confidence:
                     continue
                 loaded[whisper_id] = whisper
         ordered = sorted(
             loaded.values(),
-            key=lambda w: (0 if w.whisper_type == "alert" else 1, w.created_at),
+            key=lambda w: (whisper_delivery_rank(w.whisper_type), w.created_at),
         )
         return ordered[:max_items]
 
@@ -475,6 +594,19 @@ class AsyncRedisCoordination:
             deleted += int(bool(await client.delete(self._payload_key(whisper_id))))
         return deleted
 
+    async def _async_coalesce_progress(self, client: Any, whisper: Whisper) -> None:
+        """Async counterpart of ``RedisCoordination._coalesce_progress``."""
+
+        index_key = self._target_index_key(whisper.target)
+        for raw_id in await client.zrange(index_key, 0, -1):
+            whisper_id = str(raw_id)
+            if whisper_id == whisper.whisper_id:
+                continue
+            payload = await client.hgetall(self._payload_key(whisper_id))
+            if _is_superseded_progress(payload, whisper):
+                await client.zrem(index_key, whisper_id)
+                await client.delete(self._payload_key(whisper_id))
+
     async def _async_is_delivered(self, client: Any, whisper_id: str, agent_id: str) -> bool:
         return agent_id in await client.hgetall(self._delivery_key(whisper_id))
 
@@ -494,6 +626,9 @@ class AsyncRedisCoordination:
             created_at=float(payload["created_at"]),
             ttl_seconds=int(payload.get("ttl_seconds", 1800)),
             dissent_target=str(payload.get("dissent_target") or "") or None,
+            in_reply_to=str(payload.get("in_reply_to") or "") or None,
+            thread_id=str(payload.get("thread_id") or "") or None,
+            task_id=str(payload.get("task_id") or "") or None,
         )
 
     async def _async_iter_whisper_ids(self, client: Any) -> list[str]:

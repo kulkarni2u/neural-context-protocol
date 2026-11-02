@@ -5,6 +5,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from functools import partial
+from typing import Any
 
 import anyio
 
@@ -17,6 +18,9 @@ from ncp.types import (
     DecisionRecord,
     OutcomeRecord,
     SubconsciousChunk,
+    TaskOpResult,
+    TaskRecord,
+    TaskStatus,
     TurnRecord,
     Whisper,
 )
@@ -526,6 +530,14 @@ class BaseStore(ABC):
     def whisper_pending(self, whisper_id: str) -> bool:
         """Return True if the whisper is still queued and not yet expired."""
 
+    def get_whisper(self, whisper_id: str) -> Whisper | None:
+        """Return a still-queued whisper by id, or None.
+
+        Used to resolve reply threads. Backends without lookup support return
+        None, which makes a reply fall back to ``thread_id = in_reply_to``.
+        """
+        return None
+
     # ------------------------------------------------------------------
     # Turn / cost / conscious logging
 
@@ -706,6 +718,140 @@ class BaseStore(ABC):
         fn = partial(self.link_decision_outcome, decision_id, outcome_id)
         return await anyio.to_thread.run_sync(fn)
 
+    # ------------------------------------------------------------------
+    # Task ledger (coordination primitives C, spec section 5)
+    #
+    # Non-abstract defaults so backends and fakes that predate the ledger keep
+    # working. Real backends override all of them. ``now`` is injectable so
+    # lease expiry can be tested without sleeping. Owner mutations return a
+    # ``TaskOpResult`` (``ok=False, reason="lease_lost"`` for a stale token)
+    # rather than raising.
+
+    def create_task(self, task: TaskRecord) -> tuple[TaskRecord, bool]:
+        """Insert an open task. Returns ``(task, created)``; an existing
+        ``(pipeline_id, dedupe_key)`` returns the existing task and ``False``."""
+        raise NCPStoreError("task ledger not supported")
+
+    def claim_task(
+        self,
+        *,
+        agent_id: str,
+        task_id: str | None = None,
+        pipeline_id: str | None = None,
+        slot: str | None = None,
+        lease_seconds: float = 300.0,
+        now: float | None = None,
+    ) -> TaskRecord | None:
+        """Atomically claim one open task (by id, or the oldest open one for
+        ``pipeline_id``/``slot``). Returns the claimed task including its fresh
+        ``lease_token``, or ``None`` when nothing could be claimed."""
+        raise NCPStoreError("task ledger not supported")
+
+    def heartbeat_task(
+        self,
+        task_id: str,
+        lease_token: str,
+        *,
+        lease_seconds: float = 300.0,
+        checkpoint_chunk_id: str | None = None,
+        now: float | None = None,
+    ) -> TaskOpResult:
+        """Extend the lease (and optionally record a checkpoint chunk id)."""
+        raise NCPStoreError("task ledger not supported")
+
+    def release_task(
+        self,
+        task_id: str,
+        lease_token: str,
+        *,
+        error: str | None = None,
+        now: float | None = None,
+    ) -> TaskOpResult:
+        """Return a claimed task to ``open``; the attempt still counts."""
+        raise NCPStoreError("task ledger not supported")
+
+    def complete_task(
+        self,
+        task_id: str,
+        lease_token: str,
+        *,
+        status: TaskStatus,
+        summary: str | None = None,
+        result_chunk_ids: Sequence[str] | None = None,
+        turn_id: str | None = None,
+        now: float | None = None,
+    ) -> TaskOpResult:
+        """Terminal transition to ``done`` or ``failed`` (summary kept as
+        ``error`` only for ``failed``)."""
+        raise NCPStoreError("task ledger not supported")
+
+    def cancel_task(
+        self,
+        task_id: str,
+        agent_id: str,
+        *,
+        reason: str | None = None,
+        now: float | None = None,
+    ) -> TaskOpResult:
+        """Cancel an ``open`` or ``claimed`` task; only ``created_by`` may."""
+        raise NCPStoreError("task ledger not supported")
+
+    def get_task(self, task_id: str, *, now: float | None = None) -> TaskRecord | None:
+        """Fetch one task after lazy lease expiry."""
+        raise NCPStoreError("task ledger not supported")
+
+    def list_tasks(
+        self,
+        *,
+        pipeline_id: str | None = None,
+        status: TaskStatus | None = None,
+        slot: str | None = None,
+        owner: str | None = None,
+        limit: int = 50,
+        now: float | None = None,
+    ) -> list[TaskRecord]:
+        """Bounded list (``limit`` <= 50), oldest first, after lazy expiry."""
+        raise NCPStoreError("task ledger not supported")
+
+    def expire_task_leases(
+        self,
+        pipeline_id: str | None = None,
+        now: float | None = None,
+    ) -> list[TaskRecord]:
+        """Move expired claims back to ``open`` (or ``failed`` with
+        ``error="lease_expired"`` at ``max_attempts``). Returns the rows it
+        transitioned, in their new state."""
+        raise NCPStoreError("task ledger not supported")
+
+    async def async_create_task(self, task: TaskRecord) -> tuple[TaskRecord, bool]:
+        return await anyio.to_thread.run_sync(self.create_task, task)
+
+    async def async_claim_task(self, **kwargs: Any) -> TaskRecord | None:
+        return await anyio.to_thread.run_sync(partial(self.claim_task, **kwargs))
+
+    async def async_heartbeat_task(self, task_id: str, lease_token: str, **kwargs: Any) -> TaskOpResult:
+        return await anyio.to_thread.run_sync(partial(self.heartbeat_task, task_id, lease_token, **kwargs))
+
+    async def async_release_task(self, task_id: str, lease_token: str, **kwargs: Any) -> TaskOpResult:
+        return await anyio.to_thread.run_sync(partial(self.release_task, task_id, lease_token, **kwargs))
+
+    async def async_complete_task(self, task_id: str, lease_token: str, **kwargs: Any) -> TaskOpResult:
+        return await anyio.to_thread.run_sync(partial(self.complete_task, task_id, lease_token, **kwargs))
+
+    async def async_cancel_task(self, task_id: str, agent_id: str, **kwargs: Any) -> TaskOpResult:
+        return await anyio.to_thread.run_sync(partial(self.cancel_task, task_id, agent_id, **kwargs))
+
+    async def async_get_task(self, task_id: str, **kwargs: Any) -> TaskRecord | None:
+        return await anyio.to_thread.run_sync(partial(self.get_task, task_id, **kwargs))
+
+    async def async_list_tasks(self, **kwargs: Any) -> list[TaskRecord]:
+        return await anyio.to_thread.run_sync(partial(self.list_tasks, **kwargs))
+
+    async def async_expire_task_leases(
+        self, pipeline_id: str | None = None, now: float | None = None
+    ) -> list[TaskRecord]:
+        return await anyio.to_thread.run_sync(partial(self.expire_task_leases, pipeline_id, now))
+
     def query_precedents(
         self,
         query: str,
@@ -798,6 +944,47 @@ class BaseStore(ABC):
         - whisper_queue: {total, by_type: {type: count}}
         """
 
+    def overview_rows(
+        self,
+        *,
+        pipelines: Sequence[str] | None = None,
+        pipeline_prefix: str | None = None,
+        since: float | None = None,
+        viewer: str | None = None,
+        now: float | None = None,
+        include_tasks: bool = True,
+        stale_open_seconds: float = 1800.0,
+    ) -> list[dict[str, Any]]:
+        """Per-pipeline raw facts for the cross-pipeline overview (read-only).
+
+        ``since`` is a window in seconds: only pipelines whose newest
+        chunk/whisper/turn/task activity is within it are returned. Rows with
+        a null ``pipeline_id`` are ignored. ``viewer``'s inbox is peeked, never
+        drained or acknowledged. Task fields are omitted when ``include_tasks``
+        is false or the ledger is unsupported. See ``ncp.stores.overview_facts``
+        for the row shape.
+
+        This default composes public methods and works on every backend, less
+        efficiently and with the caveats documented on
+        ``generic_overview_rows``. SQLite overrides it with grouped SQL.
+        """
+        from ncp.stores.overview_facts import generic_overview_rows
+
+        return generic_overview_rows(
+            self,
+            pipelines=pipelines,
+            pipeline_prefix=pipeline_prefix,
+            since=since,
+            viewer=viewer,
+            now=now,
+            include_tasks=include_tasks,
+            stale_open_seconds=stale_open_seconds,
+        )
+
+    async def async_overview_rows(self, **kwargs: Any) -> list[dict[str, Any]]:
+        """Async counterpart of :meth:`overview_rows` (thread-pool by default)."""
+        return await anyio.to_thread.run_sync(partial(self.overview_rows, **kwargs))
+
     # ------------------------------------------------------------------
     # Async Counterpart Surface
 
@@ -840,6 +1027,10 @@ class BaseStore(ABC):
     async def async_emit_whisper(self, whisper: Whisper) -> None:
         """Asynchronously persist a whisper using thread pool."""
         await anyio.to_thread.run_sync(self.emit_whisper, whisper)
+
+    async def async_get_whisper(self, whisper_id: str) -> Whisper | None:
+        """Asynchronously look up a queued whisper using thread pool."""
+        return await anyio.to_thread.run_sync(self.get_whisper, whisper_id)
 
     async def async_record_dissent(self, chunk_id: str, *, identity_id: str | None = None) -> bool:
         """Asynchronously record a dissent against a chunk using thread pool."""

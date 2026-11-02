@@ -32,6 +32,8 @@ FULL_NON_MEMO_TOOL_NAMES = [
     "ncp_get_context",
     "ncp_write_memory",
     "ncp_emit_whisper",
+    "ncp_wait_whispers",
+    "ncp_overview",
     "ncp_post_turn",
     "ncp_remember",
     "ncp_recall",
@@ -252,6 +254,9 @@ class TestToolsList:
             "ncp_get_context",
             "ncp_write_memory",
             "ncp_emit_whisper",
+            "ncp_wait_whispers",
+            "ncp_task",
+            "ncp_overview",
             "ncp_post_turn",
             "ncp_remember",
             "ncp_recall",
@@ -313,6 +318,8 @@ class TestToolsList:
             ("dissent",): ["string", "DissentPayload"],
             ("alert",): ["string", "AlertPayload"],
             ("world_check",): ["string", "WorldCheckPayload"],
+            ("progress",): ["ProgressPayload"],
+            ("result",): ["ResultPayload"],
             ("nudge", "consolidation_ready"): ["string"],
         }
 
@@ -355,7 +362,7 @@ class TestToolsList:
         (project / ".git").mkdir(parents=True)
         (project / ".ncp").mkdir()
         (project / ".ncp" / "config.toml").write_text(
-            '[tools]\nprofile = "full"\n\n[memoization]\nenabled = true\n'
+            '[tools]\nprofile = "full"\n\n[memoization]\nenabled = true\n\n[tasks]\nenabled = true\n'
         )
         input_stream = io.BytesIO(_frame(_req("tools/list")))
         output_stream = io.BytesIO()

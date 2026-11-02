@@ -85,6 +85,10 @@ Bounded retrieval is the entry point, not the whole story. The mechanisms below 
 - **Whispers** — short, directed, bounded-TTL signals between specific agents (handoffs, dissent, drift notes) instead of broadcasting full state.
 - **Cross-host handoffs** — one agent hands its task to another host through the same protocol, carrying bounded context forward instead of a transcript. See [Cross-agent handoffs](#cross-agent-handoffs).
 - **Shared pipeline memory** — every host on a `pipeline_id` reads and writes the same bounded, scored context.
+- **Request/reply threads** — a `share`/`request` whisper opens a thread; workers answer with typed `progress` and `result` whispers linked by `in_reply_to`, so a router can match results to dispatches without parsing prose. See [Coordinating many agents from one router](#coordinating-many-agents-from-one-router).
+- **Push delivery** — `ncp_wait_whispers` (long-poll) and `GET /events` (SSE) wake an agent when something is queued for it. Notifications never carry the payload; delivery and acknowledgement still go through `ncp_get_context`.
+- **Task ledger** (opt-in) — durable tasks with leased, fenced claims, heartbeats, checkpoints, retry limits and dedupe keys, so in-flight work survives a router or worker restart. NCP records claims; your orchestrator still decides who runs.
+- **Cross-pipeline overview** — `ncp_overview` gives a router one ranked, token-bounded line per active pipeline (failed tasks, waiting results, expiring claims first) instead of one context call per pipeline.
 
 ### Trust and accountability
 
@@ -540,6 +544,43 @@ trusting the defaults.
 
 -----
 
+## Coordinating many agents from one router
+
+A common multi-agent shape is one long-lived **router** that receives events and dispatches **workers** in parallel. NCP gives that router four primitives on the same bus. It still does not schedule anything: your orchestrator decides who runs, and NCP records what is in flight and who is waiting on what.
+
+| Primitive | Tool | What it gives the router |
+|---|---|---|
+| Request/reply threads | `ncp_emit_whisper` with `progress`/`result` and `in_reply_to` | Results matched to the request that caused them |
+| Push delivery | `ncp_wait_whispers`, `GET /events` | Wake on new work instead of polling `ncp_get_context` |
+| Task ledger | `ncp_task` (opt-in) | Durable record of in-flight work, with leases that expire if a worker dies |
+| Overview | `ncp_overview` | One bounded line per pipeline, most urgent first |
+
+```text
+router loop:
+  ncp_wait_whispers(agent_id="router", timeout_seconds=30)   # sleep until something arrives
+  ncp_overview(agent_id="router")                             # which pipelines need attention?
+  ncp_get_context(agent_id="router", pipeline_id=p, ...)      # receive results for pipeline p
+  ncp_task(action="create", assign_to="reviewer", dedupe_key="github:pr/142:review", ...)
+  ncp_record_outcome(turn_id=...)                             # once success is independently verified
+  ncp_post_turn(...)
+
+worker:
+  ncp_task(action="claim", agent_id="reviewer", pipeline_id=p, slot="review")   # returns lease_token
+  ncp_get_context(...) → work → ncp_task(action="heartbeat", lease_token=..., progress={...})
+  ncp_write_memory(finding) → ncp_task(action="complete", lease_token=..., summary=..., result_chunk_ids=[...])
+```
+
+Safety properties:
+
+- **Fenced claims.** Each claim rotates a `lease_token`. A worker whose lease expired cannot heartbeat or complete a task that someone else has since claimed.
+- **Owner-checked results.** A `progress`/`result` whisper that names a `task_id` is rejected unless it comes from the task's current owner.
+- **Self-reported until verified.** `complete` sends a linked `result` whisper but never records an outcome. The router calls `ncp_record_outcome` once it has independent evidence, such as tests passing.
+- **Data, not instructions.** Notifications carry ids only. Task titles, summaries and overview snippets are agent-written text and are rendered as quoted data.
+
+On SQLite, notifications are in-process, and a store poll (`[notify].poll_interval_seconds`, default 2s) picks up whispers written by other processes. With pgvector + Redis they travel over Redis pub/sub. Postgres deployments must apply `018_add_tasks.sql` (`ncp migrate apply`) before enabling `[tasks]`. Full contract: [design doc](./docs/specs/2026-11-02-ncp-coordination-primitives-design.md) and protocol spec §4i–§4k.
+
+-----
+
 ## What NCP is (and isn't)
 
 **NCP is the agent-to-agent memory bus and context protocol, not the orchestrator.**
@@ -612,13 +653,20 @@ ncp_compile_decision_query — compile a bounded decision packet for any decisio
 ncp_record_outcome   — attach outcome feedback to chunks, turns, or a decision
 ncp_lookup_memo      — check for reusable completed work by signature
 ncp_record_memo      — store reusable completed work by signature
+ncp_wait_whispers    — block until a whisper is queued for this agent (peeks, never drains)
+ncp_task             — opt-in task ledger: create / claim / heartbeat / release / complete / cancel / get / list
+ncp_overview         — ranked, token-bounded summary across active pipelines (read-only)
 ```
+
+`ncp_wait_whispers` and `ncp_overview` are in the full tool profile; `ncp_task` appears only when `[tasks].enabled = true`. None of them are in the `core` profile.
 
 The core agent-to-agent protocol is still: read context, publish memory, signal peers, and record outcomes. The memory facade (`ncp_remember` / `ncp_recall` / `ncp_improve`) is an ergonomic layer over the same trust-aware chunks and graph edges.
 
 **Streaming.** `ncp_get_context` accepts `stream: true` and delivers the context blocks progressively — as NDJSON or SSE over HTTP, or as `ncp/stream_chunk` JSON-RPC notifications over stdio — so a host can start consuming context before assembly finishes. The runtime also serves `/healthz`, an `/sse` discovery endpoint, and `/message`, and supports CORS (`--cors-origin`) and MCP protocol-version negotiation across spec versions. A stdio transport is available via `ncp serve-stdio` for hosts that prefer it over HTTP.
 
 By default the server requires no token on loopback (`127.0.0.1`/`localhost`/`::1`). Set `[server].auth_token` in `.ncp/config.toml` (generated by `ncp init`), the `NCP_AUTH_TOKEN` env var, or `--auth-token` on `ncp serve` to require an `Authorization: Bearer <token>` header on `/mcp` and `/sse`. Never bind `ncp serve` to a non-loopback host without one of these set.
+
+`GET /events?agent_id=...&pipeline_id=...` is an SSE stream of payload-free doorbell frames (`ready`, `whisper`, `task`) for long-running orchestrators. It uses the same bearer auth and is capped by `[notify].max_subscribers`.
 
 Each session is capped at 3 `ncp_fetch` calls per turn; in Redis mode that budget is coordinated across processes so the cap holds even with multiple hosts on one pipeline.
 
@@ -643,6 +691,8 @@ for piece in ncp.stream(agent=fixer, turn="..."):  # streamed variant
 ```
 
 `run` and `stream` go through an adapter (`LocalAdapter` by default) and persist the turn automatically.
+
+The coordination functions live on `ncp.api`: `wait_whispers` and `subscribe` (push delivery), `create_task`, `claim_task`, `heartbeat_task`, `release_task`, `complete_task`, `cancel_task`, `get_task` and `list_tasks` (task ledger, synchronous stores), and `overview`. They return the same results as the matching MCP tools.
 
 -----
 
@@ -686,6 +736,7 @@ ncp viz         # pipeline visualization
 ncp graph       # export typed chunk relationships as JSON or Graphviz DOT
 ncp trust-drift # trust-drift observability: rising, falling, and feedback summary
 ncp precedents  # query past decisions: 'show me decisions like this one'
+ncp overview    # ranked cross-pipeline summary: failed tasks, waiting results, expiring claims
 ncp consolidate # merge and compact memory
 ncp calibrate   # recalibrate trust (add --feedback for the self-improvement pass)
 ncp refine      # evidence-backed procedural self-refinement: ingest/show/propose/apply/rollback
@@ -759,6 +810,8 @@ ncp explain --cwd /path/to/project
 | `[retention]`    | Hard cap on working chunks per pipeline                                                    |
 | `[providers]`    | Per-model pricing used by `ncp cost` (configurable)                                        |
 | `[server]`       | `auth_token` for non-loopback binds                                                        |
+| `[notify]`       | Push delivery: `enabled`, `backend` (auto/memory/redis), `max_subscribers`, `max_wait_seconds`, `poll_interval_seconds` |
+| `[tasks]`        | Task ledger (off by default): `enabled`, lease defaults and limits, `default_max_attempts`, `stale_open_seconds` |
 
 Pgvector schema changes are managed with versioned, checksummed migrations that support rollback:
 
@@ -836,6 +889,7 @@ NCP is the memory bus. In our workflows, Sarathi is one orchestrator that runs o
 - [Protocol spec](./docs/NCP_PROTOCOL_SPEC.md)
 - [HTTP API contract](./docs/NCP_HTTP_API.md)
 - [Context policies (foundation)](./docs/NCP_CONTEXT_POLICY.md)
+- [Router coordination primitives (design)](./docs/specs/2026-11-02-ncp-coordination-primitives-design.md)
 - [Graph engineering plan](./docs/NCP_GRAPH_ENGINEERING_PLAN.md)
 - [Benchmark: task success at matched budget](./docs/NCP_BENCHMARK_TASK_SUCCESS.md)
 - [Benchmark: provider-real efficacy](./docs/NCP_BENCHMARK_EFFICACY_LIVE.md)

@@ -21,6 +21,7 @@ from collections.abc import Sequence
 from contextlib import asynccontextmanager
 from dataclasses import replace as dataclass_replace
 from typing import Any, AsyncIterator
+from uuid import uuid4
 
 import anyio
 import structlog
@@ -28,10 +29,13 @@ import structlog
 from ncp.config import NCPConfig
 from ncp.stores.base import (
     BaseStore,
+    NCPStoreError,
     NCPStoreUnavailableError,
     _validate_turn_chunk_relation,
     merge_outcome_chunk_rows,
 )
+from ncp.stores import overview_sql, task_sql
+from ncp.stores.overview_facts import INBOX_MIN_CONFIDENCE, inbox_counts, live_whispers, newest_results, whisper_activity
 from ncp.stores.bitemporal import collect_successor_ids, filter_bitemporal
 from ncp.stores.graph import (
     backfill_edges_for_chunk,
@@ -80,6 +84,9 @@ from ncp.types import (
     DecisionRecord,
     OutcomeRecord,
     SubconsciousChunk,
+    TaskOpResult,
+    TaskRecord,
+    TaskStatus,
     TurnRecord,
     Whisper,
 )
@@ -1431,6 +1438,84 @@ class AsyncPgvectorStore(BaseStore):
             "whisper_queue": whisper_queue,
         }
 
+    async def async_overview_rows(  # type: ignore[override]
+        self,
+        *,
+        pipelines: Any = None,
+        pipeline_prefix: str | None = None,
+        since: float | None = None,
+        viewer: str | None = None,
+        now: float | None = None,
+        include_tasks: bool = True,
+        stale_open_seconds: float = 1800.0,
+    ) -> list[dict[str, Any]]:
+        """Grouped-SQL cross-pipeline overview facts via native async I/O.
+
+        Same semantics as ``PgvectorStore.overview_rows`` (shared statements in
+        ``ncp/stores/overview_sql.py``): the viewer's inbox and the newest
+        queued ``result`` whisper come from ``AsyncRedisCoordination`` by
+        peeking only, and are empty without Redis.
+        """
+        now = time.time() if now is None else float(now)
+        cutoff = None if since is None else now - float(since)
+        wanted = None if pipelines is None else set(pipelines)
+        if include_tasks:
+            try:
+                await self.async_expire_task_leases(None, now)
+            except NCPStoreError:
+                include_tasks = False
+
+        queued: list[Whisper] = []
+        if self._acoordination is not None:
+            try:
+                queued = live_whispers(await self._acoordination.scan_whispers(), now)
+            except Exception:
+                queued = []
+
+        stmts = overview_sql.statements(
+            now=now, cutoff=cutoff, include_tasks=include_tasks, stale_open_seconds=stale_open_seconds
+        )
+        facts: dict[str, list[dict[str, Any]]] = {}
+        async with self._aconnect() as conn:
+            async with conn.cursor() as cur:
+                for name, (sql, params) in stmts.items():
+                    await cur.execute(self._sql(sql), params)
+                    facts[name] = await self._afetchall(cur)
+
+        activity = overview_sql.select_pipelines(
+            facts["activity"],
+            whisper_activity(queued),
+            wanted=wanted,
+            prefix=pipeline_prefix,
+            cutoff=cutoff,
+        )
+        if not activity:
+            return []
+        inbox: dict[str, dict[str, int]] = {}
+        if viewer and self._acoordination is not None:
+            for pid in activity:
+                try:
+                    peeked = await self._acoordination.peek_whispers(
+                        agent_id=viewer, pipeline_id=pid, max_items=200, min_confidence=INBOX_MIN_CONFIDENCE
+                    )
+                    inbox[pid] = inbox_counts(live_whispers(peeked, now))
+                except Exception:
+                    inbox[pid] = {}
+        return overview_sql.build_rows(
+            activity,
+            facts,
+            include_tasks=include_tasks,
+            viewer=viewer,
+            inbox=inbox,
+            result_whisper=newest_results(queued),
+        )
+
+    async def async_get_whisper(self, whisper_id: str) -> Whisper | None:
+        """Look up a queued whisper via native async Redis coordination."""
+        if self._acoordination is None:
+            return None
+        return await self._acoordination.get_whisper(whisper_id)
+
     async def async_emit_whisper(self, whisper: Whisper) -> None:
         """Emit whisper via native async Redis coordination (no thread shim)."""
         if self._acoordination is None:
@@ -1953,6 +2038,198 @@ class AsyncPgvectorStore(BaseStore):
                     (outcome_id, decision_id),
                 )
                 return cur.rowcount > 0
+
+    # ── task ledger (coordination primitives C, spec section 5) ───────────
+
+    async def _atask_rows(self, cur: Any, statement: task_sql.Statement) -> list[dict[str, Any]]:
+        sql, params = statement
+        await cur.execute(self._sql(sql), params)
+        return await self._afetchall(cur)
+
+    async def async_expire_task_leases(
+        self, pipeline_id: str | None = None, now: float | None = None
+    ) -> list[TaskRecord]:
+        now = time.time() if now is None else float(now)
+        async with self._aconnect() as conn:
+            async with conn.cursor() as cur:
+                rows = await self._atask_rows(cur, task_sql.expire_stmt(now, pipeline_id, None))
+        return [task_sql.row_to_task(row) for row in rows]
+
+    async def async_create_task(self, task: TaskRecord) -> tuple[TaskRecord, bool]:
+        async with self._aconnect() as conn:
+            async with conn.cursor() as cur:
+                rows = await self._atask_rows(cur, task_sql.insert_stmt(task))
+                if rows:
+                    return task_sql.row_to_task(rows[0]), True
+                assert task.dedupe_key is not None
+                rows = await self._atask_rows(
+                    cur, task_sql.select_by_dedupe_stmt(task.pipeline_id, task.dedupe_key)
+                )
+        return task_sql.row_to_task(rows[0]), False
+
+    async def async_claim_task(
+        self,
+        *,
+        agent_id: str,
+        task_id: str | None = None,
+        pipeline_id: str | None = None,
+        slot: str | None = None,
+        lease_seconds: float = 300.0,
+        now: float | None = None,
+    ) -> TaskRecord | None:
+        if task_id is None and pipeline_id is None:
+            raise ValueError("claim_task requires task_id or pipeline_id")
+        now = time.time() if now is None else float(now)
+        async with self._aconnect() as conn:
+            async with conn.cursor() as cur:
+                await self._atask_rows(cur, task_sql.expire_stmt(now, pipeline_id, task_id))
+                rows = await self._atask_rows(
+                    cur,
+                    task_sql.claim_stmt(
+                        agent_id=agent_id,
+                        token=uuid4().hex,
+                        now=now,
+                        lease_seconds=lease_seconds,
+                        task_id=task_id,
+                        pipeline_id=pipeline_id,
+                        slot=slot,
+                    ),
+                )
+        return task_sql.row_to_task(rows[0]) if rows else None
+
+    async def _atask_owner_mutation(
+        self,
+        task_id: str,
+        lease_token: str,
+        now: float,
+        mutation: tuple[str, tuple[Any, ...]],
+    ) -> TaskOpResult:
+        async with self._aconnect() as conn:
+            async with conn.cursor() as cur:
+                await self._atask_rows(cur, task_sql.expire_stmt(now, None, task_id))
+                rows = await self._atask_rows(
+                    cur,
+                    task_sql.owner_update_stmt(
+                        mutation[0], mutation[1], task_id=task_id, lease_token=lease_token, now=now
+                    ),
+                )
+                if rows:
+                    return TaskOpResult(
+                        ok=True, task=task_sql.row_to_task(rows[0]), previous_status="claimed"
+                    )
+                current = await self._atask_rows(cur, task_sql.select_stmt(task_id))
+        if not current:
+            return TaskOpResult(ok=False, reason="not_found")
+        task = task_sql.row_to_task(current[0])
+        return TaskOpResult(ok=False, reason="lease_lost", task=task, previous_status=task.status)
+
+    async def async_heartbeat_task(
+        self,
+        task_id: str,
+        lease_token: str,
+        *,
+        lease_seconds: float = 300.0,
+        checkpoint_chunk_id: str | None = None,
+        now: float | None = None,
+    ) -> TaskOpResult:
+        now = time.time() if now is None else float(now)
+        return await self._atask_owner_mutation(
+            task_id, lease_token, now, task_sql.heartbeat_set(now, lease_seconds, checkpoint_chunk_id)
+        )
+
+    async def async_release_task(
+        self,
+        task_id: str,
+        lease_token: str,
+        *,
+        error: str | None = None,
+        now: float | None = None,
+    ) -> TaskOpResult:
+        now = time.time() if now is None else float(now)
+        return await self._atask_owner_mutation(task_id, lease_token, now, task_sql.release_set(error))
+
+    async def async_complete_task(
+        self,
+        task_id: str,
+        lease_token: str,
+        *,
+        status: TaskStatus,
+        summary: str | None = None,
+        result_chunk_ids: Sequence[str] | None = None,
+        turn_id: str | None = None,
+        now: float | None = None,
+    ) -> TaskOpResult:
+        if status not in ("done", "failed"):
+            raise ValueError("complete_task status must be 'done' or 'failed'")
+        now = time.time() if now is None else float(now)
+        return await self._atask_owner_mutation(
+            task_id,
+            lease_token,
+            now,
+            task_sql.complete_set(status, summary, list(result_chunk_ids or []), turn_id),
+        )
+
+    async def async_cancel_task(
+        self,
+        task_id: str,
+        agent_id: str,
+        *,
+        reason: str | None = None,
+        now: float | None = None,
+    ) -> TaskOpResult:
+        now = time.time() if now is None else float(now)
+        async with self._aconnect() as conn:
+            async with conn.cursor() as cur:
+                await self._atask_rows(cur, task_sql.expire_stmt(now, None, task_id))
+                current = await self._atask_rows(cur, task_sql.select_stmt(task_id, for_update=True))
+                if not current:
+                    return TaskOpResult(ok=False, reason="not_found")
+                before = task_sql.row_to_task(current[0])
+                if before.created_by != agent_id:
+                    return TaskOpResult(
+                        ok=False, reason="not_allowed", task=before, previous_status=before.status
+                    )
+                if before.status not in ("open", "claimed"):
+                    return TaskOpResult(
+                        ok=False, reason="terminal", task=before, previous_status=before.status
+                    )
+                rows = await self._atask_rows(cur, task_sql.cancel_stmt(task_id, reason, now))
+        return TaskOpResult(
+            ok=True,
+            task=task_sql.row_to_task(rows[0]),
+            previous_status=before.status,
+            previous_owner=before.owner,
+        )
+
+    async def async_get_task(self, task_id: str, *, now: float | None = None) -> TaskRecord | None:
+        now = time.time() if now is None else float(now)
+        async with self._aconnect() as conn:
+            async with conn.cursor() as cur:
+                await self._atask_rows(cur, task_sql.expire_stmt(now, None, task_id))
+                rows = await self._atask_rows(cur, task_sql.select_stmt(task_id))
+        return task_sql.row_to_task(rows[0]) if rows else None
+
+    async def async_list_tasks(
+        self,
+        *,
+        pipeline_id: str | None = None,
+        status: TaskStatus | None = None,
+        slot: str | None = None,
+        owner: str | None = None,
+        limit: int = 50,
+        now: float | None = None,
+    ) -> list[TaskRecord]:
+        now = time.time() if now is None else float(now)
+        async with self._aconnect() as conn:
+            async with conn.cursor() as cur:
+                await self._atask_rows(cur, task_sql.expire_stmt(now, pipeline_id, None))
+                rows = await self._atask_rows(
+                    cur,
+                    task_sql.list_stmt(
+                        pipeline_id=pipeline_id, status=status, slot=slot, owner=owner, limit=limit
+                    ),
+                )
+        return [task_sql.row_to_task(row) for row in rows]
 
     async def async_record_memo(
         self,

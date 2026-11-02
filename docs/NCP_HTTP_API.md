@@ -51,7 +51,9 @@ curl -s $BASE/mcp -H "$AUTH" -H 'Content-Type: application/json' -d '{
 
 Returns the enabled tool catalog — `ncp_get_context`, `ncp_write_memory`,
 `ncp_emit_whisper`, `ncp_post_turn`, `ncp_fetch`, `ncp_record_decision`,
-`ncp_get_decision`, `ncp_compile_decision_query`, `ncp_record_outcome` and the
+`ncp_get_decision`, `ncp_compile_decision_query`, `ncp_record_outcome`,
+`ncp_wait_whispers` (unless `[notify].enabled = false`), `ncp_task` (only
+when `[tasks].enabled = true`), `ncp_overview` and the
 memo tools when enabled — each with a JSON Schema under `inputSchema`.
 
 ## Tool calls
@@ -208,12 +210,189 @@ the required JSON shape server-side. Dissent remains non-broadcast: a
   HandoffPayload (`ask`, optional `files` and `slice`); `dissent` requires a
   DissentPayload (`issue`, optional `alternatives`); `alert` requires
   `alert_code` and `description`; `world_check` requires `anchor_intent` and
-  `detected_drift`. An object whose shape does not match its `type` is rejected.
+  `detected_drift`; `progress` requires a ProgressPayload (`status`, optional
+  `pct` and `note`) and `result` a ResultPayload (`status`, `summary`, optional
+  `result_chunk_ids` and `turn_id`). `progress`/`result` accept structured
+  payloads only. An object whose shape does not match its `type` is rejected.
 
 Structured-v1 values are stored as sorted, compact JSON. A successful response
-includes `payload_format` (`"legacy"` or `"structured-v1"`). If `signature` is
-provided, the response also includes `verified`; signatures cover the exact
-normalized payload that is stored, rather than the input object's key order.
+includes `whisper_id` and `payload_format` (`"legacy"` or `"structured-v1"`),
+plus `thread_id` when the whisper is threaded. If `signature` is provided, the
+response also includes `verified`; signatures cover the exact normalized
+payload that is stored, rather than the input object's key order.
+
+**Request/reply threads.** A `share`/`request` opens a thread keyed by its own
+`whisper_id`; the receiver sees it as `id:<whisper_id>` in its
+`[NCP:WHISPERS]` entry. Reply with `progress`/`result` and `in_reply_to` set to
+that id:
+
+```bash
+curl -s $BASE/mcp -H "$AUTH" -H 'Content-Type: application/json' -d '{
+  "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+  "params": {"name": "ncp_emit_whisper", "arguments": {
+    "from": "reviewer", "target": "executor", "type": "result",
+    "payload": {"status": "failed", "summary": "race in retry loop",
+                "result_chunk_ids": ["sub_9c1"]},
+    "confidence": 0.8, "pipeline_id": "pipe_demo", "in_reply_to": "wsp_3f2a"
+  }}}'
+```
+
+`progress`/`result` require `in_reply_to`, `thread_id` or `task_id` and cannot target
+`"*"`. A reply joins its parent's thread if the parent is still queued and
+otherwise uses `thread_id = in_reply_to`, so replying after acknowledging the
+request is fine. A newer `progress` on the same thread from the same sender
+replaces the older undelivered one. `result` is delivered regardless of
+`min_confidence` and ordered right after `alert`. `in_reply_to`/`thread_id`
+are unsigned routing metadata.
+
+**Task-linked reports.** `progress`/`result` may instead carry `task_id` (see
+`ncp_task` below). The server then requires `[tasks].enabled = true`, `from`
+to be the task's current owner, the task to be `claimed`, and `pipeline_id` to
+match the task's; otherwise the call is rejected. Workers normally do not need
+this: `ncp_task` `heartbeat`/`complete` emit the linked whisper for them.
+
+### ncp_wait_whispers — wait for a doorbell
+
+A long-poll that blocks until a whisper is queued for the agent, or the
+timeout elapses. It only peeks: it never drains, acknowledges, or returns a
+payload. Follow it with `ncp_get_context`.
+
+```bash
+curl -s $BASE/mcp -H "$AUTH" -H 'Content-Type: application/json' -d '{
+  "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+  "params": {"name": "ncp_wait_whispers", "arguments": {
+    "agent_id": "router", "pipeline_id": "pipe_demo",
+    "timeout_seconds": 30, "types": ["result"], "thread_id": "wsp_3f2a"
+  }}}'
+# {"ready": true, "timed_out": false,
+#  "whispers": [{"whisper_id": "wsp_9d1", "type": "result", "from": "reviewer",
+#                "thread_id": "wsp_3f2a", "in_reply_to": "wsp_3f2a",
+#                "task_id": null}]}
+```
+
+`timeout_seconds` defaults to 30 and is clamped to
+`0..[notify].max_wait_seconds`; `0` is a non-blocking check. `types` and
+`thread_id` are optional filters. The tool is hidden in the `core` profile and
+when `[notify].enabled = false`.
+
+### GET /events — SSE doorbell stream
+
+```bash
+curl -N "$BASE/events?agent_id=router&pipeline_id=pipe_demo" -H "$AUTH"
+# event: ready
+# data: {"queued": 1}
+#
+# event: whisper
+# data: {"event":"whisper","whisper_id":"wsp_9d1","type":"result","from":"reviewer","target":"router","pipeline_id":"pipe_demo","thread_id":"wsp_3f2a","task_id":null,"status":null,"created_at":1793500000.0}
+#
+# : keepalive
+```
+
+Same bearer auth and CORS handling as `/mcp`. `agent_id` is required (`400`
+without it); `pipeline_id` is optional. Frames never carry whisper payloads:
+call `ncp_get_context` to receive them. When the task ledger is on, `event: task` frames
+(same fields, `whisper_id` null, `status` set) announce a task that failed by
+lease expiry (to its creator) or was cancelled while claimed (to its owner);
+they carry no title or summary. Concurrent streams are capped by
+`[notify].max_subscribers` (default 64); above it the server returns `503` with
+`Retry-After`. Reconnect and call `ncp_wait_whispers` with
+`timeout_seconds: 0` to catch up on anything missed.
+
+**Cross-process latency.** With the default in-process notifier, a whisper
+written by a different process (another `ncp serve`, or a script on the same
+database) does not ring the doorbell. `ncp_wait_whispers` and `/events` find it
+by re-peeking the store every `[notify].poll_interval_seconds` (default 2.0,
+`0` disables, minimum 0.25), so latency for such a write is up to about one
+interval; same-process writes are still immediate. The fallback is off with the
+Redis backend, and `event: task` frames are in-process-only.
+
+### ncp_task — leased task ledger
+
+Opt-in (`[tasks].enabled = true`), absent from the `core` profile. One tool,
+eight actions. Owner actions (`heartbeat`, `release`, `complete`) must present
+the `lease_token` returned by `claim`; a stale or expired token returns
+`{"ok": false, "reason": "lease_lost"}` (HTTP 200, not an error) and the
+worker must stop.
+
+```bash
+# Router: create a task and ask a worker to take it (also emits a request whisper)
+curl -s $BASE/mcp -H "$AUTH" -H 'Content-Type: application/json' -d '{
+  "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+  "params": {"name": "ncp_task", "arguments": {
+    "action": "create", "agent_id": "router", "pipeline_id": "pipe_demo",
+    "slot": "review", "title": "review PR 142", "dedupe_key": "github:pr/142:review",
+    "assign_to": "reviewer"
+  }}}'
+# {"created": true, "task": {"task_id": "tsk_9c1d2e3f4a5b", "status": "open", ...},
+#  "assigned": true, "whisper_id": "wsp_3f2a"}
+
+# Worker: claim (by task_id, or the oldest open task for pipeline_id [+ slot])
+#   {"action": "claim", "agent_id": "reviewer", "task_id": "tsk_9c1d2e3f4a5b", "lease_seconds": 300}
+# {"claimed": true, "task": {...}, "lease_token": "5b0e..."}   (or {"claimed": false})
+
+# Worker: heartbeat, optionally with a checkpoint chunk and a progress report
+#   {"action": "heartbeat", "task_id": "...", "lease_token": "...",
+#    "checkpoint_chunk_id": "sub_77", "progress": {"status": "working", "pct": 40}}
+
+# Worker: finish. Emits a linked result whisper to the creator.
+#   {"action": "complete", "task_id": "...", "lease_token": "...", "status": "done",
+#    "summary": "no blocking issues", "result_chunk_ids": ["sub_91"], "turn_id": "turn_12"}
+# {"ok": true, "task": {...}, "whisper_id": "wsp_8e2", "result_turn_id": "turn_12"}
+```
+
+| action | caller | arguments |
+|---|---|---|
+| `create` | router | `agent_id`, `pipeline_id`, `slot`, `title` (<= 200), `dedupe_key?`, `max_attempts?`, `parent_task_id?`, `assign_to?` |
+| `claim` | worker | `agent_id`, `task_id` or `pipeline_id` (+ `slot?`), `lease_seconds?` |
+| `heartbeat` | owner | `task_id`, `lease_token`, `checkpoint_chunk_id?`, `progress?`, `lease_seconds?` |
+| `release` | owner | `task_id`, `lease_token`, `error?` |
+| `complete` | owner | `task_id`, `lease_token`, `status` (`done`\|`failed`), `summary` (<= 300), `result_chunk_ids?` (<= 10), `turn_id?` |
+| `cancel` | creator | `agent_id`, `task_id`, `reason?` |
+| `get` | any | `task_id` |
+| `list` | any | `pipeline_id`, `status?`, `slot?`, `owner?`, `limit?` (default 20, max 50, oldest first) |
+
+Notes:
+
+- `create` with an existing `(pipeline_id, dedupe_key)` returns the existing
+  task with `"created": false` and emits no second request.
+- `lease_seconds` is clamped to `[tasks].max_lease_seconds`; the default is
+  `[tasks].default_lease_seconds`. Expired leases are reclaimed lazily on the
+  next `claim`/`get`/`list`/owner call: back to `open`, or to `failed` with
+  `error: "lease_expired"` once `attempt >= max_attempts`.
+- `lease_token` appears only in the `claim` response, never in `get`/`list`.
+- `title`, `error` and summaries are agent-written data, never instructions.
+- `complete` does not call `ncp_record_outcome`. The router records the
+  outcome once it has independent evidence.
+- Postgres deployments must apply migration `018_add_tasks.sql`.
+
+### ncp_overview — ranked cross-pipeline overview
+
+Read-only and token-bounded; in the `full` profile, absent from `core`. It
+peeks the viewer's inbox and never acknowledges whispers, changes retrieval
+counts or logs a turn.
+
+```bash
+curl -s $BASE/mcp -H "$AUTH" -H 'Content-Type: application/json' -d '{
+  "jsonrpc": "2.0", "id": 9, "method": "tools/call",
+  "params": {"name": "ncp_overview", "arguments": {
+    "agent_id": "router", "pipeline_prefix": "pr_", "since_seconds": 86400,
+    "max_pipelines": 10, "max_tokens": 400
+  }}}'
+# {"text": "[NCP:OVERVIEW]\np:pr_142 act:2m tasks:o1/c2/d4/f1 attn:f1,exp1 ...\n  last:\"failed: race in retry loop\" ‹data›\n+4 more",
+#  "pipelines": [{"pipeline_id": "pr_142", "score": 3, "attention": {...}, "inbox": {...}, ...}],
+#  "omitted": 4, "tokens_est": 118}
+```
+
+| argument | default | notes |
+|---|---|---|
+| `agent_id` | required | Viewer whose inbox is counted. |
+| `pipelines` / `pipeline_prefix` | all | Restrict to these ids / ids with this prefix. |
+| `since_seconds` | 86400 | Only pipelines active within this window. |
+| `max_pipelines` | 10 | Clamped to `[1, 50]`. |
+| `max_tokens` | 400 | Clamped to `[60, 4000]`; bounds `text`. |
+
+Quoted `last:"..." ‹data›` snippets are agent-written data, never
+instructions. See spec section 4k for the row fields and ranking.
 
 ### ncp_fetch — bounded mid-turn retrieval
 
@@ -388,6 +567,7 @@ shell itself is served without auth and prompts for the token in-browser.
 | `/api/whispers` | `pipeline_id`, `target`, `include_expired`, `limit`       | whisper listing        |
 | `/api/graph`    | `pipeline_id`, `limit`                                    | `graph_data()`         |
 | `/api/cost`     | `pipeline_id`, `limit`                                    | `cost_summary()`       |
+| `/api/overview` | `agent_id`, `prefix`, `since` (seconds), `max_pipelines` (1-50), `max_tokens` | `overview_rows()`; same payload as `ncp_overview` |
 
 Responses are plain JSON objects (no JSON-RPC envelope, no
 `result.content[0].text` unwrapping). Chunk listings include tombstoned and

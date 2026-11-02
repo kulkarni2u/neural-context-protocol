@@ -4,6 +4,170 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [Unreleased]
 
+## [1.8.0] - 2026-11-02
+
+### Release scope
+
+This release adds router coordination primitives, so one long-lived router
+agent can coordinate many workers over the bus: request/reply whisper threads
+(`progress`/`result`), push delivery (`ncp_wait_whispers`, `GET /events`), an
+opt-in task ledger with leased, fenced claims (`ncp_task`, plus `ncp.api`
+task functions), and a ranked cross-pipeline overview (`ncp_overview`,
+`ncp overview`, `GET /api/overview`). NCP still does not schedule work: it
+records claims and rings payload-free doorbells. The new tools are outside
+the `core` profile and `[tasks]` is off by default. Postgres deployments must
+apply `018_add_tasks.sql` before enabling `[tasks]`. Read **Changed** before
+upgrading: newly emitted `share`/`request` whispers show an `id:` token in
+`[NCP:WHISPERS]`, and `ncp.api.emit` now enforces the task owner check.
+
+### Added
+
+- **Request/reply whisper threads** (`ncp/types.py`, `ncp/stores/sqlite.py`,
+  `ncp/stores/redis_coordination.py`, `ncp/encoder.py`, `ncp/mcp/server.py`):
+  first step of the router coordination primitives
+  (`docs/specs/2026-11-02-ncp-coordination-primitives-design.md`, capability
+  A). Whispers gain optional `in_reply_to` and `thread_id`. A `share`/`request`
+  opens a thread keyed by its own `whisper_id`; a reply joins its parent's
+  thread, or uses `in_reply_to` as the thread key when the parent was already
+  acknowledged. New whisper types `progress` (`ProgressPayload`) and `result`
+  (`ResultPayload`) are reply-only: they require `in_reply_to` or `thread_id`
+  and cannot broadcast. A newer `progress` on a thread replaces the older
+  undelivered one, and `result` skips the confidence filter and is delivered
+  right after alerts. `ncp_emit_whisper` takes `in_reply_to`/`thread_id` and
+  now returns `whisper_id` (and `thread_id` when threaded). Stores gain
+  `get_whisper`/`async_get_whisper`.
+
+- **Push delivery for whispers** (`ncp/notify.py`, `ncp/mcp/server.py`,
+  `ncp/api.py`, `ncp/config.py`): capability B of the coordination primitives.
+  A notification is a doorbell, not a delivery: events carry ids and routing
+  fields only, never the payload, and `ncp_get_context` stays the only way to
+  receive and acknowledge a whisper. New `ncp_wait_whispers` MCP tool
+  (long-poll peek, never drains; hidden in the `core` profile and when
+  `[notify].enabled = false`), `GET /events` SSE endpoint (bearer auth, `ready`
+  frame, `whisper` frames, keepalives, `max_subscribers` cap with 503 and
+  `Retry-After`), `InProcessNotifier` and `RedisNotifier` (pub/sub on
+  `{stream}:notify:{pipeline_id|_}:{target}`), a new `[notify]` config section
+  (`enabled`, `backend`, `max_subscribers`, `max_wait_seconds`), and
+  `ncp.api.wait_whispers`/`ncp.api.subscribe`. `ncp_emit_whisper` and
+  `ncp.api.emit` publish only after the store accepts the whisper, and a
+  notifier failure never fails an emit. stdio and webhooks are not included.
+
+- **Task ledger** (`ncp/types.py`, `ncp/stores/*`, `ncp/stores/task_sql.py`,
+  `ncp/migrations/018_add_tasks.sql`, `ncp/mcp/server.py`, `ncp/notify.py`,
+  `ncp/config.py`): capability C of the coordination primitives. New
+  `TaskRecord`/`TaskStatus`/`TaskOpResult` and an opt-in `ncp_task` MCP tool
+  (`create`, `claim`, `heartbeat`, `release`, `complete`, `cancel`, `get`,
+  `list`; hidden unless `[tasks].enabled = true` and never in the `core`
+  profile). Claims are atomic (SQLite `BEGIN IMMEDIATE`; Postgres
+  `FOR UPDATE SKIP LOCKED`), every claim rotates a fencing `lease_token`, and
+  owner actions with a stale token return `lease_lost` instead of raising.
+  Leases expire lazily (back to `open`, or `failed` with
+  `error="lease_expired"` at `max_attempts`); `dedupe_key` makes `create`
+  idempotent per pipeline. `complete` emits a linked `result` whisper and does
+  not record an outcome. `BaseStore` gains non-abstract task methods (default:
+  `NCPStoreError("task ledger not supported")`) plus async counterparts, with
+  SQLite, sync Postgres and native async Postgres implementations. Whispers
+  gain `task_id` (SQLite column and index, Redis hash field); `progress` and
+  `result` accept it in place of `in_reply_to`/`thread_id`, and
+  `ncp_emit_whisper` rejects it unless `from` is the task's current owner and
+  the task is claimed. Doorbell events gain `event: "task"` (failed by expiry,
+  or cancelled while claimed) and `task_id`/`status` fields, and `GET /events`
+  emits `event: task` frames. New `[tasks]` config section (`enabled`,
+  `default_lease_seconds`, `max_lease_seconds`, `default_max_attempts`,
+  `stale_open_seconds`).
+
+- **Cross-pipeline overview** (`ncp/overview.py`, `ncp/stores/overview_facts.py`,
+  `ncp/stores/base.py`, `ncp/stores/sqlite.py`, `ncp/stores/pgvector_async.py`,
+  `ncp/mcp/server.py`, `ncp/cli.py`, `ncp/api.py`): capability D of the
+  coordination primitives. New read-only `ncp_overview` MCP tool (full profile
+  only, no config flag) returning a ranked, token-bounded `[NCP:OVERVIEW]`
+  block plus structured rows: activity age, task counts, attention flags
+  (failed, expiring claims, stale open tasks), the viewer's inbox by type
+  (peeked, never drained), newest result/failed-task snippet, newest decision,
+  drift and 24h dissent. Rows rank by `3*failed + 2*inbox(result|alert|dissent)
+  + 2*expiring_claims + 1*stale_open`; agent-written text is quoted, truncated
+  to 60 characters, escaped and marked `‹data›`. Also `ncp overview [--json]`,
+  `GET /api/overview` (same auth as the other `/api/*` routes) and
+  `ncp.api.overview`. `BaseStore` gains `overview_rows`/`async_overview_rows`
+  (a generic default composed from public methods, with native
+  implementations on SQLite and Postgres; see the Postgres parity entry
+  below). The tool runs lease expiry first, so a task that fails by expiry
+  during an overview read still notifies its creator.
+
+- **Task ledger library API** (`ncp/tasks.py`, `ncp/api.py`,
+  `ncp/mcp/server.py`): the `ncp_task` action logic, lazy lease expiry with its
+  doorbell and the whisper `task_id` owner check move into a shared
+  `TaskService`, so `ncp.api` gains `create_task`, `claim_task`,
+  `heartbeat_task`, `release_task`, `complete_task`, `cancel_task`, `get_task`
+  and `list_tasks` with results identical to the tool. `ncp.api.emit` now
+  rejects a `progress`/`result` whisper carrying a `task_id` unless it comes
+  from the claiming owner, closing the gap where library callers skipped the
+  check. Task functions need a synchronous store and `[tasks].enabled = true`.
+
+- **Cross-process whisper wake-ups without Redis** (`ncp/notify.py`,
+  `ncp/api.py`, `ncp/mcp/server.py`, `ncp/config.py`): new
+  `[notify] poll_interval_seconds` (default 2.0, `0` disables, minimum 0.25;
+  off with the Redis backend). `ncp_wait_whispers` and `api.wait_whispers`
+  now share `ncp.notify.wait_for_whispers` and re-peek the store every
+  interval, and `GET /events` and `api.subscribe` use a shared
+  `PollingSubscription` that announces eligible whispers written by other
+  processes once per connection (queued-at-connect and doorbell-announced ids
+  are never repeated). Frames stay payload-free; `task` events remain
+  in-process-only.
+
+- **Postgres parity for the cross-pipeline overview** (`ncp/stores/overview_sql.py`,
+  `ncp/stores/pgvector.py`, `ncp/stores/pgvector_async.py`,
+  `ncp/stores/redis_coordination.py`): `PgvectorStore.overview_rows` and
+  `AsyncPgvectorStore.async_overview_rows` are now native grouped SQL with the
+  same semantics as SQLite (pipelines discovered from chunks, turns, decisions
+  and tasks; real `dissent_24h`; no 50-task cap). Inbox counts and the newest
+  `result` whisper come from Redis by peeking only. `RedisCoordination` and
+  `AsyncRedisCoordination` gain a read-only `scan_whispers`, and the async class
+  a public `peek_whispers`. SQLite's overview now also counts decisions as
+  pipeline activity. Verified live on Postgres 16 with pgvector (full
+  `_init_db`, migration 017 to 018, SQLite/Postgres row parity); live tests
+  run when `NCP_TASKS_PG_DSN` (and `NCP_TASKS_REDIS_URL`) are set.
+
+### Changed
+
+- A whisper with `task_id` renders `task:<task_id>` (and `id:`) in its
+  `[NCP:WHISPERS]` header; task-less whispers render unchanged. The
+  `progress`/`result` linkage error now reads "require in_reply_to, thread_id
+  or task_id". Progress coalescing also keys on `task_id`. `NotifyEvent`
+  gained `event="task"`, `task_id` and `status`; `whisper_id` is null for task
+  events.
+- Threaded whispers render `id:`, `re:` and (when it adds information) `th:`
+  tokens in their `[NCP:WHISPERS]` header, so a receiver can reply. Newly
+  emitted `share`/`request` whispers are threaded and therefore show `id:`;
+  unthreaded whispers render byte-for-byte as before.
+- `ncp.api.emit` now applies the same task owner check as `ncp_emit_whisper`:
+  a `progress`/`result` whisper carrying `task_id` raises `ValueError` unless
+  it comes from the current owner of a claimed task, and always raises when
+  `[tasks].enabled = false`.
+- The SQLite overview counts decision records as pipeline activity, matching
+  Postgres.
+
+### Upgrade notes
+
+- SQLite adds `whispers.in_reply_to`, `whispers.thread_id` and
+  `idx_whispers_thread` idempotently on open. Postgres needs no migration:
+  whispers live in Redis, whose hashes gain the two fields.
+- `in_reply_to`/`thread_id` are unsigned routing metadata; authorship
+  signatures still cover only the payload.
+- **Postgres deployments must apply `018_add_tasks.sql`** before enabling
+  `[tasks]` (fresh installs create the table automatically; run
+  `ncp migrate apply` on existing databases). SQLite
+  creates the `tasks` table and adds `whispers.task_id` plus
+  `idx_whispers_task` idempotently on open. `[tasks]` is off by default, so
+  nothing changes until it is enabled.
+- `[notify]` is on by default and needs no migration. `backend = "auto"` uses
+  Redis pub/sub only for the `pgvector` store. SQLite deployments use the
+  in-process notifier plus a store poll every `poll_interval_seconds`
+  (default 2s), so whispers written by another process wake waiters within
+  about one interval; `task` events stay in-process on SQLite.
+- Library callers that send `progress`/`result` whispers with `task_id`
+  through `ncp.api.emit` must now be the claiming owner (see Changed).
+
 ## [1.7.1] - 2026-10-30
 
 ### Release scope
