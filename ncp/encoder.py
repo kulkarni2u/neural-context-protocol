@@ -205,13 +205,13 @@ class PidginEncoder:
         return "\n".join([header, *self._encode_whisper_payload_lines(whisper.payload)])
 
     def _encode_whisper_thread_tokens(self, whisper: Whisper) -> list[str]:
-        """Request/reply linkage tokens; empty for unthreaded whispers.
+        """Request/reply linkage tokens; empty for unthreaded, task-less whispers.
 
         ``id:`` is what a receiver passes back as ``in_reply_to``; ``th:`` is
         shown only when it adds information beyond ``id``/``re``.
         """
 
-        if whisper.thread_id is None and whisper.in_reply_to is None:
+        if whisper.thread_id is None and whisper.in_reply_to is None and whisper.task_id is None:
             return []
         tokens = [f"id:{whisper.whisper_id}"]
         if whisper.in_reply_to is not None:
@@ -221,6 +221,8 @@ class PidginEncoder:
             whisper.in_reply_to,
         }:
             tokens.append(f"th:{whisper.thread_id}")
+        if whisper.task_id is not None:
+            tokens.append(f"task:{whisper.task_id}")
         return tokens
 
     def _encode_whisper_payload_lines(self, payload: str) -> list[str]:

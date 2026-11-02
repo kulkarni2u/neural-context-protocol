@@ -284,8 +284,8 @@ Where the shipped code differs from the sketch above:
 - The confidence pre-filter uses the fixed 0.60 floor the assembler uses
   (`Assembler._peek_whispers`), not `[whispers] min_confidence`, which the
   assembler does not read.
-- `task_id` is omitted from events and from `ncp_wait_whispers` rows until
-  capability C lands; rows carry `in_reply_to` instead.
+- `task_id` was omitted from events and from `ncp_wait_whispers` rows until
+  capability C; both now carry it (null when absent).
 - `ncp_wait_whispers` with `timeout_seconds: 0` reports `timed_out: false`.
 
 ### 4.4 Library API
@@ -475,6 +475,73 @@ outside event (an email subject, a PR title) carries that text verbatim, so
 the overview (§6) truncates and labels it. Signed task mutations under
 `require_signatures` are deferred (§8). Until then, the ledger has the same
 "anyone who can reach the endpoint" authorization model as whispers.
+
+### 5.9 Implementation notes (PR 3)
+
+Deviations from, and details beyond, the text above:
+
+- **`BaseStore` task methods are non-abstract** (§5.7 said abstract). They
+  default to `raise NCPStoreError("task ledger not supported")` so existing
+  fake and third-party stores keep working. The async store implements the
+  `async_*` forms natively; its sync forms keep the base default.
+- **Results instead of exceptions.** Owner mutations and `cancel` return a
+  `TaskOpResult(ok, reason, task, previous_status, previous_owner)`.
+  `reason` is `lease_lost`, `not_found`, `not_allowed` (cancel by a
+  non-creator) or `terminal`. `claim_task` returns the claimed `TaskRecord`
+  (with `lease_token`) or `None`; `create_task` returns `(task, created)`.
+  `now` is an injectable keyword on every store method so tests need no
+  sleeps.
+- **`release` at the attempt limit fails the task.** §5.2 only shows
+  `release` returning to `open`. A task whose `attempt >= max_attempts` that
+  is released would otherwise sit `open` forever (the claim also refuses
+  `attempt >= max_attempts`), so it becomes `failed` with
+  `error = "max_attempts_exhausted"` (or the supplied `error`) and rings the
+  creator like a lease-expiry failure.
+- **`complete` summary storage.** `TaskRecord` has no summary field. For
+  `status = failed` the summary (truncated to 300 chars) is stored in `error`;
+  for `done` it travels only in the `result` whisper.
+- **Expiry notifications are published by the tool layer.** The store cannot
+  publish, so `ncp_task` calls `expire_task_leases` (and rings `created_by`
+  for each row now `failed`) before `claim`, `get`, `list` and owner actions.
+  The store also runs expiry inside those operations, so state is correct for
+  direct library callers, but a library caller that lets the store expire a
+  task on its own does not get a doorbell. A rare race where another thread's
+  internal expiry wins the transition before the tool layer's explicit call
+  can also skip the doorbell; the state is still correct and a `get`/`list`
+  shows it.
+- **Expiry scope.** `get` and the owner actions expire only the task they
+  touch; `claim` and `list` expire the pipeline (or the one task). Expiry
+  uses select-then-update by id inside the write transaction on every SQLite
+  version; only `claim` has the `RETURNING` versus fallback split.
+- **Ledger enabled check on emit.** The `task_id` owner check (§5.6) also
+  requires the task's `pipeline_id` to equal the whisper's, and rejects
+  `progress`/`result` carrying `task_id` when `[tasks].enabled = false` or the
+  store raises "task ledger not supported". Other whisper types may carry
+  `task_id` without the check. `ncp.api.emit` does not perform the owner
+  check (only the MCP tool does); `ncp.api` wrappers for the ledger were not
+  added in this PR.
+- **Progress coalescing** now keys on `(pipeline_id, from_agent, target,
+  thread_id, task_id)`, so task-only progress for different tasks does not
+  replace each other. SQLite matches with `IS`, so a null `thread_id` or
+  `task_id` coalesces too.
+- **`NotifyEvent` for tasks** reuses the whisper event shape: `event="task"`,
+  `type="task"`, `whisper_id=null`, `from="ncp_ledger"` (or the cancelling
+  agent), `target`, `pipeline_id`, `task_id`, `status`, `created_at`. The
+  whisper event gains `task_id` and `status` (null) so both kinds share one
+  schema.
+- **Rendering.** A whisper with `task_id` renders `task:<task_id>` after the
+  other linkage tokens, and `id:` is shown whenever any of `thread_id`,
+  `in_reply_to` or `task_id` is set.
+- **Postgres schema.** `ncp/migrations/018_add_tasks.sql` is mirrored in
+  `PGVECTOR_SCHEMA_TEMPLATE` (as for decisions). Sync and async stores share
+  one set of statement builders in `ncp/stores/task_sql.py`. The dedupe insert
+  is `ON CONFLICT (pipeline_id, dedupe_key) WHERE dedupe_key IS NOT NULL DO
+  NOTHING` followed by a select of the existing row. `cancel` reads the row
+  `FOR UPDATE` to check the creator before updating.
+- **`stale_open_seconds`** is parsed and exposed (`tasks_stale_open_seconds`)
+  but unused until capability D.
+- **`ncp_overview`** (§5.3 mentions it) does not exist yet; lazy expiry there
+  is for PR 4.
 
 ---
 

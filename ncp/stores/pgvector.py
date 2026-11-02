@@ -14,6 +14,7 @@ import struct
 from pathlib import Path
 from typing import Any
 import time
+from uuid import uuid4
 
 from ncp.config import NCPConfig
 from ncp.stores.base import (
@@ -56,7 +57,8 @@ from ncp.stores.retrieval import (
     score_vector_distance,
 )
 from ncp.tokens import estimate_tokens
-from ncp.types import CalibrationReport, ChunkEdge, ConsolidationReport, ConsciousBlock, DecisionRecord, NCPResponse, OutcomeRecord, SubconsciousChunk, TurnRecord, Whisper
+from ncp.stores import task_sql
+from ncp.types import CalibrationReport, ChunkEdge, ConsolidationReport, ConsciousBlock, DecisionRecord, NCPResponse, OutcomeRecord, SubconsciousChunk, TaskOpResult, TaskRecord, TaskStatus, TurnRecord, Whisper
 
 logger = logging.getLogger("ncp")
 
@@ -342,6 +344,40 @@ CREATE INDEX IF NOT EXISTS {prefix}decisions_state_hash_idx
     ON {schema}.{prefix}decisions (state_hash);
 CREATE INDEX IF NOT EXISTS {prefix}decisions_pipeline_idx
     ON {schema}.{prefix}decisions (pipeline_id, created_at DESC);
+
+-- Task ledger (coordination primitives C). Mirrors migration 018 so a fresh
+-- install and a migrated install converge on the same shape.
+CREATE TABLE IF NOT EXISTS {schema}.{prefix}tasks (
+    task_id TEXT PRIMARY KEY,
+    pipeline_id TEXT NOT NULL,
+    slot TEXT NOT NULL,
+    title TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open',
+    created_by TEXT NOT NULL,
+    owner TEXT,
+    lease_token TEXT,
+    lease_expires_at DOUBLE PRECISION,
+    heartbeat_at DOUBLE PRECISION,
+    attempt INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 3,
+    dedupe_key TEXT,
+    parent_task_id TEXT,
+    origin_whisper_id TEXT,
+    checkpoint_chunk_id TEXT,
+    result_chunk_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+    result_turn_id TEXT,
+    error TEXT,
+    version INTEGER NOT NULL DEFAULT 0,
+    created_at DOUBLE PRECISION NOT NULL,
+    updated_at DOUBLE PRECISION NOT NULL
+);
+CREATE INDEX IF NOT EXISTS {prefix}tasks_pipeline_status_idx
+    ON {schema}.{prefix}tasks (pipeline_id, status, created_at);
+CREATE INDEX IF NOT EXISTS {prefix}tasks_owner_status_idx
+    ON {schema}.{prefix}tasks (owner, status);
+CREATE UNIQUE INDEX IF NOT EXISTS {prefix}tasks_dedupe_idx
+    ON {schema}.{prefix}tasks (pipeline_id, dedupe_key)
+    WHERE dedupe_key IS NOT NULL;
 """
 
 
@@ -1672,6 +1708,219 @@ class PgvectorStore(BaseStore):
                 return cursor.rowcount > 0
             finally:
                 self._close_cursor(cursor)
+
+    # ── task ledger (coordination primitives C, spec section 5) ───────────
+
+    def _task_rows(self, cursor: Any, statement: task_sql.Statement) -> list[dict[str, Any]]:
+        sql, params = statement
+        cursor.execute(self._sql(sql), params)
+        return self._fetchall(cursor)
+
+    def expire_task_leases(
+        self, pipeline_id: str | None = None, now: float | None = None
+    ) -> list[TaskRecord]:
+        now = time.time() if now is None else float(now)
+        with self._connect() as connection:
+            cursor = connection.cursor()
+            try:
+                rows = self._task_rows(cursor, task_sql.expire_stmt(now, pipeline_id, None))
+            finally:
+                self._close_cursor(cursor)
+        return [task_sql.row_to_task(row) for row in rows]
+
+    def create_task(self, task: TaskRecord) -> tuple[TaskRecord, bool]:
+        with self._connect() as connection:
+            cursor = connection.cursor()
+            try:
+                rows = self._task_rows(cursor, task_sql.insert_stmt(task))
+                if rows:
+                    return task_sql.row_to_task(rows[0]), True
+                assert task.dedupe_key is not None
+                rows = self._task_rows(
+                    cursor, task_sql.select_by_dedupe_stmt(task.pipeline_id, task.dedupe_key)
+                )
+            finally:
+                self._close_cursor(cursor)
+        return task_sql.row_to_task(rows[0]), False
+
+    def claim_task(
+        self,
+        *,
+        agent_id: str,
+        task_id: str | None = None,
+        pipeline_id: str | None = None,
+        slot: str | None = None,
+        lease_seconds: float = 300.0,
+        now: float | None = None,
+    ) -> TaskRecord | None:
+        if task_id is None and pipeline_id is None:
+            raise ValueError("claim_task requires task_id or pipeline_id")
+        now = time.time() if now is None else float(now)
+        with self._connect() as connection:
+            cursor = connection.cursor()
+            try:
+                self._task_rows(cursor, task_sql.expire_stmt(now, pipeline_id, task_id))
+                rows = self._task_rows(
+                    cursor,
+                    task_sql.claim_stmt(
+                        agent_id=agent_id,
+                        token=uuid4().hex,
+                        now=now,
+                        lease_seconds=lease_seconds,
+                        task_id=task_id,
+                        pipeline_id=pipeline_id,
+                        slot=slot,
+                    ),
+                )
+            finally:
+                self._close_cursor(cursor)
+        return task_sql.row_to_task(rows[0]) if rows else None
+
+    def _task_owner_mutation(
+        self,
+        task_id: str,
+        lease_token: str,
+        now: float,
+        mutation: tuple[str, tuple[Any, ...]],
+    ) -> TaskOpResult:
+        with self._connect() as connection:
+            cursor = connection.cursor()
+            try:
+                self._task_rows(cursor, task_sql.expire_stmt(now, None, task_id))
+                rows = self._task_rows(
+                    cursor,
+                    task_sql.owner_update_stmt(
+                        mutation[0], mutation[1], task_id=task_id, lease_token=lease_token, now=now
+                    ),
+                )
+                if rows:
+                    return TaskOpResult(
+                        ok=True, task=task_sql.row_to_task(rows[0]), previous_status="claimed"
+                    )
+                current = self._task_rows(cursor, task_sql.select_stmt(task_id))
+            finally:
+                self._close_cursor(cursor)
+        if not current:
+            return TaskOpResult(ok=False, reason="not_found")
+        task = task_sql.row_to_task(current[0])
+        return TaskOpResult(ok=False, reason="lease_lost", task=task, previous_status=task.status)
+
+    def heartbeat_task(
+        self,
+        task_id: str,
+        lease_token: str,
+        *,
+        lease_seconds: float = 300.0,
+        checkpoint_chunk_id: str | None = None,
+        now: float | None = None,
+    ) -> TaskOpResult:
+        now = time.time() if now is None else float(now)
+        return self._task_owner_mutation(
+            task_id, lease_token, now, task_sql.heartbeat_set(now, lease_seconds, checkpoint_chunk_id)
+        )
+
+    def release_task(
+        self,
+        task_id: str,
+        lease_token: str,
+        *,
+        error: str | None = None,
+        now: float | None = None,
+    ) -> TaskOpResult:
+        now = time.time() if now is None else float(now)
+        return self._task_owner_mutation(task_id, lease_token, now, task_sql.release_set(error))
+
+    def complete_task(
+        self,
+        task_id: str,
+        lease_token: str,
+        *,
+        status: TaskStatus,
+        summary: str | None = None,
+        result_chunk_ids: Sequence[str] | None = None,
+        turn_id: str | None = None,
+        now: float | None = None,
+    ) -> TaskOpResult:
+        if status not in ("done", "failed"):
+            raise ValueError("complete_task status must be 'done' or 'failed'")
+        now = time.time() if now is None else float(now)
+        return self._task_owner_mutation(
+            task_id,
+            lease_token,
+            now,
+            task_sql.complete_set(status, summary, list(result_chunk_ids or []), turn_id),
+        )
+
+    def cancel_task(
+        self,
+        task_id: str,
+        agent_id: str,
+        *,
+        reason: str | None = None,
+        now: float | None = None,
+    ) -> TaskOpResult:
+        now = time.time() if now is None else float(now)
+        with self._connect() as connection:
+            cursor = connection.cursor()
+            try:
+                self._task_rows(cursor, task_sql.expire_stmt(now, None, task_id))
+                current = self._task_rows(cursor, task_sql.select_stmt(task_id, for_update=True))
+                if not current:
+                    return TaskOpResult(ok=False, reason="not_found")
+                before = task_sql.row_to_task(current[0])
+                if before.created_by != agent_id:
+                    return TaskOpResult(
+                        ok=False, reason="not_allowed", task=before, previous_status=before.status
+                    )
+                if before.status not in ("open", "claimed"):
+                    return TaskOpResult(
+                        ok=False, reason="terminal", task=before, previous_status=before.status
+                    )
+                rows = self._task_rows(cursor, task_sql.cancel_stmt(task_id, reason, now))
+            finally:
+                self._close_cursor(cursor)
+        return TaskOpResult(
+            ok=True,
+            task=task_sql.row_to_task(rows[0]),
+            previous_status=before.status,
+            previous_owner=before.owner,
+        )
+
+    def get_task(self, task_id: str, *, now: float | None = None) -> TaskRecord | None:
+        now = time.time() if now is None else float(now)
+        with self._connect() as connection:
+            cursor = connection.cursor()
+            try:
+                self._task_rows(cursor, task_sql.expire_stmt(now, None, task_id))
+                rows = self._task_rows(cursor, task_sql.select_stmt(task_id))
+            finally:
+                self._close_cursor(cursor)
+        return task_sql.row_to_task(rows[0]) if rows else None
+
+    def list_tasks(
+        self,
+        *,
+        pipeline_id: str | None = None,
+        status: TaskStatus | None = None,
+        slot: str | None = None,
+        owner: str | None = None,
+        limit: int = 50,
+        now: float | None = None,
+    ) -> list[TaskRecord]:
+        now = time.time() if now is None else float(now)
+        with self._connect() as connection:
+            cursor = connection.cursor()
+            try:
+                self._task_rows(cursor, task_sql.expire_stmt(now, pipeline_id, None))
+                rows = self._task_rows(
+                    cursor,
+                    task_sql.list_stmt(
+                        pipeline_id=pipeline_id, status=status, slot=slot, owner=owner, limit=limit
+                    ),
+                )
+            finally:
+                self._close_cursor(cursor)
+        return [task_sql.row_to_task(row) for row in rows]
 
     def record_memo(
         self,

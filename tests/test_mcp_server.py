@@ -254,6 +254,7 @@ class TestToolsList:
             "ncp_write_memory",
             "ncp_emit_whisper",
             "ncp_wait_whispers",
+            "ncp_task",
             "ncp_post_turn",
             "ncp_remember",
             "ncp_recall",
@@ -359,7 +360,7 @@ class TestToolsList:
         (project / ".git").mkdir(parents=True)
         (project / ".ncp").mkdir()
         (project / ".ncp" / "config.toml").write_text(
-            '[tools]\nprofile = "full"\n\n[memoization]\nenabled = true\n'
+            '[tools]\nprofile = "full"\n\n[memoization]\nenabled = true\n\n[tasks]\nenabled = true\n'
         )
         input_stream = io.BytesIO(_frame(_req("tools/list")))
         output_stream = io.BytesIO()

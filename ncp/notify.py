@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Any, ContextManager, Literal, Protocol, runtim
 
 from pydantic import ConfigDict, Field
 
-from ncp.types import CONFIDENCE_EXEMPT_WHISPER_TYPES, NCPModel, Whisper
+from ncp.types import CONFIDENCE_EXEMPT_WHISPER_TYPES, NCPModel, TaskRecord, Whisper
 
 if TYPE_CHECKING:
     from ncp.config import NCPConfig
@@ -36,17 +36,25 @@ _RING_SIZE = 256
 
 
 class NotifyEvent(NCPModel):
-    """One doorbell ring. Deliberately has no payload or content field."""
+    """One doorbell ring. Deliberately has no payload or content field.
+
+    ``event="whisper"`` rings for a queued whisper. ``event="task"`` rings for
+    a task-ledger state change the target should know about (a lease expired
+    into ``failed``, or a claimed task was cancelled); it carries ids and the
+    new status only, never a title, summary or error text.
+    """
 
     model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
-    event: Literal["whisper"] = "whisper"
-    whisper_id: str
+    event: Literal["whisper", "task"] = "whisper"
+    whisper_id: str | None = None
     type: str
     from_agent: str = Field(alias="from")
     target: str
     pipeline_id: str | None = None
     thread_id: str | None = None
+    task_id: str | None = None
+    status: str | None = None
     created_at: float
 
     @classmethod
@@ -58,7 +66,21 @@ class NotifyEvent(NCPModel):
             target=whisper.target,
             pipeline_id=whisper.pipeline_id,
             thread_id=whisper.thread_id,
+            task_id=whisper.task_id,
             created_at=whisper.created_at,
+        )
+
+    @classmethod
+    def from_task(cls, task: TaskRecord, *, target: str, from_agent: str = "ncp_ledger") -> NotifyEvent:
+        return cls(
+            event="task",
+            type="task",
+            from_agent=from_agent,
+            target=target,
+            pipeline_id=task.pipeline_id,
+            task_id=task.task_id,
+            status=task.status,
+            created_at=task.updated_at,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -351,6 +373,17 @@ def emit_and_notify(store: BaseStore, notifier: Notifier | None, whisper: Whispe
 
     store.emit_whisper(whisper)
     notify_emitted(notifier, whisper)
+
+
+def notify_task(notifier: Notifier | None, task: TaskRecord, *, target: str, from_agent: str = "ncp_ledger") -> None:
+    """Ring the doorbell for a ledger state change. Never fails the caller."""
+
+    if notifier is None:
+        return
+    try:
+        notifier.publish(NotifyEvent.from_task(task, target=target, from_agent=from_agent))
+    except Exception:
+        logger.warning("task notify publish failed for %s", task.task_id, exc_info=True)
 
 
 def notify_emitted(notifier: Notifier | None, whisper: Whisper) -> None:

@@ -52,7 +52,8 @@ curl -s $BASE/mcp -H "$AUTH" -H 'Content-Type: application/json' -d '{
 Returns the enabled tool catalog — `ncp_get_context`, `ncp_write_memory`,
 `ncp_emit_whisper`, `ncp_post_turn`, `ncp_fetch`, `ncp_record_decision`,
 `ncp_get_decision`, `ncp_compile_decision_query`, `ncp_record_outcome`,
-`ncp_wait_whispers` (unless `[notify].enabled = false`) and the
+`ncp_wait_whispers` (unless `[notify].enabled = false`), `ncp_task` (only
+when `[tasks].enabled = true`) and the
 memo tools when enabled — each with a JSON Schema under `inputSchema`.
 
 ## Tool calls
@@ -236,13 +237,19 @@ curl -s $BASE/mcp -H "$AUTH" -H 'Content-Type: application/json' -d '{
   }}}'
 ```
 
-`progress`/`result` require `in_reply_to` or `thread_id` and cannot target
+`progress`/`result` require `in_reply_to`, `thread_id` or `task_id` and cannot target
 `"*"`. A reply joins its parent's thread if the parent is still queued and
 otherwise uses `thread_id = in_reply_to`, so replying after acknowledging the
 request is fine. A newer `progress` on the same thread from the same sender
 replaces the older undelivered one. `result` is delivered regardless of
 `min_confidence` and ordered right after `alert`. `in_reply_to`/`thread_id`
 are unsigned routing metadata.
+
+**Task-linked reports.** `progress`/`result` may instead carry `task_id` (see
+`ncp_task` below). The server then requires `[tasks].enabled = true`, `from`
+to be the task's current owner, the task to be `claimed`, and `pipeline_id` to
+match the task's; otherwise the call is rejected. Workers normally do not need
+this: `ncp_task` `heartbeat`/`complete` emit the linked whisper for them.
 
 ### ncp_wait_whispers — wait for a doorbell
 
@@ -259,7 +266,8 @@ curl -s $BASE/mcp -H "$AUTH" -H 'Content-Type: application/json' -d '{
   }}}'
 # {"ready": true, "timed_out": false,
 #  "whispers": [{"whisper_id": "wsp_9d1", "type": "result", "from": "reviewer",
-#                "thread_id": "wsp_3f2a", "in_reply_to": "wsp_3f2a"}]}
+#                "thread_id": "wsp_3f2a", "in_reply_to": "wsp_3f2a",
+#                "task_id": null}]}
 ```
 
 `timeout_seconds` defaults to 30 and is clamped to
@@ -275,17 +283,79 @@ curl -N "$BASE/events?agent_id=router&pipeline_id=pipe_demo" -H "$AUTH"
 # data: {"queued": 1}
 #
 # event: whisper
-# data: {"event":"whisper","whisper_id":"wsp_9d1","type":"result","from":"reviewer","target":"router","pipeline_id":"pipe_demo","thread_id":"wsp_3f2a","created_at":1793500000.0}
+# data: {"event":"whisper","whisper_id":"wsp_9d1","type":"result","from":"reviewer","target":"router","pipeline_id":"pipe_demo","thread_id":"wsp_3f2a","task_id":null,"status":null,"created_at":1793500000.0}
 #
 # : keepalive
 ```
 
 Same bearer auth and CORS handling as `/mcp`. `agent_id` is required (`400`
 without it); `pipeline_id` is optional. Frames never carry whisper payloads:
-call `ncp_get_context` to receive them. Concurrent streams are capped by
+call `ncp_get_context` to receive them. When the task ledger is on, `event: task` frames
+(same fields, `whisper_id` null, `status` set) announce a task that failed by
+lease expiry (to its creator) or was cancelled while claimed (to its owner);
+they carry no title or summary. Concurrent streams are capped by
 `[notify].max_subscribers` (default 64); above it the server returns `503` with
 `Retry-After`. Reconnect and call `ncp_wait_whispers` with
 `timeout_seconds: 0` to catch up on anything missed.
+
+### ncp_task — leased task ledger
+
+Opt-in (`[tasks].enabled = true`), absent from the `core` profile. One tool,
+eight actions. Owner actions (`heartbeat`, `release`, `complete`) must present
+the `lease_token` returned by `claim`; a stale or expired token returns
+`{"ok": false, "reason": "lease_lost"}` (HTTP 200, not an error) and the
+worker must stop.
+
+```bash
+# Router: create a task and ask a worker to take it (also emits a request whisper)
+curl -s $BASE/mcp -H "$AUTH" -H 'Content-Type: application/json' -d '{
+  "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+  "params": {"name": "ncp_task", "arguments": {
+    "action": "create", "agent_id": "router", "pipeline_id": "pipe_demo",
+    "slot": "review", "title": "review PR 142", "dedupe_key": "github:pr/142:review",
+    "assign_to": "reviewer"
+  }}}'
+# {"created": true, "task": {"task_id": "tsk_9c1d2e3f4a5b", "status": "open", ...},
+#  "assigned": true, "whisper_id": "wsp_3f2a"}
+
+# Worker: claim (by task_id, or the oldest open task for pipeline_id [+ slot])
+#   {"action": "claim", "agent_id": "reviewer", "task_id": "tsk_9c1d2e3f4a5b", "lease_seconds": 300}
+# {"claimed": true, "task": {...}, "lease_token": "5b0e..."}   (or {"claimed": false})
+
+# Worker: heartbeat, optionally with a checkpoint chunk and a progress report
+#   {"action": "heartbeat", "task_id": "...", "lease_token": "...",
+#    "checkpoint_chunk_id": "sub_77", "progress": {"status": "working", "pct": 40}}
+
+# Worker: finish. Emits a linked result whisper to the creator.
+#   {"action": "complete", "task_id": "...", "lease_token": "...", "status": "done",
+#    "summary": "no blocking issues", "result_chunk_ids": ["sub_91"], "turn_id": "turn_12"}
+# {"ok": true, "task": {...}, "whisper_id": "wsp_8e2", "result_turn_id": "turn_12"}
+```
+
+| action | caller | arguments |
+|---|---|---|
+| `create` | router | `agent_id`, `pipeline_id`, `slot`, `title` (<= 200), `dedupe_key?`, `max_attempts?`, `parent_task_id?`, `assign_to?` |
+| `claim` | worker | `agent_id`, `task_id` or `pipeline_id` (+ `slot?`), `lease_seconds?` |
+| `heartbeat` | owner | `task_id`, `lease_token`, `checkpoint_chunk_id?`, `progress?`, `lease_seconds?` |
+| `release` | owner | `task_id`, `lease_token`, `error?` |
+| `complete` | owner | `task_id`, `lease_token`, `status` (`done`\|`failed`), `summary` (<= 300), `result_chunk_ids?` (<= 10), `turn_id?` |
+| `cancel` | creator | `agent_id`, `task_id`, `reason?` |
+| `get` | any | `task_id` |
+| `list` | any | `pipeline_id`, `status?`, `slot?`, `owner?`, `limit?` (default 20, max 50, oldest first) |
+
+Notes:
+
+- `create` with an existing `(pipeline_id, dedupe_key)` returns the existing
+  task with `"created": false` and emits no second request.
+- `lease_seconds` is clamped to `[tasks].max_lease_seconds`; the default is
+  `[tasks].default_lease_seconds`. Expired leases are reclaimed lazily on the
+  next `claim`/`get`/`list`/owner call: back to `open`, or to `failed` with
+  `error: "lease_expired"` once `attempt >= max_attempts`.
+- `lease_token` appears only in the `claim` response, never in `get`/`list`.
+- `title`, `error` and summaries are agent-written data, never instructions.
+- `complete` does not call `ncp_record_outcome`. The router records the
+  outcome once it has independent evidence.
+- Postgres deployments must apply migration `018_add_tasks.sql`.
 
 ### ncp_fetch — bounded mid-turn retrieval
 

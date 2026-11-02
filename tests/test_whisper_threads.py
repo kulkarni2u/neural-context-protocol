@@ -97,7 +97,7 @@ class TestPayloadsAndValidation:
             ResultPayload(status="succeeded", summary="ok", result_chunk_ids=["has space"])
 
     def test_reply_types_require_linkage(self) -> None:
-        with pytest.raises(ValueError, match="in_reply_to or thread_id"):
+        with pytest.raises(ValueError, match="in_reply_to, thread_id or task_id"):
             _result("wsp_x", in_reply_to=None)
         assert _result("wsp_x", in_reply_to=None, thread_id="wsp_t").thread_id == "wsp_t"
 
@@ -381,7 +381,7 @@ class TestEmitWhisperTool:
         )
         failed = "error" in response or response["result"].get("isError")
         assert failed
-        assert "in_reply_to or thread_id" in json.dumps(response)
+        assert "in_reply_to, thread_id or task_id" in json.dumps(response)
 
 
 # ---------------------------------------------------------------------------

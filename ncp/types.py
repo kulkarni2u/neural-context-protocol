@@ -586,6 +586,8 @@ class Whisper(NCPModel):
     # metadata -- authorship signatures still cover only the payload.
     in_reply_to: str | None = None
     thread_id: str | None = None
+    # Coordination primitives C: the ledger task this whisper reports on.
+    task_id: str | None = None
 
     @field_validator("from_agent", "target", "whisper_id")
     @classmethod
@@ -593,7 +595,7 @@ class Whisper(NCPModel):
         field_name = getattr(info, "field_name", "field")
         return _validate_no_spaces(value, field_name)
 
-    @field_validator("ref", "pipeline_id", "dissent_target", "in_reply_to", "thread_id")
+    @field_validator("ref", "pipeline_id", "dissent_target", "in_reply_to", "thread_id", "task_id")
     @classmethod
     def _optional_whisper_no_spaces(cls, value: str | None, info: object) -> str | None:
         if value is None:
@@ -629,9 +631,9 @@ class Whisper(NCPModel):
         if self.whisper_type in THREAD_REPLY_WHISPER_TYPES:
             if self.target == "*":
                 raise ValueError(f"{self.whisper_type} whispers cannot target '*'")
-            if self.in_reply_to is None and self.thread_id is None:
+            if self.in_reply_to is None and self.thread_id is None and self.task_id is None:
                 raise ValueError(
-                    f"{self.whisper_type} whispers require in_reply_to or thread_id"
+                    f"{self.whisper_type} whispers require in_reply_to, thread_id or task_id"
                 )
 
         raw_payload = self.payload
@@ -681,6 +683,136 @@ class Whisper(NCPModel):
             raise ValueError("payload must be <= 600 characters")
 
         return self
+
+
+# Coordination primitives C: task ledger
+# (docs/specs/2026-11-02-ncp-coordination-primitives-design.md section 5).
+TaskStatus = Literal["open", "claimed", "done", "failed", "cancelled"]
+TASK_TERMINAL_STATUSES: frozenset[str] = frozenset({"done", "failed", "cancelled"})
+TASK_MAX_TITLE_CHARS = 200
+TASK_MAX_ERROR_CHARS = 300
+TASK_MAX_RESULT_CHUNKS = 10
+
+
+def new_task_id() -> str:
+    return f"tsk_{uuid4().hex[:12]}"
+
+
+class TaskRecord(NCPModel):
+    """One unit of leased work in the task ledger.
+
+    ``title`` and ``error`` are agent-written DATA, never instructions.
+    ``lease_token`` is the fencing token rotated on every claim; the MCP layer
+    returns it only to the claiming agent.
+    """
+
+    task_id: str = Field(default_factory=new_task_id)
+    pipeline_id: str
+    slot: str
+    title: str
+    status: TaskStatus = "open"
+    created_by: str
+    owner: str | None = None
+    lease_token: str | None = None
+    lease_expires_at: float | None = None
+    heartbeat_at: float | None = None
+    attempt: int = 0
+    max_attempts: int = 3
+    dedupe_key: str | None = None
+    parent_task_id: str | None = None
+    origin_whisper_id: str | None = None
+    checkpoint_chunk_id: str | None = None
+    result_chunk_ids: list[str] = Field(default_factory=list)
+    result_turn_id: str | None = None
+    error: str | None = None
+    version: int = 0
+    created_at: float = Field(default_factory=time.time)
+    updated_at: float = Field(default_factory=time.time)
+
+    @field_validator("task_id", "pipeline_id", "slot", "created_by")
+    @classmethod
+    def _task_required_no_spaces(cls, value: str, info: object) -> str:
+        field_name = getattr(info, "field_name", "field")
+        if not value:
+            raise ValueError(f"{field_name} must not be empty")
+        return _validate_no_spaces(value, field_name)
+
+    @field_validator(
+        "owner",
+        "lease_token",
+        "dedupe_key",
+        "parent_task_id",
+        "origin_whisper_id",
+        "checkpoint_chunk_id",
+        "result_turn_id",
+    )
+    @classmethod
+    def _task_optional_no_spaces(cls, value: str | None, info: object) -> str | None:
+        if value is None:
+            return value
+        field_name = getattr(info, "field_name", "field")
+        return _validate_no_spaces(value, field_name)
+
+    @field_validator("title")
+    @classmethod
+    def _task_title_bounded(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("title must not be empty")
+        if len(value) > TASK_MAX_TITLE_CHARS:
+            raise ValueError(f"title must be <= {TASK_MAX_TITLE_CHARS} characters")
+        return value
+
+    @field_validator("error")
+    @classmethod
+    def _task_error_bounded(cls, value: str | None) -> str | None:
+        if value is not None and len(value) > TASK_MAX_ERROR_CHARS:
+            raise ValueError(f"error must be <= {TASK_MAX_ERROR_CHARS} characters")
+        return value
+
+    @field_validator("result_chunk_ids")
+    @classmethod
+    def _task_chunk_ids_bounded(cls, value: list[str]) -> list[str]:
+        if len(value) > TASK_MAX_RESULT_CHUNKS:
+            raise ValueError(f"result_chunk_ids must have at most {TASK_MAX_RESULT_CHUNKS} entries")
+        return _validate_no_spaces_list(value, "result_chunk_ids")
+
+    @field_validator("attempt")
+    @classmethod
+    def _task_attempt_non_negative(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("attempt must be >= 0")
+        return value
+
+    @field_validator("max_attempts")
+    @classmethod
+    def _task_max_attempts_positive(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("max_attempts must be >= 1")
+        return value
+
+    def public_dict(self) -> dict[str, Any]:
+        """Dict form safe for get/list: the fencing token is never included."""
+
+        data = self.model_dump()
+        data.pop("lease_token", None)
+        return data
+
+
+class TaskOpResult(NCPModel):
+    """Outcome of an owner/creator ledger mutation.
+
+    ``ok=False`` is a normal result, not an error: ``reason`` is
+    ``lease_lost`` (stale or expired token, or the task is not claimed),
+    ``not_found``, ``not_allowed`` (cancel by a non-creator) or ``terminal``
+    (cancel of a finished task). ``previous_status`` is the status before the
+    mutation, so callers can tell a cancel of a claimed task from an open one.
+    """
+
+    ok: bool
+    reason: str | None = None
+    task: TaskRecord | None = None
+    previous_status: str | None = None
+    previous_owner: str | None = None
 
 
 def resolve_whisper_thread(whisper: Whisper, parent: Whisper | None = None) -> Whisper:

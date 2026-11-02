@@ -5,6 +5,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from functools import partial
+from typing import Any
 
 import anyio
 
@@ -17,6 +18,9 @@ from ncp.types import (
     DecisionRecord,
     OutcomeRecord,
     SubconsciousChunk,
+    TaskOpResult,
+    TaskRecord,
+    TaskStatus,
     TurnRecord,
     Whisper,
 )
@@ -713,6 +717,140 @@ class BaseStore(ABC):
         """Asynchronously attach an outcome id to a decision using thread pool."""
         fn = partial(self.link_decision_outcome, decision_id, outcome_id)
         return await anyio.to_thread.run_sync(fn)
+
+    # ------------------------------------------------------------------
+    # Task ledger (coordination primitives C, spec section 5)
+    #
+    # Non-abstract defaults so backends and fakes that predate the ledger keep
+    # working. Real backends override all of them. ``now`` is injectable so
+    # lease expiry can be tested without sleeping. Owner mutations return a
+    # ``TaskOpResult`` (``ok=False, reason="lease_lost"`` for a stale token)
+    # rather than raising.
+
+    def create_task(self, task: TaskRecord) -> tuple[TaskRecord, bool]:
+        """Insert an open task. Returns ``(task, created)``; an existing
+        ``(pipeline_id, dedupe_key)`` returns the existing task and ``False``."""
+        raise NCPStoreError("task ledger not supported")
+
+    def claim_task(
+        self,
+        *,
+        agent_id: str,
+        task_id: str | None = None,
+        pipeline_id: str | None = None,
+        slot: str | None = None,
+        lease_seconds: float = 300.0,
+        now: float | None = None,
+    ) -> TaskRecord | None:
+        """Atomically claim one open task (by id, or the oldest open one for
+        ``pipeline_id``/``slot``). Returns the claimed task including its fresh
+        ``lease_token``, or ``None`` when nothing could be claimed."""
+        raise NCPStoreError("task ledger not supported")
+
+    def heartbeat_task(
+        self,
+        task_id: str,
+        lease_token: str,
+        *,
+        lease_seconds: float = 300.0,
+        checkpoint_chunk_id: str | None = None,
+        now: float | None = None,
+    ) -> TaskOpResult:
+        """Extend the lease (and optionally record a checkpoint chunk id)."""
+        raise NCPStoreError("task ledger not supported")
+
+    def release_task(
+        self,
+        task_id: str,
+        lease_token: str,
+        *,
+        error: str | None = None,
+        now: float | None = None,
+    ) -> TaskOpResult:
+        """Return a claimed task to ``open``; the attempt still counts."""
+        raise NCPStoreError("task ledger not supported")
+
+    def complete_task(
+        self,
+        task_id: str,
+        lease_token: str,
+        *,
+        status: TaskStatus,
+        summary: str | None = None,
+        result_chunk_ids: Sequence[str] | None = None,
+        turn_id: str | None = None,
+        now: float | None = None,
+    ) -> TaskOpResult:
+        """Terminal transition to ``done`` or ``failed`` (summary kept as
+        ``error`` only for ``failed``)."""
+        raise NCPStoreError("task ledger not supported")
+
+    def cancel_task(
+        self,
+        task_id: str,
+        agent_id: str,
+        *,
+        reason: str | None = None,
+        now: float | None = None,
+    ) -> TaskOpResult:
+        """Cancel an ``open`` or ``claimed`` task; only ``created_by`` may."""
+        raise NCPStoreError("task ledger not supported")
+
+    def get_task(self, task_id: str, *, now: float | None = None) -> TaskRecord | None:
+        """Fetch one task after lazy lease expiry."""
+        raise NCPStoreError("task ledger not supported")
+
+    def list_tasks(
+        self,
+        *,
+        pipeline_id: str | None = None,
+        status: TaskStatus | None = None,
+        slot: str | None = None,
+        owner: str | None = None,
+        limit: int = 50,
+        now: float | None = None,
+    ) -> list[TaskRecord]:
+        """Bounded list (``limit`` <= 50), oldest first, after lazy expiry."""
+        raise NCPStoreError("task ledger not supported")
+
+    def expire_task_leases(
+        self,
+        pipeline_id: str | None = None,
+        now: float | None = None,
+    ) -> list[TaskRecord]:
+        """Move expired claims back to ``open`` (or ``failed`` with
+        ``error="lease_expired"`` at ``max_attempts``). Returns the rows it
+        transitioned, in their new state."""
+        raise NCPStoreError("task ledger not supported")
+
+    async def async_create_task(self, task: TaskRecord) -> tuple[TaskRecord, bool]:
+        return await anyio.to_thread.run_sync(self.create_task, task)
+
+    async def async_claim_task(self, **kwargs: Any) -> TaskRecord | None:
+        return await anyio.to_thread.run_sync(partial(self.claim_task, **kwargs))
+
+    async def async_heartbeat_task(self, task_id: str, lease_token: str, **kwargs: Any) -> TaskOpResult:
+        return await anyio.to_thread.run_sync(partial(self.heartbeat_task, task_id, lease_token, **kwargs))
+
+    async def async_release_task(self, task_id: str, lease_token: str, **kwargs: Any) -> TaskOpResult:
+        return await anyio.to_thread.run_sync(partial(self.release_task, task_id, lease_token, **kwargs))
+
+    async def async_complete_task(self, task_id: str, lease_token: str, **kwargs: Any) -> TaskOpResult:
+        return await anyio.to_thread.run_sync(partial(self.complete_task, task_id, lease_token, **kwargs))
+
+    async def async_cancel_task(self, task_id: str, agent_id: str, **kwargs: Any) -> TaskOpResult:
+        return await anyio.to_thread.run_sync(partial(self.cancel_task, task_id, agent_id, **kwargs))
+
+    async def async_get_task(self, task_id: str, **kwargs: Any) -> TaskRecord | None:
+        return await anyio.to_thread.run_sync(partial(self.get_task, task_id, **kwargs))
+
+    async def async_list_tasks(self, **kwargs: Any) -> list[TaskRecord]:
+        return await anyio.to_thread.run_sync(partial(self.list_tasks, **kwargs))
+
+    async def async_expire_task_leases(
+        self, pipeline_id: str | None = None, now: float | None = None
+    ) -> list[TaskRecord]:
+        return await anyio.to_thread.run_sync(partial(self.expire_task_leases, pipeline_id, now))
 
     def query_precedents(
         self,

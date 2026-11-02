@@ -34,9 +34,38 @@ All notable changes to Neural Context Protocol will be documented in this file.
   `ncp.api.wait_whispers`/`ncp.api.subscribe`. `ncp_emit_whisper` and
   `ncp.api.emit` publish only after the store accepts the whisper, and a
   notifier failure never fails an emit. stdio and webhooks are not included.
+- **Task ledger** (`ncp/types.py`, `ncp/stores/*`, `ncp/stores/task_sql.py`,
+  `ncp/migrations/018_add_tasks.sql`, `ncp/mcp/server.py`, `ncp/notify.py`,
+  `ncp/config.py`): capability C of the coordination primitives. New
+  `TaskRecord`/`TaskStatus`/`TaskOpResult` and an opt-in `ncp_task` MCP tool
+  (`create`, `claim`, `heartbeat`, `release`, `complete`, `cancel`, `get`,
+  `list`; hidden unless `[tasks].enabled = true` and never in the `core`
+  profile). Claims are atomic (SQLite `BEGIN IMMEDIATE`; Postgres
+  `FOR UPDATE SKIP LOCKED`), every claim rotates a fencing `lease_token`, and
+  owner actions with a stale token return `lease_lost` instead of raising.
+  Leases expire lazily (back to `open`, or `failed` with
+  `error="lease_expired"` at `max_attempts`); `dedupe_key` makes `create`
+  idempotent per pipeline. `complete` emits a linked `result` whisper and does
+  not record an outcome. `BaseStore` gains non-abstract task methods (default:
+  `NCPStoreError("task ledger not supported")`) plus async counterparts, with
+  SQLite, sync Postgres and native async Postgres implementations. Whispers
+  gain `task_id` (SQLite column and index, Redis hash field); `progress` and
+  `result` accept it in place of `in_reply_to`/`thread_id`, and
+  `ncp_emit_whisper` rejects it unless `from` is the task's current owner and
+  the task is claimed. Doorbell events gain `event: "task"` (failed by expiry,
+  or cancelled while claimed) and `task_id`/`status` fields, and `GET /events`
+  emits `event: task` frames. New `[tasks]` config section (`enabled`,
+  `default_lease_seconds`, `max_lease_seconds`, `default_max_attempts`,
+  `stale_open_seconds`).
 
 ### Changed
 
+- A whisper with `task_id` renders `task:<task_id>` (and `id:`) in its
+  `[NCP:WHISPERS]` header; task-less whispers render unchanged. The
+  `progress`/`result` linkage error now reads "require in_reply_to, thread_id
+  or task_id". Progress coalescing also keys on `task_id`. `NotifyEvent`
+  gained `event="task"`, `task_id` and `status`; `whisper_id` is null for task
+  events.
 - Threaded whispers render `id:`, `re:` and (when it adds information) `th:`
   tokens in their `[NCP:WHISPERS]` header, so a receiver can reply. Newly
   emitted `share`/`request` whispers are threaded and therefore show `id:`;
@@ -49,6 +78,12 @@ All notable changes to Neural Context Protocol will be documented in this file.
   whispers live in Redis, whose hashes gain the two fields.
 - `in_reply_to`/`thread_id` are unsigned routing metadata; authorship
   signatures still cover only the payload.
+- **Postgres deployments must apply `018_add_tasks.sql`** before enabling
+  `[tasks]` (fresh installs create the table automatically; run
+  `ncp migrate apply` on existing databases). SQLite
+  creates the `tasks` table and adds `whispers.task_id` plus
+  `idx_whispers_task` idempotently on open. `[tasks]` is off by default, so
+  nothing changes until it is enabled.
 - `[notify]` is on by default and needs no migration. `backend = "auto"` uses
   Redis pub/sub only for the `pgvector` store; SQLite deployments use the
   in-process notifier, so wake-ups do not cross `ncp serve` processes there.

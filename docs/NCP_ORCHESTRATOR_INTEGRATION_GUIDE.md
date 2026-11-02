@@ -333,6 +333,41 @@ wake-up costs one extra `timeout_seconds: 0` call. Filter with `types` or
 `thread_id` to wake only for, say, `result` whispers on one request. Custom
 long-lived routers can use `GET /events` (SSE) or `ncp.api.subscribe` instead.
 
+**Router loop with the task ledger.** When `[tasks].enabled = true`, the same
+loop can hand out leased, idempotent work instead of ad-hoc requests
+(`ncp_task`, spec §4j):
+
+```text
+router:
+  ncp_task(action=create, agent_id="router", pipeline_id=P, slot="review",
+           title="review PR 142", dedupe_key="github:pr/142:review",
+           assign_to="reviewer")            # idempotent; also sends the request whisper
+  loop:
+    w = ncp_wait_whispers(agent_id="router", pipeline_id=P, timeout_seconds=30)
+    ctx = ncp_get_context(agent_id="router", pipeline_id=P, ...)  # delivers result/progress
+    on a result whisper (task_id set): verify independently, then
+        ncp_record_outcome(turn_id=result.turn_id)    # complete never does this
+    on an `event: task` doorbell (failed by lease expiry): ncp_task(get/list), re-create or escalate
+    ncp_post_turn(..., pending_whisper_ids=ctx.pending_whisper_ids)
+
+worker:
+  t = ncp_task(action=claim, agent_id="reviewer", pipeline_id=P, slot="review")  # or task_id=...
+  if not t.claimed: wait
+  ncp_get_context(agent_id="reviewer", pipeline_id=P, slot=t.task.slot, ...)
+  ... work; ncp_task(action=heartbeat, task_id, lease_token, checkpoint_chunk_id?, progress?) ...
+  ncp_write_memory(finding)
+  ncp_task(action=complete, task_id, lease_token, status=done|failed, summary,
+           result_chunk_ids, turn_id)       # emits the linked result whisper
+  # any {"ok": false, "reason": "lease_lost"}: stop, another worker owns it
+```
+
+A worker that dies simply stops heartbeating; its lease expires and the next
+`claim`/`get`/`list` returns the task to `open` (or to `failed` once
+`max_attempts` is reached, which rings the creator). The next claimer can read
+the last `checkpoint_chunk_id` through `ncp_fetch`. A `dedupe_key` such as
+`github:pr/142:review` makes at-least-once event sources (webhook retries)
+safe: a repeat `create` returns the existing task with `created: false`.
+
 **Dissent.** An agent that disputes a stored claim emits a `dissent` whisper
 with `ref` set to the disputed `chunk_id`. This increments the chunk's
 dissent counter and (at the next calibration) debits its trust and propagates

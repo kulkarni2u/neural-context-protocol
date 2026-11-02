@@ -10,6 +10,7 @@ import logging
 from pathlib import Path
 import sqlite3
 import time
+from uuid import uuid4
 
 from ncp.config import NCPConfig
 from ncp.stores.base import (
@@ -59,6 +60,9 @@ from ncp.types import (
     DecisionRecord,
     OutcomeRecord,
     SubconsciousChunk,
+    TaskOpResult,
+    TaskRecord,
+    TaskStatus,
     CONFIDENCE_EXEMPT_WHISPER_TYPES,
     TurnRecord,
     Whisper,
@@ -67,6 +71,10 @@ from ncp.types import (
 
 logger = logging.getLogger("ncp")
 
+
+# ``UPDATE ... RETURNING`` needs SQLite 3.35. Module-level so tests can force
+# the older UPDATE-then-SELECT fallback.
+_SQLITE_HAS_RETURNING = sqlite3.sqlite_version_info >= (3, 35)
 
 _IN_BATCH = 500  # ids per IN (...) query; stays under SQLite's variable limit
 
@@ -150,7 +158,8 @@ CREATE TABLE IF NOT EXISTS whispers (
     created_at REAL NOT NULL,
     expires_at REAL NOT NULL,
     in_reply_to TEXT,
-    thread_id TEXT
+    thread_id TEXT,
+    task_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS whisper_deliveries (
@@ -304,6 +313,35 @@ CREATE INDEX IF NOT EXISTS idx_decisions_schema_slot ON decisions(schema_id, slo
 CREATE INDEX IF NOT EXISTS idx_decisions_state_hash ON decisions(state_hash);
 CREATE INDEX IF NOT EXISTS idx_decisions_pipeline ON decisions(pipeline_id, created_at);
 
+CREATE TABLE IF NOT EXISTS tasks (
+    task_id TEXT PRIMARY KEY,
+    pipeline_id TEXT NOT NULL,
+    slot TEXT NOT NULL,
+    title TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open',
+    created_by TEXT NOT NULL,
+    owner TEXT,
+    lease_token TEXT,
+    lease_expires_at REAL,
+    heartbeat_at REAL,
+    attempt INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 3,
+    dedupe_key TEXT,
+    parent_task_id TEXT,
+    origin_whisper_id TEXT,
+    checkpoint_chunk_id TEXT,
+    result_chunk_ids TEXT NOT NULL DEFAULT '[]',
+    result_turn_id TEXT,
+    error TEXT,
+    version INTEGER NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_tasks_pipeline_status ON tasks(pipeline_id, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_tasks_owner_status ON tasks(owner, status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_dedupe ON tasks(pipeline_id, dedupe_key) WHERE dedupe_key IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS memo_entries (
     signature TEXT PRIMARY KEY,
     task TEXT NOT NULL,
@@ -454,6 +492,8 @@ class SQLiteStore(BaseStore):
                 "ALTER TABLE whispers ADD COLUMN in_reply_to TEXT",  # coordination A
                 "ALTER TABLE whispers ADD COLUMN thread_id TEXT",  # coordination A
                 "CREATE INDEX IF NOT EXISTS idx_whispers_thread ON whispers(pipeline_id, thread_id)",
+                "ALTER TABLE whispers ADD COLUMN task_id TEXT",  # coordination C
+                "CREATE INDEX IF NOT EXISTS idx_whispers_task ON whispers(pipeline_id, task_id)",
                 "ALTER TABLE chunks ADD COLUMN embedding BLOB",  # CAP-C4
                 "ALTER TABLE memo_entries ADD COLUMN output_tokens_est INTEGER NOT NULL DEFAULT 0",  # S4.1 memo telemetry
                 "ALTER TABLE chunks ADD COLUMN valid_from REAL",  # CAP-C5
@@ -1731,12 +1771,14 @@ class SQLiteStore(BaseStore):
                     """
                     DELETE FROM whispers
                     WHERE whisper_type = 'progress' AND from_agent = ? AND target = ?
-                      AND thread_id = ? AND pipeline_id IS ? AND whisper_id != ?
+                      AND thread_id IS ? AND task_id IS ?
+                      AND pipeline_id IS ? AND whisper_id != ?
                     """,
                     (
                         whisper.from_agent,
                         whisper.target,
                         whisper.thread_id,
+                        whisper.task_id,
                         whisper.pipeline_id,
                         whisper.whisper_id,
                     ),
@@ -1746,8 +1788,8 @@ class SQLiteStore(BaseStore):
                 INSERT OR REPLACE INTO whispers (
                     whisper_id, pipeline_id, from_agent, target, whisper_type,
                     payload, confidence, ref, dissent_target, verified, created_at, expires_at,
-                    in_reply_to, thread_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    in_reply_to, thread_id, task_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     whisper.whisper_id,
@@ -1764,6 +1806,7 @@ class SQLiteStore(BaseStore):
                     whisper.created_at + whisper.ttl_seconds,
                     whisper.in_reply_to,
                     whisper.thread_id,
+                    whisper.task_id,
                 ),
             )
 
@@ -3207,6 +3250,365 @@ class SQLiteStore(BaseStore):
             )
             return cursor.rowcount > 0
 
+    # ------------------------------------------------------------------
+    # Task ledger (coordination primitives C, spec section 5)
+
+    @staticmethod
+    def _row_to_task(row: sqlite3.Row) -> TaskRecord:
+        raw_chunks = row["result_chunk_ids"]
+        try:
+            chunk_ids = [str(c) for c in json.loads(raw_chunks)] if raw_chunks else []
+        except (TypeError, ValueError):
+            chunk_ids = []
+        return TaskRecord(
+            task_id=row["task_id"],
+            pipeline_id=row["pipeline_id"],
+            slot=row["slot"],
+            title=row["title"],
+            status=row["status"],
+            created_by=row["created_by"],
+            owner=row["owner"],
+            lease_token=row["lease_token"],
+            lease_expires_at=row["lease_expires_at"],
+            heartbeat_at=row["heartbeat_at"],
+            attempt=int(row["attempt"]),
+            max_attempts=int(row["max_attempts"]),
+            dedupe_key=row["dedupe_key"],
+            parent_task_id=row["parent_task_id"],
+            origin_whisper_id=row["origin_whisper_id"],
+            checkpoint_chunk_id=row["checkpoint_chunk_id"],
+            result_chunk_ids=chunk_ids,
+            result_turn_id=row["result_turn_id"],
+            error=row["error"],
+            version=int(row["version"]),
+            created_at=float(row["created_at"]),
+            updated_at=float(row["updated_at"]),
+        )
+
+    def _expire_task_leases_tx(
+        self,
+        connection: sqlite3.Connection,
+        now: float,
+        *,
+        pipeline_id: str | None = None,
+        task_id: str | None = None,
+    ) -> list[TaskRecord]:
+        """Lazy expiry inside an open IMMEDIATE transaction (spec 5.3).
+
+        Select-then-update by id: one code path for every SQLite version, and
+        atomic because the write lock is already held.
+        """
+        clauses = ["status = 'claimed'", "lease_expires_at < ?"]
+        params: list[object] = [now]
+        if pipeline_id is not None:
+            clauses.append("pipeline_id = ?")
+            params.append(pipeline_id)
+        if task_id is not None:
+            clauses.append("task_id = ?")
+            params.append(task_id)
+        ids = [
+            row["task_id"]
+            for row in connection.execute(
+                f"SELECT task_id FROM tasks WHERE {' AND '.join(clauses)}", params
+            ).fetchall()
+        ]
+        if not ids:
+            return []
+        marks = ",".join("?" for _ in ids)
+        connection.execute(
+            f"""
+            UPDATE tasks
+               SET status = CASE WHEN attempt >= max_attempts THEN 'failed' ELSE 'open' END,
+                   owner = NULL, lease_token = NULL, lease_expires_at = NULL,
+                   error = CASE WHEN attempt >= max_attempts THEN 'lease_expired' ELSE error END,
+                   updated_at = ?, version = version + 1
+             WHERE task_id IN ({marks}) AND status = 'claimed'
+            """,
+            [now, *ids],
+        )
+        rows = connection.execute(
+            f"SELECT * FROM tasks WHERE task_id IN ({marks}) ORDER BY created_at, task_id", ids
+        ).fetchall()
+        return [self._row_to_task(row) for row in rows]
+
+    def expire_task_leases(
+        self, pipeline_id: str | None = None, now: float | None = None
+    ) -> list[TaskRecord]:
+        now = time.time() if now is None else float(now)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            return self._expire_task_leases_tx(connection, now, pipeline_id=pipeline_id)
+
+    def create_task(self, task: TaskRecord) -> tuple[TaskRecord, bool]:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if task.dedupe_key is not None:
+                existing = connection.execute(
+                    "SELECT * FROM tasks WHERE pipeline_id = ? AND dedupe_key = ?",
+                    (task.pipeline_id, task.dedupe_key),
+                ).fetchone()
+                if existing is not None:
+                    return self._row_to_task(existing), False
+            connection.execute(
+                """
+                INSERT INTO tasks (
+                    task_id, pipeline_id, slot, title, status, created_by, owner,
+                    lease_token, lease_expires_at, heartbeat_at, attempt, max_attempts,
+                    dedupe_key, parent_task_id, origin_whisper_id, checkpoint_chunk_id,
+                    result_chunk_ids, result_turn_id, error, version, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task.task_id, task.pipeline_id, task.slot, task.title, task.status,
+                    task.created_by, task.owner, task.lease_token, task.lease_expires_at,
+                    task.heartbeat_at, task.attempt, task.max_attempts, task.dedupe_key,
+                    task.parent_task_id, task.origin_whisper_id, task.checkpoint_chunk_id,
+                    json.dumps(task.result_chunk_ids), task.result_turn_id, task.error,
+                    task.version, task.created_at, task.updated_at,
+                ),
+            )
+        return task, True
+
+    def claim_task(
+        self,
+        *,
+        agent_id: str,
+        task_id: str | None = None,
+        pipeline_id: str | None = None,
+        slot: str | None = None,
+        lease_seconds: float = 300.0,
+        now: float | None = None,
+    ) -> TaskRecord | None:
+        if task_id is None and pipeline_id is None:
+            raise ValueError("claim_task requires task_id or pipeline_id")
+        now = time.time() if now is None else float(now)
+        token = uuid4().hex
+        where = ["status = 'open'", "attempt < max_attempts"]
+        params: list[object] = []
+        if task_id is not None:
+            where.append("task_id = ?")
+            params.append(task_id)
+        if pipeline_id is not None:
+            where.append("pipeline_id = ?")
+            params.append(pipeline_id)
+        if slot is not None:
+            where.append("slot = ?")
+            params.append(slot)
+        cond = " AND ".join(where)
+        update = (
+            "UPDATE tasks SET status = 'claimed', owner = ?, lease_token = ?, "
+            "lease_expires_at = ?, heartbeat_at = ?, attempt = attempt + 1, "
+            "updated_at = ?, version = version + 1 "
+            f"WHERE status = 'open' AND task_id = (SELECT task_id FROM tasks WHERE {cond} "
+            "ORDER BY created_at, task_id LIMIT 1)"
+        )
+        update_params = [agent_id, token, now + float(lease_seconds), now, now, *params]
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._expire_task_leases_tx(connection, now, pipeline_id=pipeline_id, task_id=task_id)
+            if _SQLITE_HAS_RETURNING:
+                row = connection.execute(update + " RETURNING *", update_params).fetchone()
+            else:
+                cursor = connection.execute(update, update_params)
+                row = None
+                if cursor.rowcount > 0:
+                    row = connection.execute(
+                        "SELECT * FROM tasks WHERE lease_token = ?", (token,)
+                    ).fetchone()
+        return None if row is None else self._row_to_task(row)
+
+    def _owner_mutation(
+        self,
+        task_id: str,
+        lease_token: str,
+        now: float,
+        mutate: str,
+        mutate_params: list[object],
+    ) -> TaskOpResult:
+        """Run a fenced UPDATE (``mutate`` is the SET clause) for the lease holder.
+
+        Zero rows changed is a normal ``lease_lost`` result, never an error.
+        """
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._expire_task_leases_tx(connection, now, task_id=task_id)
+            before = connection.execute(
+                "SELECT * FROM tasks WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            if before is None:
+                return TaskOpResult(ok=False, reason="not_found")
+            cursor = connection.execute(
+                f"UPDATE tasks SET {mutate}, updated_at = ?, version = version + 1 "
+                "WHERE task_id = ? AND status = 'claimed' AND lease_token = ? "
+                "AND lease_expires_at >= ?",
+                [*mutate_params, now, task_id, lease_token, now],
+            )
+            if cursor.rowcount == 0:
+                return TaskOpResult(
+                    ok=False,
+                    reason="lease_lost",
+                    task=self._row_to_task(before),
+                    previous_status=before["status"],
+                )
+            after = connection.execute(
+                "SELECT * FROM tasks WHERE task_id = ?", (task_id,)
+            ).fetchone()
+        return TaskOpResult(
+            ok=True,
+            task=self._row_to_task(after),
+            previous_status=before["status"],
+            previous_owner=before["owner"],
+        )
+
+    def heartbeat_task(
+        self,
+        task_id: str,
+        lease_token: str,
+        *,
+        lease_seconds: float = 300.0,
+        checkpoint_chunk_id: str | None = None,
+        now: float | None = None,
+    ) -> TaskOpResult:
+        now = time.time() if now is None else float(now)
+        return self._owner_mutation(
+            task_id,
+            lease_token,
+            now,
+            "lease_expires_at = ?, heartbeat_at = ?, "
+            "checkpoint_chunk_id = COALESCE(?, checkpoint_chunk_id)",
+            [now + float(lease_seconds), now, checkpoint_chunk_id],
+        )
+
+    def release_task(
+        self,
+        task_id: str,
+        lease_token: str,
+        *,
+        error: str | None = None,
+        now: float | None = None,
+    ) -> TaskOpResult:
+        now = time.time() if now is None else float(now)
+        bounded = None if error is None else error[:300]
+        # attempt counts: an exhausted task fails instead of re-opening.
+        return self._owner_mutation(
+            task_id,
+            lease_token,
+            now,
+            "status = CASE WHEN attempt >= max_attempts THEN 'failed' ELSE 'open' END, "
+            "owner = NULL, lease_token = NULL, lease_expires_at = NULL, "
+            "error = CASE WHEN attempt >= max_attempts "
+            "THEN COALESCE(?, 'max_attempts_exhausted') ELSE COALESCE(?, error) END",
+            [bounded, bounded],
+        )
+
+    def complete_task(
+        self,
+        task_id: str,
+        lease_token: str,
+        *,
+        status: TaskStatus,
+        summary: str | None = None,
+        result_chunk_ids: Sequence[str] | None = None,
+        turn_id: str | None = None,
+        now: float | None = None,
+    ) -> TaskOpResult:
+        if status not in ("done", "failed"):
+            raise ValueError("complete_task status must be 'done' or 'failed'")
+        now = time.time() if now is None else float(now)
+        chunk_ids = list(result_chunk_ids or [])
+        error = summary[:300] if (status == "failed" and summary) else None
+        return self._owner_mutation(
+            task_id,
+            lease_token,
+            now,
+            "status = ?, lease_token = NULL, lease_expires_at = NULL, "
+            "result_chunk_ids = ?, result_turn_id = COALESCE(?, result_turn_id), "
+            "error = COALESCE(?, error)",
+            [status, json.dumps(chunk_ids), turn_id, error],
+        )
+
+    def cancel_task(
+        self,
+        task_id: str,
+        agent_id: str,
+        *,
+        reason: str | None = None,
+        now: float | None = None,
+    ) -> TaskOpResult:
+        now = time.time() if now is None else float(now)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._expire_task_leases_tx(connection, now, task_id=task_id)
+            before = connection.execute(
+                "SELECT * FROM tasks WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            if before is None:
+                return TaskOpResult(ok=False, reason="not_found")
+            prior = self._row_to_task(before)
+            if before["created_by"] != agent_id:
+                return TaskOpResult(
+                    ok=False, reason="not_allowed", task=prior, previous_status=before["status"]
+                )
+            if before["status"] not in ("open", "claimed"):
+                return TaskOpResult(
+                    ok=False, reason="terminal", task=prior, previous_status=before["status"]
+                )
+            connection.execute(
+                "UPDATE tasks SET status = 'cancelled', lease_token = NULL, "
+                "lease_expires_at = NULL, error = COALESCE(?, error), "
+                "updated_at = ?, version = version + 1 WHERE task_id = ?",
+                (None if reason is None else reason[:300], now, task_id),
+            )
+            after = connection.execute(
+                "SELECT * FROM tasks WHERE task_id = ?", (task_id,)
+            ).fetchone()
+        return TaskOpResult(
+            ok=True,
+            task=self._row_to_task(after),
+            previous_status=before["status"],
+            previous_owner=before["owner"],
+        )
+
+    def get_task(self, task_id: str, *, now: float | None = None) -> TaskRecord | None:
+        now = time.time() if now is None else float(now)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._expire_task_leases_tx(connection, now, task_id=task_id)
+            row = connection.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
+        return None if row is None else self._row_to_task(row)
+
+    def list_tasks(
+        self,
+        *,
+        pipeline_id: str | None = None,
+        status: TaskStatus | None = None,
+        slot: str | None = None,
+        owner: str | None = None,
+        limit: int = 50,
+        now: float | None = None,
+    ) -> list[TaskRecord]:
+        now = time.time() if now is None else float(now)
+        clauses: list[str] = []
+        params: list[object] = []
+        for column, value in (
+            ("pipeline_id", pipeline_id),
+            ("status", status),
+            ("slot", slot),
+            ("owner", owner),
+        ):
+            if value is not None:
+                clauses.append(f"{column} = ?")
+                params.append(value)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._expire_task_leases_tx(connection, now, pipeline_id=pipeline_id)
+            rows = connection.execute(
+                f"SELECT * FROM tasks {where} ORDER BY created_at, task_id LIMIT ?",
+                [*params, max(1, min(50, int(limit)))],
+            ).fetchall()
+        return [self._row_to_task(row) for row in rows]
+
     def query_precedents(
         self,
         query: str,
@@ -3784,6 +4186,7 @@ class SQLiteStore(BaseStore):
             verified=bool(row["verified"]) if "verified" in row.keys() and row["verified"] is not None else False,
             in_reply_to=row["in_reply_to"] if "in_reply_to" in row.keys() else None,
             thread_id=row["thread_id"] if "thread_id" in row.keys() else None,
+            task_id=row["task_id"] if "task_id" in row.keys() else None,
         )
 
     def _select_whispers(

@@ -82,7 +82,8 @@ class TestNotifyEvent:
         event = _event(whisper_type="request", payload={"ask": "secret ask"})
         data = event.to_dict()
         assert set(data) == {
-            "event", "whisper_id", "type", "from", "target", "pipeline_id", "thread_id", "created_at",
+            "event", "whisper_id", "type", "from", "target", "pipeline_id", "thread_id", "task_id",
+            "status", "created_at",
         }
         assert "payload" not in data
         assert "secret ask" not in event.to_json()
@@ -259,7 +260,7 @@ class TestWaitWhispersTool:
         assert result["ready"] is True and result["timed_out"] is False
         assert result["whispers"] == [
             {"whisper_id": whisper.whisper_id, "type": "nudge", "from": "worker",
-             "thread_id": None, "in_reply_to": None}
+             "thread_id": None, "in_reply_to": None, "task_id": None}
         ]
         assert "payload" not in json.dumps(result)
 

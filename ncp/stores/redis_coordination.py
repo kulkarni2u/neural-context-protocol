@@ -27,6 +27,7 @@ def _is_superseded_progress(payload: dict[str, str], newer: Whisper) -> bool:
         and payload.get("from_agent") == newer.from_agent
         and payload.get("target") == newer.target
         and (payload.get("thread_id") or None) == newer.thread_id
+        and (payload.get("task_id") or None) == newer.task_id
         and (payload.get("pipeline_id") or None) == newer.pipeline_id
     )
 
@@ -107,6 +108,7 @@ class RedisCoordination:
                 "dissent_target": whisper.dissent_target or "",
                 "in_reply_to": whisper.in_reply_to or "",
                 "thread_id": whisper.thread_id or "",
+                "task_id": whisper.task_id or "",
             },
         )
         client.expire(payload_key, whisper.ttl_seconds + 5)
@@ -321,6 +323,7 @@ class RedisCoordination:
             dissent_target=str(payload.get("dissent_target") or "") or None,
             in_reply_to=str(payload.get("in_reply_to") or "") or None,
             thread_id=str(payload.get("thread_id") or "") or None,
+            task_id=str(payload.get("task_id") or "") or None,
         )
         return whisper
 
@@ -466,6 +469,7 @@ class AsyncRedisCoordination:
                 "dissent_target": whisper.dissent_target or "",
                 "in_reply_to": whisper.in_reply_to or "",
                 "thread_id": whisper.thread_id or "",
+                "task_id": whisper.task_id or "",
             },
         )
         await client.expire(payload_key, whisper.ttl_seconds + 5)
@@ -574,6 +578,7 @@ class AsyncRedisCoordination:
             dissent_target=str(payload.get("dissent_target") or "") or None,
             in_reply_to=str(payload.get("in_reply_to") or "") or None,
             thread_id=str(payload.get("thread_id") or "") or None,
+            task_id=str(payload.get("task_id") or "") or None,
         )
 
     async def _async_iter_whisper_ids(self, client: Any) -> list[str]:

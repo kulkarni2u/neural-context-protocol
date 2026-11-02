@@ -81,6 +81,14 @@ DEFAULT_CONFIG = {
         "max_subscribers": 64,
         "max_wait_seconds": 60,
     },
+    "tasks": {
+        # Coordination primitives C: leased task ledger (ncp_task). Opt-in.
+        "enabled": False,
+        "default_lease_seconds": 300,
+        "max_lease_seconds": 3600,
+        "default_max_attempts": 3,
+        "stale_open_seconds": 1800,  # overview attention threshold (capability D)
+    },
     "observability": {
         "log_level": "info",
         "log_format": "pretty",
@@ -621,6 +629,27 @@ class NCPConfig:
     @property
     def notify_max_wait_seconds(self) -> float:
         return max(0.0, float(self.values.get("notify", {}).get("max_wait_seconds", 60)))
+
+    @property
+    def tasks_enabled(self) -> bool:
+        return bool(self.values.get("tasks", {}).get("enabled", False))
+
+    @property
+    def tasks_max_lease_seconds(self) -> float:
+        return max(1.0, float(self.values.get("tasks", {}).get("max_lease_seconds", 3600)))
+
+    @property
+    def tasks_default_lease_seconds(self) -> float:
+        raw = float(self.values.get("tasks", {}).get("default_lease_seconds", 300))
+        return min(max(1.0, raw), self.tasks_max_lease_seconds)
+
+    @property
+    def tasks_default_max_attempts(self) -> int:
+        return max(1, int(self.values.get("tasks", {}).get("default_max_attempts", 3)))
+
+    @property
+    def tasks_stale_open_seconds(self) -> float:
+        return max(0.0, float(self.values.get("tasks", {}).get("stale_open_seconds", 1800)))
 
     @property
     def whisper_min_author_reputation(self) -> float:
