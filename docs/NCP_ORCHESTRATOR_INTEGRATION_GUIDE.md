@@ -316,6 +316,23 @@ which model — NCP does not route. `joint_confidence` is advisory: a bounded
 heuristic over evidence trust, contradiction and drift, not a calibrated
 probability, and it must not be reported as one.
 
+**Router loop (wait, get_context, act, post_turn).** A router that fans work
+out to workers should block on the doorbell instead of polling:
+
+```text
+loop:
+  w = ncp_wait_whispers(agent_id="router", pipeline_id=P, timeout_seconds=30)
+  if not w.ready: continue                      # timed out; just wait again
+  ctx = ncp_get_context(agent_id="router", pipeline_id=P, ...)   # drains + delivers
+  act on ctx  (dispatch, retry, ncp_record_outcome on verified success)
+  ncp_post_turn(..., pending_whisper_ids=ctx.pending_whisper_ids)  # acks
+```
+
+`ncp_wait_whispers` only peeks and returns ids, never payloads, so a lost
+wake-up costs one extra `timeout_seconds: 0` call. Filter with `types` or
+`thread_id` to wake only for, say, `result` whispers on one request. Custom
+long-lived routers can use `GET /events` (SSE) or `ncp.api.subscribe` instead.
+
 **Dissent.** An agent that disputes a stored claim emits a `dissent` whisper
 with `ref` set to the disputed `chunk_id`. This increments the chunk's
 dissent counter and (at the next calibration) debits its trust and propagates

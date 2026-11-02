@@ -20,6 +20,20 @@ All notable changes to Neural Context Protocol will be documented in this file.
   right after alerts. `ncp_emit_whisper` takes `in_reply_to`/`thread_id` and
   now returns `whisper_id` (and `thread_id` when threaded). Stores gain
   `get_whisper`/`async_get_whisper`.
+- **Push delivery for whispers** (`ncp/notify.py`, `ncp/mcp/server.py`,
+  `ncp/api.py`, `ncp/config.py`): capability B of the coordination primitives.
+  A notification is a doorbell, not a delivery: events carry ids and routing
+  fields only, never the payload, and `ncp_get_context` stays the only way to
+  receive and acknowledge a whisper. New `ncp_wait_whispers` MCP tool
+  (long-poll peek, never drains; hidden in the `core` profile and when
+  `[notify].enabled = false`), `GET /events` SSE endpoint (bearer auth, `ready`
+  frame, `whisper` frames, keepalives, `max_subscribers` cap with 503 and
+  `Retry-After`), `InProcessNotifier` and `RedisNotifier` (pub/sub on
+  `{stream}:notify:{pipeline_id|_}:{target}`), a new `[notify]` config section
+  (`enabled`, `backend`, `max_subscribers`, `max_wait_seconds`), and
+  `ncp.api.wait_whispers`/`ncp.api.subscribe`. `ncp_emit_whisper` and
+  `ncp.api.emit` publish only after the store accepts the whisper, and a
+  notifier failure never fails an emit. stdio and webhooks are not included.
 
 ### Changed
 
@@ -35,6 +49,9 @@ All notable changes to Neural Context Protocol will be documented in this file.
   whispers live in Redis, whose hashes gain the two fields.
 - `in_reply_to`/`thread_id` are unsigned routing metadata; authorship
   signatures still cover only the payload.
+- `[notify]` is on by default and needs no migration. `backend = "auto"` uses
+  Redis pub/sub only for the `pgvector` store; SQLite deployments use the
+  in-process notifier, so wake-ups do not cross `ncp serve` processes there.
 
 ## [1.7.1] - 2026-10-30
 

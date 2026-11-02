@@ -34,6 +34,12 @@ older undelivered one, and `result` is always delivered regardless of
 confidence. Keep `summary` to the distilled finding and put durable detail in
 memory (`ncp_write_memory`), referenced via `result_chunk_ids`.
 
+Waiting for replies: call `ncp_wait_whispers` (`agent_id`, optional
+`timeout_seconds`, `types`, `thread_id`) instead of polling. It blocks until
+something is queued for you, but only peeks and returns ids, never payloads,
+so follow it with `ncp_get_context` to actually receive and acknowledge.
+`timeout_seconds: 0` is a cheap non-blocking check.
+
 Whisper hygiene:
 
 - Keep `payload` to the specific fact/ask (max ~600 normalized chars) —

@@ -9,6 +9,8 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import hmac
 import json
+import select
+import socket
 import sys
 import threading
 import time
@@ -26,6 +28,13 @@ from ncp.chunker import filter_content
 from ncp.config import NCPConfig, load_config
 from ncp.context_policy import ContextPolicyError, resolve_context_policy
 from ncp.drift import EmbeddingAdapter, compute_drift
+from ncp.notify import (
+    InProcessNotifier,
+    Notifier,
+    eligible_whispers,
+    emit_and_notify,
+    get_process_notifier,
+)
 from ncp.stores.base import BaseStore
 from ncp.stores.consolidation import reduce_candidates
 from ncp.stores.factory import create_store
@@ -468,6 +477,36 @@ MCP_TOOLS: list[dict[str, object]] = [
                     },
                 },
             ],
+        },
+    },
+    {
+        "name": "ncp_wait_whispers",
+        "description": (
+            "Long-poll doorbell: block until a whisper is queued for this agent or the timeout "
+            "elapses. Peeks only -- never drains or acknowledges, and never returns payloads. "
+            "Follow with ncp_get_context to receive and acknowledge the whispers."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "agent_id": {"type": "string", "description": "Agent waiting for whispers"},
+                "pipeline_id": {"type": "string"},
+                "timeout_seconds": {
+                    "type": "number",
+                    "minimum": 0,
+                    "description": (
+                        "Seconds to wait (clamped to [notify].max_wait_seconds). Default 30. "
+                        "0 is a non-blocking check."
+                    ),
+                },
+                "types": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Only count whispers of these types.",
+                },
+                "thread_id": {"type": "string", "description": "Only count whispers on this thread."},
+            },
+            "required": ["agent_id"],
         },
     },
     {
@@ -943,6 +982,7 @@ CORE_TOOL_NAMES = frozenset({
     "ncp_fetch",
 })
 MEMO_TOOL_NAMES = frozenset({"ncp_lookup_memo", "ncp_record_memo", "ncp_verify_memo"})
+NOTIFY_TOOL_NAMES = frozenset({"ncp_wait_whispers"})
 
 
 def tools_for_config(config: NCPConfig | None) -> list[dict[str, object]]:
@@ -955,6 +995,8 @@ def tools_for_config(config: NCPConfig | None) -> list[dict[str, object]]:
     }
     if not config.memoization_enabled:
         enabled_names -= MEMO_TOOL_NAMES
+    if not config.notify_enabled:
+        enabled_names = set(enabled_names) - NOTIFY_TOOL_NAMES
     return [tool for tool in MCP_TOOLS if str(tool["name"]) in enabled_names]
 
 
@@ -1134,7 +1176,15 @@ def _build_drift_embedding_adapter(config: NCPConfig) -> EmbeddingAdapter | None
         return None
 
 
-def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[str, ToolHandler]:
+def make_handlers(
+    store: BaseStore,
+    *,
+    config: NCPConfig | None = None,
+    notifier: Notifier | None = None,
+) -> dict[str, ToolHandler]:
+    if notifier is None:
+        notifier = InProcessNotifier() if config is None else get_process_notifier(config, store=store)
+    notify_max_wait = config.notify_max_wait_seconds if config is not None else 60.0
     sessions: dict[str, FetchSession] = {}
     sessions_lock = threading.Lock()
     coordination = getattr(store, "coordination", None)
@@ -1746,6 +1796,63 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
             )
         return result
 
+    def _handle_wait_whispers(args: dict[str, object]) -> object:
+        agent_id = str(args["agent_id"])
+        raw_pipeline = args.get("pipeline_id")
+        pipeline_id = None if raw_pipeline is None else str(raw_pipeline)
+        try:
+            timeout = float(args.get("timeout_seconds", 30))
+        except (TypeError, ValueError):
+            timeout = 30.0
+        if timeout != timeout:  # NaN
+            timeout = 30.0
+        timeout = min(max(timeout, 0.0), notify_max_wait)
+        raw_types = args.get("types")
+        types = {str(t) for t in raw_types} if isinstance(raw_types, (list, tuple)) and raw_types else None
+        raw_thread = args.get("thread_id")
+        thread_id = None if raw_thread is None else str(raw_thread)
+
+        def _eligible() -> list[Whisper]:
+            return eligible_whispers(
+                store,
+                agent_id=agent_id,
+                pipeline_id=pipeline_id,
+                types=types,
+                thread_id=thread_id,
+            )
+
+        def _result(found: list[Whisper], *, timed_out: bool) -> dict[str, object]:
+            return {
+                "ready": bool(found),
+                "timed_out": timed_out,
+                "whispers": [
+                    {
+                        "whisper_id": w.whisper_id,
+                        "type": w.whisper_type,
+                        "from": w.from_agent,
+                        "thread_id": w.thread_id,
+                        "in_reply_to": w.in_reply_to,
+                    }
+                    for w in found
+                ],
+            }
+
+        if notifier is None or timeout <= 0:
+            found = _eligible()
+            return _result(found, timed_out=not found and timeout > 0)
+        # Subscribe before the first peek so a whisper emitted between the
+        # peek and the wait still rings the doorbell.
+        deadline = time.monotonic() + timeout
+        with notifier.subscribe(agent_id=agent_id, pipeline_id=pipeline_id) as sub:
+            while True:
+                found = _eligible()
+                if found:
+                    return _result(found, timed_out=False)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return _result([], timed_out=True)
+                sub.poll(remaining)
+
     def _handle_emit_whisper(args: dict[str, object]) -> object:
         whisper_type = str(args["type"])
         payload, payload_format = normalize_whisper_payload(
@@ -1793,7 +1900,7 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
                 "could not be verified (missing/invalid signature or revoked identity)."
             )
         whisper.verified = verified
-        store.emit_whisper(whisper)
+        emit_and_notify(store, notifier, whisper)
         result: dict[str, object] = {
             "emitted": True,
             "whisper_id": whisper.whisper_id,
@@ -2563,6 +2670,7 @@ def make_handlers(store: BaseStore, *, config: NCPConfig | None = None) -> dict[
         "ncp_get_context": _handle_get_context,
         "ncp_write_memory": _handle_write_memory,
         "ncp_emit_whisper": _handle_emit_whisper,
+        "ncp_wait_whispers": _handle_wait_whispers,
         "ncp_post_turn": _handle_post_turn,
         "ncp_fetch": _handle_fetch,
         "ncp_record_decision": _handle_record_decision,
@@ -2954,14 +3062,25 @@ def _create_handlers_with_store(
     store_path: str | Path | None = None,
     cwd: Path | None = None,
 ) -> tuple[dict[str, ToolHandler], BaseStore, list[dict[str, object]]]:
+    handlers, store, tools, _notifier, _config = _create_server_parts(store_path=store_path, cwd=cwd)
+    return handlers, store, tools
+
+
+def _create_server_parts(
+    *,
+    store_path: str | Path | None = None,
+    cwd: Path | None = None,
+) -> tuple[dict[str, ToolHandler], BaseStore, list[dict[str, object]], Notifier | None, NCPConfig]:
+    """Build handlers plus the ONE notifier the handlers and HTTP /events share."""
     if store_path:
         config = load_config(env={"NCP_STORE_PATH": str(store_path)})
     else:
         config = load_config(cwd=cwd or Path.cwd())
     store = create_store(config)
     tools = tools_for_config(config)
-    handlers = handlers_for_tools(make_handlers(store, config=config), tools)
-    return handlers, store, tools
+    notifier = get_process_notifier(config, store=store)
+    handlers = handlers_for_tools(make_handlers(store, config=config, notifier=notifier), tools)
+    return handlers, store, tools, notifier, config
 
 
 def serve_streams(
@@ -3213,8 +3332,14 @@ class _MCPHTTPServer(ThreadingHTTPServer):
         auth_token: str | None,
         cors_allowed_origins: list[str],
         max_body_bytes: int,
+        notifier: Notifier | None = None,
+        max_subscribers: int = 64,
     ) -> None:
         self.handlers = handlers
+        self.notifier = notifier
+        self.max_subscribers = max(1, max_subscribers)
+        self._subscriber_count = 0
+        self._subscriber_lock = threading.Lock()
         self.tools = tools
         self.store = store
         self.sse_path = sse_path
@@ -3225,6 +3350,17 @@ class _MCPHTTPServer(ThreadingHTTPServer):
         self.max_body_bytes = max_body_bytes
         self._shutdown_event = threading.Event()
         super().__init__(server_address, _MCPHTTPHandler)
+
+    def acquire_subscriber(self) -> bool:
+        with self._subscriber_lock:
+            if self._subscriber_count >= self.max_subscribers:
+                return False
+            self._subscriber_count += 1
+            return True
+
+    def release_subscriber(self) -> None:
+        with self._subscriber_lock:
+            self._subscriber_count = max(0, self._subscriber_count - 1)
 
 
 class _MCPHTTPHandler(BaseHTTPRequestHandler):
@@ -3375,6 +3511,9 @@ class _MCPHTTPHandler(BaseHTTPRequestHandler):
 
         parsed = urllib.parse.urlsplit(self.path)
         path = parsed.path
+        if path == "/events":
+            self._handle_events(parsed.query)
+            return
         if path == "/ui":
             # Redirect so the page's relative asset URLs resolve under /ui/.
             self.send_response(HTTPStatus.MOVED_PERMANENTLY)
@@ -3393,6 +3532,78 @@ class _MCPHTTPHandler(BaseHTTPRequestHandler):
             return
 
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+
+    def _client_disconnected(self) -> bool:
+        """True when the peer has closed its end (readable socket yielding EOF)."""
+        try:
+            readable, _, _ = select.select([self.connection], [], [], 0)
+            if not readable:
+                return False
+            return self.connection.recv(1, socket.MSG_PEEK) == b""
+        except (OSError, ValueError):
+            return True
+
+    def _handle_events(self, query: str) -> None:
+        """``GET /events``: SSE doorbell stream. Frames never carry whisper payloads."""
+        if not self._authorized():
+            self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
+            return
+        params = {k: v[-1] for k, v in urllib.parse.parse_qs(query).items()}
+        agent_id = params.get("agent_id", "").strip()
+        if not agent_id:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "agent_id is required"})
+            return
+        pipeline_id = params.get("pipeline_id") or None
+        notifier = self.server.notifier
+        if notifier is None:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "notify_disabled"})
+            return
+        if not self.server.acquire_subscriber():
+            body = _json_bytes({"error": "too_many_subscribers"})
+            self.send_response(HTTPStatus.SERVICE_UNAVAILABLE)
+            self.send_header("Retry-After", "5")
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self._send_cors_headers()
+            self.end_headers()
+            self.wfile.write(body)
+            self.wfile.flush()
+            self.close_connection = True
+            return
+        try:
+            with notifier.subscribe(agent_id=agent_id, pipeline_id=pipeline_id) as sub:
+                try:
+                    queued = len(eligible_whispers(self.server.store, agent_id=agent_id, pipeline_id=pipeline_id))
+                except Exception:
+                    queued = 0
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "close")
+                self._send_cors_headers()
+                self.end_headers()
+                self.close_connection = True
+                try:
+                    self.wfile.write(f"event: ready\ndata: {json.dumps({'queued': queued})}\n\n".encode("utf-8"))
+                    self.wfile.flush()
+                    last_write = time.monotonic()
+                    while not self.server._shutdown_event.is_set():
+                        if self._client_disconnected():
+                            return
+                        for event in sub.poll(min(0.25, max(0.01, self.server.keepalive_seconds))):
+                            self.wfile.write(f"event: whisper\ndata: {event.to_json()}\n\n".encode("utf-8"))
+                            self.wfile.flush()
+                            last_write = time.monotonic()
+                        if time.monotonic() - last_write >= self.server.keepalive_seconds:
+                            self.wfile.write(b": keepalive\n\n")
+                            self.wfile.flush()
+                            last_write = time.monotonic()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    return
+        finally:
+            self.server.release_subscriber()
 
     def _serve_ui_asset(self, rel_path: str) -> None:
         """Serve a static file from ``_ui_static_root()`` for ``/ui/`` and ``/ui/<asset>``.
@@ -3528,8 +3739,9 @@ def create_http_server(
     auth_token: str | None = None,
     cors_allowed_origins: list[str] | None = None,
     max_body_bytes: int = 10_485_760,
+    max_subscribers: int | None = None,
 ) -> _MCPHTTPServer:
-    handlers, store, tools = _create_handlers_with_store(store_path=store_path, cwd=cwd)
+    handlers, store, tools, notifier, config = _create_server_parts(store_path=store_path, cwd=cwd)
     return _MCPHTTPServer(
         (host, port),
         handlers=handlers,
@@ -3541,6 +3753,8 @@ def create_http_server(
         auth_token=auth_token,
         cors_allowed_origins=list(cors_allowed_origins or []),
         max_body_bytes=max(1, max_body_bytes),
+        notifier=notifier,
+        max_subscribers=config.notify_max_subscribers if max_subscribers is None else max_subscribers,
     )
 
 

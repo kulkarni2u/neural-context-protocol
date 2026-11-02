@@ -74,6 +74,13 @@ DEFAULT_CONFIG = {
         # Default 0.0 (off) -- every dissent counts, same as before.
         "dissent_min_author_reputation": 0.0,
     },
+    "notify": {
+        # Coordination primitives B: doorbell-only push delivery (no payloads).
+        "enabled": True,
+        "backend": "auto",  # auto | memory | redis
+        "max_subscribers": 64,
+        "max_wait_seconds": 60,
+    },
     "observability": {
         "log_level": "info",
         "log_format": "pretty",
@@ -597,6 +604,23 @@ class NCPConfig:
     @property
     def whisper_ttl_default(self) -> int:
         return int(self.values.get("whispers", {}).get("default_ttl_seconds", 1800))
+
+    @property
+    def notify_enabled(self) -> bool:
+        return bool(self.values.get("notify", {}).get("enabled", True))
+
+    @property
+    def notify_backend(self) -> str:
+        backend = str(self.values.get("notify", {}).get("backend", "auto")).strip().lower()
+        return backend if backend in {"auto", "memory", "redis"} else "auto"
+
+    @property
+    def notify_max_subscribers(self) -> int:
+        return max(1, int(self.values.get("notify", {}).get("max_subscribers", 64)))
+
+    @property
+    def notify_max_wait_seconds(self) -> float:
+        return max(0.0, float(self.values.get("notify", {}).get("max_wait_seconds", 60)))
 
     @property
     def whisper_min_author_reputation(self) -> float:

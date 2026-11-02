@@ -51,7 +51,8 @@ curl -s $BASE/mcp -H "$AUTH" -H 'Content-Type: application/json' -d '{
 
 Returns the enabled tool catalog — `ncp_get_context`, `ncp_write_memory`,
 `ncp_emit_whisper`, `ncp_post_turn`, `ncp_fetch`, `ncp_record_decision`,
-`ncp_get_decision`, `ncp_compile_decision_query`, `ncp_record_outcome` and the
+`ncp_get_decision`, `ncp_compile_decision_query`, `ncp_record_outcome`,
+`ncp_wait_whispers` (unless `[notify].enabled = false`) and the
 memo tools when enabled — each with a JSON Schema under `inputSchema`.
 
 ## Tool calls
@@ -242,6 +243,49 @@ request is fine. A newer `progress` on the same thread from the same sender
 replaces the older undelivered one. `result` is delivered regardless of
 `min_confidence` and ordered right after `alert`. `in_reply_to`/`thread_id`
 are unsigned routing metadata.
+
+### ncp_wait_whispers — wait for a doorbell
+
+A long-poll that blocks until a whisper is queued for the agent, or the
+timeout elapses. It only peeks: it never drains, acknowledges, or returns a
+payload. Follow it with `ncp_get_context`.
+
+```bash
+curl -s $BASE/mcp -H "$AUTH" -H 'Content-Type: application/json' -d '{
+  "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+  "params": {"name": "ncp_wait_whispers", "arguments": {
+    "agent_id": "router", "pipeline_id": "pipe_demo",
+    "timeout_seconds": 30, "types": ["result"], "thread_id": "wsp_3f2a"
+  }}}'
+# {"ready": true, "timed_out": false,
+#  "whispers": [{"whisper_id": "wsp_9d1", "type": "result", "from": "reviewer",
+#                "thread_id": "wsp_3f2a", "in_reply_to": "wsp_3f2a"}]}
+```
+
+`timeout_seconds` defaults to 30 and is clamped to
+`0..[notify].max_wait_seconds`; `0` is a non-blocking check. `types` and
+`thread_id` are optional filters. The tool is hidden in the `core` profile and
+when `[notify].enabled = false`.
+
+### GET /events — SSE doorbell stream
+
+```bash
+curl -N "$BASE/events?agent_id=router&pipeline_id=pipe_demo" -H "$AUTH"
+# event: ready
+# data: {"queued": 1}
+#
+# event: whisper
+# data: {"event":"whisper","whisper_id":"wsp_9d1","type":"result","from":"reviewer","target":"router","pipeline_id":"pipe_demo","thread_id":"wsp_3f2a","created_at":1793500000.0}
+#
+# : keepalive
+```
+
+Same bearer auth and CORS handling as `/mcp`. `agent_id` is required (`400`
+without it); `pipeline_id` is optional. Frames never carry whisper payloads:
+call `ncp_get_context` to receive them. Concurrent streams are capped by
+`[notify].max_subscribers` (default 64); above it the server returns `503` with
+`Retry-After`. Reconnect and call `ncp_wait_whispers` with
+`timeout_seconds: 0` to catch up on anything missed.
 
 ### ncp_fetch — bounded mid-turn retrieval
 

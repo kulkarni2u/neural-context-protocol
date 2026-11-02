@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import time
+from collections.abc import Sequence
+from typing import ContextManager
 from uuid import uuid4
 
 from ncp.adapters.base import BaseAdapter
@@ -13,6 +15,7 @@ from ncp.assembler import Assembler, AssemblyResult
 from ncp.config import NCPConfig, load_config
 from ncp.context_policy import ResolvedContextPolicy, resolve_context_policy
 from ncp.costs import calculate_cost
+from ncp.notify import Subscription, eligible_whispers, emit_and_notify, get_process_notifier
 from ncp.stores.base import BaseStore
 from ncp.stores.factory import create_store
 from ncp.stores.memo import compute_dependency_fingerprint, compute_turn_memo_signature, memo_ineligibility
@@ -25,6 +28,7 @@ from ncp.types import (
     NCPResponse,
     SubconsciousChunk,
     Whisper,
+    resolve_whisper_thread,
 )
 
 _CONFIG: NCPConfig | None = None
@@ -206,8 +210,71 @@ def emit(
 
     resolved_config = config or _CONFIG or configure(cwd=Path.cwd())
     resolved_store = store or create_store(resolved_config)
-    resolved_store.emit_whisper(whisper)
+    whisper = resolve_whisper_thread(
+        whisper,
+        None if whisper.in_reply_to is None else resolved_store.get_whisper(whisper.in_reply_to),
+    )
+    emit_and_notify(resolved_store, get_process_notifier(resolved_config, store=resolved_store), whisper)
     return whisper.whisper_id
+
+
+def wait_whispers(
+    *,
+    agent_id: str,
+    pipeline_id: str | None = None,
+    timeout: float = 30.0,
+    types: Sequence[str] | None = None,
+    thread_id: str | None = None,
+    store: BaseStore | None = None,
+    config: NCPConfig | None = None,
+) -> list[Whisper]:
+    """Wait until a whisper is queued for ``agent_id`` and return it (peek only).
+
+    Returns the eligible whispers without draining them; follow with
+    ``get_context``/``run`` to receive and acknowledge. Empty list on timeout.
+    ``timeout`` is clamped to ``[notify].max_wait_seconds``.
+    """
+
+    resolved_config = config or _CONFIG or configure(cwd=Path.cwd())
+    resolved_store = store or create_store(resolved_config)
+    notifier = get_process_notifier(resolved_config, store=resolved_store)
+    type_set = set(types) if types else None
+    deadline = time.monotonic() + min(max(0.0, timeout), resolved_config.notify_max_wait_seconds)
+
+    def _peek() -> list[Whisper]:
+        return eligible_whispers(
+            resolved_store, agent_id=agent_id, pipeline_id=pipeline_id, types=type_set, thread_id=thread_id
+        )
+
+    if notifier is None:
+        return _peek()
+    with notifier.subscribe(agent_id=agent_id, pipeline_id=pipeline_id) as sub:
+        while True:
+            found = _peek()
+            remaining = deadline - time.monotonic()
+            if found or remaining <= 0:
+                return found
+            sub.poll(remaining)
+
+
+def subscribe(
+    *,
+    agent_id: str,
+    pipeline_id: str | None = None,
+    config: NCPConfig | None = None,
+    store: BaseStore | None = None,
+) -> ContextManager[Subscription]:
+    """Subscribe to doorbell events (no payloads) for in-process orchestrators.
+
+    Use as ``with subscribe(agent_id=...) as sub: for event in sub: ...`` or
+    ``sub.poll(timeout)``. Raises ``RuntimeError`` when ``[notify]`` is disabled.
+    """
+
+    resolved_config = config or _CONFIG or configure(cwd=Path.cwd())
+    notifier = get_process_notifier(resolved_config, store=store)
+    if notifier is None:
+        raise RuntimeError("Push delivery is disabled ([notify].enabled = false).")
+    return notifier.subscribe(agent_id=agent_id, pipeline_id=pipeline_id)
 
 
 def run(

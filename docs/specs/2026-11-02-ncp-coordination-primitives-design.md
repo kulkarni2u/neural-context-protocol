@@ -268,6 +268,26 @@ management. The doorbell model makes it a pure add-on later.
 **stdio** is out of scope. One client per process, and hosts do not surface
 custom notifications to the model. `ncp_wait_whispers` covers this case.
 
+### 4.3.1 Implementation notes (PR 2)
+
+Where the shipped code differs from the sketch above:
+
+- The helper is public: `ncp.notify.emit_and_notify(store, notifier, whisper)`
+  (not underscore-prefixed), because `ncp.api` and the MCP server both import it.
+- `backend = "auto"` picks Redis when the store is `pgvector` and a Redis URL
+  is set, not merely when a URL is set. The default `[redis] url` is always
+  non-empty, so URL presence cannot distinguish a SQLite deployment.
+- `subscribe()` yields a `Subscription` with `poll(timeout)` and iteration,
+  rather than a bare iterator, so callers can bound each blocking read and
+  exit promptly on shutdown. `ncp_wait_whispers` subscribes before its first
+  peek so a whisper emitted between the peek and the wait is not missed.
+- The confidence pre-filter uses the fixed 0.60 floor the assembler uses
+  (`Assembler._peek_whispers`), not `[whispers] min_confidence`, which the
+  assembler does not read.
+- `task_id` is omitted from events and from `ncp_wait_whispers` rows until
+  capability C lands; rows carry `in_reply_to` instead.
+- `ncp_wait_whispers` with `timeout_seconds: 0` reports `timed_out: false`.
+
 ### 4.4 Library API
 
 `ncp.api.wait_whispers(agent_id=…, pipeline_id=…, timeout=…)` wraps

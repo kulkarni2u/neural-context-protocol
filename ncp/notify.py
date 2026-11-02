@@ -1,0 +1,362 @@
+"""Push delivery for whispers: a doorbell, never a delivery.
+
+See docs/specs/2026-11-02-ncp-coordination-primitives-design.md section 4.
+
+A :class:`NotifyEvent` says "something is queued for you". It never carries
+the whisper payload or any chunk content. The whisper queue plus
+``ncp_get_context`` remain the only way to deliver and acknowledge whispers,
+so losing a notification is harmless: a client simply peeks again.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+import json
+import logging
+import threading
+import time
+from typing import TYPE_CHECKING, Any, ContextManager, Literal, Protocol, runtime_checkable
+
+from pydantic import ConfigDict, Field
+
+from ncp.types import CONFIDENCE_EXEMPT_WHISPER_TYPES, NCPModel, Whisper
+
+if TYPE_CHECKING:
+    from ncp.config import NCPConfig
+    from ncp.stores.base import BaseStore
+
+logger = logging.getLogger(__name__)
+
+# The assembler drains whispers with a fixed 0.60 confidence floor
+# (Assembler._peek_whispers); the doorbell mirrors it.
+WHISPER_MIN_CONFIDENCE = 0.60
+_RING_SIZE = 256
+
+
+class NotifyEvent(NCPModel):
+    """One doorbell ring. Deliberately has no payload or content field."""
+
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    event: Literal["whisper"] = "whisper"
+    whisper_id: str
+    type: str
+    from_agent: str = Field(alias="from")
+    target: str
+    pipeline_id: str | None = None
+    thread_id: str | None = None
+    created_at: float
+
+    @classmethod
+    def from_whisper(cls, whisper: Whisper) -> NotifyEvent:
+        return cls(
+            whisper_id=whisper.whisper_id,
+            type=whisper.whisper_type,
+            from_agent=whisper.from_agent,
+            target=whisper.target,
+            pipeline_id=whisper.pipeline_id,
+            thread_id=whisper.thread_id,
+            created_at=whisper.created_at,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return self.model_dump(by_alias=True)
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), separators=(",", ":"))
+
+
+def event_matches(event: NotifyEvent, agent_id: str, pipeline_id: str | None) -> bool:
+    """Matching rule shared by every notifier (mirrors the store's whisper scoping)."""
+
+    if event.pipeline_id != pipeline_id:
+        return False
+    if event.target == "*":
+        return event.from_agent != agent_id
+    return event.target == agent_id
+
+
+def should_notify(whisper: Whisper, *, min_confidence: float = WHISPER_MIN_CONFIDENCE) -> bool:
+    """Cheap publish-time pre-filter: skip whispers the confidence rule would hide.
+
+    The reputation gate is intentionally not applied (it needs a store read),
+    so the doorbell may occasionally ring for a whisper that
+    ``ncp_get_context`` later filters out.
+    """
+
+    if whisper.whisper_type in CONFIDENCE_EXEMPT_WHISPER_TYPES:
+        return True
+    return whisper.confidence >= min_confidence
+
+
+def eligible_whispers(
+    store: BaseStore,
+    *,
+    agent_id: str,
+    pipeline_id: str | None,
+    types: set[str] | None = None,
+    thread_id: str | None = None,
+) -> list[Whisper]:
+    """Peek (never drain) whispers ``ncp_get_context`` would deliver, after filters."""
+
+    found = store.peek_whispers(
+        agent_id=agent_id,
+        pipeline_id=pipeline_id,
+        max_items=200,
+        min_confidence=WHISPER_MIN_CONFIDENCE,
+    )
+    return [
+        w
+        for w in found
+        if (types is None or w.whisper_type in types) and (thread_id is None or w.thread_id == thread_id)
+    ]
+
+
+class Subscription(Protocol):
+    def poll(self, timeout: float) -> list[NotifyEvent]:
+        """Block up to ``timeout`` seconds and return buffered events (maybe empty)."""
+
+    def __iter__(self) -> Iterator[NotifyEvent]: ...
+
+
+@runtime_checkable
+class Notifier(Protocol):
+    def publish(self, event: NotifyEvent) -> None: ...
+
+    def wait(self, *, agent_id: str, pipeline_id: str | None, timeout: float) -> list[NotifyEvent]: ...
+
+    def subscribe(self, *, agent_id: str, pipeline_id: str | None) -> ContextManager[Subscription]: ...
+
+
+class _InProcessSubscription:
+    def __init__(self, notifier: InProcessNotifier, agent_id: str, pipeline_id: str | None) -> None:
+        self._notifier = notifier
+        self.agent_id = agent_id
+        self.pipeline_id = pipeline_id
+        self._buffer: deque[NotifyEvent] = deque(maxlen=_RING_SIZE)
+        self._closed = False
+
+    def poll(self, timeout: float) -> list[NotifyEvent]:
+        cond = self._notifier._cond
+        deadline = time.monotonic() + max(0.0, timeout)
+        with cond:
+            while not self._buffer and not self._closed:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                cond.wait(remaining)
+            events = list(self._buffer)
+            self._buffer.clear()
+            return events
+
+    def close(self) -> None:
+        with self._notifier._cond:
+            self._closed = True
+            self._notifier._cond.notify_all()
+
+    def __iter__(self) -> Iterator[NotifyEvent]:
+        while not self._closed:
+            yield from self.poll(1.0)
+
+
+class InProcessNotifier:
+    """Thread-safe in-process doorbell: one Condition, a ring buffer per subscriber."""
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition()
+        self._subs: list[_InProcessSubscription] = []
+
+    def publish(self, event: NotifyEvent) -> None:
+        with self._cond:
+            for sub in self._subs:
+                if event_matches(event, sub.agent_id, sub.pipeline_id):
+                    sub._buffer.append(event)
+            self._cond.notify_all()
+
+    @contextmanager
+    def subscribe(self, *, agent_id: str, pipeline_id: str | None = None) -> Iterator[_InProcessSubscription]:
+        sub = _InProcessSubscription(self, agent_id, pipeline_id)
+        with self._cond:
+            self._subs.append(sub)
+        try:
+            yield sub
+        finally:
+            sub.close()
+            with self._cond:
+                if sub in self._subs:
+                    self._subs.remove(sub)
+
+    def wait(self, *, agent_id: str, pipeline_id: str | None = None, timeout: float) -> list[NotifyEvent]:
+        """Wait for events published *after* this call starts.
+
+        Callers that must not miss events published between a store peek and
+        the wait should ``subscribe`` first, then peek, then ``poll``.
+        """
+
+        with self.subscribe(agent_id=agent_id, pipeline_id=pipeline_id) as sub:
+            return sub.poll(timeout)
+
+
+class _RedisSubscription:
+    def __init__(self, pubsub: Any, agent_id: str, pipeline_id: str | None) -> None:
+        self._pubsub = pubsub
+        self.agent_id = agent_id
+        self.pipeline_id = pipeline_id
+        self._closed = False
+
+    def _decode(self, message: Any) -> NotifyEvent | None:
+        if not isinstance(message, dict) or message.get("type") not in (None, "message", "pmessage"):
+            return None
+        data = message.get("data")
+        if isinstance(data, bytes):
+            data = data.decode("utf-8", "replace")
+        if not isinstance(data, str):
+            return None
+        try:
+            event = NotifyEvent.model_validate(json.loads(data))
+        except Exception:
+            return None
+        return event if event_matches(event, self.agent_id, self.pipeline_id) else None
+
+    def poll(self, timeout: float) -> list[NotifyEvent]:
+        """Block until the first matching event (or timeout), then drain what is buffered."""
+        deadline = time.monotonic() + max(0.0, timeout)
+        events: list[NotifyEvent] = []
+        while not self._closed:
+            remaining = 0.0 if events else max(0.0, deadline - time.monotonic())
+            message = self._pubsub.get_message(ignore_subscribe_messages=True, timeout=remaining)
+            if message is None:
+                if events or remaining <= 0:
+                    break
+                continue
+            event = self._decode(message)
+            if event is not None:
+                events.append(event)
+        return events
+
+    def close(self) -> None:
+        self._closed = True
+        for name in ("unsubscribe", "close"):
+            try:
+                getattr(self._pubsub, name)()
+            except Exception:  # pragma: no cover - best effort cleanup
+                logger.debug("redis pubsub %s failed", name, exc_info=True)
+
+    def __iter__(self) -> Iterator[NotifyEvent]:
+        while not self._closed:
+            yield from self.poll(1.0)
+
+
+class RedisNotifier:
+    """Redis pub/sub doorbell on ``{stream}:notify:{pipeline_id or '_'}:{target}``."""
+
+    def __init__(
+        self,
+        url: str,
+        *,
+        stream: str = "ncp:whispers",
+        client_factory: Callable[[str], Any] | None = None,
+    ) -> None:
+        from ncp.stores.redis_coordination import _default_redis_factory
+
+        self.url = url
+        self.stream = stream
+        self._client_factory = client_factory or _default_redis_factory
+        self._client: Any | None = None
+        self._lock = threading.Lock()
+
+    def channel(self, pipeline_id: str | None, target: str) -> str:
+        return f"{self.stream}:notify:{pipeline_id or '_'}:{target}"
+
+    def _client_or_create(self) -> Any:
+        with self._lock:
+            if self._client is None:
+                self._client = self._client_factory(self.url)
+            return self._client
+
+    def publish(self, event: NotifyEvent) -> None:
+        self._client_or_create().publish(self.channel(event.pipeline_id, event.target), event.to_json())
+
+    @contextmanager
+    def subscribe(self, *, agent_id: str, pipeline_id: str | None = None) -> Iterator[_RedisSubscription]:
+        pubsub = self._client_or_create().pubsub()
+        pubsub.subscribe(self.channel(pipeline_id, agent_id), self.channel(pipeline_id, "*"))
+        sub = _RedisSubscription(pubsub, agent_id, pipeline_id)
+        try:
+            yield sub
+        finally:
+            sub.close()
+
+    def wait(self, *, agent_id: str, pipeline_id: str | None = None, timeout: float) -> list[NotifyEvent]:
+        with self.subscribe(agent_id=agent_id, pipeline_id=pipeline_id) as sub:
+            return sub.poll(timeout)
+
+
+def create_notifier(
+    config: NCPConfig,
+    *,
+    store: BaseStore | None = None,
+    client_factory: Callable[[str], Any] | None = None,
+) -> Notifier:
+    """Build the notifier for ``[notify] backend = auto|memory|redis``.
+
+    ``auto`` picks Redis when Redis is the whisper path (``pgvector`` store with
+    a Redis URL). The default ``[redis] url`` is always non-empty, so the mere
+    presence of a URL cannot be the signal for a SQLite deployment.
+    """
+
+    backend = config.notify_backend
+    if backend == "auto":
+        store_type = str(config.values.get("store", {}).get("type", "sqlite"))
+        use_redis = store_type == "pgvector" and bool(config.redis_url)
+    elif backend == "redis":
+        use_redis = True
+    else:
+        use_redis = False
+    if not use_redis:
+        return InProcessNotifier()
+    factory = client_factory
+    coordination = getattr(store, "coordination", None)
+    if factory is None and coordination is not None:
+        factory = getattr(coordination, "_client_factory", None)
+    return RedisNotifier(config.redis_url, stream=config.redis_stream, client_factory=factory)
+
+
+_PROCESS_NOTIFIERS: dict[tuple[str, str, str], Notifier] = {}
+_PROCESS_LOCK = threading.Lock()
+
+
+def get_process_notifier(config: NCPConfig, *, store: BaseStore | None = None) -> Notifier | None:
+    """Process-level notifier per config (cached); ``None`` when notify is disabled."""
+
+    if not config.notify_enabled:
+        return None
+    key = (config.notify_backend, config.redis_url, config.redis_stream)
+    with _PROCESS_LOCK:
+        notifier = _PROCESS_NOTIFIERS.get(key)
+        if notifier is None:
+            notifier = create_notifier(config, store=store)
+            _PROCESS_NOTIFIERS[key] = notifier
+        return notifier
+
+
+def emit_and_notify(store: BaseStore, notifier: Notifier | None, whisper: Whisper) -> None:
+    """Persist ``whisper`` then ring the doorbell.
+
+    The publish happens only after ``store.emit_whisper`` returns, so a failed
+    persist never rings. A notifier failure is logged and never fails the emit.
+    """
+
+    store.emit_whisper(whisper)
+    notify_emitted(notifier, whisper)
+
+
+def notify_emitted(notifier: Notifier | None, whisper: Whisper) -> None:
+    if notifier is None or not should_notify(whisper):
+        return
+    try:
+        notifier.publish(NotifyEvent.from_whisper(whisper))
+    except Exception:
+        logger.warning("whisper notify publish failed for %s", whisper.whisper_id, exc_info=True)

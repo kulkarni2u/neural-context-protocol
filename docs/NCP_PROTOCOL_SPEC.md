@@ -1107,6 +1107,70 @@ install and a migrated install converge. An existing database opens without
 error and loses nothing.
 ```
 
+## 4i. Push Delivery (normative)
+
+Push delivery lets an agent or orchestrator learn that a whisper is queued
+without polling. It is a **doorbell, not a delivery**.
+
+**Doorbell semantics.**
+
+- A notification never contains the whisper payload or any chunk content.
+- The whisper queue and `ncp_get_context` remain the only way to deliver and
+  acknowledge whispers. Reputation gating, confidence filtering, caps and
+  acknowledgement therefore live in exactly one place, and the
+  prompt-injection posture of §1.4 and §5.1 is unchanged.
+- Losing a notification is harmless: a client that reconnects calls
+  `ncp_wait_whispers` with `timeout_seconds: 0` and continues.
+- A notification may occasionally ring for a whisper that `ncp_get_context`
+  later filters out. At publish time only the confidence rule is applied (a
+  whisper below `0.60` does not ring unless its type is `alert`,
+  `world_check` or `result`); the reputation gate is not, because it needs a
+  store read.
+
+**Publish point.** A notification is published only after the store accepted
+the whisper, with the `thread_id` resolved. A notifier failure is logged and
+never fails the emit.
+
+**Event schema.** One JSON object, with no other fields:
+
+```json
+{"event": "whisper", "whisper_id": "wsp_…", "type": "result",
+ "from": "reviewer", "target": "router", "pipeline_id": "pr_142",
+ "thread_id": "wsp_3f2a", "created_at": 1793500000.0}
+```
+
+`pipeline_id` and `thread_id` are `null` when absent. An event matches a
+subscriber `(agent_id, pipeline_id)` when `target == agent_id` or
+`target == "*"`, the pipeline ids are equal (`null` matches `null` only), and
+the subscriber is not the sender of a broadcast.
+
+**`ncp_wait_whispers`.** Arguments: `agent_id` (required), `pipeline_id`,
+`timeout_seconds` (clamped to `0..[notify].max_wait_seconds`, default 30),
+`types` (array filter) and `thread_id` (filter). It peeks the queue first and
+returns immediately when something is eligible; otherwise it waits for the
+doorbell up to the timeout and peeks again. It never drains or acknowledges.
+Result: `{"ready": bool, "timed_out": bool, "whispers": [{"whisper_id",
+"type", "from", "thread_id", "in_reply_to"}]}`; no payloads.
+`timeout_seconds: 0` is a non-blocking check (`timed_out` is `false`). The
+tool is not in the `core` profile and is hidden when `[notify].enabled` is
+`false`.
+
+**`GET /events?agent_id=…&pipeline_id=…`** (HTTP transport only). Server-sent
+events with the same bearer auth and CORS rules as `/mcp`. `agent_id` is
+required (`400` otherwise). The first frame is `event: ready` with
+`{"queued": <count of currently eligible whispers>}`; then `event: whisper`
+frames carry the event above, and `: keepalive` comment frames are sent every
+`keepalive_seconds`. Concurrent streams are capped by
+`[notify].max_subscribers` (default 64); above the cap the server answers
+`503` with a `Retry-After` header. The stream ends on server shutdown or
+client disconnect.
+
+**Backends.** `[notify] backend = auto | memory | redis`. `memory` is an
+in-process notifier (wake-ups stay inside one process). `redis` publishes on
+`{stream}:notify:{pipeline_id or '_'}:{target}` (`*` for broadcast). `auto`
+selects Redis when Redis carries whispers (the `pgvector` store), otherwise
+in-process. stdio has no push channel; use `ncp_wait_whispers`.
+
 ---
 
 ## 5. Trust Boundaries (normative, first-class)
@@ -1546,6 +1610,12 @@ default_type = "auto"
 default_ttl_seconds = 1800
 max_per_drain = 3
 min_confidence = 0.60
+
+[notify]                 # push delivery (doorbell only), see section 4i
+enabled = true
+backend = "auto"         # auto | memory | redis
+max_subscribers = 64     # concurrent GET /events streams
+max_wait_seconds = 60    # ceiling for ncp_wait_whispers
 
 [observability]
 log_level = "info"
