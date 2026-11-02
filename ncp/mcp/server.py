@@ -2272,6 +2272,13 @@ def make_handlers(
         max_pipelines, max_tokens = clamp_limits(
             args.get("max_pipelines", DEFAULT_MAX_PIPELINES), args.get("max_tokens", DEFAULT_MAX_TOKENS)
         )
+        if tasks_enabled:
+            # Expire leases here (not only inside the store) so a task that
+            # fails by expiry rings its creator, exactly as ncp_task does.
+            try:
+                _expire_and_notify()
+            except NCPStoreError:
+                pass  # store without ledger support: overview omits task fields
         return build_overview(
             store,
             viewer=viewer,

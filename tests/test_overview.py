@@ -860,3 +860,36 @@ class TestApiEndpoint:
     def test_not_listed_as_mcp_tool_route_conflict(self, tmp_path: Path) -> None:
         with _HttpServer(tmp_path) as srv:
             assert srv.get("/api/nope")[0] == 404
+
+
+def test_overview_tool_rings_creator_for_tasks_failed_by_expiry(tmp_path: Path) -> None:
+    from ncp.notify import InProcessNotifier
+
+    (tmp_path / ".ncp").mkdir(exist_ok=True)
+    (tmp_path / ".ncp" / "config.toml").write_text("[tasks]\nenabled = true\n")
+    config = load_config(cwd=tmp_path)
+    local_store = SQLiteStore(tmp_path / "ring.db")
+    created, _ = local_store.create_task(
+        TaskRecord(pipeline_id="pipe_ring", slot="build", title="t", created_by="router", max_attempts=1)
+    )
+    past = time.time() - 1000
+    claimed = local_store.claim_task(agent_id="worker", task_id=created.task_id, lease_seconds=5, now=past)
+    assert claimed is not None
+
+    notifier = InProcessNotifier()
+    handlers = make_handlers(local_store, config=config, notifier=notifier)
+    with notifier.subscribe(agent_id="router", pipeline_id="pipe_ring") as sub:
+        response = _handle_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "ncp_overview", "arguments": {"agent_id": "router"}},
+            },
+            handlers,
+        )
+        assert "error" not in json.loads(response)
+        events = sub.poll(0.5)
+    assert [(e.event, e.task_id, e.status) for e in events] == [("task", created.task_id, "failed")]
+    task = local_store.get_task(created.task_id)
+    assert task is not None and task.status == "failed"

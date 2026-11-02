@@ -646,8 +646,9 @@ Deviations from, and details beyond, the text above:
   at the peek's `max_items`.
 - **Lazy expiry** runs `expire_task_leases` over all pipelines when the ledger
   is enabled, so the overview does the state correction a `get`/`list` would.
-  Unlike the tool layer for `ncp_task`, it does not publish doorbells for tasks
-  that fail by expiry here.
+  The `ncp_overview` tool runs the same expire-and-notify step as `ncp_task`
+  first, so tasks that fail by expiry ring their creator. Direct library or
+  CLI callers of `overview_rows` still correct state without a doorbell.
 - **Rendering.** Added tokens beyond the §6.3 example: `stale<N>` in `attn:`,
   `x<N>` (cancelled) in `tasks:`, `dissent24h:<N>`. `dec:` values are reduced
   to inert tokens (<= 32 chars each) instead of being quoted. The `last:` line
