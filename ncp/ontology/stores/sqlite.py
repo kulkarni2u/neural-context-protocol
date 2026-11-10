@@ -231,7 +231,21 @@ class SQLiteOntologyStore:
                     if connection.in_transaction:
                         connection.execute("ROLLBACK")
                     raise
-                connection.execute("COMMIT")
+                try:
+                    connection.execute("COMMIT")
+                except BaseException:
+                    # A failed COMMIT (e.g. SQLITE_BUSY) leaves the transaction
+                    # open; a shared connection would otherwise stay wedged.
+                    if connection.in_transaction:
+                        connection.execute("ROLLBACK")
+                    raise
+
+    @staticmethod
+    def _plain(connection: sqlite3.Connection) -> sqlite3.Cursor:
+        """Tuple rows regardless of the (possibly shared) connection's row factory."""
+        cursor = connection.cursor()
+        cursor.row_factory = None
+        return cursor
 
     @staticmethod
     def _rows(
@@ -254,7 +268,7 @@ class SQLiteOntologyStore:
                 "CREATE TABLE IF NOT EXISTS ontology_schema_versions"
                 " (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
             )
-            current = connection.execute(
+            current = self._plain(connection).execute(
                 "SELECT IFNULL(MAX(version), 0) FROM ontology_schema_versions"
             ).fetchone()[0]
             for version, statements in _MIGRATIONS:
@@ -291,10 +305,10 @@ class SQLiteOntologyStore:
     def _valid_evidence_sql(self, connection: sqlite3.Connection) -> str:
         """``EXISTS`` clause over alias ``r``: one valid row whose chunk is still live.
 
-        Without an NCP ``chunks`` table there is nothing to reconcile against,
-        matching the assert-time rule.
+        Without an NCP ``chunks`` table no chunk can be live, so chunk evidence
+        never counts (fail closed), matching the assert-time rule.
         """
-        chunk_ok = "1"
+        chunk_ok = "e.evidence_type != 'chunk'"
         if self._has_chunks_table(connection):
             live = _LIVE_CHUNK.format(namespace="r.namespace")
             chunk_ok = (
@@ -310,7 +324,7 @@ class SQLiteOntologyStore:
         self, connection: sqlite3.Connection, chunk_id: str, namespace: str, now: datetime,
     ) -> bool:
         if not self._has_chunks_table(connection):
-            return True
+            return False  # nothing to reconcile against: fail closed
         live = _LIVE_CHUNK.format(namespace=":namespace")
         return self._row(
             connection, f"SELECT 1 FROM chunks c WHERE c.chunk_id = :chunk_id AND {live}",
@@ -330,7 +344,7 @@ class SQLiteOntologyStore:
         )
         if row is None:
             return None
-        aliases = [alias for (alias,) in connection.execute(
+        aliases = [alias for (alias,) in self._plain(connection).execute(
             "SELECT alias FROM ontology_aliases WHERE entity_id = ? ORDER BY alias",
             (row["entity_id"],),
         )]
@@ -722,7 +736,7 @@ class SQLiteOntologyStore:
         if not requested:
             return []
         marks = ",".join("?" * len(requested))
-        visible = {entity_id for (entity_id,) in connection.execute(
+        visible = {entity_id for (entity_id,) in self._plain(connection).execute(
             f"SELECT entity_id FROM ontology_entities WHERE entity_id IN ({marks})"
             " AND tenant_id = ? AND namespace IN (?, ?) AND deleted_at IS NULL",
             (*requested, auth.scope.tenant_id, auth.scope.namespace, GLOBAL_NAMESPACE),
@@ -789,7 +803,7 @@ class SQLiteOntologyStore:
                     " AND relation_id IN (SELECT relation_id FROM ontology_relations"
                     " WHERE tenant_id = ? AND namespace = ?)"
                 )
-                affected.update(relation_id for (relation_id,) in connection.execute(
+                affected.update(relation_id for (relation_id,) in self._plain(connection).execute(
                     f"SELECT DISTINCT relation_id FROM ontology_relation_evidence WHERE {where}",
                     (*batch, *scope),
                 ))
@@ -807,6 +821,10 @@ class SQLiteOntologyStore:
                     (relation_id,),
                 )
                 assert row is not None
+                if row["status"] == "verified":
+                    # Changing a verified relation's support is a verification
+                    # act; raising rolls back every update in this call.
+                    _require(auth, "verify")
                 revision = int(row["revision"])
                 event_type = "evidence_invalidated"
                 if row["status"] == "verified" and int(row["valid"]) == 0:
@@ -825,7 +843,7 @@ class SQLiteOntologyStore:
 
     def revoke_relation(self, relation_id: UUID, *, auth: AuthContext, reason: str) -> Relation:
         """Mark a relation revoked (idempotent). Revoking another principal's needs admin."""
-        _require(auth, "write")
+        _require_write(auth, auth.scope)  # before the lookup: no existence oracle
         if not reason.strip():
             raise ValueError("reason is required")
         stamp = _ts(datetime.now(timezone.utc))
@@ -838,7 +856,6 @@ class SQLiteOntologyStore:
             )
             if row is None:
                 raise ValueError("relation is not available")
-            _require_write(auth, auth.scope)
             if row["asserted_by"] != auth.principal_id:
                 _require(auth, "admin")
             if row["status"] != "revoked":

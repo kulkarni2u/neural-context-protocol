@@ -429,3 +429,110 @@ def test_concurrent_idempotent_asserts(store, tmp_path):
         thread.join()
     assert not errors and len(results) == 2 and results[0] == results[1]
     assert count(tmp_path / "ncp.db", "SELECT COUNT(*) FROM ontology_relations") == 1
+
+
+# -- review regressions ------------------------------------------------------
+
+
+def test_chunk_evidence_fails_closed_without_chunks_table(store):
+    api, db = service("api"), database("db")
+    put(store, api, db)
+    with pytest.raises(ValueError, match="evidence chunk is not available"):
+        store.assert_relation(rel(api, db, status="verified", evidence=(chunk_ref("sub_made_up"),)),
+                              auth=auth(), idempotency_key="k")
+    store.assert_relation(rel(api, db, status="verified", evidence=(attestation(),)),
+                          auth=auth(), idempotency_key="k2")
+    assert len(verified_paths(store)) == 1
+
+
+def test_stored_chunk_evidence_without_chunks_table_is_not_verified(tmp_path):
+    path = tmp_path / "ncp.db"
+    ncp = SQLiteStore(path)
+    store = SQLiteOntologyStore.inherit(ncp, registry())
+    api, db = service("api"), database("db")
+    put(store, api, db)
+    chunk_id = live_chunk(ncp, "api writes orders into the primary database")
+    store.assert_relation(rel(api, db, status="verified", evidence=(chunk_ref(chunk_id),)),
+                          auth=auth(), idempotency_key="k")
+    with sqlite3.connect(path) as connection:
+        connection.execute("ALTER TABLE chunks RENAME TO chunks_moved")
+    assert verified_paths(store) == ()
+
+
+def test_invalidating_verified_support_needs_verify(tmp_path):
+    ncp = SQLiteStore(tmp_path / "ncp.db")
+    store = SQLiteOntologyStore.inherit(ncp, registry())
+    api, db, cache = service("api"), database("db"), database("cache")
+    put(store, api, db, cache)
+    chunk_id = live_chunk(ncp, "api writes orders into the primary database")
+    store.assert_relation(rel(api, cache, evidence=(chunk_ref(chunk_id),)), auth=auth(),
+                          idempotency_key="candidate")
+    store.assert_relation(rel(api, db, status="verified", evidence=(chunk_ref(chunk_id),)),
+                          auth=auth(), idempotency_key="verified")
+    writer = auth(caps=frozenset({"read", "write"}), principal="other")
+    with pytest.raises(PermissionError, match="verify"):
+        store.invalidate_evidence([chunk_id], auth=writer, reason="x")
+    assert len(verified_paths(store)) == 1  # rolled back, candidate evidence included
+    assert count(tmp_path / "ncp.db", "SELECT COUNT(*) FROM ontology_relation_evidence"
+                 " WHERE status = 'invalidated'") == 0
+    assert store.invalidate_evidence([chunk_id], auth=auth(), reason="forgotten") == 2
+
+
+def test_shared_connection_with_custom_row_factory(tmp_path):
+    connection = sqlite3.connect(tmp_path / "shared.db", check_same_thread=False)
+    connection.row_factory = lambda cursor, row: {
+        column[0]: value for column, value in zip(cursor.description, row)
+    }
+    shared = SQLiteOntologyStore(connection, registry())
+    api, db = service("api"), database("db")
+    put(shared, api, db)
+    stored = shared.get_entity(api.entity_id, auth=auth())
+    assert stored is not None and stored.aliases == ("api-svc",)
+    shared.assert_relation(rel(api, db), auth=auth(), idempotency_key="k")
+    paths = shared.traverse(GraphQuery(seeds=(api.entity_id,), verified_only=False),
+                            auth=auth()).paths
+    assert len(paths) == 1
+
+
+def test_failed_commit_does_not_wedge_shared_connection(tmp_path):
+    path = tmp_path / "shared.db"
+    connection = sqlite3.connect(path, timeout=0.1, check_same_thread=False)  # rollback journal
+    shared = SQLiteOntologyStore(connection, registry())
+    reader = sqlite3.connect(path, isolation_level=None)
+    reader.execute("BEGIN")
+    reader.execute("SELECT * FROM ontology_entities").fetchall()  # holds SHARED until COMMIT
+    with pytest.raises(sqlite3.OperationalError, match="locked"):
+        shared.upsert_entity(service("api"), auth=auth())
+    assert not connection.in_transaction
+    reader.execute("COMMIT")
+    assert shared.upsert_entity(service("api"), auth=auth()).revision == 1
+
+
+def test_revoke_checks_capabilities_before_lookup(store):
+    g1, g2 = node("g1", GLOBAL), node("g2", GLOBAL)
+    put(store, g1, g2)
+    edge = store.assert_relation(rel(g1, g2, "LINKS"), auth=auth(GLOBAL, ALL),
+                                 idempotency_key="k")
+    non_admin = auth(GLOBAL, frozenset({"write"}))
+    for relation_id in (edge.relation_id, uuid4()):
+        with pytest.raises(PermissionError, match="admin"):
+            store.revoke_relation(relation_id, auth=non_admin, reason="x")
+
+
+def test_chunk_liveness_columns_and_units(tmp_path):
+    ncp = SQLiteStore(tmp_path / "ncp.db")
+    store = SQLiteOntologyStore.inherit(ncp, registry())
+    api, db = service("api"), database("db")
+    put(store, api, db)
+    expiring = SubconsciousChunk(layer="semantic", content="api uses the ledger database",
+                                 src="tool_result", pipeline_id="prod",
+                                 expiry=datetime.now(timezone.utc).timestamp() + 3600)
+    assert ncp.write(expiring)
+    store.assert_relation(rel(api, db, status="verified", evidence=(chunk_ref(expiring.chunk_id),)),
+                          auth=auth(), idempotency_key="k")
+    assert len(verified_paths(store)) == 1  # epoch-seconds expiry in the future is live
+    newer = live_chunk(ncp, "api moved refunds to a separate ledger in december")
+    # superseded_by alone retires the chunk, even while valid_to is in the future
+    assert ncp.supersede(expiring.chunk_id, newer,
+                         valid_to=datetime.now(timezone.utc).timestamp() + 3600)
+    assert verified_paths(store) == ()
