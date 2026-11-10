@@ -182,6 +182,11 @@ DEFAULT_CONFIG = {
     "server": {
         "auth_token": "",
     },
+    # Opt-in authenticated principals for the HTTP transport (ncp/principals.py):
+    # one [principals.<name>] table per bearer token, each with agent_id,
+    # token_sha256 or token_env, optional pipelines and capabilities. Empty
+    # (default) keeps the single shared [server].auth_token behaviour.
+    "principals": {},
     "memoization": {
         "enabled": False,
         "max_age_hours": 24,
@@ -699,6 +704,11 @@ class NCPConfig:
     def server_auth_token(self) -> str | None:
         val = self.values.get("server", {}).get("auth_token")
         return str(val) if val else None
+
+    @property
+    def principals_config(self) -> Any:
+        """Raw ``[principals]`` value; parsed and validated by ``ncp.principals.load_principals``."""
+        return self.values.get("principals", {})
 
     @property
     def pipeline_max_working_chunks(self) -> int:

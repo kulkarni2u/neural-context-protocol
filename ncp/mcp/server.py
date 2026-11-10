@@ -31,6 +31,15 @@ from ncp.chunker import filter_content
 from ncp.config import NCPConfig, load_config
 from ncp.context_policy import ContextPolicyError, resolve_context_policy
 from ncp.drift import EmbeddingAdapter, compute_drift
+from ncp.principals import (
+    AuthorizationError,
+    Principal,
+    PrincipalRegistry,
+    ToolAuthorizer,
+    authorize_events,
+    authorize_read,
+    load_principals,
+)
 from ncp.overview import (
     DEFAULT_MAX_PIPELINES,
     DEFAULT_MAX_TOKENS,
@@ -3230,12 +3239,25 @@ def _negotiate_version(client_version: str) -> str:
     return _LATEST_VERSION
 
 
+# JSON-RPC error code for a tool call the authenticated principal may not make.
+FORBIDDEN_ERROR_CODE = -32003
+
+
 def _handle_request(
     req: dict[str, object],
     handlers: dict[str, ToolHandler],
     *,
     tools: Sequence[dict[str, object]] = MCP_TOOLS,
+    principal: Principal | None = None,
+    authorizer: ToolAuthorizer | None = None,
 ) -> str | StreamResponse:
+    """Dispatch one JSON-RPC request.
+
+    ``principal``/``authorizer`` are set by the HTTP transport when
+    ``[principals]`` is configured; every tools/call is then checked (and its
+    identity arguments bound) by ``authorizer.check_call`` before the handler
+    runs. Both None (stdio, or no principals) means no authorization layer.
+    """
     req_id = req.get("id")
     method = str(req.get("method", ""))
     params: dict[str, object] = req.get("params", {}) or {}
@@ -3273,11 +3295,17 @@ def _handle_request(
         if handler is None:
             return _err_response(req_id, -32601, f"Tool not found: {tool_name}")
         try:
-            result = handler(arguments)
+            if principal is not None and authorizer is not None:
+                arguments = authorizer.check_call(principal, tool_name, arguments)
+                result = authorizer.filter_result(principal, tool_name, handler(arguments))
+            else:
+                result = handler(arguments)
             if isinstance(result, StreamResponse):
                 result.request_id = req_id
                 return result
             return _ok(req_id, {"content": [{"type": "text", "text": json.dumps(result)}]})
+        except AuthorizationError as exc:
+            return _err_response(req_id, FORBIDDEN_ERROR_CODE, f"Forbidden: {exc}")
         except NotImplementedError as exc:
             _err(f"Tool {tool_name} unavailable for current backend: {traceback.format_exc()}")
             return _err_response(
@@ -3364,16 +3392,19 @@ def _create_handlers_with_store(
     return handlers, store, tools
 
 
+def _load_server_config(*, store_path: str | Path | None = None, cwd: Path | None = None) -> NCPConfig:
+    if store_path:
+        return load_config(env={"NCP_STORE_PATH": str(store_path)})
+    return load_config(cwd=cwd or Path.cwd())
+
+
 def _create_server_parts(
     *,
     store_path: str | Path | None = None,
     cwd: Path | None = None,
 ) -> tuple[dict[str, ToolHandler], BaseStore, list[dict[str, object]], Notifier | None, NCPConfig]:
     """Build handlers plus the ONE notifier the handlers and HTTP /events share."""
-    if store_path:
-        config = load_config(env={"NCP_STORE_PATH": str(store_path)})
-    else:
-        config = load_config(cwd=cwd or Path.cwd())
+    config = _load_server_config(store_path=store_path, cwd=cwd)
     store = create_store(config)
     tools = tools_for_config(config)
     notifier = get_process_notifier(config, store=store)
@@ -3694,8 +3725,12 @@ class _MCPHTTPServer(ThreadingHTTPServer):
         max_subscribers: int = 64,
         config: NCPConfig | None = None,
         socket_timeout_seconds: float | None = _HTTP_SOCKET_TIMEOUT_SECONDS,
+        principals: PrincipalRegistry | None = None,
     ) -> None:
         self.config = config
+        # Opt-in authenticated principals; None keeps the single shared token.
+        self.principals = principals
+        self.authorizer = ToolAuthorizer(store) if principals is not None else None
         self.socket_timeout_seconds = socket_timeout_seconds
         self.handlers = handlers
         self.notifier = notifier
@@ -3817,6 +3852,22 @@ class _MCPHTTPHandler(BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", origin)
             self.send_header("Vary", "Origin")
 
+    def _authenticate(self) -> tuple[bool, Principal | None]:
+        """Authenticate the request: ``(ok, principal)``.
+
+        Without principals this is the legacy shared-token check and the
+        principal is always None. With principals the bearer token must map
+        to one (the legacy [server].auth_token maps to an implicit admin).
+        """
+        registry = self.server.principals
+        if registry is None:
+            return self._authorized(), None
+        principal = registry.resolve_authorization(self.headers.get("Authorization"))
+        return principal is not None, principal
+
+    def _send_forbidden(self, exc: AuthorizationError) -> None:
+        self._send_json(HTTPStatus.FORBIDDEN, {"error": "forbidden", "detail": str(exc)})
+
     def _authorized(self) -> bool:
         token = self.server.auth_token
         if not token:
@@ -3901,7 +3952,11 @@ class _MCPHTTPHandler(BaseHTTPRequestHandler):
             return
         self.send_response(HTTPStatus.NO_CONTENT)
         self._send_cors_headers()
-        allowed_headers = "Content-Type, Authorization" if self.server.auth_token else "Content-Type"
+        allowed_headers = (
+            "Content-Type, Authorization"
+            if self.server.auth_token or self.server.principals is not None
+            else "Content-Type"
+        )
         self.send_header("Access-Control-Allow-Headers", allowed_headers)
         self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
         self.send_header("Content-Length", "0")
@@ -3920,7 +3975,7 @@ class _MCPHTTPHandler(BaseHTTPRequestHandler):
             if not self._origin_allowed():
                 self._send_json(HTTPStatus.FORBIDDEN, {"error": "forbidden_origin"})
                 return
-            if not self._authorized():
+            if not self._authenticate()[0]:
                 self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
                 return
 
@@ -3982,15 +4037,22 @@ class _MCPHTTPHandler(BaseHTTPRequestHandler):
 
     def _handle_events(self, query: str) -> None:
         """``GET /events``: SSE doorbell stream. Frames never carry whisper payloads."""
-        if not self._authorized():
+        ok, principal = self._authenticate()
+        if not ok:
             self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
             return
         params = {k: v[-1] for k, v in urllib.parse.parse_qs(query).items()}
         agent_id = params.get("agent_id", "").strip()
+        pipeline_id = params.get("pipeline_id") or None
+        if principal is not None:
+            try:
+                agent_id = authorize_events(principal, agent_id=agent_id or None, pipeline_id=pipeline_id) or ""
+            except AuthorizationError as exc:
+                self._send_forbidden(exc)
+                return
         if not agent_id:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "agent_id is required"})
             return
-        pipeline_id = params.get("pipeline_id") or None
         notifier = self.server.notifier
         if notifier is None:
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "notify_disabled"})
@@ -4088,7 +4150,8 @@ class _MCPHTTPHandler(BaseHTTPRequestHandler):
 
     def _handle_api_get(self, path: str, query: str) -> None:
         """Dispatch a ``/api/*`` GET request. Auth-gated; JSON responses only."""
-        if not self._authorized():
+        ok, principal = self._authenticate()
+        if not ok:
             self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
             return
         route = _API_ROUTES.get(path)
@@ -4096,6 +4159,15 @@ class _MCPHTTPHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
             return
         params = _query_params(query)
+        if principal is not None:
+            # /api/overview spans pipelines and takes no pipeline_id, so it is
+            # an unscoped read: admin only (and no pipeline allowlist).
+            scope = None if route is None else (params.get("pipeline_id") or None)
+            try:
+                authorize_read(principal, pipeline_id=scope, endpoint=path)
+            except AuthorizationError as exc:
+                self._send_forbidden(exc)
+                return
         try:
             if route is None:
                 payload = _api_overview_payload(self.server.store, params, self.server.config)
@@ -4138,7 +4210,8 @@ class _MCPHTTPHandler(BaseHTTPRequestHandler):
             return
         if self._reject_forbidden_request(check_origin=True):
             return
-        if not self._authorized():
+        authenticated, principal = self._authenticate()
+        if not authenticated:
             self._drain_request_body()
             self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
             return
@@ -4173,7 +4246,13 @@ class _MCPHTTPHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_payload"})
             return
 
-        response = _handle_request(payload, self.server.handlers, tools=self.server.tools)
+        response = _handle_request(
+            payload,
+            self.server.handlers,
+            tools=self.server.tools,
+            principal=principal,
+            authorizer=self.server.authorizer,
+        )
         prefers_sse = self._prefers_event_stream()
         if isinstance(response, StreamResponse):
             if prefers_sse:
@@ -4205,6 +4284,8 @@ def create_http_server(
     socket_timeout_seconds: float | None = _HTTP_SOCKET_TIMEOUT_SECONDS,
 ) -> _MCPHTTPServer:
     handlers, store, tools, notifier, config = _create_server_parts(store_path=store_path, cwd=cwd)
+    # Raises PrincipalConfigError on an invalid [principals] table: fail closed.
+    principals = load_principals(config.principals_config, legacy_token=auth_token or None)
     return _MCPHTTPServer(
         (host, port),
         handlers=handlers,
@@ -4220,6 +4301,7 @@ def create_http_server(
         max_subscribers=config.notify_max_subscribers if max_subscribers is None else max_subscribers,
         config=config,
         socket_timeout_seconds=socket_timeout_seconds,
+        principals=principals,
     )
 
 
@@ -4238,14 +4320,20 @@ def serve_http(
 ) -> None:
     """Run the MCP server over HTTP POST plus an SSE discovery stream.
 
-    Binding to a non-loopback host requires ``auth_token``; without one the
-    server refuses to start and exits with status 2.
+    Binding to a non-loopback host requires ``auth_token`` or configured
+    ``[principals]``; without either the server refuses to start and exits
+    with status 2. stdio (``serve``) never applies principals.
     """
-    if not _is_loopback_host(host) and not auth_token:
+    try:
+        principals_configured = bool(_load_server_config(store_path=store_path, cwd=cwd).principals_config)
+    except Exception:
+        # A config that cannot load fails again, loudly, in create_http_server.
+        principals_configured = False
+    if not _is_loopback_host(host) and not auth_token and not principals_configured:
         _err(
             f"ERROR: refusing to bind the NCP HTTP server to non-loopback host {host!r} "
-            "without an auth token. Pass --auth-token, set NCP_AUTH_TOKEN, or set "
-            "[server].auth_token in config.toml; or bind to 127.0.0.1."
+            "without an auth token. Pass --auth-token, set NCP_AUTH_TOKEN, set "
+            "[server].auth_token or [principals] in config.toml; or bind to 127.0.0.1."
         )
         sys.exit(2)
     try:
@@ -4265,6 +4353,12 @@ def serve_http(
         _err(f"NCP HTTP server failed to start: {exc}\n{traceback.format_exc()}")
         sys.exit(1)
 
+    registry = getattr(server, "principals", None)
+    if registry is not None and registry.has_legacy_token:
+        _err(
+            "NOTE: [principals] is configured and [server].auth_token is also set; the shared "
+            "token acts as an implicit admin principal. Remove it once every client has its own token."
+        )
     try:
         server.serve_forever()
     finally:

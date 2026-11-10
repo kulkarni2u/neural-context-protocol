@@ -18,6 +18,26 @@ accept are now rejected.
   `Host` values are accepted (`403`). A negative `Content-Length`, which used
   to read until EOF past the size limit, is `400`. Connections idle on the
   socket for 30 seconds are closed.
+- **Authenticated principals, opt-in** (`ncp/principals.py`,
+  `ncp/mcp/server.py`): every tool trusted the `agent_id` the caller declared,
+  so anyone holding the shared token could post a turn as another agent and
+  rewrite its `owns`/`must_not`, credit its own chunks, or declare
+  `src=user_verified`. A `[principals.<name>]` table now maps a bearer token
+  (stored as `token_sha256`, or read from `token_env`) to an `agent_id`, an
+  optional `pipelines` allowlist and the capabilities `admin`, `verify` and
+  `record_outcome`. With principals configured the HTTP server binds identity
+  arguments to the token's agent and rejects a mismatch (JSON-RPC `-32003`),
+  enforces the pipeline allowlist (an omitted `pipeline_id` is rejected for a
+  pipeline-limited principal), requires `verify` for `src=user_verified` and
+  `ncp_verify_memo`, requires `record_outcome` with explicit `chunk_ids` and
+  no self-crediting for outcomes, rejects overwriting or superseding another
+  agent's chunk, keys the `ncp_fetch` budget by principal, and returns `403`
+  for unscoped `/api/*` reads unless the principal is an unrestricted admin.
+  A token is then required on loopback too, and the bundled UI needs an admin
+  token. `[server].auth_token` acts as an implicit admin while both are set.
+  Nothing changes when no principals are configured, and stdio is not
+  covered. See "Principals" in `docs/NCP_HTTP_API.md` for the rules and the
+  limits.
 - **Non-loopback bind requires a token**: `ncp serve` exits with status 2
   instead of printing a warning.
 - **Trust inputs are validated**: `ncp_record_outcome` requires a finite

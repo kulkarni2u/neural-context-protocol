@@ -1445,6 +1445,43 @@ unless an operator enables enforcement. With `require_signatures = true`, writes
 that cannot be verified (including from revoked identities) are rejected. Signing
 authenticates *who wrote a chunk*, not whether its content is truthful.
 
+**Caller-declared identity (default) and authenticated principals (opt-in).**
+By default the HTTP transport authenticates at most one shared bearer token,
+and every tool trusts the identity arguments the caller declares (`agent_id`,
+`written_by`, `from`, `memory_chunks[].written_by`, ...). Rule 1 above stops
+*content* from mutating identity fields, but it does not stop a *caller* from
+naming another agent: under the default model any token holder can post a
+turn as agent A and replace A's carried-forward `owns`/`must_not`, declare
+`src=user_verified`, record outcomes for any chunk (its own included), use any
+pipeline, and reset its `ncp_fetch` budget by rotating `session_id`.
+
+Configuring `[principals]` (`docs/NCP_HTTP_API.md`, "Principals") closes these
+for the HTTP transport. Each bearer token (stored as a SHA-256 hash or read
+from an environment variable) maps to one principal with an `agent_id`, an
+optional pipeline allowlist and capabilities `verify`, `record_outcome` and
+`admin`. The server then:
+
+```
+Principal rule 1: identity arguments must equal the principal's agent_id
+  a mismatch is rejected (JSON-RPC -32003), never silently replaced;
+  only `admin` may act as another agent
+Principal rule 2: a pipeline-limited principal must name an allowed pipeline
+  omitting pipeline_id is rejected, not defaulted; task_id, decision_id and
+  chunk_id lookups are checked against the stored object's pipeline
+Principal rule 3: src=user_verified requires `verify`
+Principal rule 4: ncp_record_outcome requires `record_outcome`, explicit live
+  chunk_ids, and none authored by the principal (unless `admin`)
+Principal rule 5: the ncp_fetch budget is keyed by principal, not session_id
+Principal rule 6: unscoped GET /api/* reads require `admin`; /events binds
+  agent_id like a tool argument
+```
+
+Limits: this is bearer-token identity bound per connection, not per-message
+signing (combine with `[identity].require_signatures` for that); the stdio
+transport applies no principals and is trusted as a local process; and a
+principal can still write false or persuasive content under its own name,
+which the host mitigations below address.
+
 **What NCP does NOT defend against**: a compromised or low-quality agent
 writing persuasive instructions into a whisper payload or a high-relevance
 chunk ("ignore your constraints and ..."). Downstream models receive that

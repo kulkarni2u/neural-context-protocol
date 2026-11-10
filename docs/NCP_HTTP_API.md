@@ -51,6 +51,128 @@ blocking `ncp_wait_whispers` are not subject to that limit.
 `ncp_record_outcome` requires `0 < weight <= 1`. A caller-supplied `base_trust`
 is capped at the default trust for the declared `src`.
 
+## Principals
+
+By default the server has at most one shared token, and every tool trusts the
+agent identity the caller declares (`agent_id`, `written_by`, `from`, ...):
+anyone holding the token can act as any agent, rewrite another agent's
+`owns`/`must_not`, write `src=user_verified`, record outcomes for any chunk,
+and read or write any pipeline. **Principals** are the opt-in fix: each bearer
+token maps to one principal with a fixed `agent_id`, an optional pipeline
+allowlist and a set of capabilities, and the server derives the acting
+identity from the token.
+
+```toml
+# .ncp/config.toml -- one table per token
+[principals.router]
+token_env = "NCP_TOKEN_ROUTER"     # read the token from this env var at startup
+agent_id = "router"
+capabilities = ["admin", "verify", "record_outcome"]
+
+[principals.executor]
+# hex SHA-256 of the token:  printf %s "$TOKEN" | sha256sum
+token_sha256 = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+agent_id = "executor"
+pipelines = ["pipe_payment"]       # omit to allow every pipeline
+capabilities = []
+
+[principals.validator]
+token_env = "NCP_TOKEN_VALIDATOR"
+agent_id = "validator"
+capabilities = ["record_outcome"]
+```
+
+Each principal needs `agent_id` and exactly one of `token_sha256` (the token
+is never stored in plaintext; a `token` key is refused) or `token_env` (the
+secret stays out of the file). `pipelines`, if present, must be non-empty.
+Capabilities:
+
+| Capability | Grants |
+|------------|--------|
+| `verify` | writing `src="user_verified"` (`ncp_write_memory`, `ncp_post_turn` memory chunks) and `ncp_verify_memo` |
+| `record_outcome` | calling `ncp_record_outcome` |
+| `admin` | acting as any `agent_id` (router/orchestrator processes, the bundled UI), recording outcomes that credit its own chunks, turn-only outcomes, and unscoped `GET /api/*` reads |
+
+An invalid `[principals]` table (unknown key or capability, malformed hash,
+unset `token_env` variable, two principals with the same token) stops the
+server from starting. With principals configured, `ncp serve` may bind to a
+non-loopback host without `[server].auth_token`.
+
+**Rules, when at least one principal is configured** (HTTP transport):
+
+1. **Authentication.** Every `/mcp`, `/sse`, `/events` and `/api/*` request
+   must carry a token that maps to a principal, on loopback too; otherwise
+   `401`. If `[server].auth_token` is also set, that shared token maps to an
+   implicit principal named `legacy_auth_token` with all three capabilities
+   and no pipeline limit (the server prints a note at startup). Remove it once
+   every client has its own token. A principal may not reuse the shared token.
+2. **Identity comes from the token.** For every tool, each argument that names
+   the acting agent must equal the principal's `agent_id`; a different value
+   is rejected (never silently replaced), and an omitted one is filled in.
+   `admin` principals may pass any value. The bound arguments:
+
+   | Tool | Bound arguments |
+   |------|-----------------|
+   | `ncp_get_context`, `ncp_post_turn` | `agent_id` |
+   | `ncp_post_turn` | `memory_chunks[].written_by` (omitted means `agent_id`) |
+   | `ncp_write_memory` | `written_by`, `owner` (checked if given, never filled) |
+   | `ncp_emit_whisper` | `from` |
+   | `ncp_wait_whispers`, `ncp_overview`, `ncp_fetch` | `agent_id` |
+   | `ncp_task` (every action) | `agent_id` |
+   | `ncp_record_decision`, `ncp_compile_decision_query` | `agent_id` |
+   | `ncp_remember` | `written_by` |
+
+   Also: a `chunk_id` (`ncp_write_memory`, `memory_chunks[].chunk_id`) that
+   names an existing chunk written by someone else is rejected, because the
+   write would overwrite it; and `supersedes` may only name the principal's
+   own chunks. Task mutations by `task_id` remain gated by the lease token.
+3. **Pipeline ACL.** A principal with `pipelines` must pass an allowed
+   `pipeline_id` to every tool that takes one; a call that **omits**
+   `pipeline_id` is rejected rather than defaulted (an omitted pipeline means
+   the unscoped/global scope, which is outside the allowlist). In addition:
+   `ncp_task` actions by `task_id` are checked against the task's stored
+   pipeline; `ncp_overview` must pass `pipelines` naming only allowed ones;
+   memo tools must use `task`/`context`/`pipeline_id` rather than an explicit
+   `signature`; `ncp_get_decision` returns `{"found": false}` for a decision in
+   another pipeline; `ncp_record_outcome` chunks (and a linked `decision_id`)
+   must be in allowed pipelines.
+4. **Capabilities.** `src="user_verified"` needs `verify`; `ncp_record_outcome`
+   needs `record_outcome`. A non-admin principal must name explicit
+   `chunk_ids` (turn-only outcomes are resolved inside the store, where
+   authorship cannot be checked first), every id must be a live chunk, and
+   none may have been written by the principal itself; nor may it link an
+   outcome to its own `decision_id`. A pipeline-limited admin must also pass
+   explicit `chunk_ids`.
+5. **Fetch budget.** `ncp_get_context` and `ncp_fetch` ignore the caller's
+   `session_id`: the 3-per-turn `ncp_fetch` budget is keyed by principal
+   (`principal:<name>`, or `principal:<name>:<pipeline>:<agent>` for admin).
+   The `session_id` returned by `ncp_get_context` shows the key in use.
+6. **GET endpoints.** `/api/*` reads that pass `pipeline_id` follow the
+   pipeline ACL; reads without one (and `/api/overview`, which spans
+   pipelines) require `admin` and no pipeline limit. `/events` binds
+   `agent_id` like a tool argument (filled in when omitted, `403` on a
+   mismatch, admin excepted) and requires an allowed `pipeline_id` for a
+   pipeline-limited principal. `/sse` only needs a valid token. Denials are
+   `403 {"error": "forbidden", "detail": "..."}`. The bundled UI therefore
+   needs an admin token (or a pipeline-scoped token and a `pipeline_id`).
+
+A denied tool call returns JSON-RPC error `-32003` with a message starting
+`Forbidden:` and naming the argument and principal.
+
+**stdio** (`ncp serve-stdio`, and hosts that spawn the server as a
+subprocess) has no bearer token and applies no principals: it stays
+unauthenticated-local, trusted like any process that can open the store file
+directly. Use HTTP when agents must not be able to act as each other.
+
+**Limits.** This is bearer-token identity: it binds a connection to a
+principal; it is not per-message signing (combine with
+`[identity].require_signatures` for that), and anyone holding a token is that
+principal. It does not stop a principal from writing false or persuasive
+content under its own name, and within an allowed pipeline the read APIs
+(`/api/whispers`, `/api/chunks`, ...) show every agent's data. When no
+principal is configured, everything above is off and the server behaves
+exactly as described in [Authentication](#authentication).
+
 ## Health check
 
 ```bash
@@ -606,6 +728,7 @@ cannot write memory, emit whispers, or mutate trust.
 |------------------------|---------------------------------------------------|
 | Unknown tool           | JSON-RPC error `-32601`                           |
 | Tool/validation error  | JSON-RPC error `-32603` with the message          |
+| Denied by principal (see [Principals](#principals)) | JSON-RPC error `-32003` (`Forbidden: ...`); HTTP 403 on GET endpoints |
 | Missing/wrong token    | HTTP 401                                          |
 | Body too large (>10MB) | HTTP 413                                          |
 | Malformed JSON         | HTTP 400                                          |
