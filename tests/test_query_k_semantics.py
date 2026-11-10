@@ -94,13 +94,13 @@ def test_sqlite_trust_recency_k_upper_bound(tmp_path: Path) -> None:
 # PgvectorStore _query_vector — SQL LIMIT must equal max(1, k)
 # ---------------------------------------------------------------------------
 
-pytest.importorskip("psycopg2", reason="pgvector extra not installed")
+pytest.importorskip("psycopg", reason="pgvector extra not installed")
 
 from ncp.stores.pgvector import PgvectorStore  # noqa: E402
 
 
 def _mock_conn_returning(rows: list[dict]) -> MagicMock:
-    """Build a mock psycopg2 connection whose cursor returns `rows` on fetchall."""
+    """Build a mock psycopg connection whose cursor returns `rows` on fetchall."""
     cursor = MagicMock()
     cursor.fetchall.return_value = rows
     cursor.description = [(col, None, None, None, None, None, None) for col in rows[0]] if rows else []

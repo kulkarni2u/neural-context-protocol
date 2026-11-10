@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from importlib import resources
 from pathlib import Path
 import sys
+from typing import Any, Callable
 from urllib.parse import urlsplit, urlunsplit
 
 import json
@@ -25,6 +26,7 @@ from ncp.config import NCPConfig
 from ncp.stores.base import BaseStore
 from ncp.stores.base import NCPStoreUnavailableError
 from ncp.stores.factory import create_store
+from ncp.stores.migrations import PSYCOPG_MISSING_MESSAGE, MigrationError, psycopg_available
 from ncp.types import Whisper
 
 console = Console()
@@ -72,21 +74,54 @@ def _write_provider_template(
     template_parts: tuple[str, ...],
     *,
     executable: bool = False,
-) -> None:
+    transform: Callable[[str], str] | None = None,
+) -> bool:
+    """Write a packaged template unless the file exists. Returns True if written."""
     destination = cwd / relative_path
     if destination.exists():
         console.print(f"  [dim]Preserved existing {relative_path}[/dim]")
-        return
+        return False
 
     destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text(_load_provider_template(*template_parts))
+    text = _load_provider_template(*template_parts)
+    if transform is not None:
+        text = transform(text)
+    destination.write_text(text)
     if executable:
         destination.chmod(0o755)
     console.print(f"  Wrote [bold]{relative_path}[/bold]")
+    return True
 
 
-def _install_claude_hooks(cwd: Path) -> None:
-    _write_provider_template(cwd, ".mcp.json", ("claude", "mcp_servers.json"))
+# The header references an environment variable; the secret itself is never written
+# into these (normally committed) files.
+_CLAUDE_AUTH_HEADER = "Bearer ${NCP_AUTH_TOKEN}"
+_OPENCODE_AUTH_HEADER = "Bearer {env:NCP_AUTH_TOKEN}"
+
+
+def _with_auth_header(template_text: str, servers_key: str, header_value: str) -> str:
+    """Add an Authorization header to the `ncp` server entry of a JSON host config."""
+    data = json.loads(template_text)
+    data[servers_key]["ncp"]["headers"] = {"Authorization": header_value}
+    return json.dumps(data, indent=2) + "\n"
+
+
+def _auth_hint(path: str) -> None:
+    console.print(
+        f"  [yellow]{path} already exists and was not changed.[/yellow] If the server requires "
+        "a token, add an Authorization header to its `ncp` entry."
+    )
+
+
+def _install_claude_hooks(cwd: Path, *, auth: bool = False) -> None:
+    mcp_transform = (
+        (lambda text: _with_auth_header(text, "mcpServers", _CLAUDE_AUTH_HEADER)) if auth else None
+    )
+    written = _write_provider_template(
+        cwd, ".mcp.json", ("claude", "mcp_servers.json"), transform=mcp_transform
+    )
+    if auth and not written:
+        _auth_hint(".mcp.json")
     _write_provider_template(cwd, ".claude/settings.json", ("claude", "settings.json"))
     _write_provider_template(
         cwd,
@@ -101,7 +136,9 @@ def _install_claude_hooks(cwd: Path) -> None:
     )
 
 
-def _install_codex_hooks(cwd: Path) -> None:
+def _install_codex_hooks(cwd: Path, *, auth: bool = False) -> None:
+    # Codex reads MCP servers from its own user-level config, which init does not
+    # write, so there is no project-level MCP entry here to attach a header to.
     _write_provider_template(cwd, "AGENTS.md", ("codex", "AGENTS.md"))
     _write_provider_template(cwd, ".codex/hooks.json", ("codex", "hooks.json"))
     _write_provider_template(
@@ -112,9 +149,16 @@ def _install_codex_hooks(cwd: Path) -> None:
     )
 
 
-def _install_opencode_hooks(cwd: Path) -> None:
+def _install_opencode_hooks(cwd: Path, *, auth: bool = False) -> None:
     _write_provider_template(cwd, "AGENTS.md", ("opencode", "AGENTS.md"))
-    _write_provider_template(cwd, "opencode.json", ("opencode", "opencode.json"))
+    oc_transform = (
+        (lambda text: _with_auth_header(text, "mcp", _OPENCODE_AUTH_HEADER)) if auth else None
+    )
+    written = _write_provider_template(
+        cwd, "opencode.json", ("opencode", "opencode.json"), transform=oc_transform
+    )
+    if auth and not written:
+        _auth_hint("opencode.json")
     _write_provider_template(
         cwd,
         ".opencode/plugins/ncp.js",
@@ -122,7 +166,7 @@ def _install_opencode_hooks(cwd: Path) -> None:
     )
 
 
-def _offer_provider_hook_setup(cwd: Path, *, is_tty: bool) -> None:
+def _offer_provider_hook_setup(cwd: Path, *, is_tty: bool, auth: bool = False) -> None:
     if not is_tty:
         return
 
@@ -137,7 +181,7 @@ def _offer_provider_hook_setup(cwd: Path, *, is_tty: bool) -> None:
             continue
         console.print(f"{label} detected at [bold]{path}[/bold]")
         if click.confirm(f"Add NCP hook/setup files for {label}?", default=True):
-            installer(cwd)
+            installer(cwd, auth=auth)
 
 
 def _render_config_template(
@@ -443,31 +487,37 @@ def _run_compose(cwd: Path, engine: str, compose_path: Path, args: list[str]) ->
 
 
 def _wait_for_pg(dsn: str, timeout: int = 60) -> bool:
-    """Poll until Postgres accepts connections or timeout (seconds) elapses."""
-    try:
-        import psycopg2  # type: ignore[import]
-    except ImportError:
-        return True  # can't verify, proceed optimistically
+    """Poll until Postgres accepts connections or timeout (seconds) elapses.
+
+    Raises MigrationError when the psycopg v3 driver is not installed, so a missing
+    driver is never reported as a ready database.
+    """
+    from ncp.stores.migrations import connect as pg_connect
+
     deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
+    while True:
         try:
-            conn = psycopg2.connect(dsn, connect_timeout=3)
-            conn.close()
+            pg_connect(dsn, connect_timeout=3).close()
             return True
+        except MigrationError:
+            raise  # connect() only raises this for a missing driver
         except Exception:
-            time.sleep(2)
-    return False
+            pass
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(2)
 
 
 def _apply_migrations_now(cwd: Path) -> tuple[bool, list | str]:
     """Run pending migrations. Returns (success, applied_list_or_error_string)."""
+    conn = None
     try:
-        import psycopg2  # type: ignore[import]
         from ncp.config import load_config
         from ncp.stores.migrations import MigrationRunner
+        from ncp.stores.migrations import connect as pg_connect
 
         config = load_config(cwd=cwd)
-        conn = psycopg2.connect(config.pgvector_dsn)
+        conn = pg_connect(config.pgvector_dsn)
         runner = MigrationRunner(
             conn,
             schema=config.pgvector_schema,
@@ -475,13 +525,19 @@ def _apply_migrations_now(cwd: Path) -> tuple[bool, list | str]:
         )
         runner.bootstrap()
         applied = runner.apply_all()
-        conn.close()
         return True, applied
     except Exception as exc:
         return False, str(exc)
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 @click.group()
+@click.version_option(version=ncp.__version__, prog_name="ncp")
 def main() -> None:
     """Neural Context Protocol CLI."""
 
@@ -542,6 +598,12 @@ def init_command(  # noqa: C901
     config_dir = cwd / ".ncp"
     config_dir.mkdir(parents=True, exist_ok=True)
     config_path = config_dir / "config.toml"
+
+    # A missing psycopg v3 driver is reported once, up front; config is still written
+    # and the command exits non-zero at the end because migrations could not run.
+    driver_missing = store_type == "pgvector" and not psycopg_available()
+    if driver_missing:
+        console.print(f"[red]{PSYCOPG_MISSING_MESSAGE}[/red]")
 
     resolved_pg_dsn = "postgresql://postgres:postgres@127.0.0.1:5432/ncp"
     resolved_redis_url = "redis://127.0.0.1:6379/0"
@@ -667,7 +729,13 @@ def init_command(  # noqa: C901
         claude_path.write_text(CLAUDE_MD_TEMPLATE)
 
     # ── Provider hook/setup files ─────────────────────────────────────────────
-    _offer_provider_hook_setup(cwd, is_tty=is_tty)
+    try:
+        from ncp.config import load_config
+
+        token_configured = bool(load_config(cwd=cwd).server_auth_token)
+    except Exception:
+        token_configured = False
+    _offer_provider_hook_setup(cwd, is_tty=is_tty, auth=token_configured)
 
     # ── Start containers + run migrations (managed pgvector) ──────────────────
     if store_type == "pgvector" and resolved_infra_mode == "managed" and start_containers:
@@ -682,7 +750,18 @@ def init_command(  # noqa: C901
             )
             raise SystemExit(1)
         console.print("[green]Containers started.[/green] Waiting for Postgres to be ready…")
-        if not _wait_for_pg(resolved_pg_dsn):
+        pg_ready = False
+        if driver_missing:
+            console.print("Skipping the Postgres check; run [bold]ncp migrate apply[/bold] after installing it.")
+        else:
+            try:
+                pg_ready = _wait_for_pg(resolved_pg_dsn)
+            except MigrationError as exc:  # driver vanished between the check above and now
+                console.print(f"[red]{exc}[/red]")
+                driver_missing = True
+        if driver_missing:
+            pass
+        elif not pg_ready:
             console.print(
                 "[yellow]Postgres did not become ready within 60 s. "
                 "Run `ncp migrate apply` manually once it's up.[/yellow]"
@@ -693,11 +772,20 @@ def init_command(  # noqa: C901
     # ── Run migrations (byo pgvector) ─────────────────────────────────────────
     if store_type == "pgvector" and resolved_infra_mode == "byo":
         run_mig = click.confirm("Run schema migrations now?", default=True) if is_tty else False
-        if run_mig:
+        if run_mig and driver_missing:
+            console.print("Skipping migrations; run [bold]ncp migrate apply[/bold] after installing the driver.")
+        elif run_mig:
             _run_migrations_and_report(cwd)
 
     # ── Summary ───────────────────────────────────────────────────────────────
     console.print(f"\n[green bold]NCP initialized in {cwd}[/green bold]")
+    if token_configured:
+        console.print(
+            "\nThe server requires a bearer token. Generated agent configs reference it as "
+            "[bold]NCP_AUTH_TOKEN[/bold] (the secret is not written to them). Export it in the "
+            "shell that launches your agent:\n"
+            "  [bold]export NCP_AUTH_TOKEN=\"$(grep -m1 auth_token .ncp/config.toml | cut -d'\"' -f2)\"[/bold]"
+        )
     if store_type == "sqlite":
         console.print("Next: [bold]ncp status[/bold] then [bold]ncp serve[/bold]")
     else:
@@ -707,6 +795,8 @@ def init_command(  # noqa: C901
                 f"To start infra later: [bold]ncp infra up[/bold]  "
                 f"(or `{resolved_engine} compose -f .ncp/compose.yaml up -d`)"
             )
+    if driver_missing:
+        raise SystemExit(1)
 
 
 def _run_migrations_and_report(cwd: Path) -> None:
@@ -727,7 +817,7 @@ def _run_migrations_and_report(cwd: Path) -> None:
 @main.command("status")
 @click.option("--cwd", type=click.Path(path_type=Path), default=Path.cwd)
 @click.option("--pipeline-id", default=None, help="Optional pipeline filter for richer status detail.")
-@click.option("--json-output", is_flag=True, help="Emit machine-readable JSON instead of tables.")
+@click.option("--json", "--json-output", "json_output", is_flag=True, help="Emit machine-readable JSON instead of tables.")
 def status_command(cwd: Path, pipeline_id: str | None, json_output: bool) -> None:
     """Show rich NCP store status."""
 
@@ -820,7 +910,7 @@ def status_command(cwd: Path, pipeline_id: str | None, json_output: bool) -> Non
 @click.option("--cwd", type=click.Path(path_type=Path), default=Path.cwd)
 @click.option("--pipeline-id", default=None, help="Optional pipeline filter.")
 @click.option("--limit", default=10, show_default=True, type=click.IntRange(1, 50))
-@click.option("--json-output", is_flag=True, help="Emit machine-readable JSON instead of tables.")
+@click.option("--json", "--json-output", "json_output", is_flag=True, help="Emit machine-readable JSON instead of tables.")
 def cost_command(cwd: Path, pipeline_id: str | None, limit: int, json_output: bool) -> None:
     """Show cost totals, rollups, and recent turn cost entries."""
 
@@ -908,7 +998,7 @@ def cost_command(cwd: Path, pipeline_id: str | None, limit: int, json_output: bo
 @click.option("--cwd", type=click.Path(path_type=Path), default=Path.cwd)
 @click.option("--pipeline-id", default=None, help="Optional pipeline filter.")
 @click.option("--limit", default=5, show_default=True, type=click.IntRange(1, 20))
-@click.option("--json-output", is_flag=True, help="Emit machine-readable JSON instead of a narrative summary.")
+@click.option("--json", "--json-output", "json_output", is_flag=True, help="Emit machine-readable JSON instead of a narrative summary.")
 def explain_command(cwd: Path, pipeline_id: str | None, limit: int, json_output: bool) -> None:
     """Explain the current NCP store state in a human-readable way."""
 
@@ -974,7 +1064,7 @@ def explain_command(cwd: Path, pipeline_id: str | None, limit: int, json_output:
 @click.option("--pipeline-id", default="demo_pipeline", show_default=True)
 @click.option("--store-path", type=click.Path(path_type=Path), default=None,
               help="Optional SQLite store path to keep the demo artifacts instead of using a temporary store.")
-@click.option("--json-output", is_flag=True, help="Emit machine-readable JSON instead of the demo table.")
+@click.option("--json", "--json-output", "json_output", is_flag=True, help="Emit machine-readable JSON instead of the demo table.")
 def demo_command(
     cwd: Path,
     pipeline_id: str,
@@ -1320,7 +1410,7 @@ def memory_remember_command(
 @click.option("--pipeline-id", default=None, help="Pipeline scope")
 @click.option("--k", default=5, show_default=True, type=int, help="Number of results")
 @click.option("--mode", default="auto", show_default=True, type=click.Choice(["auto", "hybrid", "graph"]))
-@click.option("--json-output", is_flag=True, help="Emit machine-readable JSON")
+@click.option("--json", "--json-output", "json_output", is_flag=True, help="Emit machine-readable JSON")
 def memory_recall_command(
     query: str,
     cwd: Path,
@@ -1480,7 +1570,8 @@ def overview_command(
 @main.command("viz")
 @click.option("--cwd", type=click.Path(path_type=Path), default=Path.cwd)
 @click.option("--pipeline-id", default=None, help="Optional pipeline scope filter.")
-def viz_command(cwd: Path, pipeline_id: str | None) -> None:
+@click.option("--json", "--json-output", "json_output", is_flag=True, help="Emit machine-readable JSON instead of panels.")
+def viz_command(cwd: Path, pipeline_id: str | None, json_output: bool) -> None:
     """Show operator view: chunk distribution, age brackets, top chunks, pipelines, whispers."""
 
     from rich.panel import Panel
@@ -1491,6 +1582,10 @@ def viz_command(cwd: Path, pipeline_id: str | None) -> None:
         data = store.viz_data(pipeline_id=pipeline_id)
     except NCPStoreUnavailableError as exc:
         raise click.ClickException(str(exc)) from exc
+
+    if json_output:
+        click.echo(json.dumps(data, indent=2, sort_keys=True, default=str))
+        return
 
     console.print(f"[bold]NCP Viz[/bold]  store={_store_display(config)}"
                   + (f"  pipeline={pipeline_id}" if pipeline_id else ""))
@@ -1727,11 +1822,13 @@ def graph_command(
 @click.option("--pipeline-id", default=None, help="Scope consolidation to one pipeline.")
 @click.option("--dry-run", is_flag=True, default=False, help="Preview merges without writing.")
 @click.option("--similarity-threshold", default=None, type=float, help="Override config similarity threshold.")
+@click.option("--json", "--json-output", "json_output", is_flag=True, help="Emit the report as machine-readable JSON.")
 def consolidate_command(
     cwd: Path | None,
     pipeline_id: str | None,
     dry_run: bool,
     similarity_threshold: float | None,
+    json_output: bool,
 ) -> None:
     """Merge redundant chunks and clean up tombstones."""
     from ncp.config import load_config
@@ -1754,6 +1851,12 @@ def consolidate_command(
         )
     except NCPStoreUnavailableError as exc:
         raise click.ClickException(str(exc)) from exc
+
+    if json_output:
+        import dataclasses
+
+        click.echo(json.dumps(dataclasses.asdict(report), indent=2, sort_keys=True, default=str))
+        return
 
     table = Table(title="Consolidation Report", box=box.SIMPLE)
     table.add_column("Metric", style="cyan")
@@ -2125,7 +2228,8 @@ def identity_create_command(cwd: Path | None, label: str | None) -> None:
 
 @identity_group.command("list")
 @click.option("--cwd", default=None, type=click.Path(exists=True, file_okay=False, path_type=Path))
-def identity_list_command(cwd: Path | None) -> None:
+@click.option("--json", "--json-output", "json_output", is_flag=True, help="Emit machine-readable JSON instead of a table.")
+def identity_list_command(cwd: Path | None, json_output: bool) -> None:
     """List local identities."""
     from ncp.config import load_config
 
@@ -2134,6 +2238,10 @@ def identity_list_command(cwd: Path | None) -> None:
     if not callable(getattr(store, "list_identities", None)):
         raise click.ClickException("Configured store does not support identities.")
     rows = store.list_identities()
+
+    if json_output:
+        click.echo(json.dumps(list(rows), indent=2, sort_keys=True, default=str))
+        return
 
     table = Table(title="Identities", box=box.SIMPLE)
     table.add_column("Identity", style="cyan")
@@ -2171,7 +2279,7 @@ def identity_revoke_command(identity_id: str, cwd: Path | None) -> None:
 @main.command("reputation")
 @click.option("--cwd", default=None, type=click.Path(exists=True, file_okay=False, path_type=Path))
 @click.option("--top", default=20, show_default=True, type=int, help="Maximum rows to show.")
-@click.option("--json-output", is_flag=True, help="Emit machine-readable JSON instead of a table.")
+@click.option("--json", "--json-output", "json_output", is_flag=True, help="Emit machine-readable JSON instead of a table.")
 def reputation_command(cwd: Path | None, top: int, json_output: bool) -> None:
     """Show local reputation scores."""
     from ncp.config import load_config
@@ -2219,7 +2327,7 @@ def reputation_command(cwd: Path | None, top: int, json_output: bool) -> None:
               help="Typed decisions only: filter by what produced the choice.")
 @click.option("--min-confidence", default=0.0, show_default=True, type=click.FloatRange(0.0, 1.0),
               help="Typed decisions only: minimum confidence.")
-@click.option("--json-output", is_flag=True, help="Emit machine-readable JSON instead of tables.")
+@click.option("--json", "--json-output", "json_output", is_flag=True, help="Emit machine-readable JSON instead of tables.")
 def precedents_command(
     query: str,
     cwd: Path,
@@ -2357,7 +2465,7 @@ def precedents_command(
 @click.option("--cwd", type=click.Path(path_type=Path), default=Path.cwd)
 @click.option("--pipeline-id", default=None, help="Optional pipeline scope filter.")
 @click.option("--top-k", default=10, show_default=True, type=click.IntRange(1, 50), help="Number of top rising/falling chunks to show.")
-@click.option("--json-output", is_flag=True, help="Emit machine-readable JSON instead of tables.")
+@click.option("--json", "--json-output", "json_output", is_flag=True, help="Emit machine-readable JSON instead of tables.")
 def trust_drift_command(cwd: Path, pipeline_id: str | None, top_k: int, json_output: bool) -> None:
     """Show trust-drift observability: which chunks are gaining or losing trust.
 
@@ -2530,11 +2638,10 @@ def migrate_group() -> None:
 def _migration_runner(cwd: Path, migrations_dir: Path | None) -> tuple:
     from ncp.config import load_config
     from ncp.stores.migrations import MigrationRunner
+    from ncp.stores.migrations import connect as pg_connect
 
-    try:
-        import psycopg2
-    except ImportError:
-        console.print("[red]psycopg2 not installed — pip install neural-context-protocol[pgvector][/red]")
+    if not psycopg_available():
+        console.print(f"[red]{PSYCOPG_MISSING_MESSAGE}[/red]")
         raise SystemExit(1)
 
     config = load_config(cwd=cwd)
@@ -2542,7 +2649,7 @@ def _migration_runner(cwd: Path, migrations_dir: Path | None) -> tuple:
         console.print("[red]migrate commands require store.type = pgvector in .ncp/config.toml[/red]")
         raise SystemExit(1)
 
-    conn = psycopg2.connect(config.pgvector_dsn)
+    conn = pg_connect(config.pgvector_dsn)
     runner = MigrationRunner(
         conn,
         schema=config.pgvector_schema,
@@ -2553,10 +2660,20 @@ def _migration_runner(cwd: Path, migrations_dir: Path | None) -> tuple:
     return conn, runner
 
 
+def _migration_status_payload(status: Any) -> dict[str, Any]:
+    """JSON-ready view of a MigrationStatus (shared by `migrate check --json` and `doctor`)."""
+    return {
+        "applied": [dict(row) for row in status.applied],
+        "pending": [{"version": mf.version, "name": mf.name} for mf in status.pending],
+        "mismatches": [dict(row) for row in status.mismatches],
+    }
+
+
 @migrate_group.command("check")
 @click.option("--cwd", type=click.Path(path_type=Path, exists=True, file_okay=False), default=Path.cwd)
 @click.option("--migrations-dir", type=click.Path(path_type=Path, exists=True, file_okay=False), default=None, help="Custom migrations directory.")
-def migrate_check(cwd: Path, migrations_dir: Path | None) -> None:
+@click.option("--json", "--json-output", "json_output", is_flag=True, help="Emit machine-readable JSON instead of tables.")
+def migrate_check(cwd: Path, migrations_dir: Path | None, json_output: bool) -> None:
     """Show applied, pending, and checksum-mismatched migrations."""
     from ncp.stores.migrations import MigrationStatus
 
@@ -2565,6 +2682,12 @@ def migrate_check(cwd: Path, migrations_dir: Path | None) -> None:
         status: MigrationStatus = runner.check()
     finally:
         conn.close()
+
+    if json_output:
+        click.echo(json.dumps(_migration_status_payload(status), indent=2, sort_keys=True))
+        if status.mismatches:
+            raise SystemExit(1)
+        return
 
     t_applied = Table("Version", "Name", "Applied At", title="Applied", box=box.SIMPLE)
     for row in status.applied:
@@ -2641,6 +2764,214 @@ def migrate_rollback(version: int, cwd: Path, dry_run: bool, migrations_dir: Pat
         console.print(result["sql"])
     else:
         console.print(f"[green]Rolled back v{result['version']} {result['name']}[/green]")
+
+
+# ── doctor ────────────────────────────────────────────────────────────────────
+
+_OPTIONAL_MODULES = (
+    ("fastembed", "local-embeddings"),
+    ("tiktoken", "tokens"),
+    ("psycopg", "pgvector"),
+    ("psycopg_pool", "pgvector"),
+    ("pgvector", "pgvector"),
+    ("redis", "redis"),
+    ("anthropic", "providers"),
+    ("openai", "providers"),
+    ("google.genai", "providers"),
+    ("mistralai", "providers"),
+    ("cohere", "providers"),
+)
+
+
+def _module_available(name: str) -> bool:
+    import importlib.util
+
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def _check(name: str, status: str, detail: str, fix: str = "") -> dict[str, str]:
+    return {"name": name, "status": status, "detail": detail, "fix": fix}
+
+
+def _doctor_config(cwd: Path) -> tuple[dict[str, str], NCPConfig | None]:
+    from ncp.config import find_project_root, load_config
+
+    config_path = find_project_root(cwd) / ".ncp" / "config.toml"
+    try:
+        config = load_config(cwd=cwd)
+    except Exception as exc:
+        return _check("config", "fail", f"{config_path} is not usable: {exc}",
+                      "Fix the TOML / store.type in .ncp/config.toml."), None
+    if not config_path.is_file():
+        return _check("config", "warn", "no .ncp/config.toml found; built-in defaults are in use",
+                      "Run `ncp init` to create one."), config
+    return _check("config", "ok", str(config_path)), config
+
+
+def _doctor_store(config: NCPConfig) -> dict[str, str]:
+    import sqlite3
+
+    name = f"store ({config.store_type})"
+    if config.store_type == "sqlite":
+        path = config.store_path
+        if not path.exists():
+            # The store creates missing parent directories, so the nearest existing ancestor must be writable.
+            ancestor = next((p for p in path.parents if p.is_dir()), None)
+            if ancestor is not None and os.access(ancestor, os.W_OK):
+                return _check(name, "ok", f"{path} does not exist yet; it is created on first use")
+            return _check(name, "fail", f"{path} cannot be created (no writable parent directory)",
+                          "Create the directory or change [store].path.")
+        try:
+            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2)
+            try:
+                conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchall()
+            finally:
+                conn.close()
+        except sqlite3.Error as exc:
+            return _check(name, "fail", f"{path} cannot be opened: {exc}",
+                          "Check the file is a SQLite database and readable.")
+        return _check(name, "ok", str(path))
+    if not psycopg_available():
+        return _check(name, "fail", PSYCOPG_MISSING_MESSAGE,
+                      "pip install 'neural-context-protocol[pgvector]'")
+    from ncp.stores.migrations import connect as pg_connect
+
+    try:
+        pg_connect(config.pgvector_dsn, connect_timeout=3).close()
+    except Exception as exc:
+        return _check(name, "fail", f"cannot connect to {_store_display(config)}: {exc}",
+                      "Start Postgres (`ncp infra up`) or fix [pgvector].dsn.")
+    return _check(name, "ok", f"connected to {_store_display(config)}")
+
+
+def _doctor_migrations(config: NCPConfig) -> dict[str, str]:
+    from ncp.stores.migrations import MigrationRunner
+    from ncp.stores.migrations import connect as pg_connect
+
+    name = "migrations"
+    try:
+        conn = pg_connect(config.pgvector_dsn, connect_timeout=3)
+    except Exception:
+        return _check(name, "warn", "skipped: store is not reachable", "Fix the store check first.")
+    try:
+        runner = MigrationRunner(
+            conn, schema=config.pgvector_schema, prefix=config.pgvector_table_prefix
+        )
+        try:
+            payload = _migration_status_payload(runner.check())
+        except Exception:
+            # Version table missing (nothing applied yet). Read-only: never bootstrap here.
+            conn.rollback()
+            payload = {"applied": [], "mismatches": [],
+                       "pending": [{"version": f.version, "name": f.name} for f in runner._discover()]}
+    except Exception as exc:
+        return _check(name, "warn", f"could not read migration state: {exc}", "Run `ncp migrate check`.")
+    finally:
+        conn.close()
+    if payload["mismatches"]:
+        return _check(name, "fail", f"{len(payload['mismatches'])} applied migration(s) changed on disk",
+                      "Run `ncp migrate check` for details.")
+    if payload["pending"]:
+        return _check(name, "warn", f"{len(payload['pending'])} pending migration(s)",
+                      "Run `ncp migrate apply`.")
+    return _check(name, "ok", f"{len(payload['applied'])} applied, none pending")
+
+
+def _doctor_server(host: str, port: int) -> dict[str, str]:
+    import httpx
+
+    url = f"http://{host}:{port}/healthz"
+    try:
+        response = httpx.get(url, timeout=1.5)
+    except httpx.HTTPError:
+        return _check("server", "warn", f"not running at {host}:{port}", "Start it with `ncp serve`.")
+    if response.status_code != 200:
+        return _check("server", "warn", f"{url} answered HTTP {response.status_code}",
+                      "Check `ncp serve` logs and the host/port.")
+    return _check("server", "ok", f"{url} answered 200")
+
+
+def _doctor_auth(config: NCPConfig) -> dict[str, str]:
+    token = os.environ.get("NCP_AUTH_TOKEN") or config.server_auth_token
+    if not token:
+        return _check("auth", "ok", "no auth token configured (fine on loopback)")
+    missing: list[str] = []
+    seen = False
+    for filename, servers_key in ((".mcp.json", "mcpServers"), ("opencode.json", "mcp")):
+        path = config.project_root / filename
+        if not path.is_file():
+            continue
+        seen = True
+        try:
+            entry = json.loads(path.read_text()).get(servers_key, {}).get("ncp", {})
+        except (OSError, ValueError, AttributeError):
+            missing.append(f"{filename} (unreadable)")
+            continue
+        headers = entry.get("headers") if isinstance(entry, dict) else None
+        if not (isinstance(headers, dict) and any(k.lower() == "authorization" for k in headers)):
+            missing.append(filename)
+    if missing:
+        return _check("auth", "warn",
+                      f"token configured but {', '.join(missing)} has no Authorization header; agents will get 401",
+                      'Add "headers": {"Authorization": "Bearer ${NCP_AUTH_TOKEN}"} to the ncp entry '
+                      "and export NCP_AUTH_TOKEN.")
+    detail = ("token configured; agent config carries an Authorization header" if seen
+              else "token configured; no agent config file found")
+    return _check("auth", "ok", detail)
+
+
+def _doctor_embeddings(config: NCPConfig) -> dict[str, str]:
+    if not config.embedding_enabled:
+        return _check("embeddings", "ok", "disabled in config")
+    if config.embedding_provider != "local":
+        return _check("embeddings", "ok", f"provider '{config.embedding_provider}' (not checked)")
+    if _module_available("fastembed"):
+        return _check("embeddings", "ok", "fastembed is importable")
+    return _check("embeddings", "warn",
+                  "embeddings are enabled but fastembed is not installed; retrieval is lexical-only",
+                  "pip install 'neural-context-protocol[local-embeddings]' or set [embedding].enabled = false.")
+
+
+def _doctor_extras() -> dict[str, str]:
+    found = [f"{mod} [{extra}]" for mod, extra in _OPTIONAL_MODULES if _module_available(mod)]
+    absent = [mod for mod, _ in _OPTIONAL_MODULES if not _module_available(mod)]
+    detail = "installed: " + (", ".join(found) or "none") + "; missing: " + (", ".join(absent) or "none")
+    return _check("optional extras", "ok", detail)
+
+
+@main.command("doctor")
+@click.option("--cwd", type=click.Path(path_type=Path), default=Path.cwd)
+@click.option("--host", envvar="NCP_HOST", default="127.0.0.1", show_default=True,
+              help="Server host to probe (env: NCP_HOST).")
+@click.option("--port", envvar="NCP_PORT", default=4242, show_default=True, type=int,
+              help="Server port to probe (env: NCP_PORT).")
+@click.option("--json", "--json-output", "json_output", is_flag=True, help="Emit machine-readable JSON.")
+def doctor_command(cwd: Path, host: str, port: int, json_output: bool) -> None:
+    """Diagnose config, store, migrations, server, auth and optional extras (read-only)."""
+    config_check, config = _doctor_config(cwd)
+    checks = [config_check]
+    if config is not None:
+        checks.append(_doctor_store(config))
+        if config.store_type == "pgvector":
+            checks.append(_doctor_migrations(config))
+        checks.append(_doctor_server(host, port))
+        checks.append(_doctor_auth(config))
+        checks.append(_doctor_embeddings(config))
+    checks.append(_doctor_extras())
+
+    failed = any(c["status"] == "fail" for c in checks)
+    if json_output:
+        click.echo(json.dumps({"ok": not failed, "checks": checks}, indent=2, sort_keys=True))
+    else:
+        for c in checks:
+            click.echo(f"{c['status'].upper():<4} {c['name']}: {c['detail']}")
+            if c["fix"] and c["status"] != "ok":
+                click.echo(f"     fix: {c['fix']}")
+    if failed:
+        raise SystemExit(1)
 
 
 @main.group("infra")

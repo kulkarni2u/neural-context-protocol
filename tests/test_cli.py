@@ -77,7 +77,8 @@ def test_cli_init_skips_provider_hooks_when_noninteractive(
     assert not (tmp_path / "opencode.json").exists()
 
 
-def test_cli_init_can_select_pgvector_store(tmp_path: Path) -> None:
+def test_cli_init_can_select_pgvector_store(tmp_path: Path, monkeypatch: object) -> None:
+    monkeypatch.setattr("ncp.cli.psycopg_available", lambda: True)  # driver presence is not under test
     runner = CliRunner()
 
     result = runner.invoke(main, ["init", "--cwd", str(tmp_path), "--store", "pgvector"])
@@ -88,7 +89,8 @@ def test_cli_init_can_select_pgvector_store(tmp_path: Path) -> None:
     assert "pgvector" in result.output
 
 
-def test_cli_init_preserves_existing_config(tmp_path: Path) -> None:
+def test_cli_init_preserves_existing_config(tmp_path: Path, monkeypatch: object) -> None:
+    monkeypatch.setattr("ncp.cli.psycopg_available", lambda: True)  # driver presence is not under test
     runner = CliRunner()
 
     first = runner.invoke(main, ["init", "--cwd", str(tmp_path), "--store", "sqlite"])
@@ -113,7 +115,8 @@ def test_cli_init_skips_auth_token_for_sqlite_loopback_quickstart(tmp_path: Path
     assert '# auth_token = ""' in config_text
 
 
-def test_cli_init_generates_auth_token_for_pgvector(tmp_path: Path) -> None:
+def test_cli_init_generates_auth_token_for_pgvector(tmp_path: Path, monkeypatch: object) -> None:
+    monkeypatch.setattr("ncp.cli.psycopg_available", lambda: True)  # driver presence is not under test
     runner = CliRunner()
 
     result = runner.invoke(main, ["init", "--cwd", str(tmp_path), "--store", "pgvector"])
@@ -126,7 +129,8 @@ def test_cli_init_generates_auth_token_for_pgvector(tmp_path: Path) -> None:
     assert match.group(1)
 
 
-def test_cli_init_does_not_regenerate_auth_token(tmp_path: Path) -> None:
+def test_cli_init_does_not_regenerate_auth_token(tmp_path: Path, monkeypatch: object) -> None:
+    monkeypatch.setattr("ncp.cli.psycopg_available", lambda: True)  # driver presence is not under test
     runner = CliRunner()
 
     first = runner.invoke(main, ["init", "--cwd", str(tmp_path), "--store", "pgvector"])

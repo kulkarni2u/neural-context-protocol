@@ -30,6 +30,10 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
 
     steps:
       - name: Check out repository
@@ -38,7 +42,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python-version }}
           cache: "pip"
 
       - name: Install package, provider, and dev dependencies
@@ -47,16 +51,22 @@ jobs:
       - name: Lint
         run: python -m ruff check .
 
+      - name: Type check (non-blocking)
+        continue-on-error: true
+        run: python -m mypy ncp
+
       - name: Run tests
         run: python -m pytest -p no:cacheprovider tests
 
       - name: Benchmark gates
+        if: matrix.python-version == '3.11'
         run: |
           python benchmarks/coding_pipeline/run.py --turns 40 | python -c "import json,sys; artifact=json.load(sys.stdin); summary=artifact['summary']; assert summary['pass'], summary; print('coding gate OK', summary['reduction_factor'])"
           python benchmarks/needle/run.py --turns 24 --needles 6 --budget 4 | python -c "import json,sys; artifact=json.load(sys.stdin); assert artifact['summary']['ncp_beats_sliding_window'], artifact['summary']; print('needle gate OK')"
           python benchmarks/memo_reuse/run.py | python -c "import json,sys; artifact=json.load(sys.stdin); assert artifact['summary']['pass'], artifact['summary']; print('memo reuse gate OK', artifact['summary']['cost_per_verified_success_reduction'])"
 
       - name: Build artifacts
+        if: matrix.python-version == '3.11'
         run: python -m build
 
   pgvector-redis:
@@ -99,7 +109,7 @@ jobs:
           cache: "pip"
 
       - name: Install package with pgvector, redis, and dev dependencies
-        run: python -m pip install -e '.[pgvector,redis,dev]' psycopg2-binary
+        run: python -m pip install -e '.[pgvector,redis,dev]'
 
       - name: Run pgvector, migration, and coordination integration tests
         env:
