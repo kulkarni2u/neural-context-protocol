@@ -51,6 +51,29 @@ Observed on June 9, 2026:
 - net total token-equivalent savings vs raw replay: `56230.67`
 - benchmark pass gate: `true`
 
+### Plain RAG arm (token accounting only)
+
+A `plain_rag` baseline now also appears under `summary.baselines`: BM25 over the
+raw transcript entries, queried with the same text NCP's assembler gets, packed
+best-first into the same explicit context ceiling (340 tokens) NCP is capped at.
+Measured with `python3 benchmarks/coding_pipeline/run.py --turns 40`:
+
+| Arm | Peak input tokens | Final input tokens | Final vs NCP |
+|---|---:|---:|---:|
+| ncp | 371 | 260 | 1.00x |
+| plain_rag | 377 | 358 | 1.38x |
+| sliding_window | 383 | 377 | 1.45x |
+| rolling_summary | 2096 | 2096 | 8.06x |
+| raw_replay | 3426 | 3426 | 13.18x |
+
+This is a token-count comparison only and says nothing about whether plain
+RAG's context is adequate or worse. Because both arms are capped at the same
+ceiling, plain RAG necessarily lands close to NCP; NCP's lower final-turn count
+reflects it not filling the ceiling, not retrieval quality. The existing pass
+gate is unchanged and does not involve plain RAG. The research pipeline
+benchmark gets the same arm (40 turns: ncp peak 404 / final 272, plain_rag
+peak 406 / final 258, so plain RAG is slightly smaller at the final turn there).
+
 ## Interpretation
 
 This is a stronger bounded-context result than the earlier single-baseline

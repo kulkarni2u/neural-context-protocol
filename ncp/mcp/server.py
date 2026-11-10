@@ -8,7 +8,9 @@ from hashlib import sha256
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import hmac
+import ipaddress
 import json
+import math
 import select
 import socket
 import sys
@@ -16,6 +18,7 @@ import threading
 import time
 import traceback
 import urllib.parse
+from uuid import uuid4
 from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO, Sequence, get_args
@@ -28,6 +31,15 @@ from ncp.chunker import filter_content
 from ncp.config import NCPConfig, load_config
 from ncp.context_policy import ContextPolicyError, resolve_context_policy
 from ncp.drift import EmbeddingAdapter, compute_drift
+from ncp.principals import (
+    AuthorizationError,
+    Principal,
+    PrincipalRegistry,
+    ToolAuthorizer,
+    authorize_events,
+    authorize_read,
+    load_principals,
+)
 from ncp.overview import (
     DEFAULT_MAX_PIPELINES,
     DEFAULT_MAX_TOKENS,
@@ -176,7 +188,7 @@ MCP_TOOLS: list[dict[str, object]] = [
                 "written_by": {"type": "string", "description": "Agent writing this chunk"},
                 "chunk_id": {"type": "string", "description": "Optional chunk ID (auto-generated if omitted)"},
                 "pipeline_id": {"type": "string"},
-                "base_trust": {"type": "number", "description": "Optional explicit trust score 0.0-1.0; otherwise derived from src."},
+                "base_trust": {"type": "number", "description": "Optional explicit trust score 0.0-1.0; otherwise derived from src. Capped at the default trust for the declared src (it can lower trust, never raise it)."},
                 "signature": {
                     "type": "string",
                     "description": (
@@ -688,7 +700,7 @@ MCP_TOOLS: list[dict[str, object]] = [
                                 "enum": ["prose", "json", "code", "table", "auto"],
                                 "description": "Optional declared content shape. Defaults to 'prose'.",
                             },
-                            "base_trust": {"type": "number", "description": "Optional explicit trust (0-1)."},
+                            "base_trust": {"type": "number", "description": "Optional explicit trust (0-1), capped at the default trust for the declared src."},
                             "signature": {
                                 "type": "string",
                                 "description": (
@@ -946,7 +958,7 @@ MCP_TOOLS: list[dict[str, object]] = [
                 },
                 "weight": {
                     "type": "number",
-                    "description": "Evidence weight multiplier (default 1.0). Higher = stronger signal.",
+                    "description": "Evidence weight multiplier, 0 < weight <= 1 (default 1.0). Higher = stronger signal; 0, negative, >1, NaN and infinity are rejected.",
                 },
                 "note": {
                     "type": "string",
@@ -1870,11 +1882,19 @@ def make_handlers(
             kwargs["caused_by"] = str(caused_by)
         if (chunk_type := args.get("chunk_type")) is not None:
             kwargs["chunk_type"] = str(chunk_type)
+        # Declare the correction on the chunk itself, so write-time dedup knows it
+        # must not suppress this chunk as a duplicate of what it supersedes (a
+        # 'supersedes' edge in `edges` is only written after the chunk is stored).
+        declared = [str(supersedes)] if supersedes is not None else []
+        declared += [str(item["dst"]) for item in raw_edges if item["type"] == "supersedes"]
+        declared = [target for target in dict.fromkeys(declared) if target != kwargs.get("chunk_id")]
+        if declared:
+            kwargs["supersedes"] = declared[0] if len(declared) == 1 else json.dumps(declared)
 
         raw_ref: str | None = None
         if will_produce_raw_ref:
             raw_chunk = SubconsciousChunk(
-                chunk_id=f"raw_{kwargs.get('chunk_id', '')}_{int(time.time() * 1000)}",
+                chunk_id=f"raw_{kwargs.get('chunk_id', '')}_{int(time.time() * 1000)}_{uuid4().hex[:12]}",
                 layer=str(args["layer"]),
                 content=raw_content,
                 src="tool_result",
@@ -2243,7 +2263,7 @@ def make_handlers(
         assembler = Assembler(store=store, config=config)
         response = NCPResponse(
             content=str(args["result_full"]),
-            turn_id=str(args.get("turn_id") or f"turn_{int(time.time() * 1000)}"),
+            turn_id=str(args.get("turn_id") or f"turn_{int(time.time() * 1000)}_{uuid4().hex[:12]}"),
             pipeline_id=conscious.pipeline_id,
             model=str(args.get("model", "unknown")),
             input_tokens=_int_arg(args, "input_tokens", 0),
@@ -2725,13 +2745,13 @@ def make_handlers(
         outcome_id: str | None = args.get("outcome_id")
         if outcome_id is not None and not isinstance(outcome_id, str):
             raise ValueError("ncp_record_outcome 'outcome_id' must be a string or null")
-        weight = float(args.get("weight", 1.0) or 1.0)
+        weight = _outcome_weight_arg(args.get("weight", 1.0))
         note: str | None = args.get("note")
         if note is not None and not isinstance(note, str):
             raise ValueError("ncp_record_outcome 'note' must be a string or null")
 
         outcome = OutcomeRecord(
-            outcome_id=outcome_id or f"out_{int(time.time() * 1000)}",
+            outcome_id=outcome_id or f"out_{int(time.time() * 1000)}_{uuid4().hex[:12]}",
             turn_id=turn_id,
             chunk_ids=chunk_ids,
             success=success,
@@ -2970,6 +2990,22 @@ def _float_arg(args: dict[str, object], name: str, default: float) -> float:
         return default
 
 
+def _outcome_weight_arg(value: object) -> float:
+    """Validate ncp_record_outcome's ``weight``: a finite number in (0, 1].
+
+    ``None`` (an explicit JSON null) keeps the 1.0 default. Booleans and
+    strings are rejected rather than coerced.
+    """
+    if value is None:
+        return 1.0
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("ncp_record_outcome 'weight' must be a number")
+    weight = float(value)
+    if not math.isfinite(weight) or not 0.0 < weight <= 1.0:
+        raise ValueError(f"ncp_record_outcome 'weight' must satisfy 0 < weight <= 1, got {value!r}")
+    return weight
+
+
 def _list_arg(args: dict[str, object], name: str, default: list[str]) -> list[str]:
     if name not in args:
         return list(default)
@@ -3082,17 +3118,26 @@ def _parse_iso_timestamp(value: object, *, field: str) -> float:
         raise ValueError(f"{field} must be an ISO-8601 timestamp or epoch seconds: {value!r}") from exc
 
 
+_SRC_DEFAULT_TRUST: dict[str, float] = {
+    "user_verified": 0.95,
+    "tool_result": 0.80,
+    "synthesis": 0.70,
+    "agent_inferred": 0.60,
+    "subcon_retrieved": 0.55,
+    "skill_ref": 0.60,
+}
+_UNKNOWN_SRC_TRUST = 0.70
+
+
 def _trust_from_args(args: dict[str, object]) -> float:
+    # The src table is both the default and the ceiling: an explicit
+    # base_trust may lower trust but can never claim more than the declared
+    # src type is worth, so base_trust cannot be used to bypass src tiering.
+    src_trust = _SRC_DEFAULT_TRUST.get(str(args.get("src", "")), _UNKNOWN_SRC_TRUST)
     if "base_trust" in args:
-        return min(1.0, max(0.0, _float_arg(args, "base_trust", 0.7)))
-    return {
-        "user_verified": 0.95,
-        "tool_result": 0.80,
-        "synthesis": 0.70,
-        "agent_inferred": 0.60,
-        "subcon_retrieved": 0.55,
-        "skill_ref": 0.60,
-    }.get(str(args.get("src", "")), 0.70)
+        # max(0.0, nan) is 0.0, so a NaN base_trust lands on the floor.
+        return min(src_trust, max(0.0, _float_arg(args, "base_trust", src_trust)))
+    return src_trust
 
 
 # CAP-T2: the two highest static-trust tiers in _trust_from_args -- the ones
@@ -3202,12 +3247,25 @@ def _negotiate_version(client_version: str) -> str:
     return _LATEST_VERSION
 
 
+# JSON-RPC error code for a tool call the authenticated principal may not make.
+FORBIDDEN_ERROR_CODE = -32003
+
+
 def _handle_request(
     req: dict[str, object],
     handlers: dict[str, ToolHandler],
     *,
     tools: Sequence[dict[str, object]] = MCP_TOOLS,
+    principal: Principal | None = None,
+    authorizer: ToolAuthorizer | None = None,
 ) -> str | StreamResponse:
+    """Dispatch one JSON-RPC request.
+
+    ``principal``/``authorizer`` are set by the HTTP transport when
+    ``[principals]`` is configured; every tools/call is then checked (and its
+    identity arguments bound) by ``authorizer.check_call`` before the handler
+    runs. Both None (stdio, or no principals) means no authorization layer.
+    """
     req_id = req.get("id")
     method = str(req.get("method", ""))
     params: dict[str, object] = req.get("params", {}) or {}
@@ -3245,11 +3303,17 @@ def _handle_request(
         if handler is None:
             return _err_response(req_id, -32601, f"Tool not found: {tool_name}")
         try:
-            result = handler(arguments)
+            if principal is not None and authorizer is not None:
+                arguments = authorizer.check_call(principal, tool_name, arguments)
+                result = authorizer.filter_result(principal, tool_name, handler(arguments))
+            else:
+                result = handler(arguments)
             if isinstance(result, StreamResponse):
                 result.request_id = req_id
                 return result
             return _ok(req_id, {"content": [{"type": "text", "text": json.dumps(result)}]})
+        except AuthorizationError as exc:
+            return _err_response(req_id, FORBIDDEN_ERROR_CODE, f"Forbidden: {exc}")
         except NotImplementedError as exc:
             _err(f"Tool {tool_name} unavailable for current backend: {traceback.format_exc()}")
             return _err_response(
@@ -3336,16 +3400,21 @@ def _create_handlers_with_store(
     return handlers, store, tools
 
 
+def _load_server_config(*, store_path: str | Path | None = None, cwd: Path | None = None) -> NCPConfig:
+    if store_path:
+        # Keep ``cwd``: dropping it read the config (and so [principals] and
+        # the auth token) from the process directory instead of the project.
+        return load_config(cwd=cwd or Path.cwd(), env={"NCP_STORE_PATH": str(store_path)})
+    return load_config(cwd=cwd or Path.cwd())
+
+
 def _create_server_parts(
     *,
     store_path: str | Path | None = None,
     cwd: Path | None = None,
 ) -> tuple[dict[str, ToolHandler], BaseStore, list[dict[str, object]], Notifier | None, NCPConfig]:
     """Build handlers plus the ONE notifier the handlers and HTTP /events share."""
-    if store_path:
-        config = load_config(env={"NCP_STORE_PATH": str(store_path)})
-    else:
-        config = load_config(cwd=cwd or Path.cwd())
+    config = _load_server_config(store_path=store_path, cwd=cwd)
     store = create_store(config)
     tools = tools_for_config(config)
     notifier = get_process_notifier(config, store=store)
@@ -3615,6 +3684,36 @@ _API_ROUTES: dict[str, Callable[[BaseStore, dict[str, str]], object]] = {
 }
 
 
+# Host header names accepted when the server is bound to a loopback address.
+# Anything else is a DNS-rebinding attempt: a browser that resolved an
+# attacker's hostname to 127.0.0.1 still sends that hostname as Host.
+_LOOPBACK_HOST_NAMES = frozenset({"localhost", "127.0.0.1", "::1"})
+# Per-socket-operation timeout for HTTP connections: a client that stops
+# sending (or stops reading) mid-request frees its handler thread instead of
+# holding it forever. It bounds each recv/send, not the request as a whole, so
+# long-lived streams (/sse, /events) and a blocking ncp_wait_whispers, which
+# do not wait on the client socket, are unaffected.
+_HTTP_SOCKET_TIMEOUT_SECONDS = 30.0
+
+
+def _is_loopback_host(host: str) -> bool:
+    """True when ``host`` (a bind address or hostname) is loopback-only."""
+    name = host.strip().strip("[]").lower()
+    if name == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(name).is_loopback
+    except ValueError:
+        return False
+
+
+def _is_json_content_type(value: str | None) -> bool:
+    """``application/json``, optionally with parameters such as ``charset``."""
+    if not value:
+        return False
+    return value.split(";", 1)[0].strip().lower() == "application/json"
+
+
 class _MCPHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -3635,8 +3734,14 @@ class _MCPHTTPServer(ThreadingHTTPServer):
         notifier: Notifier | None = None,
         max_subscribers: int = 64,
         config: NCPConfig | None = None,
+        socket_timeout_seconds: float | None = _HTTP_SOCKET_TIMEOUT_SECONDS,
+        principals: PrincipalRegistry | None = None,
     ) -> None:
         self.config = config
+        # Opt-in authenticated principals; None keeps the single shared token.
+        self.principals = principals
+        self.authorizer = ToolAuthorizer(store) if principals is not None else None
+        self.socket_timeout_seconds = socket_timeout_seconds
         self.handlers = handlers
         self.notifier = notifier
         self.max_subscribers = max(1, max_subscribers)
@@ -3652,6 +3757,9 @@ class _MCPHTTPServer(ThreadingHTTPServer):
         self.max_body_bytes = max_body_bytes
         self._shutdown_event = threading.Event()
         super().__init__(server_address, _MCPHTTPHandler)
+        # Decided from the address actually bound ("localhost" resolves to
+        # 127.0.0.1 here), not from the string the caller passed.
+        self.loopback_bound = _is_loopback_host(str(self.server_address[0]))
 
     def acquire_subscriber(self) -> bool:
         with self._subscriber_lock:
@@ -3671,6 +3779,67 @@ class _MCPHTTPHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format: str, *args: object) -> None:
         return
+
+    def setup(self) -> None:
+        # StreamRequestHandler.setup applies self.timeout to the socket.
+        self.timeout = self.server.socket_timeout_seconds
+        super().setup()
+
+    def _host_allowed(self) -> bool:
+        """DNS-rebinding guard: on a loopback bind, Host must name loopback.
+
+        A request with no Host header at all is let through: browsers always
+        send one, so its absence cannot be a rebinding attack.
+        """
+        if not self.server.loopback_bound:
+            return True
+        host = self.headers.get("Host")
+        if host is None:
+            return True
+        try:
+            name = urllib.parse.urlsplit("//" + host.strip()).hostname
+        except ValueError:
+            return False
+        return name in _LOOPBACK_HOST_NAMES
+
+    def _origin_allowed(self) -> bool:
+        """Reject browser requests from origins that are not allowlisted.
+
+        No Origin header (curl, MCP hosts, same-origin GETs in most browsers)
+        is allowed. Otherwise the origin must be in the CORS allowlist, or be
+        this server's own origin (scheme http/https with netloc equal to the
+        Host header) so the bundled /ui can call /api/*. On a loopback bind
+        Host itself is already pinned to loopback by _host_allowed.
+        """
+        origin = self.headers.get("Origin")
+        if not origin:
+            return True
+        if self._cors_origin() is not None:
+            return True
+        host = self.headers.get("Host")
+        if not host:
+            return False
+        try:
+            parts = urllib.parse.urlsplit(origin.strip())
+        except ValueError:
+            return False
+        return (
+            parts.scheme in ("http", "https")
+            and parts.path == ""
+            and parts.netloc.lower() == host.strip().lower()
+        )
+
+    def _reject_forbidden_request(self, *, check_origin: bool) -> bool:
+        """Send a 403 and return True when Host (or Origin) is not acceptable."""
+        if not self._host_allowed():
+            self._drain_request_body()
+            self._send_json(HTTPStatus.FORBIDDEN, {"error": "forbidden_host"})
+            return True
+        if check_origin and not self._origin_allowed():
+            self._drain_request_body()
+            self._send_json(HTTPStatus.FORBIDDEN, {"error": "forbidden_origin"})
+            return True
+        return False
 
     def _cors_origin(self) -> str | None:
         origin = self.headers.get("Origin")
@@ -3692,6 +3861,22 @@ class _MCPHTTPHandler(BaseHTTPRequestHandler):
         if origin is not None:
             self.send_header("Access-Control-Allow-Origin", origin)
             self.send_header("Vary", "Origin")
+
+    def _authenticate(self) -> tuple[bool, Principal | None]:
+        """Authenticate the request: ``(ok, principal)``.
+
+        Without principals this is the legacy shared-token check and the
+        principal is always None. With principals the bearer token must map
+        to one (the legacy [server].auth_token maps to an implicit admin).
+        """
+        registry = self.server.principals
+        if registry is None:
+            return self._authorized(), None
+        principal = registry.resolve_authorization(self.headers.get("Authorization"))
+        return principal is not None, principal
+
+    def _send_forbidden(self, exc: AuthorizationError) -> None:
+        self._send_json(HTTPStatus.FORBIDDEN, {"error": "forbidden", "detail": str(exc)})
 
     def _authorized(self) -> bool:
         token = self.server.auth_token
@@ -3773,15 +3958,23 @@ class _MCPHTTPHandler(BaseHTTPRequestHandler):
             return
 
     def do_OPTIONS(self) -> None:
+        if self._reject_forbidden_request(check_origin=False):
+            return
         self.send_response(HTTPStatus.NO_CONTENT)
         self._send_cors_headers()
-        allowed_headers = "Content-Type, Authorization" if self.server.auth_token else "Content-Type"
+        allowed_headers = (
+            "Content-Type, Authorization"
+            if self.server.auth_token or self.server.principals is not None
+            else "Content-Type"
+        )
         self.send_header("Access-Control-Allow-Headers", allowed_headers)
         self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
         self.send_header("Content-Length", "0")
         self.end_headers()
 
     def do_GET(self) -> None:
+        if self._reject_forbidden_request(check_origin=False):
+            return
         if self.path == "/healthz":
             self._send_json(
                 HTTPStatus.OK,
@@ -3789,7 +3982,10 @@ class _MCPHTTPHandler(BaseHTTPRequestHandler):
             )
             return
         if self.path == self.server.sse_path:
-            if not self._authorized():
+            if not self._origin_allowed():
+                self._send_json(HTTPStatus.FORBIDDEN, {"error": "forbidden_origin"})
+                return
+            if not self._authenticate()[0]:
                 self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
                 return
 
@@ -3813,6 +4009,10 @@ class _MCPHTTPHandler(BaseHTTPRequestHandler):
 
         parsed = urllib.parse.urlsplit(self.path)
         path = parsed.path
+        if (path == "/events" or path.startswith("/api/")) and not self._origin_allowed():
+            # Data-bearing GETs; /healthz and the static /ui shell are not gated.
+            self._send_json(HTTPStatus.FORBIDDEN, {"error": "forbidden_origin"})
+            return
         if path == "/events":
             self._handle_events(parsed.query)
             return
@@ -3847,15 +4047,22 @@ class _MCPHTTPHandler(BaseHTTPRequestHandler):
 
     def _handle_events(self, query: str) -> None:
         """``GET /events``: SSE doorbell stream. Frames never carry whisper payloads."""
-        if not self._authorized():
+        ok, principal = self._authenticate()
+        if not ok:
             self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
             return
         params = {k: v[-1] for k, v in urllib.parse.parse_qs(query).items()}
         agent_id = params.get("agent_id", "").strip()
+        pipeline_id = params.get("pipeline_id") or None
+        if principal is not None:
+            try:
+                agent_id = authorize_events(principal, agent_id=agent_id or None, pipeline_id=pipeline_id) or ""
+            except AuthorizationError as exc:
+                self._send_forbidden(exc)
+                return
         if not agent_id:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "agent_id is required"})
             return
-        pipeline_id = params.get("pipeline_id") or None
         notifier = self.server.notifier
         if notifier is None:
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "notify_disabled"})
@@ -3953,7 +4160,8 @@ class _MCPHTTPHandler(BaseHTTPRequestHandler):
 
     def _handle_api_get(self, path: str, query: str) -> None:
         """Dispatch a ``/api/*`` GET request. Auth-gated; JSON responses only."""
-        if not self._authorized():
+        ok, principal = self._authenticate()
+        if not ok:
             self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
             return
         route = _API_ROUTES.get(path)
@@ -3961,6 +4169,15 @@ class _MCPHTTPHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
             return
         params = _query_params(query)
+        if principal is not None:
+            # /api/overview spans pipelines and takes no pipeline_id, so it is
+            # an unscoped read: admin only (and no pipeline allowlist).
+            scope = None if route is None else (params.get("pipeline_id") or None)
+            try:
+                authorize_read(principal, pipeline_id=scope, endpoint=path)
+            except AuthorizationError as exc:
+                self._send_forbidden(exc)
+                return
         try:
             if route is None:
                 payload = _api_overview_payload(self.server.store, params, self.server.config)
@@ -3986,7 +4203,10 @@ class _MCPHTTPHandler(BaseHTTPRequestHandler):
         except ValueError:
             self.close_connection = True
             return
-        if content_length <= 0:
+        if content_length < 0:
+            self.close_connection = True
+            return
+        if content_length == 0:
             return
         if content_length > self.server.max_body_bytes:
             self.close_connection = True
@@ -3998,14 +4218,28 @@ class _MCPHTTPHandler(BaseHTTPRequestHandler):
             self._drain_request_body()
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
             return
-        if not self._authorized():
+        if self._reject_forbidden_request(check_origin=True):
+            return
+        authenticated, principal = self._authenticate()
+        if not authenticated:
             self._drain_request_body()
             self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
+            return
+        # A cross-origin page can send text/plain (or form) POSTs with no CORS
+        # preflight; requiring application/json forces one.
+        if not _is_json_content_type(self.headers.get("Content-Type")):
+            self._drain_request_body()
+            self._send_json(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, {"error": "unsupported_media_type"})
             return
 
         try:
             content_length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
+            self.close_connection = True
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_content_length"})
+            return
+        if content_length < 0:
+            # rfile.read(-1) would read until EOF, past any size limit.
             self.close_connection = True
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_content_length"})
             return
@@ -4015,14 +4249,20 @@ class _MCPHTTPHandler(BaseHTTPRequestHandler):
             return
         try:
             payload = json.loads(self.rfile.read(content_length).decode("utf-8"))
-        except json.JSONDecodeError as exc:
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_json", "detail": str(exc)})
             return
         if not isinstance(payload, dict):
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_payload"})
             return
 
-        response = _handle_request(payload, self.server.handlers, tools=self.server.tools)
+        response = _handle_request(
+            payload,
+            self.server.handlers,
+            tools=self.server.tools,
+            principal=principal,
+            authorizer=self.server.authorizer,
+        )
         prefers_sse = self._prefers_event_stream()
         if isinstance(response, StreamResponse):
             if prefers_sse:
@@ -4051,8 +4291,11 @@ def create_http_server(
     cors_allowed_origins: list[str] | None = None,
     max_body_bytes: int = 10_485_760,
     max_subscribers: int | None = None,
+    socket_timeout_seconds: float | None = _HTTP_SOCKET_TIMEOUT_SECONDS,
 ) -> _MCPHTTPServer:
     handlers, store, tools, notifier, config = _create_server_parts(store_path=store_path, cwd=cwd)
+    # Raises PrincipalConfigError on an invalid [principals] table: fail closed.
+    principals = load_principals(config.principals_config, legacy_token=auth_token or None)
     return _MCPHTTPServer(
         (host, port),
         handlers=handlers,
@@ -4067,6 +4310,8 @@ def create_http_server(
         notifier=notifier,
         max_subscribers=config.notify_max_subscribers if max_subscribers is None else max_subscribers,
         config=config,
+        socket_timeout_seconds=socket_timeout_seconds,
+        principals=principals,
     )
 
 
@@ -4083,12 +4328,24 @@ def serve_http(
     cors_allowed_origins: list[str] | None = None,
     max_body_bytes: int = 10_485_760,
 ) -> None:
-    """Run the MCP server over HTTP POST plus an SSE discovery stream."""
-    if host not in {"127.0.0.1", "localhost", "::1"} and not auth_token:
+    """Run the MCP server over HTTP POST plus an SSE discovery stream.
+
+    Binding to a non-loopback host requires ``auth_token`` or configured
+    ``[principals]``; without either the server refuses to start and exits
+    with status 2. stdio (``serve``) never applies principals.
+    """
+    try:
+        principals_configured = bool(_load_server_config(store_path=store_path, cwd=cwd).principals_config)
+    except Exception:
+        # A config that cannot load fails again, loudly, in create_http_server.
+        principals_configured = False
+    if not _is_loopback_host(host) and not auth_token and not principals_configured:
         _err(
-            "WARNING: NCP HTTP server is bound to a non-loopback host without auth_token. "
-            "Set an auth token before exposing this endpoint."
+            f"ERROR: refusing to bind the NCP HTTP server to non-loopback host {host!r} "
+            "without an auth token. Pass --auth-token, set NCP_AUTH_TOKEN, set "
+            "[server].auth_token or [principals] in config.toml; or bind to 127.0.0.1."
         )
+        sys.exit(2)
     try:
         server = create_http_server(
             host=host,
@@ -4106,6 +4363,12 @@ def serve_http(
         _err(f"NCP HTTP server failed to start: {exc}\n{traceback.format_exc()}")
         sys.exit(1)
 
+    registry = getattr(server, "principals", None)
+    if registry is not None and registry.has_legacy_token:
+        _err(
+            "NOTE: [principals] is configured and [server].auth_token is also set; the shared "
+            "token acts as an implicit admin principal. Remove it once every client has its own token."
+        )
     try:
         server.serve_forever()
     finally:

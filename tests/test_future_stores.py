@@ -66,7 +66,7 @@ class _FakeCursor:
                 ]
             )
             return
-        if "SELECT content FROM" in normalized and "COALESCE(pipeline_id, '') = COALESCE(%s, '')" in normalized:
+        if "SELECT content, chunk_id FROM" in normalized and "COALESCE(pipeline_id, '') = COALESCE(%s, '')" in normalized:
             zone, layer, pipeline_id, exclude_chunk_id, limit = params
             matches = [
                 row
@@ -76,7 +76,9 @@ class _FakeCursor:
                 and row["chunk_id"] != exclude_chunk_id
             ]
             matches.sort(key=lambda row: row["created_at"], reverse=True)
-            self._rows = [{"content": row["content"]} for row in matches[: int(limit)]]
+            self._rows = [
+                {"content": row["content"], "chunk_id": row["chunk_id"]} for row in matches[: int(limit)]
+            ]
             return
         if "INSERT INTO" in normalized and "chunks (" in normalized:
             self._insert_chunk(params)
@@ -93,6 +95,11 @@ class _FakeCursor:
             return
         if "UPDATE" in normalized and "chunks SET retrieval_count = retrieval_count + 1" in normalized:
             return  # retrieval tracking update — no-op in fake store
+        if normalized.startswith("SELECT 1 FROM") and "tombstones WHERE chunk_id = %s AND expires_at >= %s" in normalized:
+            row = self._db.tombstones.get(str(params[0]))
+            forgotten = row is not None and float(row["expires_at"]) >= float(params[1])
+            self._rows = [{"?column?": 1}] if forgotten else []
+            return
         if "DELETE FROM" in normalized and "chunks WHERE chunk_id = %s" in normalized:
             self._db.chunks.pop(str(params[0]), None)
             return
@@ -1293,15 +1300,17 @@ def test_build_embedding_adapter_openai_missing_dependency_or_key_falls_back(
 
 
 def test_create_store_selects_pgvector(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    captured: dict[str, str] = {}
+    captured: dict[str, object] = {}
 
     class _FakePgvectorStore:
-        def __init__(self, dsn: str, *, schema: str, table_prefix: str, redis_url: str, redis_stream: str, config: object = None, embedding_adapter: object = None, max_working_chunks_per_pipeline: int = 0) -> None:
+        def __init__(self, dsn: str, *, schema: str, table_prefix: str, redis_url: str, redis_stream: str, config: object = None, embedding_adapter: object = None, max_working_chunks: int | None = None, gc_threshold: int | None = None, max_working_chunks_per_pipeline: int = 0) -> None:
             captured["dsn"] = dsn
             captured["schema"] = schema
             captured["table_prefix"] = table_prefix
             captured["redis_url"] = redis_url
             captured["redis_stream"] = redis_stream
+            captured["max_working_chunks"] = max_working_chunks
+            captured["gc_threshold"] = gc_threshold
 
     monkeypatch.setattr("ncp.stores.factory.PgvectorStore", _FakePgvectorStore)
     project = tmp_path / "repo"
@@ -1328,6 +1337,9 @@ def test_create_store_selects_pgvector(monkeypatch: pytest.MonkeyPatch, tmp_path
         "table_prefix": "demo_",
         "redis_url": "redis://127.0.0.1:6379/0",
         "redis_stream": "ncp:whispers",
+        # [pipeline] defaults reach the store (they used to be dropped).
+        "max_working_chunks": 500,
+        "gc_threshold": 400,
     }
 
 

@@ -2,7 +2,7 @@
 
 **Date:** 2026-05-28
 **Slice:** NCP 0.6.x — IVF-FLAT index migration
-**Status:** Approved
+**Status:** Implemented (migration 004, `ncp/migrations/004_add_ivfflat_index.sql`; see CHANGELOG 0.6.x)
 
 ---
 

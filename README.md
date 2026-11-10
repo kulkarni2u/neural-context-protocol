@@ -6,7 +6,7 @@
 ![PyPI](https://img.shields.io/pypi/v/neural-context-protocol)
 
 **Bounded, trust-weighted memory for multi-agent systems.**
-MCP-native. Agents share context without replaying full transcripts. Around 13x fewer tokens than raw replay — see [Benchmarks](#benchmarks).
+MCP-native. Agents share context without replaying full transcripts. Fewer tokens than replaying history: about 1.44x fewer than a sliding window and about 13x fewer than raw replay in the 4-agent coding benchmark. The raw-replay figure is a worst-case floor that grows with turn count — see [Benchmarks](#benchmarks).
 
 -----
 
@@ -602,13 +602,18 @@ NCP adds bounded retrieval, provenance, optional authenticated authorship, disse
 | Scenario                               | Baseline       | Baseline tokens | NCP tokens | Result     | Caveat |
 |----------------------------------------|----------------|----------------:|-----------:|-----------:|--------|
 | 4-agent coding pipeline (40 turns)     | sliding window | 377             | 261        | **1.44x**  | Closest accounting comparison for a bounded recent-context baseline. |
+| 4-agent coding pipeline (40 turns)     | plain RAG (BM25) | 358           | 260        | **1.38x**  | Token accounting only, at the same 340-token ceiling; says nothing about context quality. |
 | 4-agent coding pipeline (40 turns)     | raw replay     | 3,426           | 261        | **13.13x** | Worst-case floor; the ratio scales with turn count. |
 | 4-agent coding pipeline (40 turns)     | rolling summary| 2,096           | 261        | **8.03x**  | Token accounting only; does not score summary quality. |
 | 6-role research pipeline (36 turns)    | raw replay     | 3,277           | 267        | **12.27x** | Worst-case floor for a deterministic synthetic research trace. |
 | Cross-host handoff (Claude -> OpenCode)| window baseline| 0.0 success     | 0.8 success| **+0.8**   | Local harness with a noise-only control, not a distributed-host reliability study. |
-| Needle recall at budget 4              | sliding window | 0.00            | 0.50       | **+0.50**  | Synthetic budget-stress recall check. |
+| Needle recall at budget 4              | sliding window | 0.00            | 1.00       | **+1.00**  | Synthetic budget-stress recall check. |
+| Needle recall at budget 4              | plain RAG (BM25) | 1.00          | 1.00       | **tie**    | Lexical task: any BM25 retriever solves it; shows NCP is not worse than ordinary retrieval, not that it is better. |
 | Task success at matched budget 400 (12 tasks, mock) | sliding window | 0.00 | 1.00 | **+1.00** | Context adequacy with a deterministic mock provider, not live model success. |
+| Task success at matched budget 400 (12 tasks, mock) | plain RAG (BM25) | 1.00 | 1.00 | **tie** | Ties at every budget tried (150-800); mock scoring only checks the fact is present. NCP used fewer tokens at budget 800 (568 vs 783 median). |
 | HotpotQA-style multi-hop QA at matched budget 300 (15 tasks) | sliding window | 0.00 | 1.00 | **+1.00** | Synthetic, HotpotQA-shaped context-adequacy check — not the official HotpotQA dataset or PlugMem's own eval harness (see [the benchmark's README](./benchmarks/hotpotqa_style/README.md)). |
+| HotpotQA-style multi-hop QA at matched budget 300 (15 tasks) | plain RAG (BM25) | 1.00 | 1.00 | **tie** | Plain RAG **beats** NCP at tighter budgets: 1.00 vs 0.60 at budget 150 and 1.00 vs 0.87 at 200. |
+| Conflicting / low-trust memory, true claim ranked first at k=1 (60 tasks) | plain RAG (BM25) | 0.33 | 0.98 | **+0.65** | Claims differ only by value, so BM25 ties; NCP uses trust, supersedes, outcomes and dissent. NCP's one miss per seed is a retrieval ranking issue (a common word outweighs the topical terms), and it loses when the wrong claim is the trusted one (0.00 vs 0.58). Seed 7; NCP is 0.98 on all five seeds tried. See `docs/NCP_BENCHMARK_CONFLICT_TRUST.md`. |
 
 MACE multi-agent coordination score (40 turns): **0.8915**
 
@@ -618,6 +623,8 @@ These are deterministic token-accounting benchmarks. The task-success row measur
 A separate, complementary compression benchmark measures ingestion-time noise reduction on a fixed noisy-payload corpus: **33% aggregate token reduction** (537 → 360, `chars_div4`, pass gate aggregate >= 0.20), ranging from **68%** on duplicate-heavy logs down to **2%** on already-dense stack traces (see [the compression benchmark doc](./docs/NCP_BENCHMARK_COMPRESSION.md)).
 
 A third, complementary benchmark targets the many-parallel-workers-to-one-synthesizer fan-in case: with `[retrieval].reduce_fanin_enabled` off (today's default), **25% of NCP's own bounded top-k retrieval slots are near-duplicates of another slot in the same result** on a deterministic 40-worker/4-topic corpus; enabling it merges the near-duplicates, drops malformed candidates, and flags likely contradictions for the reading model, at a **13% token reduction** against an unbounded raw dump of all 40 workers (see [the fan-in reduction benchmark doc](./docs/NCP_BENCHMARK_FANIN_REDUCE.md) for the full methodology and an honest account of the contradiction-flagging heuristic's false-positive rate).
+
+Plain RAG is BM25 top-k over the raw transcript turns packed into the same token budget, with none of NCP's trust weighting, whispers, distillation or consolidation (`ncp.bench.baselines.PlainRagBaseline`). On the context-adequacy benchmarks above it ties NCP, and on the HotpotQA-style set it beats NCP at budgets of 200 tokens or less; those benchmarks do not exercise the features that distinguish NCP from ordinary retrieval. The conflicting-memory benchmark does: when contradicting claims match the query equally well, NCP ranks the true one first in 0.98 of tasks against 0.33 for plain RAG, with the caveats in its row above. Efficacy mock mode (`benchmarks/efficacy`, budgets 200 and 400) shows the same tie: NCP 1.00, plain RAG 1.00, rolling summary 1.00, sliding window 0.00.
 
 Benchmarks are reproducible:
 
@@ -664,7 +671,7 @@ The core agent-to-agent protocol is still: read context, publish memory, signal 
 
 **Streaming.** `ncp_get_context` accepts `stream: true` and delivers the context blocks progressively — as NDJSON or SSE over HTTP, or as `ncp/stream_chunk` JSON-RPC notifications over stdio — so a host can start consuming context before assembly finishes. The runtime also serves `/healthz`, an `/sse` discovery endpoint, and `/message`, and supports CORS (`--cors-origin`) and MCP protocol-version negotiation across spec versions. A stdio transport is available via `ncp serve-stdio` for hosts that prefer it over HTTP.
 
-By default the server requires no token on loopback (`127.0.0.1`/`localhost`/`::1`). Set `[server].auth_token` in `.ncp/config.toml` (generated by `ncp init`), the `NCP_AUTH_TOKEN` env var, or `--auth-token` on `ncp serve` to require an `Authorization: Bearer <token>` header on `/mcp` and `/sse`. Never bind `ncp serve` to a non-loopback host without one of these set.
+By default the server requires no token on loopback (`127.0.0.1`/`localhost`/`::1`). Set `[server].auth_token` in `.ncp/config.toml` (generated by `ncp init`), the `NCP_AUTH_TOKEN` env var, or `--auth-token` on `ncp serve` to require an `Authorization: Bearer <token>` header on `/mcp` and `/sse`. `ncp serve` refuses to start on a non-loopback host unless one of these is set.
 
 `GET /events?agent_id=...&pipeline_id=...` is an SSE stream of payload-free doorbell frames (`ready`, `whisper`, `task`) for long-running orchestrators. It uses the same bearer auth and is capped by `[notify].max_subscribers`.
 
@@ -738,6 +745,8 @@ ncp trust-drift # trust-drift observability: rising, falling, and feedback summa
 ncp precedents  # query past decisions: 'show me decisions like this one'
 ncp overview    # ranked cross-pipeline summary: failed tasks, waiting results, expiring claims
 ncp consolidate # merge and compact memory
+ncp vacuum      # delete aged rows from append-only tables (--older-than 30d; previews unless --yes)
+ncp forget      # permanently delete specific chunks (--chunk / --agent / --pipeline; previews unless --yes)
 ncp calibrate   # recalibrate trust (add --feedback for the self-improvement pass)
 ncp refine      # evidence-backed procedural self-refinement: ingest/show/propose/apply/rollback
 ncp handoff     # cross-agent handoff coordination
@@ -747,6 +756,25 @@ ncp reputation  # per-identity reputation: score, confidence, observation count
 ncp emit        # emit a whisper from the CLI
 ncp demo        # run a self-contained demo pipeline
 ```
+
+### Retention and deletion
+
+`ncp vacuum --older-than 30d` trims the append-only bookkeeping tables
+(`cost_log`, `drift_history`, `turn_chunks`, consumed `outcomes`, terminal `tasks`,
+and so on; the newest `conscious_log` snapshot per agent is kept) and never touches
+memory chunks, whispers, identities or decisions. Trimming `cost_log` lowers the spend
+the budget governor reads. `ncp forget --chunk <id>` (repeatable), `--agent <written_by>`
+and `--pipeline <id>` (combined as AND) permanently delete chunks, their `raw_ref`
+backups, edges and turn links, and leave a permanent tombstone so the same `chunk_id`
+cannot be written again. `--pipeline` never matches `scope='global'` chunks, and
+`user_verified` chunks are deleted when you select them. Both commands only preview
+unless you pass `--yes` (or confirm at the prompt on a terminal); `--dry-run` never
+deletes and `--json` emits the counts. Both are supported on SQLite and sync
+pgvector; other backends report that they are not implemented.
+
+Back up the SQLite store with `sqlite3 .ncp/store.db ".backup backup.db"`, or stop
+`ncp serve` first. The store runs in WAL mode, so copying `store.db` alone while the
+server is running can miss recent writes that still sit in `store.db-wal`.
 
 ### Web UI
 
@@ -801,13 +829,13 @@ ncp explain --cwd /path/to/project
 | Block            | Controls                                                                                  |
 |------------------|-------------------------------------------------------------------------------------------|
 | `[budget]`       | Context token budget and per-pressure chunk/whisper caps (default → high → critical)       |
-| `[pipeline]`     | Working-set size and GC (`max_working_chunks`, `gc_threshold`, default TTL)                |
+| `[pipeline]`     | Working-set size and GC (`max_working_chunks`, `gc_threshold`, default TTL); eviction is lowest trust/recency first and never removes `user_verified` chunks |
 | `[whispers]`     | Whisper TTL, max per drain, and `min_confidence` to deliver                                |
 | `[retrieval]`    | Signal weights, `generation_penalty_base`, `edge_expansion`, rerank, trust propagation, `reduce_fanin_enabled` |
 | `[embedding]`    | Semantic vector retrieval — on by default (local, no API key); provider, model, graceful lexical-only fallback if `fastembed` is absent |
 | `[reputation]`   | Beta-reputation `gain`, `forget`, `confidence_k`                                           |
 | `[consolidation]`| Similarity threshold, trust floor, and optional LLM model for memory compaction            |
-| `[retention]`    | Hard cap on working chunks per pipeline                                                    |
+| `[retention]`    | Hard cap on working chunks per pipeline (`user_verified` chunks are never evicted)         |
 | `[providers]`    | Per-model pricing used by `ncp cost` (configurable)                                        |
 | `[server]`       | `auth_token` for non-loopback binds                                                        |
 | `[notify]`       | Push delivery: `enabled`, `backend` (auto/memory/redis), `max_subscribers`, `max_wait_seconds`, `poll_interval_seconds` |

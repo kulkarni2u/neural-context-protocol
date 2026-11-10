@@ -23,9 +23,9 @@ verification before acting on it.
 
 ## Fallback: HTTP API (when no MCP host is available)
 
-If the agent has no MCP connection, drive the same five tools directly over
+If the agent has no MCP connection, drive the same tools directly over
 HTTP against `ncp serve` (default `http://127.0.0.1:4242/mcp`). See
-`docs/NCP_HTTP_API.md` for the full contract. Example:
+`docs/NCP_HTTP_API.md` for the tool catalog and full contract. Example:
 
 ```bash
 curl -s http://127.0.0.1:4242/mcp -H 'Content-Type: application/json' -d '{

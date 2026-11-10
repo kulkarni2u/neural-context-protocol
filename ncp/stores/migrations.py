@@ -31,6 +31,37 @@ class MigrationError(Exception):
     pass
 
 
+PSYCOPG_MISSING_MESSAGE = (
+    "psycopg (v3) is not installed. Install it with: "
+    "pip install 'neural-context-protocol[pgvector]'"
+)
+
+
+def psycopg_available() -> bool:
+    """Return True when the psycopg v3 driver can be imported."""
+    try:
+        import psycopg  # type: ignore[import]  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def connect(dsn: str, *, connect_timeout: int | None = None) -> Any:
+    """Open a psycopg v3 connection for the migration runner.
+
+    The connection is left in psycopg's default non-autocommit mode: the runner
+    commits and rolls back explicitly, one transaction per migration.
+    Raises MigrationError when the driver is missing.
+    """
+    try:
+        import psycopg  # type: ignore[import]
+    except ImportError as exc:
+        raise MigrationError(PSYCOPG_MISSING_MESSAGE) from exc
+    if connect_timeout is not None:
+        return psycopg.connect(dsn, connect_timeout=connect_timeout)
+    return psycopg.connect(dsn)
+
+
 _DOWN_RE = re.compile(r"^\s*--\s*DOWN\s*$", re.MULTILINE | re.IGNORECASE)
 _UP_RE = re.compile(r"^\s*--\s*UP\s*$", re.MULTILINE | re.IGNORECASE)
 
@@ -182,7 +213,7 @@ class MigrationRunner:
         lock_key = self._lock_key()
         cur = self._conn.cursor()
         try:
-            cur.execute("SELECT pg_try_advisory_lock(%s)", (lock_key,))
+            cur.execute("SELECT pg_try_advisory_lock(%s::bigint)", (lock_key,))
             if not cur.fetchone()[0]:
                 raise MigrationError(
                     "Could not acquire advisory lock — another migration may be running"
@@ -214,7 +245,7 @@ class MigrationRunner:
                 ) from exc
             finally:
                 try:
-                    cur.execute("SELECT pg_advisory_unlock(%s)", (lock_key,))
+                    cur.execute("SELECT pg_advisory_unlock(%s::bigint)", (lock_key,))
                     self._conn.commit()
                 except Exception:
                     pass  # lock released automatically when connection closes
@@ -245,7 +276,7 @@ class MigrationRunner:
         lock_key = self._lock_key()
         cur = self._conn.cursor()
         try:
-            cur.execute("SELECT pg_try_advisory_lock(%s)", (lock_key,))
+            cur.execute("SELECT pg_try_advisory_lock(%s::bigint)", (lock_key,))
             if not cur.fetchone()[0]:
                 raise MigrationError(
                     "Could not acquire advisory lock — another migration may be running"
@@ -265,7 +296,7 @@ class MigrationRunner:
                 raise MigrationError(f"Rollback of v{version} failed: {exc}") from exc
             finally:
                 try:
-                    cur.execute("SELECT pg_advisory_unlock(%s)", (lock_key,))
+                    cur.execute("SELECT pg_advisory_unlock(%s::bigint)", (lock_key,))
                     self._conn.commit()
                 except Exception:
                     pass  # lock released automatically when connection closes

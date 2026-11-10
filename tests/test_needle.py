@@ -65,3 +65,20 @@ def test_needle_recall_first_evicted_turn_keys_match_all_needles(tmp_path: Path)
     assert set(eviction_turns.keys()) == {f"needle_{i:02d}" for i in range(1, k + 1)}
     for v in eviction_turns.values():
         assert v is None or isinstance(v, int)
+
+
+def test_needle_recall_reports_plain_rag_arm(tmp_path: Path) -> None:
+    artifact = needle_recall(
+        store_path=tmp_path / "needle-rag.db",
+        turns=18,
+        k_needles=4,
+        budget=3,
+        pipeline_id="pipe_needle_rag",
+    )
+    summary = artifact["summary"]
+    assert "plain_rag" in summary["recall_at_final"]
+    assert isinstance(summary["ncp_ties_or_beats_plain_rag"], bool)
+    for row in artifact["recall_curve"]:
+        assert 0.0 <= float(row["plain_rag_recall"]) <= 1.0
+        assert row["plain_rag_budget_tokens"] == row["window_token_estimate"]
+        assert all("plain_rag_present" in n for n in row["needles"])

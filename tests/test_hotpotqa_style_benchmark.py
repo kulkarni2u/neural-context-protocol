@@ -61,7 +61,7 @@ def test_run_hotpotqa_style_artifact_schema(tmp_path: Path) -> None:
     rows = artifact["rows"]
     assert rows
 
-    conditions = {"ncp", "sliding_window", "raw_replay"}
+    conditions = {"ncp", "sliding_window", "raw_replay", "plain_rag"}
     by_task: dict[str, set[str]] = {}
     for row in rows:
         for key in ("task_id", "kind", "condition", "context_tokens", "success", "missing"):

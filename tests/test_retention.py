@@ -94,3 +94,19 @@ def test_retention_config_default_is_zero_and_reads_configured_value(tmp_path: P
 
     configured = load_config(cwd=project)
     assert configured.retention_max_working_chunks_per_pipeline == 5000
+
+
+def test_retention_never_evicts_user_verified_chunks(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "store.db", max_working_chunks_per_pipeline=3)
+
+    # The lowest-scored chunks are user_verified; a trust-only ranking would evict them first.
+    for i in range(2):
+        chunk = _chunk(f"uv_{i}", base_trust=0.05).model_copy(update={"src": "user_verified"})
+        assert store.write(chunk) is True
+    for i in range(4):
+        assert store.write(_chunk(f"sub_{i}", base_trust=0.5 + i * 0.1)) is True
+
+    surviving_ids = {chunk.chunk_id for chunk in store.get_working_zone(pipeline_id="pipe_1")}
+    assert {"uv_0", "uv_1"} <= surviving_ids
+    assert len(surviving_ids) == 3
+    assert surviving_ids - {"uv_0", "uv_1"} == {"sub_3"}

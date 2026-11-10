@@ -30,6 +30,19 @@ services:
       timeout: 5s
       retries: 20
 
+  ncp:
+    profiles: ["server"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "127.0.0.1:4242:4242"
+    environment:
+      NCP_AUTH_TOKEN: ${NCP_AUTH_TOKEN:-}
+    volumes:
+      - ncp-data:/data
+
 volumes:
   ncp-postgres-data:
   ncp-redis-data:
+  ncp-data:

@@ -1,6 +1,9 @@
 # NCP Coordination Primitives — Design
 
-**Status:** Draft for review. Not implemented.
+**Status:** Implemented in 1.8.0 (capabilities A, B, C and D; see CHANGELOG
+1.8.0). Deferred: webhook delivery (B.2) and a stdio notification
+transport, which this document already scoped out. Open questions in §8
+other than the resolved one are not settled by the release.
 **Date:** 2026-11-02
 **Scope:** Four additive capabilities that let a long-lived *router* agent
 coordinate many concurrent *worker* agents over the NCP bus:

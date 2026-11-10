@@ -4,6 +4,166 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [Unreleased]
 
+Read **Changed** before upgrading: several requests the HTTP server used to
+accept are now rejected.
+
+### Security
+
+- **HTTP transport hardening** (`ncp/mcp/server.py`): a page open in the
+  user's browser could drive every tool on a local, token-less server with a
+  `text/plain` no-cors POST, and read responses through DNS rebinding. POST
+  now requires `Content-Type: application/json` (`415`), an `Origin` that is
+  neither same-origin nor passed with `--cors-origin` is rejected (`403`) on
+  POST, `/api/*`, `/events` and `/sse`, and on a loopback bind only loopback
+  `Host` values are accepted (`403`). A negative `Content-Length`, which used
+  to read until EOF past the size limit, is `400`. Connections idle on the
+  socket for 30 seconds are closed.
+- **Authenticated principals, opt-in** (`ncp/principals.py`,
+  `ncp/mcp/server.py`): every tool trusted the `agent_id` the caller declared,
+  so anyone holding the shared token could post a turn as another agent and
+  rewrite its `owns`/`must_not`, credit its own chunks, or declare
+  `src=user_verified`. A `[principals.<name>]` table now maps a bearer token
+  (stored as `token_sha256`, or read from `token_env`) to an `agent_id`, an
+  optional `pipelines` allowlist and the capabilities `admin`, `verify` and
+  `record_outcome`. With principals configured the HTTP server binds identity
+  arguments to the token's agent and rejects a mismatch (JSON-RPC `-32003`),
+  enforces the pipeline allowlist (an omitted `pipeline_id` is rejected for a
+  pipeline-limited principal), requires `verify` for `src=user_verified` and
+  `ncp_verify_memo`, requires `record_outcome` with explicit `chunk_ids` and
+  no self-crediting for outcomes, rejects overwriting or superseding another
+  agent's chunk, keys the `ncp_fetch` budget by principal, and returns `403`
+  for unscoped `/api/*` reads unless the principal is an unrestricted admin.
+  `ncp_improve` needs `admin`, an existing `turn_id` can be re-posted only by
+  its own agent, and `recent` refs, `retrieved_chunk_ids`, a dissent `ref` and
+  a task's `parent_task_id` must point inside the allowed pipelines.
+  A token is then required on loopback too, and the bundled UI needs an admin
+  token. `[server].auth_token` acts as an implicit admin while both are set.
+  Nothing changes when no principals are configured, and stdio is not
+  covered. See "Principals" in `docs/NCP_HTTP_API.md` for the rules and the
+  limits.
+- **Non-loopback bind requires a token**: `ncp serve` exits with status 2
+  instead of printing a warning.
+- **Trust inputs are validated**: `ncp_record_outcome` requires a finite
+  `weight` with `0 < weight <= 1` (it was unbounded, and `NaN` was accepted). A
+  caller-supplied `base_trust` is capped at the default for the declared `src`.
+- `ncp_remember` stored its source chunk as `tool_result` at trust 0.95,
+  above the 0.80 ceiling for that `src`. It now uses 0.80.
+- **Whisper ack ownership** (`ncp/stores/sqlite.py`,
+  `ncp/stores/redis_coordination.py`): a targeted whisper can be acknowledged
+  only by its target or its sender. Any agent could previously delete another
+  agent's unread whisper through `ack_whisper_ids`.
+
+### Added
+
+- `ncp doctor [--json]`: checks config, store reachability, pending
+  migrations, the server, the auth header in agent configs, embeddings and
+  optional extras.
+- `ncp --version`.
+- `--json` is accepted wherever `--json-output` is, and on `migrate check`,
+  `viz`, `identity list` and `consolidate`.
+- `ncp init` writes an `Authorization: Bearer ${NCP_AUTH_TOKEN}` header into
+  `.mcp.json` and `opencode.json` when a token is configured, and prints how to
+  export the variable. The token itself is not written to those files.
+- `vacuum(older_than_seconds, dry_run=False)` on the SQLite and sync pgvector
+  stores: removes aged rows from the append-only tables and edge or turn-link
+  rows that point at chunks that no longer exist.
+- `ncp vacuum --older-than <30d|12h|...> [--dry-run] [--yes] [--json]`: the
+  operator command for `vacuum`. It previews unless `--yes` is passed or a
+  terminal prompt is confirmed.
+- `ncp forget [--chunk ID ...] [--agent WRITTEN_BY] [--pipeline ID]`: deletes
+  the selected chunks on request, with their `raw_ref` backups, edges, turn
+  links, aliases and memo entries, and leaves a non-expiring tombstone. A
+  forgotten `chunk_id` cannot be written again. `--pipeline` never reaches
+  `scope='global'` chunks; `user_verified` chunks are deleted when selected.
+  Backed by `forget()` and `forget_candidates()` on the SQLite and sync
+  pgvector stores.
+- Indexes on the expiry columns that soft GC deletes on (created on open for
+  SQLite; migration `019_add_expiry_indexes.sql` for Postgres).
+- A plain BM25 RAG baseline (`ncp.bench.baselines.PlainRagBaseline`) as an
+  additional arm in the needle, task-success, efficacy, HotpotQA-style and
+  pipeline benchmarks.
+- A conflicting and low-trust memory benchmark (`benchmarks/conflict_trust`,
+  `docs/NCP_BENCHMARK_CONFLICT_TRUST.md`): contradicting claims that differ
+  only by value, resolved by source trust, `supersedes`, outcomes, dissent or
+  repetition. NCP ranks the true claim first in 0.98 of the resolvable tasks
+  against 0.33 for plain RAG (seed 7; 0.98 on seeds 1, 2, 3, 7 and 11). It
+  found the write-time dedup defect listed under Fixed, and shows that NCP
+  surfaces the wrong claim when the wrong claim is the trusted one. Gated in
+  CI.
+- `Dockerfile` and a `server` compose profile for `ncp serve`
+  (`docs/NCP_DOCKER.md`).
+- `CONTRIBUTING.md`, `SECURITY.md`, a `py.typed` marker, Dependabot config,
+  `make lint` and `make build`.
+
+### Changed
+
+- POSTs to `/mcp` and `/message` without `Content-Type: application/json` get
+  `415`. Scripts using raw `curl` must send the header.
+- Requests with a cross-origin `Origin`, or (on a loopback bind) a `Host`
+  other than `localhost`, `127.0.0.1` or `[::1]`, get `403`. This includes
+  `/etc/hosts` aliases for the loopback address.
+- Hard GC evicts the lowest trust/recency chunks first instead of the oldest,
+  and never evicts `user_verified` chunks; the `[retention]` per-pipeline cap
+  now spares them too. A write with no pipeline now counts
+  and evicts only chunks with no pipeline; it used to count across every
+  pipeline.
+- `[pipeline].max_working_chunks` and `gc_threshold` now take effect. They
+  were documented but never passed to the stores. Defaults are unchanged.
+- Generated `turn_`, `out_` and `raw_` ids gain a random suffix. Ids built
+  from a millisecond timestamp collided under concurrent use, which overwrote
+  turns and silently dropped outcomes.
+- Async Redis: an unattributed acknowledgement of a broadcast whisper no
+  longer deletes it for every recipient, matching the sync path. Broadcast
+  delivery hashes now expire.
+- The `all` extra includes `pgvector` and `redis`. The `http` extra is empty;
+  nothing imported `aiohttp`.
+
+### Fixed
+
+- Write-time near-duplicate detection discarded contradicting claims. Two
+  sentences that differed only in a non-numeric value ("deploy window is on
+  Friday morning" / "...on Tuesday morning") were treated as duplicates, so
+  `write()` returned `False` and the correction was never stored, even when the
+  new chunk set `supersedes` to the stored one. A chunk that declares
+  `supersedes` is now never a duplicate of the chunk it supersedes (SQLite,
+  pgvector, async pgvector; `ncp_write_memory` now sets the chunk's `supersedes`
+  from its `supersedes` argument and `supersedes` edges before writing), and `is_near_duplicate` treats same-length texts
+  that differ by one or two substituted content words as different claims
+  (case, punctuation, stopwords, numbers and inflections such as retry/retries
+  do not count). Consolidation and fan-in merging keep the previous rule and can
+  still merge two claims that differ by a single word. Found by
+  `benchmarks/conflict_trust`.
+- `ncp migrate` and `ncp init --store pgvector` imported `psycopg2`, which the
+  `pgvector` extra does not install. They now use psycopg v3, and a missing
+  driver is reported as an error instead of being skipped.
+- The pgvector stores wrote an empty `meta`, so a chunk's `raw_ref` was never
+  persisted on Postgres. They now store it as SQLite does. Chunks written
+  before this have no stored `raw_ref`.
+- `ncp serve --cwd <project> --store-path <path>` read `.ncp/config.toml` from
+  the process directory, not the project, so run from elsewhere it ignored the
+  project's auth token and `[principals]`. It now honours `--cwd`.
+- A POST body that is not valid UTF-8 returns `400` instead of dropping the
+  connection.
+- SQLite no longer leaves `whisper_deliveries` rows behind when a broadcast
+  whisper expires.
+
+### Documentation
+
+- The README headline states both token comparisons (about 1.44x against a
+  sliding window, about 13x against raw replay). The benchmark tables report
+  that plain RAG ties NCP on the current lexical benchmarks and beats it on the
+  HotpotQA-style set at budgets of 200 tokens or less, and the needle recall
+  figure is corrected from 0.50 to the measured 1.00.
+- Spec statuses, tool counts and the HTTP API tool list match the code, with a
+  test that every server tool is documented. Three completed planning documents
+  moved to `docs/archive/`.
+
+### CI
+
+- Tests run on Python 3.11, 3.12 and 3.13, with a non-blocking mypy step. The
+  pgvector job no longer installs `psycopg2-binary` and runs the new live store
+  lifecycle tests.
+
 ## [1.8.0] - 2026-11-02
 
 ### Release scope

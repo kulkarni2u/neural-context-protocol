@@ -83,3 +83,24 @@ python3 benchmarks/hotpotqa_style/run.py --store-path /tmp/hp.db
 The command prints one JSON artifact with per-task, per-condition rows
 (`context_tokens`, `success`, `missing` facts) and a `summary` block
 (`by_condition`, `by_kind_and_condition`, pass gate).
+
+## Plain RAG arm
+
+A `plain_rag` condition (BM25 top-k over the raw paragraphs, one document each,
+packed best-first into the same token budget; no trust, recency or dedup) runs
+alongside the others. Measured success rate (15 tasks, `--budget B`):
+
+| Budget | ncp | plain_rag | sliding_window | raw_replay |
+|---:|---:|---:|---:|---:|
+| 150 | 0.60 | 1.00 | 0.00 | 1.00 |
+| 200 | 0.87 | 1.00 | 0.00 | 1.00 |
+| 300 | 1.00 | 1.00 | 0.00 | 1.00 |
+| 400 | 1.00 | 1.00 | 0.53 | 1.00 |
+| 800 | 1.00 | 1.00 | 1.00 | 1.00 |
+
+**Plain RAG beats NCP at tight budgets (150, 200) and ties from 300 up.** In
+this synthetic set both needed paragraphs share vocabulary with the question,
+which favors BM25 over raw paragraphs; NCP's chunk assembly (k-limited,
+trust/relevance weighted, with all paragraphs given identical trust here) has
+no trust signal to exploit and loses some paragraphs at small budgets. The
+benchmark does not exercise trust, whispers or consolidation.

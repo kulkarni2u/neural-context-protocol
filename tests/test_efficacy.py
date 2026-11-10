@@ -40,15 +40,15 @@ def test_efficacy_mock_artifact_uses_provider_real_contract(tmp_path):
     assert artifact["budget"] == 400
     assert artifact["seeds"] == 1
     assert artifact["n_tasks"] == 2
-    assert artifact["conditions"] == ["ncp", "sliding_window", "rolling_summary"]
+    assert artifact["conditions"] == ["ncp", "sliding_window", "rolling_summary", "plain_rag"]
     assert artifact["config"]["ncp_retrieval_k"] == 8
-    assert len(artifact["rows"]) == 6
+    assert len(artifact["rows"]) == 8
     assert {row["model"] for row in artifact["rows"]} == {"mock"}
     assert {row["cost_source"] for row in artifact["rows"]} == {"not_applicable"}
     assert {row["cost_usd"] for row in artifact["rows"]} == {0.0}
 
     by_condition = artifact["summary"]["by_condition"]
-    assert set(by_condition) == {"ncp", "sliding_window", "rolling_summary"}
+    assert set(by_condition) == {"ncp", "sliding_window", "rolling_summary", "plain_rag"}
     for summary in by_condition.values():
         assert 0.0 <= summary["success_rate"] <= 1.0
         assert summary["mean_tokens"] > 0

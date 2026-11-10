@@ -139,6 +139,29 @@ model = "BAAI/bge-small-en-v1.5"
 # non-loopback host. `ncp init --store pgvector` generates one automatically.
 # auth_token = ""
 
+# [principals.<name>]
+# OPT-IN authenticated principals for the HTTP transport (docs/NCP_HTTP_API.md,
+# "Principals"). Off when no [principals.*] table exists. Each table maps one
+# bearer token to an agent: the server then rejects identity arguments
+# (agent_id, written_by, from, ...) that differ from agent_id, enforces the
+# pipelines allowlist, and gates capabilities. Exactly one of token_sha256
+# (hex SHA-256 of the token: printf %s "$TOKEN" | sha256sum) or token_env (an
+# environment variable holding the token) -- never the plaintext token.
+# Capabilities: "verify" (src=user_verified, ncp_verify_memo), "record_outcome"
+# (ncp_record_outcome, never crediting its own chunks) and "admin" (act as any
+# agent_id; unscoped /api reads). If [server].auth_token is also set it acts as
+# an implicit admin. stdio (serve-stdio) applies no principals.
+# [principals.router]
+# token_env = "NCP_TOKEN_ROUTER"
+# agent_id = "router"
+# capabilities = ["admin", "verify", "record_outcome"]
+#
+# [principals.executor]
+# token_sha256 = "<64 hex chars>"
+# agent_id = "executor"
+# pipelines = ["pipe_payment"]   # omit to allow every pipeline
+# capabilities = []
+
 # [identity]
 # OPT-IN Ed25519 authorship enforcement (CAP-T1, WI-013). When false (default),
 # unsigned writes/whispers keep working and any supplied signature is verified

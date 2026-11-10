@@ -18,7 +18,7 @@ Status: **Done** (in v1.7.1, tested) · **Partial** · **Missing**.
 | 4b | Memo reuse bypasses gates | Done | `memo_ineligibility` used by MCP + run/stream | Behavior change: Python reuse now needs verification by default. |
 | 4c | Replacement keeps verification | Done | memo upsert SQL in all 3 stores | |
 | 4d | Post-turn batch bypasses checks | Done | `mcp/server.py::_validated_batch_chunk` | Batch path still does not noise-filter or create `raw_ref`. |
-| 4e | Fan-in merges before contradiction | Done | `consolidation.py::claim_polarity`, `same_claim_shape`, `_mergeable` | Polarity is a cue heuristic. Numeric value changes are never merged or deduped; non-numeric value conflicts ("Monday" vs "Friday") are still not detected. |
+| 4e | Fan-in merges before contradiction | Done | `consolidation.py::claim_polarity`, `same_claim_shape`, `_mergeable` | Polarity is a cue heuristic. Numeric value changes are never merged or deduped. Non-numeric value conflicts ("Monday" vs "Friday") are no longer deduped at write time (`claim_value_substitutions`, used by `is_near_duplicate`), but consolidation and fan-in merging still use the looser `same_claim_shape` and can merge them. |
 | 5 | Provider cache/usage accounting | Done | `adapters/base.py::TokenUsage`, openai/anthropic/gemini | Cohere/Mistral/Ollama report no cache fields, so nothing to split there. |
 | 6 | Streaming usage + whisper acks | Done | `openai.py` `include_usage`; `_finish_turn` acks | Anthropic already read final usage; usage now resets per request. |
 | 7 | ContextPolicy runtime | Mostly done (PR #58 + identity on `NCPResponse`) | `context_policy.py`, `api.py` | `ncp_fetch`, decisions, memo and whisper reads ignore policy. The policy is **not** an authorization boundary (see Plan P0-A). |

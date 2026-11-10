@@ -38,7 +38,7 @@ def compile_memory(
         written_by=written_by,
         pipeline_id=pipeline_id,
         chunk_type=chunk_type,
-        base_trust=0.95,
+        base_trust=0.80,  # the tool_result default: raw caller text earns no more than its src tier
     )
     atom_texts = _atom_texts(filtered.filtered, chunk_type=chunk_type, max_atoms=max_atoms)
     atoms = [

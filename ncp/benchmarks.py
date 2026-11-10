@@ -7,6 +7,7 @@ from pathlib import Path
 
 from ncp.bench.baselines import (
     BaselineStrategy,
+    PlainRagBaseline,
     RawReplayBaseline,
     RollingSummaryBaseline,
     SlidingWindowBaseline,
@@ -194,6 +195,14 @@ def _run_pipeline_benchmark(
             name: estimate_tokens((context + "\n" + turn).strip())
             for name, context in baseline_contexts.items()
         }
+        # Plain RAG arm: BM25 over raw transcript entries using NCP's own query
+        # text, packed into the explicit context budget when one is set, else
+        # into the number of context tokens NCP itself used this turn.
+        rag_budget = context_token_budget if context_token_budget is not None else ncp_context_tokens
+        rag_context = PlainRagBaseline(budget_tokens=rag_budget).context_for(
+            transcript=transcript, turn=f"{topic} pipeline handoff memory"
+        )
+        baseline_input_tokens["plain_rag"] = estimate_tokens((rag_context + "\n" + turn).strip())
 
         result_summary = result_builder(
             turn_number=turn_number,
@@ -245,6 +254,7 @@ def _run_pipeline_benchmark(
                 "raw_replay_input_tokens": baseline_input_tokens["raw_replay"],
                 "sliding_window_input_tokens": baseline_input_tokens["sliding_window"],
                 "rolling_summary_input_tokens": baseline_input_tokens["rolling_summary"],
+                "plain_rag_input_tokens": baseline_input_tokens["plain_rag"],
             }
         )
 
@@ -262,6 +272,20 @@ def _run_pipeline_benchmark(
             "reduction_factor_vs_ncp": reduction_factor,
             "config": _baseline_metadata(baseline),
         }
+    plain_rag_final = int(turn_rows[-1]["plain_rag_input_tokens"])
+    baseline_summary["plain_rag"] = {
+        "peak_tokens": max(int(row["plain_rag_input_tokens"]) for row in turn_rows),
+        "final_tokens": plain_rag_final,
+        "reduction_factor_vs_ncp": round(plain_rag_final / final_ncp, 2) if final_ncp else 0.0,
+        "config": {
+            "name": "plain_rag",
+            "budget_tokens": (
+                context_token_budget
+                if context_token_budget is not None
+                else "ncp_context_tokens_per_turn"
+            ),
+        },
+    }
     peak_naive = int(baseline_summary["raw_replay"]["peak_tokens"])
     final_naive = int(baseline_summary["raw_replay"]["final_tokens"])
     reduction_factor = round(final_naive / final_ncp, 2) if final_ncp else 0.0

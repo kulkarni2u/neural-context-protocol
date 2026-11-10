@@ -216,6 +216,60 @@ def claim_values(content: str) -> tuple[str, ...]:
     return tuple(_NUMBER_RE.findall(content))
 
 
+_WORD_RE = re.compile(r"[a-z0-9]+")
+_STOPWORDS = frozenset(
+    "a an the this that these those is are was were be been being am of in on at to for from by with as "
+    "and or but if then so it its it's there here has have had do does did will would can could should "
+    "may might must shall into onto over under than too very just also again still only".split()
+)
+_STEM_SUFFIXES = ("ing", "ied", "ies", "ed", "es", "s", "d")
+# A correction rewrites one or two words; beyond this a text is being reworded.
+_MAX_VALUE_SUBSTITUTIONS = 2
+
+
+def _stem(word: str) -> str:
+    """Cheap inflection stripper: retries/retried -> retry, paged/pages -> page."""
+    for suffix in _STEM_SUFFIXES:
+        if word.endswith(suffix) and len(word) - len(suffix) >= 3:
+            stem = word[: -len(suffix)]
+            return stem + "y" if suffix in ("ies", "ied") else stem
+    return word
+
+
+def _same_word(a: str, b: str) -> bool:
+    """Whether two lowercase tokens are one word up to inflection."""
+    if a == b:
+        return True
+    sa, sb = _stem(a), _stem(b)
+    if sa == sb:
+        return True
+    short, long_ = sorted((sa, sb), key=len)
+    return len(short) >= 3 and len(long_) - len(short) <= 1 and long_.startswith(short)
+
+
+def claim_value_substitutions(a: str, b: str) -> int:
+    """Count content words substituted at aligned positions of two same-length texts.
+
+    Counts positions where the lowercase word tokens of ``a`` and ``b`` differ
+    and neither token is a stopword, contains a digit (numbers are compared by
+    ``claim_values``) or is an inflection of the other. Returns 0 when the
+    token counts differ (added filler, removed clauses) or the texts hold the
+    same words in another order, so only "same sentence, one word swapped"
+    registers: "deploys on Friday morning" vs "deploys on Tuesday morning".
+    """
+    ta, tb = _WORD_RE.findall(a.lower()), _WORD_RE.findall(b.lower())
+    if len(ta) != len(tb) or sorted(ta) == sorted(tb):
+        return 0
+    return sum(
+        1
+        for x, y in zip(ta, tb, strict=True)
+        if x != y
+        and x not in _STOPWORDS and y not in _STOPWORDS
+        and not (any(c.isdigit() for c in x) or any(c.isdigit() for c in y))
+        and not _same_word(x, y)
+    )
+
+
 def same_claim_shape(a: str, b: str) -> bool:
     """Whether two texts can be the same claim: equal numeric values and polarity.
 
@@ -228,8 +282,23 @@ def same_claim_shape(a: str, b: str) -> bool:
 
 
 def is_near_duplicate(a: str, b: str, *, threshold: float = 0.92) -> bool:
-    """Write-time dedup predicate shared by every store backend."""
-    return same_claim_shape(a, b) and SequenceMatcher(None, a, b).ratio() > threshold
+    """Write-time dedup predicate shared by every store backend.
+
+    On top of ``same_claim_shape`` it also refuses to call two texts the same
+    claim when one or two content words were swapped in an otherwise identical
+    sentence (``claim_value_substitutions``): "deploys on Friday morning" and
+    "deploys on Tuesday morning" are a value conflict, not a rewording, and
+    dropping the second at write time loses a correction. Consolidation and
+    fan-in merging deliberately keep the looser ``same_claim_shape`` rule: they
+    run at a lower similarity threshold on already-stored chunks, where
+    treating every one-word difference as distinct would stop them merging
+    paraphrases at all.
+    """
+    return (
+        same_claim_shape(a, b)
+        and not 1 <= claim_value_substitutions(a, b) <= _MAX_VALUE_SUBSTITUTIONS
+        and SequenceMatcher(None, a, b).ratio() > threshold
+    )
 
 
 def _windows_overlap(a: SubconsciousChunk, b: SubconsciousChunk) -> bool:

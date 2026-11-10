@@ -2,6 +2,7 @@
 
 from .baselines import (
     BaselineStrategy,
+    PlainRagBaseline,
     RawReplayBaseline,
     RollingSummaryBaseline,
     SlidingWindowBaseline,
@@ -9,6 +10,7 @@ from .baselines import (
 
 __all__ = [
     "BaselineStrategy",
+    "PlainRagBaseline",
     "RawReplayBaseline",
     "RollingSummaryBaseline",
     "SlidingWindowBaseline",

@@ -25,13 +25,6 @@ def _make_mock_conn() -> MagicMock:
     return conn
 
 
-def _psycopg2_pool_patch(mock_conn: MagicMock) -> MagicMock:
-    """Return a mock that can replace psycopg2.pool.ThreadedConnectionPool."""
-    mock_pool = MagicMock()
-    mock_pool.getconn.return_value = mock_conn
-    return mock_pool
-
-
 # ---------------------------------------------------------------------------
 # _default_pgvector_connect must call psycopg.connect (v3)
 # ---------------------------------------------------------------------------
@@ -57,20 +50,18 @@ def test_default_connect_uses_psycopg3_connect() -> None:
 def test_pool_created_with_psycopg3_connection_pool() -> None:
     """Pool init must call psycopg_pool.ConnectionPool, not psycopg2 ThreadedConnectionPool."""
     mock_conn = _make_mock_conn()
-    mock_psycopg2_pool = _psycopg2_pool_patch(mock_conn)
     mock_psycopg3_pool = MagicMock()
     mock_psycopg3_pool.getconn.return_value = mock_conn
     mock_psycopg_pool_mod = MagicMock()
     mock_psycopg_pool_mod.ConnectionPool.return_value = mock_psycopg3_pool
 
-    with patch("psycopg2.pool.ThreadedConnectionPool", return_value=mock_psycopg2_pool):
-        with patch.dict(sys.modules, {"psycopg_pool": mock_psycopg_pool_mod}):
-            PgvectorStore(
-                "postgresql://localhost/ncp_test",
-                connect_factory=None,
-                min_pool_connections=2,
-                max_pool_connections=8,
-            )
+    with patch.dict(sys.modules, {"psycopg_pool": mock_psycopg_pool_mod}):
+        PgvectorStore(
+            "postgresql://localhost/ncp_test",
+            connect_factory=None,
+            min_pool_connections=2,
+            max_pool_connections=8,
+        )
 
     mock_psycopg_pool_mod.ConnectionPool.assert_called_once_with(
         conninfo="postgresql://localhost/ncp_test",
@@ -83,15 +74,13 @@ def test_pool_created_with_psycopg3_connection_pool() -> None:
 def test_pool_defaults_min2_max10_with_psycopg3() -> None:
     """Default pool sizes 2/10 must be forwarded as min_size/max_size."""
     mock_conn = _make_mock_conn()
-    mock_psycopg2_pool = _psycopg2_pool_patch(mock_conn)
     mock_psycopg3_pool = MagicMock()
     mock_psycopg3_pool.getconn.return_value = mock_conn
     mock_psycopg_pool_mod = MagicMock()
     mock_psycopg_pool_mod.ConnectionPool.return_value = mock_psycopg3_pool
 
-    with patch("psycopg2.pool.ThreadedConnectionPool", return_value=mock_psycopg2_pool):
-        with patch.dict(sys.modules, {"psycopg_pool": mock_psycopg_pool_mod}):
-            PgvectorStore("postgresql://localhost/ncp_test", connect_factory=None)
+    with patch.dict(sys.modules, {"psycopg_pool": mock_psycopg_pool_mod}):
+        PgvectorStore("postgresql://localhost/ncp_test", connect_factory=None)
 
     _, kwargs = mock_psycopg_pool_mod.ConnectionPool.call_args
     assert kwargs.get("min_size") == 2
@@ -105,15 +94,13 @@ def test_pool_defaults_min2_max10_with_psycopg3() -> None:
 def test_close_calls_pool_close_not_closeall() -> None:
     """store.close() must call pool.close() (psycopg3 API), not pool.closeall()."""
     mock_conn = _make_mock_conn()
-    mock_psycopg2_pool = _psycopg2_pool_patch(mock_conn)
     mock_psycopg3_pool = MagicMock()
     mock_psycopg3_pool.getconn.return_value = mock_conn
     mock_psycopg_pool_mod = MagicMock()
     mock_psycopg_pool_mod.ConnectionPool.return_value = mock_psycopg3_pool
 
-    with patch("psycopg2.pool.ThreadedConnectionPool", return_value=mock_psycopg2_pool):
-        with patch.dict(sys.modules, {"psycopg_pool": mock_psycopg_pool_mod}):
-            store = PgvectorStore("postgresql://localhost/ncp_test", connect_factory=None)
+    with patch.dict(sys.modules, {"psycopg_pool": mock_psycopg_pool_mod}):
+        store = PgvectorStore("postgresql://localhost/ncp_test", connect_factory=None)
 
     store.close()
 

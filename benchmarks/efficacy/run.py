@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Provider efficacy benchmark at matched context budget.
 
-This harness compares three context-construction conditions over the existing
+This harness compares four context-construction conditions over the existing
 task-success task set:
 
 - ``ncp``: NCP assembly from a SQLite store.
 - ``sliding_window``: most recent raw turns that fit the same budget.
 - ``rolling_summary``: a deterministic extractive rolling summary plus recent
   turns, fit to the same budget.
+- ``plain_rag``: BM25 top-k over the raw turns (each turn one document), packed
+  best-first into the same budget; no trust, recency, dedup or distillation.
 
 ``--provider mock`` is deterministic and keyless; it measures context adequacy,
 not model reasoning. ``--provider anthropic`` is live and skips clearly when
@@ -25,6 +27,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from ncp.bench.baselines import PlainRagBaseline
 from benchmarks.task_success.tasks import Task, get_tasks, score_response
 from ncp.api import agent as make_conscious
 from ncp.assembler import Assembler
@@ -38,7 +41,7 @@ from ncp.types import BudgetContext, SubconsciousChunk
 _LIVE_PREAMBLE = (
     "IMPORTANT: Respond with plain text only. Do NOT read any files or use any tools.\n\n"
 )
-_CONDITIONS = ("ncp", "sliding_window", "rolling_summary")
+_CONDITIONS = ("ncp", "sliding_window", "rolling_summary", "plain_rag")
 _NCP_RETRIEVAL_K = 8
 
 
@@ -223,6 +226,12 @@ def _sliding_window_context(task: Task, budget: int) -> tuple[str, int]:
     return context, estimate_tokens(context)
 
 
+def _plain_rag_context(task: Task, budget: int) -> tuple[str, int]:
+    rag = PlainRagBaseline(budget_tokens=budget)
+    context = rag.context_for(transcript=[t.content for t in task.turns], turn=task.query_text)
+    return context, estimate_tokens(context)
+
+
 def _compress_turn(turn_text: str, max_words: int = 22) -> str:
     words = turn_text.split()
     if len(words) <= max_words:
@@ -290,6 +299,8 @@ def _condition_context(task: Task, condition: str, budget: int, pipeline_id: str
         return _sliding_window_context(task, budget)
     if condition == "rolling_summary":
         return _rolling_summary_context(task, budget)
+    if condition == "plain_rag":
+        return _plain_rag_context(task, budget)
     raise ValueError(f"unknown condition {condition!r}")
 
 

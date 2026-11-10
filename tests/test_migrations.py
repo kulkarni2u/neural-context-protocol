@@ -430,7 +430,7 @@ INTEGRATION = pytest.mark.skipif(
 @INTEGRATION
 def test_migration_apply_and_rollback_live(tmp_path: Path) -> None:
     import uuid
-    import psycopg2
+    import psycopg
 
     dsn = os.environ["NCP_PGVECTOR_DSN"]
     schema = f"ncp_test_{uuid.uuid4().hex[:8]}"
@@ -443,7 +443,7 @@ def test_migration_apply_and_rollback_live(tmp_path: Path) -> None:
     )
     _sql_file(tmp_path, "001_mig_test.sql", content)
 
-    conn = psycopg2.connect(dsn)
+    conn = psycopg.connect(dsn)
     runner = MigrationRunner(conn, schema=schema, prefix=prefix, migrations_dir=tmp_path)
     try:
         runner.bootstrap()
@@ -471,3 +471,33 @@ def test_migration_apply_and_rollback_live(tmp_path: Path) -> None:
         except Exception:
             conn.rollback()
         conn.close()
+
+
+# ── psycopg v3 driver helpers (fake module only; no live database) ───────────
+
+
+def test_connect_raises_clear_error_without_driver(monkeypatch: pytest.MonkeyPatch) -> None:
+    import sys
+
+    from ncp.stores.migrations import PSYCOPG_MISSING_MESSAGE, connect, psycopg_available
+
+    monkeypatch.setitem(sys.modules, "psycopg", None)
+    assert psycopg_available() is False
+    with pytest.raises(MigrationError) as excinfo:
+        connect("postgresql://localhost/ncp")
+    assert str(excinfo.value) == PSYCOPG_MISSING_MESSAGE
+    assert "psycopg2" not in PSYCOPG_MISSING_MESSAGE
+
+
+def test_connect_passes_dsn_and_timeout_to_psycopg3(monkeypatch: pytest.MonkeyPatch) -> None:
+    import sys
+
+    from ncp.stores.migrations import connect
+
+    fake = MagicMock()
+    monkeypatch.setitem(sys.modules, "psycopg", fake)
+    assert connect("postgresql://localhost/ncp") is fake.connect.return_value
+    fake.connect.assert_called_once_with("postgresql://localhost/ncp")
+    fake.connect.reset_mock()
+    connect("postgresql://localhost/ncp", connect_timeout=3)
+    fake.connect.assert_called_once_with("postgresql://localhost/ncp", connect_timeout=3)

@@ -17,6 +17,7 @@ classifiers = [
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
   "Topic :: Software Development :: Libraries :: Python Modules",
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
@@ -47,7 +48,9 @@ providers = [
   "cohere",
 ]
 tokens = ["tiktoken>=0.7"]
-http = ["aiohttp"]
+# Retained for compatibility: nothing in ncp/ imports aiohttp any more, but removing the
+# extra would break `pip install neural-context-protocol[http]`.
+http = []
 redis = ["redis"]
 pgvector = ["psycopg[binary]", "psycopg-pool", "pgvector"]
 local-embeddings = ["fastembed>=0.4.0"]
@@ -59,6 +62,10 @@ all = [
   "cohere",
   "fastembed>=0.4.0",
   "tiktoken>=0.7",
+  "redis",
+  "psycopg[binary]",
+  "psycopg-pool",
+  "pgvector",
 ]
 dev = [
   "build",
@@ -83,6 +90,7 @@ include = ["ncp*"]
 
 [tool.setuptools.package-data]
 ncp = [
+  "py.typed",
   "templates/*.example",
   "templates/provider_hooks/claude/*",
   "templates/provider_hooks/claude/hooks/*",

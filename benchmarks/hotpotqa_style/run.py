@@ -34,15 +34,16 @@ import json
 import tempfile
 from pathlib import Path
 
-from ncp.eval import EvalTurn
+from ncp.bench.baselines import PlainRagBaseline
+from ncp.eval import ConditionResult, EvalTurn
 from ncp.eval import ncp_condition as _eval_ncp_condition
 from ncp.eval import raw_replay_condition as _eval_raw_replay_condition
 from ncp.eval import sliding_window_condition as _eval_sliding_window_condition
-from ncp.tokens import token_unit
+from ncp.tokens import estimate_tokens, token_unit
 
 from benchmarks.hotpotqa_style.tasks import Task, get_tasks, score_context
 
-_CONDITIONS = ("ncp", "sliding_window", "raw_replay")
+_CONDITIONS = ("ncp", "sliding_window", "raw_replay", "plain_rag")
 
 
 def _to_eval_turns(task: Task) -> list[EvalTurn]:
@@ -85,6 +86,17 @@ def _run_task(
             )
         elif condition == "sliding_window":
             result = _eval_sliding_window_condition(turns, budget=budget)
+        elif condition == "plain_rag":
+            rag = PlainRagBaseline(budget_tokens=budget)
+            rag_context = rag.context_for(
+                transcript=[t.content for t in turns], turn=task.query_text
+            )
+            result = ConditionResult(
+                condition="plain_rag",
+                context=rag_context,
+                context_tokens=estimate_tokens(rag_context),
+                unbounded=False,
+            )
         else:  # raw_replay
             result = _eval_raw_replay_condition(turns)
 
