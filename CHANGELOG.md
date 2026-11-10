@@ -4,6 +4,103 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [Unreleased]
 
+Read **Changed** before upgrading: several requests the HTTP server used to
+accept are now rejected.
+
+### Security
+
+- **HTTP transport hardening** (`ncp/mcp/server.py`): a page open in the
+  user's browser could drive every tool on a local, token-less server with a
+  `text/plain` no-cors POST, and read responses through DNS rebinding. POST
+  now requires `Content-Type: application/json` (`415`), an `Origin` that is
+  neither same-origin nor passed with `--cors-origin` is rejected (`403`) on
+  POST, `/api/*`, `/events` and `/sse`, and on a loopback bind only loopback
+  `Host` values are accepted (`403`). A negative `Content-Length`, which used
+  to read until EOF past the size limit, is `400`. Connections idle on the
+  socket for 30 seconds are closed.
+- **Non-loopback bind requires a token**: `ncp serve` exits with status 2
+  instead of printing a warning.
+- **Trust inputs are validated**: `ncp_record_outcome` requires a finite
+  `weight` with `0 < weight <= 1` (it was unbounded, and `NaN` was accepted). A
+  caller-supplied `base_trust` is capped at the default for the declared `src`.
+- **Whisper ack ownership** (`ncp/stores/sqlite.py`,
+  `ncp/stores/redis_coordination.py`): a targeted whisper can be acknowledged
+  only by its target or its sender. Any agent could previously delete another
+  agent's unread whisper through `ack_whisper_ids`.
+
+### Added
+
+- `ncp doctor [--json]`: checks config, store reachability, pending
+  migrations, the server, the auth header in agent configs, embeddings and
+  optional extras.
+- `ncp --version`.
+- `--json` is accepted wherever `--json-output` is, and on `migrate check`,
+  `viz`, `identity list` and `consolidate`.
+- `ncp init` writes an `Authorization: Bearer ${NCP_AUTH_TOKEN}` header into
+  `.mcp.json` and `opencode.json` when a token is configured, and prints how to
+  export the variable. The token itself is not written to those files.
+- `vacuum(older_than_seconds, dry_run=False)` on the SQLite and sync pgvector
+  stores: removes aged rows from the append-only tables and edge or turn-link
+  rows that point at chunks that no longer exist.
+- Indexes on the expiry columns that soft GC deletes on (created on open for
+  SQLite; migration `019_add_expiry_indexes.sql` for Postgres).
+- A plain BM25 RAG baseline (`ncp.bench.baselines.PlainRagBaseline`) as an
+  additional arm in the needle, task-success, efficacy, HotpotQA-style and
+  pipeline benchmarks.
+- `Dockerfile` and a `server` compose profile for `ncp serve`
+  (`docs/NCP_DOCKER.md`).
+- `CONTRIBUTING.md`, `SECURITY.md`, a `py.typed` marker, Dependabot config,
+  `make lint` and `make build`.
+
+### Changed
+
+- POSTs to `/mcp` and `/message` without `Content-Type: application/json` get
+  `415`. Scripts using raw `curl` must send the header.
+- Requests with a cross-origin `Origin`, or (on a loopback bind) a `Host`
+  other than `localhost`, `127.0.0.1` or `[::1]`, get `403`. This includes
+  `/etc/hosts` aliases for the loopback address.
+- Hard GC evicts the lowest trust/recency chunks first instead of the oldest,
+  and never evicts `user_verified` chunks. A write with no pipeline now counts
+  and evicts only chunks with no pipeline; it used to count across every
+  pipeline.
+- `[pipeline].max_working_chunks` and `gc_threshold` now take effect. They
+  were documented but never passed to the stores. Defaults are unchanged.
+- Generated `turn_`, `out_` and `raw_` ids gain a random suffix. Ids built
+  from a millisecond timestamp collided under concurrent use, which overwrote
+  turns and silently dropped outcomes.
+- Async Redis: an unattributed acknowledgement of a broadcast whisper no
+  longer deletes it for every recipient, matching the sync path. Broadcast
+  delivery hashes now expire.
+- The `all` extra includes `pgvector` and `redis`. The `http` extra is empty;
+  nothing imported `aiohttp`.
+
+### Fixed
+
+- `ncp migrate` and `ncp init --store pgvector` imported `psycopg2`, which the
+  `pgvector` extra does not install. They now use psycopg v3, and a missing
+  driver is reported as an error instead of being skipped.
+- A POST body that is not valid UTF-8 returns `400` instead of dropping the
+  connection.
+- SQLite no longer leaves `whisper_deliveries` rows behind when a broadcast
+  whisper expires.
+
+### Documentation
+
+- The README headline states both token comparisons (about 1.44x against a
+  sliding window, about 13x against raw replay). The benchmark tables report
+  that plain RAG ties NCP on the current lexical benchmarks and beats it on the
+  HotpotQA-style set at budgets of 200 tokens or less, and the needle recall
+  figure is corrected from 0.50 to the measured 1.00.
+- Spec statuses, tool counts and the HTTP API tool list match the code, with a
+  test that every server tool is documented. Three completed planning documents
+  moved to `docs/archive/`.
+
+### CI
+
+- Tests run on Python 3.11, 3.12 and 3.13, with a non-blocking mypy step. The
+  pgvector job no longer installs `psycopg2-binary` and runs the new live store
+  lifecycle tests.
+
 ## [1.8.0] - 2026-11-02
 
 ### Release scope
