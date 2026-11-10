@@ -148,6 +148,31 @@ Observed on June 10, 2026 (mock provider, default budget 400, all 12 tasks):
 - `raw_replay` success rate: `1.0` (12/12, unbounded), median context tokens `806`
 - pass gate (`ncp >= sliding_window` and `ncp >= 0.75`): `true`
 
+### Plain RAG arm
+
+A fourth condition, `plain_rag`, is BM25 top-k over the raw task turns (one
+document per turn, query = the task's `query_text`) packed best-first into the
+same budget, with no trust, recency, dedup or distillation. Reproduce with
+`python3 benchmarks/task_success/run.py --budget <B>` (mock provider, 12
+tasks). Measured success rate (median context tokens):
+
+| Budget | ncp | plain_rag | sliding_window | raw_replay (unbounded) |
+|---:|---:|---:|---:|---:|
+| 150 | 1.00 (115) | 1.00 (132) | 0.00 (114) | 1.00 (806) |
+| 200 | 1.00 (192) | 1.00 (175) | 0.00 (171) | 1.00 (806) |
+| 300 | 1.00 (259) | 1.00 (271.5) | 0.00 (286) | 1.00 (806) |
+| 400 | 1.00 (360) | 1.00 (376) | 0.00 (399) | 1.00 (806) |
+| 800 | 1.00 (567.5) | 1.00 (783) | 0.58 (790.5) | 1.00 (806) |
+
+**Plain RAG ties NCP at every budget tried.** Mock mode only checks whether
+the approved-path slug is present in the context, and the question's query
+shares vocabulary with the turn carrying it, so ordinary lexical retrieval is
+sufficient. This benchmark therefore shows NCP beats recency, not that NCP
+beats retrieval; it does not exercise trust weighting or negation handling
+(mock scoring ignores the rejected paths). At larger budgets NCP used fewer
+tokens than plain RAG for the same success (567 vs 783 at budget 800). No gate
+on plain RAG is asserted.
+
 ## Interpretation
 
 At the matched 400-token budget, NCP's relevance/condition-based retrieval

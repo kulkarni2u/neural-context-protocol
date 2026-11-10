@@ -67,7 +67,7 @@ def test_coding_pipeline_benchmark_beats_naive_replay(tmp_path: Path) -> None:
     assert artifact["token_unit"] in _VALID_TOKEN_UNITS
     assert artifact["turns"] == 12
     assert len(artifact["turn_rows"]) == 12
-    assert set(artifact["summary"]["baselines"]) == {"raw_replay", "sliding_window", "rolling_summary"}
+    assert set(artifact["summary"]["baselines"]) == {"raw_replay", "sliding_window", "rolling_summary", "plain_rag"}
     # NCP beats raw replay at all scales; material_reduction (>=3x),
     # beats_sliding_window, and pass require the full 40-turn run where raw
     # replay has grown enough and NCP's bounded context advantage is clear.
@@ -113,7 +113,7 @@ def test_research_pipeline_benchmark_beats_naive_replay(tmp_path: Path) -> None:
     assert artifact["turns"] == 10
     assert len(artifact["agents"]) == 6
     assert len(artifact["turn_rows"]) == 10
-    assert set(artifact["summary"]["baselines"]) == {"raw_replay", "sliding_window", "rolling_summary"}
+    assert set(artifact["summary"]["baselines"]) == {"raw_replay", "sliding_window", "rolling_summary", "plain_rag"}
     # material_reduction (>=3x) and beats_sliding_window require the full 36-turn run.
     assert artifact["summary"]["beats_naive"] is True
     assert artifact["summary"]["peak_ncp_tokens"] < artifact["summary"]["peak_naive_tokens"]

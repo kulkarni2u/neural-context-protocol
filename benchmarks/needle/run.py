@@ -10,6 +10,7 @@ from pathlib import Path
 import tempfile
 
 from ncp.assembler import Assembler
+from ncp.bench.baselines import PlainRagBaseline
 from ncp.api import agent
 from ncp.benchmarks import estimate_tokens, token_unit
 from ncp.stores.sqlite import SQLiteStore
@@ -125,9 +126,15 @@ def needle_recall(
 
         ncp_hits = 0
         sliding_hits = 0
+        rag_hits = 0
         per_needle: list[dict[str, object]] = []
         sliding_window_ids = planted_order[-budget:]
         sliding_window_text = "\n".join(content_by_chunk_id[chunk_id] for chunk_id in sliding_window_ids)
+        # Plain RAG arm: BM25 over raw chunk texts, packed into the same token
+        # budget the sliding window consumed this turn. No trust/recency/dedup.
+        rag_transcript = [content_by_chunk_id[chunk_id] for chunk_id in planted_order]
+        rag_budget_tokens = estimate_tokens(sliding_window_text)
+        rag = PlainRagBaseline(budget_tokens=rag_budget_tokens)
 
         for needle in needles:
             conscious = _make_conscious(pipeline_id=pipeline_id, turn=turn, needle=needle)
@@ -152,23 +159,32 @@ def needle_recall(
                 first_evicted_turn[needle.chunk_id] = turn
             if sliding_present:
                 sliding_hits += 1
+            rag_selected = rag.select(transcript=rag_transcript, query=needle.query_text)
+            rag_present = needle.content in rag_selected
+            if rag_present:
+                rag_hits += 1
             per_needle.append(
                 {
                     "chunk_id": needle.chunk_id,
                     "kind": needle.kind,
                     "ncp_present": ncp_present,
                     "sliding_window_present": sliding_present,
+                    "plain_rag_present": rag_present,
                     "retrieved_chunk_ids": retrieved_ids,
                 }
             )
 
         ncp_recall = ncp_hits / len(needles)
         sliding_recall = sliding_hits / len(needles)
+        rag_recall = rag_hits / len(needles)
         recall_curve.append(
             {
                 "turn": turn,
                 "ncp_recall": round(ncp_recall, 4),
                 "sliding_window_recall": round(sliding_recall, 4),
+                "plain_rag_recall": round(rag_recall, 4),
+                "plain_rag_hits": rag_hits,
+                "plain_rag_budget_tokens": rag_budget_tokens,
                 "ncp_hits": ncp_hits,
                 "sliding_window_hits": sliding_hits,
                 "window_chunk_budget": budget,
@@ -180,6 +196,7 @@ def needle_recall(
     final_row = recall_curve[-1]
     ncp_final = float(final_row["ncp_recall"])
     sliding_final = float(final_row["sliding_window_recall"])
+    rag_final = float(final_row["plain_rag_recall"])
     reported_deficit = ncp_final < sliding_final
 
     return {
@@ -197,7 +214,10 @@ def needle_recall(
             "recall_at_final": {
                 "ncp": round(ncp_final, 4),
                 "sliding_window": round(sliding_final, 4),
+                "plain_rag": round(rag_final, 4),
             },
+            "ncp_beats_plain_rag": ncp_final > rag_final,
+            "ncp_ties_or_beats_plain_rag": ncp_final >= rag_final,
             "ncp_beats_sliding_window": ncp_final >= sliding_final,
             "reported_deficit": reported_deficit,
             "first_evicted_turn": first_evicted_turn,

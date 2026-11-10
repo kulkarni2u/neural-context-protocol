@@ -6,7 +6,7 @@ benchmarks:
 > At the same requested context budget, does a provider receive enough usable
 > context to name the approved path and avoid rejected paths?
 
-It compares three context strategies over the shared task-success task set:
+It compares four context strategies over the shared task-success task set:
 
 - `ncp`: retrieve and assemble context through NCP.
 - `sliding_window`: keep only the newest raw transcript turns that fit.
@@ -18,6 +18,26 @@ keyless; it measures whether the required facts survived into the prompt, not
 whether a model reasoned well. Anthropic mode calls a live provider and reports
 estimated prompt tokens and USD cost per task. If `ANTHROPIC_API_KEY` is absent,
 the run records a clear skip artifact instead of silently pretending coverage.
+
+A fourth condition, `plain_rag`, is ordinary BM25 top-k retrieval over the raw
+turns packed best-first into the same budget (no trust, recency, dedup or
+distillation).
+
+### Plain RAG result (mock provider)
+
+`python3 benchmarks/efficacy/run.py --provider mock --budget <B> --seeds 5`
+(12 tasks x 5 seeds per condition). Success rate (mean prompt tokens):
+
+| Budget | ncp | plain_rag | rolling_summary | sliding_window |
+|---:|---:|---:|---:|---:|
+| 400 | 1.00 (473.4) | 1.00 (483.8) | 1.00 (487.4) | 0.00 (501.7) |
+| 200 | 1.00 (288.2) | 1.00 (280.6) | 1.00 (285.0) | 0.00 (277.2) |
+
+**Plain RAG ties NCP** (as does the rolling summary). Mock mode checks only
+that the approved-path slug reached the prompt; it does not measure model
+reasoning, trust handling or rejected-path avoidance, so it cannot separate
+NCP from ordinary retrieval. A live-provider comparison would be needed for
+that and has not been run.
 
 ## Run It
 
@@ -50,7 +70,7 @@ The JSON artifact includes:
 - `benchmark`: `provider_real_efficacy`
 - `provider`: `mock` or `anthropic`
 - `budget`, `seeds`, `n_tasks`, and `token_unit`
-- `conditions`: `ncp`, `sliding_window`, `rolling_summary`
+- `conditions`: `ncp`, `sliding_window`, `rolling_summary`, `plain_rag`
 - `config`: retrieval and summary knobs used by the harness
 - `rows`: one row per task, seed, and condition with success, failure type,
   prompt tokens, context tokens, model, cost, cost source, and a response excerpt

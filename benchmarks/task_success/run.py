@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Task-success benchmark — context adequacy at a matched token budget.
 
-For each scripted task (see ``tasks.py``), three context-construction
+For each scripted task (see ``tasks.py``), four context-construction
 conditions are evaluated at a matched token budget ``B``:
 
 - ``ncp``: the scripted turns are written into a fresh SQLite store as chunks
@@ -9,6 +9,8 @@ conditions are evaluated at a matched token budget ``B``:
   question's context is produced by ``Assembler.assemble(..., max_tokens=B)``.
 - ``sliding_window``: the raw transcript's most-recent entries that fit
   within ``B`` estimated tokens (a fixed recency window, no retrieval).
+- ``plain_rag``: BM25 top-k over the raw turns (one document per turn),
+  packed best-first into ``B`` tokens; no trust, recency, dedup or whispers.
 - ``raw_replay``: the full, unbounded transcript — a reference condition
   exempt from the budget, clearly labeled "unbounded" in the artifact.
 
@@ -34,12 +36,13 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from ncp.bench.baselines import PlainRagBaseline
 from ncp.dogfood import get_live_provider_readiness, load_dogfood_adapter
 from ncp.eval import EvalTurn
 from ncp.eval import ncp_condition as _eval_ncp_condition
 from ncp.eval import raw_replay_condition as _eval_raw_replay_condition
 from ncp.eval import sliding_window_condition as _eval_sliding_window_condition
-from ncp.tokens import token_unit
+from ncp.tokens import estimate_tokens, token_unit
 
 from benchmarks.task_success.tasks import Task, get_tasks, score_response
 
@@ -92,6 +95,14 @@ def _sliding_window_context(task: Task, budget: int) -> tuple[str, int]:
     return result.context, result.context_tokens
 
 
+def _plain_rag_context(task: Task, budget: int) -> tuple[str, int]:
+    """BM25 top-k over raw turns packed into ``budget`` tokens (no trust/recency)."""
+
+    rag = PlainRagBaseline(budget_tokens=budget)
+    context = rag.context_for(transcript=[t.content for t in task.turns], turn=task.query_text)
+    return context, estimate_tokens(context)
+
+
 def _raw_replay_context(task: Task) -> tuple[str, int]:
     """Full unbounded transcript — reference condition, exempt from the budget."""
 
@@ -125,7 +136,7 @@ def _live_response(adapter: Any, context: str, task: Task) -> str:
 # Per-task, per-condition evaluation
 # ---------------------------------------------------------------------------
 
-_CONDITIONS = ("ncp", "sliding_window", "raw_replay")
+_CONDITIONS = ("ncp", "sliding_window", "raw_replay", "plain_rag")
 
 
 def _run_task(
@@ -151,6 +162,9 @@ def _run_task(
             unbounded = False
         elif condition == "sliding_window":
             context, context_tokens = _sliding_window_context(task, budget=budget)
+            unbounded = False
+        elif condition == "plain_rag":
+            context, context_tokens = _plain_rag_context(task, budget=budget)
             unbounded = False
         else:  # raw_replay
             context, context_tokens = _raw_replay_context(task)

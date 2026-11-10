@@ -73,3 +73,53 @@ def test_rolling_summary_truncates_long_entries() -> None:
     summary_lines = [line for line in result.split("\n") if line.startswith("SUMMARY")]
     assert len(summary_lines) == 1
     assert len(summary_lines[0]) < 200
+
+
+# --- PlainRagBaseline -------------------------------------------------------
+
+from ncp.bench.baselines import PlainRagBaseline  # noqa: E402
+from ncp.tokens import estimate_tokens  # noqa: E402
+
+_RAG_TRANSCRIPT = [
+    "deploy checklist for the staging cluster",
+    "the zenbrix relay v4 is the approved transport path",
+    "lunch order was sandwiches and soup",
+    "retry backoff tuned to two seconds",
+    "dashboard colors changed to teal",
+]
+
+
+def test_plain_rag_returns_lexically_matching_turn_first() -> None:
+    b = PlainRagBaseline(budget_tokens=100)
+    result = b.context_for(transcript=_RAG_TRANSCRIPT, turn="which zenbrix relay transport is approved")
+    assert result.split("\n")[0] == _RAG_TRANSCRIPT[1]
+
+
+def test_plain_rag_respects_token_budget() -> None:
+    budget = estimate_tokens(_RAG_TRANSCRIPT[1]) + 1
+    b = PlainRagBaseline(budget_tokens=budget)
+    result = b.context_for(transcript=_RAG_TRANSCRIPT, turn="zenbrix relay approved")
+    assert estimate_tokens(result) <= budget + len(_RAG_TRANSCRIPT)  # joins add newlines only
+    assert sum(estimate_tokens(e) for e in b.select(transcript=_RAG_TRANSCRIPT, query="zenbrix")) <= budget
+    assert _RAG_TRANSCRIPT[1] in result
+
+
+def test_plain_rag_is_deterministic_and_tie_breaks_by_order() -> None:
+    b = PlainRagBaseline(budget_tokens=100)
+    ties = ["alpha one", "alpha two", "alpha three"]
+    first = b.select(transcript=ties, query="alpha")
+    assert first == b.select(transcript=ties, query="alpha")
+    assert first == ties
+
+
+def test_plain_rag_empty_inputs_and_zero_budget() -> None:
+    assert PlainRagBaseline().context_for(transcript=[], turn="x") == ""
+    assert PlainRagBaseline(budget_tokens=0).context_for(transcript=["a"], turn="a") == ""
+    assert PlainRagBaseline(budget_tokens=50).select(transcript=["a b"], query="") == ["a b"]
+
+
+def test_plain_rag_skips_oversized_entry_and_keeps_filling() -> None:
+    long_hit = "zenbrix " + "filler " * 200
+    short_hit = "zenbrix short note"
+    b = PlainRagBaseline(budget_tokens=20)
+    assert b.select(transcript=[long_hit, short_hit], query="zenbrix") == [short_hit]

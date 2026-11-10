@@ -602,13 +602,17 @@ NCP adds bounded retrieval, provenance, optional authenticated authorship, disse
 | Scenario                               | Baseline       | Baseline tokens | NCP tokens | Result     | Caveat |
 |----------------------------------------|----------------|----------------:|-----------:|-----------:|--------|
 | 4-agent coding pipeline (40 turns)     | sliding window | 377             | 261        | **1.44x**  | Closest accounting comparison for a bounded recent-context baseline. |
+| 4-agent coding pipeline (40 turns)     | plain RAG (BM25) | 358           | 260        | **1.38x**  | Token accounting only, at the same 340-token ceiling; says nothing about context quality. |
 | 4-agent coding pipeline (40 turns)     | raw replay     | 3,426           | 261        | **13.13x** | Worst-case floor; the ratio scales with turn count. |
 | 4-agent coding pipeline (40 turns)     | rolling summary| 2,096           | 261        | **8.03x**  | Token accounting only; does not score summary quality. |
 | 6-role research pipeline (36 turns)    | raw replay     | 3,277           | 267        | **12.27x** | Worst-case floor for a deterministic synthetic research trace. |
 | Cross-host handoff (Claude -> OpenCode)| window baseline| 0.0 success     | 0.8 success| **+0.8**   | Local harness with a noise-only control, not a distributed-host reliability study. |
-| Needle recall at budget 4              | sliding window | 0.00            | 0.50       | **+0.50**  | Synthetic budget-stress recall check. |
+| Needle recall at budget 4              | sliding window | 0.00            | 1.00       | **+1.00**  | Synthetic budget-stress recall check. |
+| Needle recall at budget 4              | plain RAG (BM25) | 1.00          | 1.00       | **tie**    | Lexical task: any BM25 retriever solves it; shows NCP is not worse than ordinary retrieval, not that it is better. |
 | Task success at matched budget 400 (12 tasks, mock) | sliding window | 0.00 | 1.00 | **+1.00** | Context adequacy with a deterministic mock provider, not live model success. |
+| Task success at matched budget 400 (12 tasks, mock) | plain RAG (BM25) | 1.00 | 1.00 | **tie** | Ties at every budget tried (150-800); mock scoring only checks the fact is present. NCP used fewer tokens at budget 800 (568 vs 783 median). |
 | HotpotQA-style multi-hop QA at matched budget 300 (15 tasks) | sliding window | 0.00 | 1.00 | **+1.00** | Synthetic, HotpotQA-shaped context-adequacy check — not the official HotpotQA dataset or PlugMem's own eval harness (see [the benchmark's README](./benchmarks/hotpotqa_style/README.md)). |
+| HotpotQA-style multi-hop QA at matched budget 300 (15 tasks) | plain RAG (BM25) | 1.00 | 1.00 | **tie** | Plain RAG **beats** NCP at tighter budgets: 1.00 vs 0.60 at budget 150 and 1.00 vs 0.87 at 200. |
 
 MACE multi-agent coordination score (40 turns): **0.8915**
 
@@ -618,6 +622,8 @@ These are deterministic token-accounting benchmarks. The task-success row measur
 A separate, complementary compression benchmark measures ingestion-time noise reduction on a fixed noisy-payload corpus: **33% aggregate token reduction** (537 → 360, `chars_div4`, pass gate aggregate >= 0.20), ranging from **68%** on duplicate-heavy logs down to **2%** on already-dense stack traces (see [the compression benchmark doc](./docs/NCP_BENCHMARK_COMPRESSION.md)).
 
 A third, complementary benchmark targets the many-parallel-workers-to-one-synthesizer fan-in case: with `[retrieval].reduce_fanin_enabled` off (today's default), **25% of NCP's own bounded top-k retrieval slots are near-duplicates of another slot in the same result** on a deterministic 40-worker/4-topic corpus; enabling it merges the near-duplicates, drops malformed candidates, and flags likely contradictions for the reading model, at a **13% token reduction** against an unbounded raw dump of all 40 workers (see [the fan-in reduction benchmark doc](./docs/NCP_BENCHMARK_FANIN_REDUCE.md) for the full methodology and an honest account of the contradiction-flagging heuristic's false-positive rate).
+
+Plain RAG is BM25 top-k over the raw transcript turns packed into the same token budget, with none of NCP's trust weighting, whispers, distillation or consolidation (`ncp.bench.baselines.PlainRagBaseline`). On the context-adequacy benchmarks above it ties NCP, and on the HotpotQA-style set it beats NCP at budgets of 200 tokens or less; these benchmarks do not yet exercise the features that distinguish NCP from ordinary retrieval. Efficacy mock mode (`benchmarks/efficacy`, budgets 200 and 400) shows the same tie: NCP 1.00, plain RAG 1.00, rolling summary 1.00, sliding window 0.00.
 
 Benchmarks are reproducible:
 
