@@ -92,7 +92,8 @@ accept are now rejected.
   other than `localhost`, `127.0.0.1` or `[::1]`, get `403`. This includes
   `/etc/hosts` aliases for the loopback address.
 - Hard GC evicts the lowest trust/recency chunks first instead of the oldest,
-  and never evicts `user_verified` chunks. A write with no pipeline now counts
+  and never evicts `user_verified` chunks; the `[retention]` per-pipeline cap
+  now spares them too. A write with no pipeline now counts
   and evicts only chunks with no pipeline; it used to count across every
   pipeline.
 - `[pipeline].max_working_chunks` and `gc_threshold` now take effect. They

@@ -4804,7 +4804,9 @@ class SQLiteStore(BaseStore):
             return
         rows = connection.execute(
             f"SELECT chunk_id, created_at, base_trust, generation, written_at_drift"
-            f" FROM chunks WHERE {clause}",
+            # user_verified chunks count toward the cap but are never evicted,
+            # matching _hard_gc.
+            f" FROM chunks WHERE {clause} AND src != 'user_verified'",
             params,
         ).fetchall()
         scored = self._eviction_order(rows)

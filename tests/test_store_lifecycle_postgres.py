@@ -178,3 +178,16 @@ def test_fresh_schema_has_expiry_indexes(schema: tuple[Any, str]) -> None:
         "t_idx_tombstones_expires",
         "t_idx_whispers_expires",
     } <= indexes
+
+
+def test_retention_cap_keeps_user_verified(schema: tuple[Any, str]) -> None:
+    admin, name = schema
+    store = _store(name, max_working_chunks_per_pipeline=3)
+    for index in range(2):
+        store.write(_chunk(f"uv_{index}", src="user_verified", trust=0.05), allow_duplicate=True)
+    for index in range(4):
+        store.write(_chunk(f"sub_{index}", trust=0.5 + index * 0.1), allow_duplicate=True)
+
+    remaining = _working_ids(admin, name, "pipe")
+    assert {"uv_0", "uv_1"} <= remaining
+    assert len(remaining) == 3

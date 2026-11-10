@@ -834,7 +834,7 @@ ncp explain --cwd /path/to/project
 | `[embedding]`    | Semantic vector retrieval — on by default (local, no API key); provider, model, graceful lexical-only fallback if `fastembed` is absent |
 | `[reputation]`   | Beta-reputation `gain`, `forget`, `confidence_k`                                           |
 | `[consolidation]`| Similarity threshold, trust floor, and optional LLM model for memory compaction            |
-| `[retention]`    | Hard cap on working chunks per pipeline                                                    |
+| `[retention]`    | Hard cap on working chunks per pipeline (`user_verified` chunks are never evicted)         |
 | `[providers]`    | Per-model pricing used by `ncp cost` (configurable)                                        |
 | `[server]`       | `auth_token` for non-loopback binds                                                        |
 | `[notify]`       | Push delivery: `enabled`, `backend` (auto/memory/redis), `max_subscribers`, `max_wait_seconds`, `poll_interval_seconds` |

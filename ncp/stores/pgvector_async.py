@@ -749,7 +749,7 @@ class AsyncPgvectorStore(BaseStore):
                     f"""
                     SELECT chunk_id, created_at, base_trust, generation, written_at_drift
                     FROM {{schema}}.{{prefix}}chunks
-                    WHERE {clause}
+                    WHERE {clause} AND src != 'user_verified'
                     """
                 ),
                 params,
