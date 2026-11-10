@@ -2,9 +2,9 @@
 
 from typing import Annotated, Literal
 
-from pydantic import Field
+from pydantic import Field, field_validator
 
-from ncp.ontology.models import Contract, Identifier, RetrievalMode
+from ncp.ontology.models import Capability, Contract, Identifier, RetrievalMode
 
 
 class OntologyConfig(Contract):
@@ -22,6 +22,16 @@ class OntologyConfig(Contract):
     trigger_max_ms: Annotated[int, Field(strict=True, ge=1, le=1000)] = 10
     graph_timeout_ms: Annotated[int, Field(strict=True, ge=1, le=5000)] = 50
     fallback_to_memory: bool = Field(default=True, strict=True)
+    # Capabilities granted to callers with no authenticated principal (stdio,
+    # or HTTP without [principals]). verify/admin stay denied unless listed.
+    unauthenticated_capabilities: tuple[Capability, ...] = ("read", "write")
+
+    @field_validator("unauthenticated_capabilities")
+    @classmethod
+    def unique_capabilities(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(set(value)) != len(value):
+            raise ValueError("unauthenticated_capabilities must not repeat a capability")
+        return tuple(sorted(value))
 
     def resolve_mode(
         self,

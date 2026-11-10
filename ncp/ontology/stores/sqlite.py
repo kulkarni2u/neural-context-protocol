@@ -26,8 +26,8 @@ from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 from ncp.ontology.models import (
-    GLOBAL_NAMESPACE, AuthContext, Capability, Entity, EvidenceRef, GraphPath, GraphQuery,
-    GraphResult, Relation, Scope,
+    GLOBAL_NAMESPACE, AuthContext, Capability, Entity, EntityMatch, EvidenceRef, GraphPath,
+    GraphQuery, GraphResult, Relation, Scope, normalize_key,
 )
 from ncp.ontology.registry import RelationType, SchemaRegistry
 
@@ -37,6 +37,13 @@ if TYPE_CHECKING:
 
 class OntologyConflictError(ValueError):
     """An optimistic-concurrency or idempotency precondition did not hold."""
+
+
+class OntologyNotFoundError(ValueError):
+    """A referenced object is missing or outside the caller's readable scope.
+
+    The two cases are deliberately indistinguishable.
+    """
 
 
 _TS_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"  # fixed width, so text order is time order
@@ -524,7 +531,7 @@ class SQLiteOntologyStore:
             source = self._load_entity(connection, relation.src_entity_id, auth)
             target = self._load_entity(connection, relation.dst_entity_id, auth)
             if source is None or target is None:
-                raise ValueError("relation endpoints are not available")
+                raise OntologyNotFoundError("relation endpoints are not available")
             self.registry.validate_relation(relation, source=source, target=target)
             definition = self.registry.relation_definition(relation)
 
@@ -602,7 +609,7 @@ class SQLiteOntologyStore:
         if (existing["tenant_id"], existing["namespace"]) != (
             relation.scope.tenant_id, relation.scope.namespace,
         ):
-            raise ValueError("relation_id is not available")
+            raise OntologyNotFoundError("relation_id is not available")
         identity = (
             str(relation.src_entity_id), str(relation.dst_entity_id),
             relation.relation_type, relation.schema_pack,
@@ -778,6 +785,109 @@ class SQLiteOntologyStore:
         )
         return sql, params
 
+    # -- scoped read helpers (facade) ----------------------------------------
+
+    def get_entities(
+        self, entity_ids: Sequence[UUID | str], *, auth: AuthContext,
+    ) -> dict[str, Entity]:
+        """Visible entities by id, in one read transaction; invisible ids are absent."""
+        _require(auth, "read")
+        found: dict[str, Entity] = {}
+        with self._transaction(write=False) as connection:
+            for entity_id in dict.fromkeys(str(item) for item in entity_ids):
+                entity = self._load_entity(connection, entity_id, auth)
+                if entity is not None:
+                    found[entity_id] = entity
+        return found
+
+    def resolve_entities(
+        self, key: str, *, auth: AuthContext, entity_type: str | None = None,
+        schema_pack: str | None = None, limit: int = 20,
+    ) -> tuple[EntityMatch, str]:
+        """Exact lookup of ``key`` among visible, live entities.
+
+        Canonical-key matches win; aliases are consulted only when no
+        canonical key matches. Returns the match (``entity_ids`` sorted, at most
+        ``limit + 1`` so callers can tell truncation) and which column matched
+        (``"canonical_key"``, ``"alias"`` or ``"none"``). Never picks a winner
+        among several matches.
+        """
+        _require(auth, "read")
+        normalized = normalize_key(key)
+        if not 1 <= len(normalized) <= 256:
+            raise ValueError("lookup key must contain 1 to 256 characters")
+        params: dict[str, Any] = {
+            "tenant": auth.scope.tenant_id, "namespace": auth.scope.namespace,
+            "global": GLOBAL_NAMESPACE, "key": normalized, "limit": limit + 1,
+        }
+        filters = ""
+        if entity_type is not None:
+            filters += " AND e.entity_type = :entity_type"
+            params["entity_type"] = entity_type
+        if schema_pack is not None:
+            filters += " AND e.schema_pack = :schema_pack"
+            params["schema_pack"] = schema_pack
+        visible = (
+            "e.tenant_id = :tenant AND e.namespace IN (:namespace, :global)"
+            " AND e.deleted_at IS NULL" + filters
+        )
+        with self._transaction(write=False) as connection:
+            for column, sql in (
+                ("canonical_key",
+                 f"SELECT e.entity_id FROM ontology_entities e WHERE {visible}"
+                 " AND e.canonical_key = :key ORDER BY e.entity_id LIMIT :limit"),
+                ("alias",
+                 "SELECT DISTINCT e.entity_id FROM ontology_aliases a"
+                 " JOIN ontology_entities e ON e.entity_id = a.entity_id"
+                 f" WHERE {visible} AND a.alias = :key ORDER BY e.entity_id LIMIT :limit"),
+            ):
+                ids = [UUID(entity_id) for (entity_id,) in self._plain(connection).execute(
+                    sql, params,
+                )]
+                if ids:
+                    return EntityMatch(entity_ids=tuple(ids), matched_key=normalized), column
+        return EntityMatch(entity_ids=(), matched_key=normalized), "none"
+
+    def explain_relation(
+        self, relation_id: UUID, *, auth: AuthContext,
+    ) -> tuple[Relation, list[dict[str, Any]]] | None:
+        """A visible relation plus every evidence row (valid or not) with liveness.
+
+        ``None`` when the relation is missing or outside the caller's scope.
+        Each evidence row carries ``status`` (``valid``/``invalidated``) and
+        ``live``: valid, and for chunk evidence the chunk is still live.
+        """
+        _require(auth, "read")
+        now = datetime.now(timezone.utc)
+        with self._transaction(write=False) as connection:
+            relation = self._load_relation(connection, relation_id, auth)
+            if relation is None:
+                return None
+            evidence: list[dict[str, Any]] = []
+            for row in self._rows(
+                connection,
+                "SELECT * FROM ontology_relation_evidence WHERE relation_id = ?"
+                " ORDER BY evidence_type, evidence_id, source_revision",
+                (str(relation_id),),
+            ):
+                live = row["status"] == "valid" and (
+                    row["evidence_type"] != "chunk"
+                    or self._chunk_live(
+                        connection, row["evidence_id"], relation.scope.namespace, now,
+                    )
+                )
+                evidence.append({
+                    "evidence_type": row["evidence_type"],
+                    "evidence_id": row["evidence_id"],
+                    "source_revision": row["source_revision"],
+                    "observed_at": row["observed_at"],
+                    "status": row["status"],
+                    "invalidated_reason": row["invalidated_reason"],
+                    "invalidated_at": row["invalidated_at"],
+                    "live": live,
+                })
+            return relation, evidence
+
     def invalidate_evidence(
         self, chunk_ids: Sequence[str], *, auth: AuthContext, reason: str,
     ) -> int:
@@ -855,7 +965,7 @@ class SQLiteOntologyStore:
                 (str(relation_id), auth.scope.tenant_id, auth.scope.namespace),
             )
             if row is None:
-                raise ValueError("relation is not available")
+                raise OntologyNotFoundError("relation is not available")
             if row["asserted_by"] != auth.principal_id:
                 _require(auth, "admin")
             if row["status"] != "revoked":

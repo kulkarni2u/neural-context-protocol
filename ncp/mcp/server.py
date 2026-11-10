@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime
 from hashlib import sha256
@@ -31,6 +32,7 @@ from ncp.chunker import filter_content
 from ncp.config import NCPConfig, load_config
 from ncp.context_policy import ContextPolicyError, resolve_context_policy
 from ncp.drift import EmbeddingAdapter, compute_drift
+from ncp.ontology.facade import OntologyFacade, make_tool_handlers as make_ontology_tool_handlers
 from ncp.principals import (
     AuthorizationError,
     Principal,
@@ -1108,6 +1110,164 @@ MCP_TOOLS: list[dict[str, object]] = [
     },
 ]
 
+# Opt-in ontology tools (design §7). Kept OUT of MCP_TOOLS so that with
+# ``[ontology] enabled = false`` (the default) tools/list stays byte-for-byte
+# what it was; tools_for_config appends them only when the ontology is on.
+_ONTOLOGY_PIPELINE_ARG: dict[str, object] = {
+    "type": "string",
+    "description": (
+        "Ontology namespace: a pipeline_id, or 'global'. Reads see this namespace plus "
+        "'global' (default 'global'); writes target exactly this namespace and require it. "
+        "Writing 'global' needs the admin capability."
+    ),
+}
+_ONTOLOGY_EVIDENCE_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "properties": {
+        "evidence_type": {"type": "string", "enum": ["chunk", "external_attestation"]},
+        "evidence_id": {"type": "string", "description": "NCP chunk_id or attestation id."},
+        "source_revision": {"type": "string"},
+        "observed_at": {"type": "string", "description": "ISO-8601 timestamp with timezone."},
+    },
+    "required": ["evidence_type", "evidence_id", "source_revision", "observed_at"],
+}
+ONTOLOGY_MCP_TOOLS: list[dict[str, object]] = [
+    {
+        "name": "ncp_ontology_capabilities",
+        "description": (
+            "Discover the opt-in domain ontology: whether it is enabled, its provider, schema "
+            "packs with versions and entity/relation types, traversal limits and tool names. "
+            "Optional: ordinary NCP context works without calling it."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "ncp_ontology_query",
+        "description": (
+            "Bounded, authorized graph lookup. Resolve ONE seed by entity_id or by exact key "
+            "(canonical key, then alias; entity_type narrows it), then traverse relations in both "
+            "directions. Several matches return resolved=false with candidates instead of a "
+            "guess. Limits are clamped to the server's configuration. Results are evidence-backed "
+            "facts, not execution authorization. Returns {ok, ...} or {ok:false, error:{code, message}}."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pipeline_id": _ONTOLOGY_PIPELINE_ARG,
+                "entity_id": {"type": "string", "description": "Seed entity UUID."},
+                "key": {"type": "string", "description": "Exact canonical key or alias of the seed."},
+                "entity_type": {"type": "string", "description": "Restrict key lookup to this type."},
+                "schema_pack": {"type": "string", "description": "Restrict key lookup to this pack."},
+                "relation_types": {"type": "array", "items": {"type": "string"}},
+                "max_hops": {"type": "integer", "minimum": 0},
+                "max_nodes": {"type": "integer", "minimum": 1},
+                "max_edges": {"type": "integer", "minimum": 1},
+                "verified_only": {
+                    "type": "boolean",
+                    "description": "Only verified relations with live evidence (server default).",
+                },
+            },
+        },
+    },
+    {
+        "name": "ncp_ontology_explain",
+        "description": (
+            "Read-only: one relation with all its evidence (valid/invalidated, live or not) and "
+            "its validity (status, validity window, evidence support). A relation outside the "
+            "caller's readable scope is reported as not_found."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pipeline_id": _ONTOLOGY_PIPELINE_ARG,
+                "relation_id": {"type": "string"},
+            },
+            "required": ["relation_id"],
+        },
+    },
+    {
+        "name": "ncp_ontology_assert",
+        "description": (
+            "Write an entity (kind='entity') or a relation (kind='relation') into the pipeline_id "
+            "namespace. Needs write permission; status='verified' needs the verify capability and "
+            "live evidence; 'global' needs admin. Relations require idempotency_key and "
+            "observed_at; created_by is always the authenticated caller."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "kind": {"type": "string", "enum": ["entity", "relation"]},
+                "pipeline_id": _ONTOLOGY_PIPELINE_ARG,
+                "entity": {
+                    "type": "object",
+                    "description": (
+                        "entity_type, canonical_key, display_name, aliases[], attributes{}, "
+                        "schema_pack, schema_version, deleted_at."
+                    ),
+                    "properties": {
+                        "entity_type": {"type": "string"},
+                        "canonical_key": {"type": "string"},
+                        "display_name": {"type": "string"},
+                        "aliases": {"type": "array", "items": {"type": "string"}},
+                        "attributes": {"type": "object"},
+                        "schema_pack": {"type": "string"},
+                        "schema_version": {"type": "integer"},
+                        "deleted_at": {"type": "string"},
+                    },
+                },
+                "expected_version": {
+                    "type": "integer",
+                    "description": "Entity only: revision last seen (0 = must not exist yet).",
+                },
+                "relation": {
+                    "type": "object",
+                    "description": (
+                        "src_entity_id, dst_entity_id, relation_type, confidence, observed_at, "
+                        "status (candidate|verified|disputed), valid_from, valid_until, "
+                        "attributes{}, evidence[], schema_pack, schema_version, relation_id."
+                    ),
+                    "properties": {
+                        "relation_id": {"type": "string"},
+                        "src_entity_id": {"type": "string"},
+                        "dst_entity_id": {"type": "string"},
+                        "relation_type": {"type": "string"},
+                        "status": {"type": "string", "enum": ["candidate", "verified", "disputed"]},
+                        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                        "valid_from": {"type": "string"},
+                        "valid_until": {"type": "string"},
+                        "observed_at": {"type": "string"},
+                        "attributes": {"type": "object"},
+                        "evidence": {"type": "array", "items": _ONTOLOGY_EVIDENCE_SCHEMA},
+                        "schema_pack": {"type": "string"},
+                        "schema_version": {"type": "integer"},
+                    },
+                },
+                "idempotency_key": {
+                    "type": "string",
+                    "description": "Relation only, required: replays with the same payload are no-ops.",
+                },
+            },
+            "required": ["kind", "pipeline_id"],
+        },
+    },
+    {
+        "name": "ncp_ontology_revoke",
+        "description": (
+            "Revoke a relation in the pipeline_id namespace (idempotent, audited). Revoking a "
+            "relation another principal asserted needs the admin capability."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pipeline_id": _ONTOLOGY_PIPELINE_ARG,
+                "relation_id": {"type": "string"},
+                "reason": {"type": "string"},
+            },
+            "required": ["pipeline_id", "relation_id", "reason"],
+        },
+    },
+]
+
 CORE_TOOL_NAMES = frozenset({
     "ncp_get_context",
     "ncp_write_memory",
@@ -1118,6 +1278,7 @@ CORE_TOOL_NAMES = frozenset({
 MEMO_TOOL_NAMES = frozenset({"ncp_lookup_memo", "ncp_record_memo", "ncp_verify_memo"})
 NOTIFY_TOOL_NAMES = frozenset({"ncp_wait_whispers"})
 TASK_TOOL_NAMES = frozenset({"ncp_task"})
+ONTOLOGY_TOOL_NAMES = frozenset(str(tool["name"]) for tool in ONTOLOGY_MCP_TOOLS)
 
 
 def tools_for_config(config: NCPConfig | None) -> list[dict[str, object]]:
@@ -1134,7 +1295,12 @@ def tools_for_config(config: NCPConfig | None) -> list[dict[str, object]]:
         enabled_names = set(enabled_names) - NOTIFY_TOOL_NAMES
     if not config.tasks_enabled:
         enabled_names = set(enabled_names) - TASK_TOOL_NAMES
-    return [tool for tool in MCP_TOOLS if str(tool["name"]) in enabled_names]
+    tools = [tool for tool in MCP_TOOLS if str(tool["name"]) in enabled_names]
+    # Ontology tools: full profile and [ontology] enabled only. Disabled (the
+    # default) leaves the list exactly as above.
+    if config.tool_profile != "core" and config.ontology.enabled:
+        tools += ONTOLOGY_MCP_TOOLS
+    return tools
 
 
 def handlers_for_tools(
@@ -2954,7 +3120,7 @@ def make_handlers(
     # LRU+TTL pruning without widening the returned handler mapping.
     _handle_get_context.fetch_sessions = sessions  # type: ignore[attr-defined]
 
-    return {
+    handlers: dict[str, ToolHandler] = {
         "ncp_get_context": _handle_get_context,
         "ncp_write_memory": _handle_write_memory,
         "ncp_emit_whisper": _handle_emit_whisper,
@@ -2974,6 +3140,13 @@ def make_handlers(
         "ncp_recall": _handle_recall,
         "ncp_improve": _handle_improve,
     }
+    if config is not None and config.ontology.enabled:
+        # Opt-in: only an enabled [ontology] builds the facade (and so creates
+        # the ontology tables). Disabled leaves the handler table unchanged.
+        handlers.update(make_ontology_tool_handlers(
+            OntologyFacade.from_config(config, store), current_principal,
+        ))
+    return handlers
 
 
 def _int_arg(args: dict[str, object], name: str, default: int) -> int:
@@ -3250,6 +3423,16 @@ def _negotiate_version(client_version: str) -> str:
 # JSON-RPC error code for a tool call the authenticated principal may not make.
 FORBIDDEN_ERROR_CODE = -32003
 
+# Trusted channel from the transport to handlers: the principal that
+# authenticated the current tools/call (None for stdio / no [principals]).
+# Set only by _handle_request around the handler call; handlers that need an
+# identity (the ontology tools) read it here, never from tool arguments.
+_CURRENT_PRINCIPAL: ContextVar[Principal | None] = ContextVar("ncp_current_principal", default=None)
+
+
+def current_principal() -> Principal | None:
+    return _CURRENT_PRINCIPAL.get()
+
 
 def _handle_request(
     req: dict[str, object],
@@ -3302,6 +3485,7 @@ def _handle_request(
         handler = handlers.get(tool_name) if tool_name in enabled_names else None
         if handler is None:
             return _err_response(req_id, -32601, f"Tool not found: {tool_name}")
+        principal_token = _CURRENT_PRINCIPAL.set(principal if authorizer is not None else None)
         try:
             if principal is not None and authorizer is not None:
                 arguments = authorizer.check_call(principal, tool_name, arguments)
@@ -3324,6 +3508,8 @@ def _handle_request(
         except Exception as exc:
             _err(f"Tool {tool_name} error: {traceback.format_exc()}")
             return _err_response(req_id, -32603, f"Tool error: {exc}")
+        finally:
+            _CURRENT_PRINCIPAL.reset(principal_token)
 
     # Respond with method-not-found only for requests (have an id); silently drop unknown notifications
     if req_id is None:

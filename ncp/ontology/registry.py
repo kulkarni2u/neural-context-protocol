@@ -55,6 +55,14 @@ class SchemaRegistry:
             raise ValueError("schema pack version is already registered")
         self._packs[key] = pack.model_copy(deep=True)
 
+    def packs(self) -> tuple[SchemaPack, ...]:
+        """Registered packs ordered by (id, version)."""
+        return tuple(self._packs[key] for key in sorted(self._packs))
+
+    def latest_version(self, pack_id: str) -> int | None:
+        versions = [version for (name, version) in self._packs if name == pack_id]
+        return max(versions) if versions else None
+
     def _pack(self, pack_id: str, version: int) -> SchemaPack:
         try:
             return self._packs[pack_id, version]

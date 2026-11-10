@@ -677,6 +677,54 @@ or unreadable outcome blocks reuse, regardless of confidence or outcome age.
 The packet includes `schema_version` for clients recording the decision.
 Compilation suppresses automatic embedding calls on every store backend.
 
+### Ontology tools (opt-in)
+
+Listed only with `[ontology] enabled = true` and the `full` tool profile
+(SQLite store). With the ontology disabled (the default) `tools/list` and every
+other tool response are byte-for-byte unchanged, and calling an ontology tool
+returns the ordinary `-32601 Tool not found` error.
+
+| Tool | Purpose |
+|------|---------|
+| `ncp_ontology_capabilities` | enabled flag, provider, packs with versions and entity/relation types, limits, tool names. Disabled: `{"ok": true, "enabled": false, "version": "1"}` |
+| `ncp_ontology_query` | resolve one seed (`entity_id`, or exact `key`: canonical key, then alias; `entity_type` narrows), then bounded traversal. Several matches → `resolved: false` with `ambiguity.candidates`, never a guess. `max_hops`/`max_nodes`/`max_edges` are clamped to the config (with a `clamped:` warning); `verified_only` defaults to the config |
+| `ncp_ontology_explain` | one relation, every evidence row (`status`, `live`) and `validity` (`active`, `evidence_supported`, `verified_and_supported`). Read-only |
+| `ncp_ontology_assert` | `kind: "entity"` (+ `expected_version`) or `kind: "relation"` (requires `idempotency_key` and `observed_at`; `created_by` is always the caller) |
+| `ncp_ontology_revoke` | revoke a relation (idempotent, audited) |
+
+```bash
+curl -s $BASE/mcp -H "$AUTH" -H 'Content-Type: application/json' -d '{
+  "jsonrpc": "2.0", "id": 11, "method": "tools/call",
+  "params": {"name": "ncp_ontology_query", "arguments": {
+    "pipeline_id": "pipe_demo", "key": "checkout", "entity_type": "Service", "max_hops": 2
+  }}}'
+```
+
+**Namespaces and permissions.** `pipeline_id` names the namespace (a pipeline,
+or `global`). Reads see that namespace plus `global` (default `global`); writes
+require `pipeline_id` and target exactly it. Permissions never come from tool
+arguments; they come from the authenticated principal:
+
+- read + write on pipelines in the principal's allowlist (any pipeline without
+  one); `global` is readable by every principal, writable only with `admin`;
+- `verify` (assert or change a `verified` relation) if the principal has
+  `verify`; `admin` (global writes, revoking another principal's relation) if
+  it has `admin`;
+- no principal (stdio, or HTTP without `[principals]`): principal `local` with
+  `[ontology] unauthenticated_capabilities` (default `["read", "write"]`, so
+  verified relations and global writes are denied).
+
+A pipeline outside the allowlist is rejected with `-32003 Forbidden` before the
+handler runs, like other pipeline-scoped tools.
+
+**Results.** Success: `{"ok": true, ...}`. Failure:
+`{"ok": false, "error": {"code": ..., "message": ...}}` with `code` one of
+`conflict` (idempotency key reused with another payload, revision mismatch),
+`forbidden`, `invalid`, `not_found`, `disabled`, `limit` (a hard bound such as
+more than 100 `relation_types` or 32 evidence refs). An object outside the
+caller's readable scope is reported exactly like a missing one (`not_found`);
+an authorization failure never falls back to an unscoped query.
+
 ## Streaming
 
 Pass `"stream": true` to `ncp_get_context`. Over HTTP the response is NDJSON:

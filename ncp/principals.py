@@ -76,11 +76,30 @@ PIPELINE_SCOPED_TOOLS = frozenset({
     "ncp_remember",
     "ncp_recall",
     "ncp_improve",
+    "ncp_ontology_query",
+    "ncp_ontology_explain",
+    "ncp_ontology_assert",
+    "ncp_ontology_revoke",
 })
+
+# Ontology tools whose ``pipeline_id`` may also be the reserved ``global``
+# namespace, which every principal may read. Writes to it are gated by the
+# ontology auth mapping (admin only), not here.
+ONTOLOGY_NAMESPACE_TOOLS = frozenset({
+    "ncp_ontology_query",
+    "ncp_ontology_explain",
+    "ncp_ontology_assert",
+    "ncp_ontology_revoke",
+})
+ONTOLOGY_GLOBAL_NAMESPACE = "global"
 
 # Tools with no acting-agent argument and no pipeline_id, scoped by lookups
 # instead (documented so the catalog check can tell "reviewed" from "missed").
-LOOKUP_SCOPED_TOOLS = frozenset({"ncp_overview", "ncp_get_decision", "ncp_record_outcome"})
+LOOKUP_SCOPED_TOOLS = frozenset({
+    "ncp_overview", "ncp_get_decision", "ncp_record_outcome",
+    # Static server metadata: no pipeline data, nothing to scope.
+    "ncp_ontology_capabilities",
+})
 
 _TASK_ID_ACTIONS = frozenset({"heartbeat", "release", "complete", "cancel", "get"})
 _MEMO_TOOLS = frozenset({"ncp_lookup_memo", "ncp_record_memo", "ncp_verify_memo"})
@@ -400,6 +419,8 @@ class ToolAuthorizer:
             # a pipeline_id passed alongside must still be allowed.
             if action in _TASK_ID_ACTIONS and _str_or_none(args.get("pipeline_id")) is None:
                 return
+        if tool in ONTOLOGY_NAMESPACE_TOOLS and _str_or_none(args.get("pipeline_id")) == ONTOLOGY_GLOBAL_NAMESPACE:
+            return
         if tool in _MEMO_TOOLS and args.get("signature") is not None:
             raise AuthorizationError(
                 f"{tool}: principal {principal.name!r} is pipeline-limited; pass task/context/pipeline_id "
