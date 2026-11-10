@@ -33,6 +33,7 @@ from ncp.stores.base import (
     NCPStoreUnavailableError,
     _validate_turn_chunk_relation,
     merge_outcome_chunk_rows,
+    resolve_gc_limits,
 )
 from ncp.stores import overview_sql, task_sql
 from ncp.stores.overview_facts import INBOX_MIN_CONFIDENCE, inbox_counts, live_whispers, newest_results, whisper_activity
@@ -97,6 +98,22 @@ _IN_BATCH = 500  # ids per IN (...) query
 logger = logging.getLogger("ncp")
 
 
+def _eviction_order(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Sort eviction candidates lowest trust/recency score first."""
+    now = time.time()
+    return sorted(
+        rows,
+        key=lambda row: score_trust_recency_candidate(
+            DEFAULT_RETRIEVAL_POLICY,
+            created_at=float(row["created_at"]),
+            now=now,
+            base_trust=float(row["base_trust"]),
+            generation=int(row["generation"]),
+            written_at_drift=float(row["written_at_drift"]) if row["written_at_drift"] is not None else 0.0,
+        ),
+    )
+
+
 class AsyncPgvectorStore(BaseStore):
     """Async-native pgvector store.
 
@@ -113,8 +130,8 @@ class AsyncPgvectorStore(BaseStore):
         min_pool_connections: int = 2,
         max_pool_connections: int = 10,
         open_pool: bool = False,
-        max_working_chunks: int = 500,
-        gc_threshold: int = 400,
+        max_working_chunks: int | None = None,
+        gc_threshold: int | None = None,
         max_working_chunks_per_pipeline: int = 0,
         redis_url: str | None = None,
         redis_stream: str = "ncp:whispers",
@@ -128,8 +145,10 @@ class AsyncPgvectorStore(BaseStore):
         self.table_prefix = _validate_identifier(table_prefix, field="table_prefix")
         self._min_pool = min_pool_connections
         self._max_pool = max_pool_connections
-        self.max_working_chunks = max_working_chunks
-        self.gc_threshold = gc_threshold
+        # Explicit arguments win; otherwise [pipeline] config, else 500/400.
+        self.max_working_chunks, self.gc_threshold = resolve_gc_limits(
+            max_working_chunks, gc_threshold, config
+        )
         self.max_working_chunks_per_pipeline = max_working_chunks_per_pipeline
         self.retention_evictions = 0
         # CAP-C7/WI-P2: see SQLiteStore.last_write_inferred_edge_count.
@@ -631,7 +650,11 @@ class AsyncPgvectorStore(BaseStore):
         return False
 
     async def _async_hard_gc(self, conn: Any, *, pipeline_id: str | None) -> None:
-        """Evict oldest working-zone chunks if count exceeds max_working_chunks."""
+        """Cap one pipeline's working zone; see ``SQLiteStore._hard_gc``.
+
+        Evicts lowest trust/recency score first, never ``user_verified``
+        chunks, and scopes ``pipeline_id=None`` to ``pipeline_id IS NULL``.
+        """
         # WI-006: drop expired chunks before evaluating overflow capacity.
         async with conn.cursor() as cur:
             await cur.execute(
@@ -640,19 +663,19 @@ class AsyncPgvectorStore(BaseStore):
                 ),
                 (time.time(),),
             )
-        clauses = ["zone = 'working'"]
-        params: list[object] = []
-        if pipeline_id is not None:
-            clauses.append("pipeline_id = %s")
-            params.append(pipeline_id)
-        where = " AND ".join(clauses)
+        if pipeline_id is None:
+            clause = "pipeline_id IS NULL AND zone = 'working'"
+            params: tuple[object, ...] = ()
+        else:
+            clause = "pipeline_id = %s AND zone = 'working'"
+            params = (pipeline_id,)
 
         async with conn.cursor() as cur:
             await cur.execute(
                 self._sql(
-                    f"SELECT COUNT(*) AS count FROM {{schema}}.{{prefix}}chunks WHERE {where}"
+                    f"SELECT COUNT(*) AS count FROM {{schema}}.{{prefix}}chunks WHERE {clause}"
                 ),
-                tuple(params),
+                params,
             )
             raw = await cur.fetchone()
             description = cur.description
@@ -660,30 +683,31 @@ class AsyncPgvectorStore(BaseStore):
         count = int(row["count"]) if row is not None else 0
         if count <= self.max_working_chunks:
             return
-
         overflow = count - self.gc_threshold
+        if overflow <= 0:
+            return
+
         async with conn.cursor() as cur:
             await cur.execute(
                 self._sql(
                     f"""
-                    SELECT chunk_id FROM {{schema}}.{{prefix}}chunks
-                    WHERE {where}
-                    ORDER BY created_at ASC
-                    LIMIT %s
+                    SELECT chunk_id, created_at, base_trust, generation, written_at_drift
+                    FROM {{schema}}.{{prefix}}chunks
+                    WHERE {clause} AND src != 'user_verified'
                     """
                 ),
-                (*params, overflow),
+                params,
             )
-            stale_rows = await cur.fetchall()
+            raw_rows = await cur.fetchall()
             description = cur.description
-
-        stale = [self._normalize_row(r, description) for r in stale_rows]
-        if not stale:
+        rows = [self._normalize_row(r, description) for r in raw_rows]
+        evict_ids = [str(r["chunk_id"]) for r in _eviction_order(rows)[:overflow]]
+        if not evict_ids:
             return
         async with conn.cursor() as cur:
             await cur.executemany(
                 self._sql("DELETE FROM {schema}.{prefix}chunks WHERE chunk_id = %s"),
-                [(str(row["chunk_id"]),) for row in stale],
+                [(chunk_id,) for chunk_id in evict_ids],
             )
 
     async def _async_enforce_retention(self, conn: Any, *, pipeline_id: str | None) -> None:
@@ -722,18 +746,7 @@ class AsyncPgvectorStore(BaseStore):
             description = cur.description
         rows = [self._normalize_row(r, description) for r in raw_rows]
 
-        now = time.time()
-        scored = sorted(
-            rows,
-            key=lambda row: score_trust_recency_candidate(
-                DEFAULT_RETRIEVAL_POLICY,
-                created_at=float(row["created_at"]),
-                now=now,
-                base_trust=float(row["base_trust"]),
-                generation=int(row["generation"]),
-                written_at_drift=float(row["written_at_drift"]) if row["written_at_drift"] is not None else 0.0,
-            ),
-        )
+        scored = _eviction_order(rows)
         overflow = count - cap
         evict_ids = [str(row["chunk_id"]) for row in scored[:overflow]]
         if not evict_ids:

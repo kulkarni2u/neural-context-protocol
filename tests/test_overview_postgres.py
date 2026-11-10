@@ -625,13 +625,24 @@ class TestRealPgvectorSchema:
 
             with psycopg.connect(LIVE_DSN) as conn:
                 runner = MigrationRunner(conn, schema=mig_schema, prefix="t_")
-                assert [m.version for m in runner.pending()] == [18]
-                assert runner.apply_all() == [{"version": 18, "name": "018_add_tasks"}]
+                assert [m.version for m in runner.pending()][0] == 18
+                applied = runner.apply_all()
+                assert applied[0] == {"version": 18, "name": "018_add_tasks"}
+                assert {"version": 19, "name": "019_add_expiry_indexes"} in applied
                 assert runner.pending() == [] and runner.check().mismatches == []
 
             assert _columns(mig_admin, mig_schema, "t_tasks") == _columns(fresh_admin, fresh_schema, "t_tasks")
             assert _index_defs(mig_admin, mig_schema, "t_tasks") == _index_defs(fresh_admin, fresh_schema, "t_tasks")
             assert len(_index_defs(mig_admin, mig_schema, "t_tasks")) >= 4
+            # Migration 019's expiry indexes exist on both paths.
+            for table, index in (
+                ("t_chunks", "t_idx_chunks_expiry"),
+                ("t_turn_records", "t_idx_turns_expires"),
+                ("t_tombstones", "t_idx_tombstones_expires"),
+                ("t_whispers", "t_idx_whispers_expires"),
+            ):
+                for admin, schema in ((mig_admin, mig_schema), (fresh_admin, fresh_schema)):
+                    assert any(index in d for d in _index_defs(admin, schema, table)), (schema, index)
             # The migrated database serves the ledger and the overview.
             migrated = _pg_store(mig_schema)
             assert migrated.overview_rows() == []

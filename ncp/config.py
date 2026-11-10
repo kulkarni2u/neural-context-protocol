@@ -701,6 +701,17 @@ class NCPConfig:
         return str(val) if val else None
 
     @property
+    def pipeline_max_working_chunks(self) -> int:
+        """Per-pipeline working-zone cap that triggers hard GC (``[pipeline]``)."""
+        return max(1, int(self.values.get("pipeline", {}).get("max_working_chunks", 500)))
+
+    @property
+    def pipeline_gc_threshold(self) -> int:
+        """Working-zone size hard GC evicts down to; clamped to ``[0, max_working_chunks]``."""
+        raw = int(self.values.get("pipeline", {}).get("gc_threshold", 400))
+        return min(max(0, raw), self.pipeline_max_working_chunks)
+
+    @property
     def retention_max_working_chunks_per_pipeline(self) -> int:
         return int(self.values.get("retention", {}).get("max_working_chunks_per_pipeline", 0))
 

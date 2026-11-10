@@ -22,7 +22,9 @@ from ncp.stores.base import (
     NCPStoreError,
     NCPStoreUnavailableError,
     _validate_turn_chunk_relation,
+    _vacuum_cutoff,
     merge_outcome_chunk_rows,
+    resolve_gc_limits,
 )
 from ncp.stores.bitemporal import collect_successor_ids, filter_bitemporal
 from ncp.stores.calibration import (
@@ -60,7 +62,7 @@ from ncp.stores.retrieval import (
 from ncp.tokens import estimate_tokens
 from ncp.stores import overview_sql, task_sql
 from ncp.stores.overview_facts import INBOX_MIN_CONFIDENCE, inbox_counts, live_whispers, newest_results, whisper_activity
-from ncp.types import CalibrationReport, ChunkEdge, ConsolidationReport, ConsciousBlock, DecisionRecord, NCPResponse, OutcomeRecord, SubconsciousChunk, TaskOpResult, TaskRecord, TaskStatus, TurnRecord, Whisper
+from ncp.types import CalibrationReport, ChunkEdge, ConsolidationReport, ConsciousBlock, DecisionRecord, NCPResponse, OutcomeRecord, SubconsciousChunk, TaskOpResult, TaskRecord, TaskStatus, TASK_TERMINAL_STATUSES, TurnRecord, Whisper
 
 logger = logging.getLogger("ncp")
 
@@ -191,6 +193,15 @@ CREATE INDEX IF NOT EXISTS {prefix}idx_conscious_agent
     ON {schema}.{prefix}conscious_log(agent_id, logged_at);
 CREATE INDEX IF NOT EXISTS {prefix}idx_cost_pipeline
     ON {schema}.{prefix}cost_log(pipeline_id, logged_at);
+CREATE INDEX IF NOT EXISTS {prefix}idx_chunks_expiry
+    ON {schema}.{prefix}chunks(expiry)
+    WHERE expiry IS NOT NULL;
+CREATE INDEX IF NOT EXISTS {prefix}idx_turns_expires
+    ON {schema}.{prefix}turn_records(expires_at);
+CREATE INDEX IF NOT EXISTS {prefix}idx_tombstones_expires
+    ON {schema}.{prefix}tombstones(expires_at);
+CREATE INDEX IF NOT EXISTS {prefix}idx_whispers_expires
+    ON {schema}.{prefix}whispers(expires_at);
 
 CREATE TABLE IF NOT EXISTS {schema}.{prefix}embedding_cost_log (
     id BIGSERIAL PRIMARY KEY,
@@ -418,8 +429,8 @@ class PgvectorStore(BaseStore):
         redis_url: str | None = None,
         redis_stream: str = "ncp:whispers",
         coordination: RedisCoordination | None = None,
-        max_working_chunks: int = 500,
-        gc_threshold: int = 400,
+        max_working_chunks: int | None = None,
+        gc_threshold: int | None = None,
         max_working_chunks_per_pipeline: int = 0,
         ivfflat_probes: int = 10,
         retrieval_policy: RetrievalPolicy | None = None,
@@ -449,8 +460,10 @@ class PgvectorStore(BaseStore):
         self.coordination = coordination or (
             RedisCoordination(redis_url, stream=redis_stream) if redis_url else None
         )
-        self.max_working_chunks = max_working_chunks
-        self.gc_threshold = gc_threshold
+        # Explicit arguments win; otherwise [pipeline] config, else 500/400.
+        self.max_working_chunks, self.gc_threshold = resolve_gc_limits(
+            max_working_chunks, gc_threshold, config
+        )
         self.max_working_chunks_per_pipeline = max_working_chunks_per_pipeline
         self.retention_evictions = 0
         # CAP-C7/WI-P2: see SQLiteStore.last_write_inferred_edge_count.
@@ -4121,6 +4134,68 @@ class PgvectorStore(BaseStore):
             self._close_cursor(cursor)
         return any(is_near_duplicate(chunk.content, str(row["content"])) for row in rows)
 
+    def vacuum(self, older_than_seconds: float, dry_run: bool = False) -> dict[str, int]:
+        """Delete aged rows from append-only tables; mirrors ``SQLiteStore.vacuum``."""
+        cutoff = _vacuum_cutoff(older_than_seconds)
+        counts: dict[str, int] = {}
+        with self._connect() as connection:
+            for table, where, params in self._vacuum_plan(cutoff):
+                verb = "SELECT COUNT(*) AS count FROM" if dry_run else "DELETE FROM"
+                cursor = connection.cursor()
+                try:
+                    cursor.execute(f"{verb} {self._table_name(table)} t WHERE {where}", params)
+                    if dry_run:
+                        row = self._fetchone(cursor)
+                        counts[table] = int(row["count"]) if row is not None else 0
+                    else:
+                        counts[table] = max(0, int(getattr(cursor, "rowcount", 0) or 0))
+                finally:
+                    self._close_cursor(cursor)
+        return counts
+
+    def _vacuum_plan(self, cutoff: float) -> list[tuple[str, str, tuple[object, ...]]]:
+        """Postgres twin of ``ncp.stores.sqlite._sqlite_vacuum_plan`` (rows aliased ``t``)."""
+        live_chunk = (
+            f"SELECT chunk_id FROM {self._table_name('chunks')}"
+            f" UNION SELECT alias_id FROM {self._table_name('chunk_aliases')}"
+            f" UNION SELECT chunk_id FROM {self._table_name('tombstones')}"
+        )
+        terminal = ", ".join(f"'{status}'" for status in sorted(TASK_TERMINAL_STATUSES))
+        tasks = self._table_name("tasks")
+        return [
+            (
+                "conscious_log",
+                f"t.logged_at < %s AND EXISTS (SELECT 1 FROM {self._table_name('conscious_log')} n"
+                " WHERE n.agent_id = t.agent_id AND n.pipeline_id IS NOT DISTINCT FROM t.pipeline_id"
+                " AND (n.logged_at > t.logged_at OR (n.logged_at = t.logged_at AND n.log_id > t.log_id)))",
+                (cutoff,),
+            ),
+            ("cost_log", "t.logged_at < %s", (cutoff,)),
+            ("embedding_cost_log", "t.logged_at < %s", (cutoff,)),
+            ("drift_history", "t.ts < %s", (cutoff,)),
+            ("turn_chunks", f"t.created_at < %s OR t.chunk_id NOT IN ({live_chunk})", (cutoff,)),
+            ("outcomes", "t.consumed = 1 AND t.created_at < %s", (cutoff,)),
+            (
+                "outcome_applications",
+                f"t.applied_at < %s AND t.outcome_id NOT IN"
+                f" (SELECT outcome_id FROM {self._table_name('outcomes')} WHERE consumed = 0)",
+                (cutoff,),
+            ),
+            ("dissent_log", f"t.created_at < %s AND t.chunk_id NOT IN ({live_chunk})", (cutoff,)),
+            (
+                "tasks",
+                f"t.status IN ({terminal}) AND t.updated_at < %s AND t.task_id NOT IN ("
+                f"SELECT parent_task_id FROM {tasks}"
+                f" WHERE parent_task_id IS NOT NULL AND status NOT IN ({terminal}))",
+                (cutoff,),
+            ),
+            (
+                "chunk_edges",
+                f"t.src_chunk_id NOT IN ({live_chunk}) OR t.dst_chunk_id NOT IN ({live_chunk})",
+                (),
+            ),
+        ]
+
     def _soft_gc(self, connection: Any) -> None:
         now = time.time()
         for table in ("tombstones", "whispers", "turn_records"):
@@ -4143,6 +4218,11 @@ class PgvectorStore(BaseStore):
             self._close_cursor(chunk_cursor)
 
     def _hard_gc(self, connection: Any, *, pipeline_id: str | None) -> None:
+        """Cap one pipeline's working zone; see ``SQLiteStore._hard_gc``.
+
+        Evicts lowest trust/recency score first, never ``user_verified``
+        chunks, and scopes ``pipeline_id=None`` to ``pipeline_id IS NULL``.
+        """
         # WI-006: drop expired chunks before evaluating overflow capacity.
         expiry_cursor = connection.cursor()
         try:
@@ -4152,18 +4232,17 @@ class PgvectorStore(BaseStore):
             )
         finally:
             self._close_cursor(expiry_cursor)
-        clauses = ["zone = 'working'"]
-        params: list[object] = []
-        if pipeline_id is not None:
-            clauses.append("pipeline_id = %s")
-            params.append(pipeline_id)
+        if pipeline_id is None:
+            clause = "pipeline_id IS NULL AND zone = 'working'"
+            params: tuple[object, ...] = ()
+        else:
+            clause = "pipeline_id = %s AND zone = 'working'"
+            params = (pipeline_id,)
         count_cursor = connection.cursor()
         try:
             count_cursor.execute(
-                self._sql(
-                    f"SELECT COUNT(*) AS count FROM {{schema}}.{{prefix}}chunks WHERE {' AND '.join(clauses)}"
-                ),
-                tuple(params),
+                self._sql(f"SELECT COUNT(*) AS count FROM {{schema}}.{{prefix}}chunks WHERE {clause}"),
+                params,
             )
             row = self._fetchone(count_cursor)
         finally:
@@ -4172,32 +4251,49 @@ class PgvectorStore(BaseStore):
         if count <= self.max_working_chunks:
             return
         overflow = count - self.gc_threshold
-        stale_cursor = connection.cursor()
+        if overflow <= 0:
+            return
+        candidates_cursor = connection.cursor()
         try:
-            stale_cursor.execute(
+            candidates_cursor.execute(
                 self._sql(
                     f"""
-                    SELECT chunk_id FROM {{schema}}.{{prefix}}chunks
-                    WHERE {' AND '.join(clauses)}
-                    ORDER BY created_at ASC
-                    LIMIT %s
+                    SELECT chunk_id, created_at, base_trust, generation, written_at_drift
+                    FROM {{schema}}.{{prefix}}chunks
+                    WHERE {clause} AND src != 'user_verified'
                     """
                 ),
-                (*params, overflow),
+                params,
             )
-            rows = self._fetchall(stale_cursor)
+            rows = self._fetchall(candidates_cursor)
         finally:
-            self._close_cursor(stale_cursor)
-        if not rows:
+            self._close_cursor(candidates_cursor)
+        evict_ids = [str(row["chunk_id"]) for row in self._eviction_order(rows)[:overflow]]
+        if not evict_ids:
             return
         delete_cursor = connection.cursor()
         try:
             delete_cursor.executemany(
                 self._sql("DELETE FROM {schema}.{prefix}chunks WHERE chunk_id = %s"),
-                [(str(row["chunk_id"]),) for row in rows],
+                [(chunk_id,) for chunk_id in evict_ids],
             )
         finally:
             self._close_cursor(delete_cursor)
+
+    def _eviction_order(self, rows: Sequence[Any]) -> list[Any]:
+        """Sort eviction candidates lowest trust/recency score first."""
+        now = time.time()
+        return sorted(
+            rows,
+            key=lambda row: score_trust_recency_candidate(
+                self.retrieval_policy,
+                created_at=float(row["created_at"]),
+                now=now,
+                base_trust=float(row["base_trust"]),
+                generation=int(row["generation"]),
+                written_at_drift=float(row["written_at_drift"]) if row["written_at_drift"] is not None else 0.0,
+            ),
+        )
 
     def _enforce_retention(self, connection: Any, *, pipeline_id: str | None) -> None:
         cap = self.max_working_chunks_per_pipeline
@@ -4234,18 +4330,7 @@ class PgvectorStore(BaseStore):
             rows = self._fetchall(candidates_cursor)
         finally:
             self._close_cursor(candidates_cursor)
-        now = time.time()
-        scored = sorted(
-            rows,
-            key=lambda row: score_trust_recency_candidate(
-                self.retrieval_policy,
-                created_at=float(row["created_at"]),
-                now=now,
-                base_trust=float(row["base_trust"]),
-                generation=int(row["generation"]),
-                written_at_drift=float(row["written_at_drift"]) if row["written_at_drift"] is not None else 0.0,
-            ),
-        )
+        scored = self._eviction_order(rows)
         overflow = count - cap
         evict_ids = [str(row["chunk_id"]) for row in scored[:overflow]]
         if not evict_ids:

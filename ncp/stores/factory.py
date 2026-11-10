@@ -90,6 +90,8 @@ def create_store(config: NCPConfig) -> BaseStore:
         return SQLiteStore(
             config.store_path,
             config=config,
+            max_working_chunks=config.pipeline_max_working_chunks,
+            gc_threshold=config.pipeline_gc_threshold,
             max_working_chunks_per_pipeline=config.retention_max_working_chunks_per_pipeline,
             embedding_adapter=_build_embedding_adapter(config),
         )
@@ -102,6 +104,8 @@ def create_store(config: NCPConfig) -> BaseStore:
             redis_stream=config.redis_stream,
             config=config,
             embedding_adapter=_build_embedding_adapter(config),
+            max_working_chunks=config.pipeline_max_working_chunks,
+            gc_threshold=config.pipeline_gc_threshold,
             max_working_chunks_per_pipeline=config.retention_max_working_chunks_per_pipeline,
         )
     raise NotImplementedError(

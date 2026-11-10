@@ -19,7 +19,9 @@ from ncp.stores.base import (
     NCPStoreError,
     NCPStoreUnavailableError,
     _validate_turn_chunk_relation,
+    _vacuum_cutoff,
     merge_outcome_chunk_rows,
+    resolve_gc_limits,
 )
 from ncp.stores.calibration import (
     EQUIVALENT_CONSOLIDATION,
@@ -77,6 +79,7 @@ from ncp.types import (
     TaskRecord,
     TaskStatus,
     CONFIDENCE_EXEMPT_WHISPER_TYPES,
+    TASK_TERMINAL_STATUSES,
     TurnRecord,
     Whisper,
     resolve_whisper_thread,
@@ -235,6 +238,12 @@ CREATE INDEX IF NOT EXISTS idx_turns_agent ON turn_records(agent_id, pipeline_id
 CREATE INDEX IF NOT EXISTS idx_conscious_agent ON conscious_log(agent_id, logged_at);
 CREATE INDEX IF NOT EXISTS idx_conscious_pipeline_agent ON conscious_log(pipeline_id, agent_id, logged_at);
 CREATE INDEX IF NOT EXISTS idx_cost_pipeline ON cost_log(pipeline_id, logged_at);
+-- Soft GC runs these expiry DELETEs on every write; without a leading
+-- expiry column each one is a full table scan.
+CREATE INDEX IF NOT EXISTS idx_chunks_expiry ON chunks(expiry) WHERE expiry IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_turns_expires ON turn_records(expires_at);
+CREATE INDEX IF NOT EXISTS idx_tombstones_expires ON tombstones(expires_at);
+CREATE INDEX IF NOT EXISTS idx_whispers_expires ON whispers(expires_at);
 
 CREATE TABLE IF NOT EXISTS embedding_cost_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -399,6 +408,60 @@ CREATE TABLE IF NOT EXISTS dissent_log (
 """
 
 
+def _sqlite_vacuum_plan(cutoff: float) -> list[tuple[str, str, tuple[object, ...]]]:
+    """``(table, WHERE clause, params)`` for each table ``vacuum`` trims.
+
+    A chunk id counts as live while it is in ``chunks``, is a durable
+    consolidation alias (outcomes against it credit the keeper), or has a
+    tombstone (``resolve_ref`` still forwards it).
+    """
+    live_chunk = (
+        "SELECT chunk_id FROM chunks"
+        " UNION SELECT alias_id FROM chunk_aliases"
+        " UNION SELECT chunk_id FROM tombstones"
+    )
+    terminal = ", ".join(f"'{status}'" for status in sorted(TASK_TERMINAL_STATUSES))
+    return [
+        # Keep the newest snapshot per (agent, pipeline): load_latest_conscious
+        # and the server's pipeline/agent version lookups read it.
+        (
+            "conscious_log",
+            "logged_at < ? AND EXISTS (SELECT 1 FROM conscious_log n"
+            " WHERE n.agent_id = conscious_log.agent_id AND n.pipeline_id IS conscious_log.pipeline_id"
+            " AND (n.logged_at > conscious_log.logged_at"
+            " OR (n.logged_at = conscious_log.logged_at AND n.log_id > conscious_log.log_id)))",
+            (cutoff,),
+        ),
+        ("cost_log", "logged_at < ?", (cutoff,)),
+        ("embedding_cost_log", "logged_at < ?", (cutoff,)),
+        ("drift_history", "ts < ?", (cutoff,)),
+        ("turn_chunks", f"created_at < ? OR chunk_id NOT IN ({live_chunk})", (cutoff,)),
+        # Only consumed outcomes: calibrate still has to apply unconsumed ones.
+        ("outcomes", "consumed = 1 AND created_at < ?", (cutoff,)),
+        # An unconsumed outcome's applications stop calibrate double-applying it.
+        (
+            "outcome_applications",
+            "applied_at < ? AND outcome_id NOT IN (SELECT outcome_id FROM outcomes WHERE consumed = 0)",
+            (cutoff,),
+        ),
+        # dissent_log is the per-(chunk, identity) dedup guard (CAP-T5); a row
+        # is only dropped once its chunk is gone, or the identity could dissent
+        # against the same live chunk again.
+        ("dissent_log", f"created_at < ? AND chunk_id NOT IN ({live_chunk})", (cutoff,)),
+        (
+            "tasks",
+            f"status IN ({terminal}) AND updated_at < ? AND task_id NOT IN ("
+            f"SELECT parent_task_id FROM tasks WHERE parent_task_id IS NOT NULL AND status NOT IN ({terminal}))",
+            (cutoff,),
+        ),
+        (
+            "chunk_edges",
+            f"src_chunk_id NOT IN ({live_chunk}) OR dst_chunk_id NOT IN ({live_chunk})",
+            (),
+        ),
+    ]
+
+
 class SQLiteStore(BaseStore):
     """Project-local SQLite store with BM25 retrieval and dogfood primitives."""
 
@@ -406,8 +469,8 @@ class SQLiteStore(BaseStore):
         self,
         path: str | Path,
         *,
-        max_working_chunks: int = 500,
-        gc_threshold: int = 400,
+        max_working_chunks: int | None = None,
+        gc_threshold: int | None = None,
         max_working_chunks_per_pipeline: int = 0,
         retrieval_policy: RetrievalPolicy | None = None,
         config: NCPConfig | None = None,
@@ -415,8 +478,10 @@ class SQLiteStore(BaseStore):
     ) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.max_working_chunks = max_working_chunks
-        self.gc_threshold = gc_threshold
+        # Explicit arguments win; otherwise [pipeline] config, else 500/400.
+        self.max_working_chunks, self.gc_threshold = resolve_gc_limits(
+            max_working_chunks, gc_threshold, config
+        )
         self.max_working_chunks_per_pipeline = max_working_chunks_per_pipeline
         self.retention_evictions = 0
         # CAP-C7/WI-P2: count of `refines` edges inferred+persisted by the most
@@ -1886,7 +1951,14 @@ class SQLiteStore(BaseStore):
             )
 
     def acknowledge_whispers(self, whisper_ids: Sequence[str], *, agent_id: str | None = None) -> int:
-        """Delete already-processed whispers by id."""
+        """Delete already-processed whispers by id.
+
+        With ``agent_id`` set, a targeted whisper is deleted only when
+        ``agent_id`` is its target or its sender; other ids are skipped and
+        not counted. A broadcast is marked delivered for ``agent_id`` only.
+        ``agent_id=None`` is the unattributed library path: targeted whispers
+        are deleted unchecked and broadcasts are skipped.
+        """
 
         if not whisper_ids:
             return 0
@@ -4415,6 +4487,10 @@ class SQLiteStore(BaseStore):
                 )
                 acknowledged += int(cursor.rowcount > 0)
                 continue
+            if agent_id is not None and agent_id not in (whisper.target, whisper.from_agent):
+                # A targeted whisper may only be consumed by its target (or
+                # retracted by its sender); anyone else's ack is ignored.
+                continue
             cursor = connection.execute(
                 "DELETE FROM whispers WHERE whisper_id = ?",
                 (whisper.whisper_id,),
@@ -4422,6 +4498,23 @@ class SQLiteStore(BaseStore):
             acknowledged += int(cursor.rowcount > 0)
             connection.execute("DELETE FROM whisper_deliveries WHERE whisper_id = ?", (whisper.whisper_id,))
         return acknowledged
+
+    def vacuum(self, older_than_seconds: float, dry_run: bool = False) -> dict[str, int]:
+        """Delete aged rows from append-only tables; see ``BaseStore.vacuum``."""
+        cutoff = _vacuum_cutoff(older_than_seconds)
+        counts: dict[str, int] = {}
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            for table, where, params in _sqlite_vacuum_plan(cutoff):
+                if dry_run:
+                    counts[table] = int(connection.execute(
+                        f"SELECT COUNT(*) AS count FROM {table} WHERE {where}", params
+                    ).fetchone()["count"])
+                else:
+                    counts[table] = max(0, connection.execute(
+                        f"DELETE FROM {table} WHERE {where}", params
+                    ).rowcount)
+        return counts
 
     def _with_runtime_age(self, chunk: SubconsciousChunk) -> SubconsciousChunk:
         return chunk.model_copy(update={"age_seconds": max(0.0, chunk.age_seconds)})
@@ -4491,41 +4584,70 @@ class SQLiteStore(BaseStore):
         now = time.time()
         connection.execute("DELETE FROM tombstones WHERE expires_at <= ?", (now,))
         connection.execute("DELETE FROM whispers WHERE expires_at <= ?", (now,))
+        # Broadcast delivery receipts whose whisper is gone (expired here, or
+        # by the expiry sweeps in drain/peek, or coalesced) are dead weight.
+        connection.execute(
+            "DELETE FROM whisper_deliveries"
+            " WHERE NOT EXISTS (SELECT 1 FROM whispers w WHERE w.whisper_id = whisper_deliveries.whisper_id)"
+        )
         connection.execute("DELETE FROM turn_records WHERE expires_at <= ?", (now,))
         # WI-006: reclaim chunks whose expiry has passed.
         connection.execute("DELETE FROM chunks WHERE expiry IS NOT NULL AND expiry <= ?", (now,))
 
     def _hard_gc(self, connection: sqlite3.Connection, *, pipeline_id: str | None) -> None:
+        """Cap one pipeline's working zone at ``max_working_chunks``.
+
+        On overflow, evicts down to ``gc_threshold`` in lowest trust/recency
+        score first (the same scoring ``_enforce_retention`` uses), never
+        evicting ``src='user_verified'`` chunks; they still count toward the
+        cap. ``pipeline_id=None`` is scoped to ``pipeline_id IS NULL`` rows
+        rather than every pipeline.
+        """
         # WI-006: drop expired chunks before evaluating overflow capacity.
         connection.execute(
             "DELETE FROM chunks WHERE expiry IS NOT NULL AND expiry <= ?", (time.time(),)
         )
-        clauses = ["zone = 'working'"]
-        params: list[object] = []
-        if pipeline_id is not None:
-            clauses.append("pipeline_id = ?")
-            params.append(pipeline_id)
-        count = connection.execute(
-            f"SELECT COUNT(*) AS count FROM chunks WHERE {' AND '.join(clauses)}",
+        if pipeline_id is None:
+            clause = "pipeline_id IS NULL AND zone = 'working'"
+            params: list[object] = []
+        else:
+            clause = "pipeline_id = ? AND zone = 'working'"
+            params = [pipeline_id]
+        count = int(connection.execute(
+            f"SELECT COUNT(*) AS count FROM chunks WHERE {clause}",
             params,
-        ).fetchone()["count"]
-        if int(count) <= self.max_working_chunks:
+        ).fetchone()["count"])
+        if count <= self.max_working_chunks:
             return
-        overflow = int(count) - self.gc_threshold
-        delete_rows = connection.execute(
-            f"""
-            SELECT chunk_id FROM chunks
-            WHERE {' AND '.join(clauses)}
-            ORDER BY created_at ASC
-            LIMIT ?
-            """,
-            [*params, overflow],
+        overflow = count - self.gc_threshold
+        if overflow <= 0:
+            return
+        rows = connection.execute(
+            f"SELECT chunk_id, created_at, base_trust, generation, written_at_drift"
+            f" FROM chunks WHERE {clause} AND src != 'user_verified'",
+            params,
         ).fetchall()
-        if delete_rows:
+        evict_ids = [str(row["chunk_id"]) for row in self._eviction_order(rows)[:overflow]]
+        if evict_ids:
             connection.executemany(
                 "DELETE FROM chunks WHERE chunk_id = ?",
-                [(row["chunk_id"],) for row in delete_rows],
+                [(chunk_id,) for chunk_id in evict_ids],
             )
+
+    def _eviction_order(self, rows: Sequence[Any]) -> list[Any]:
+        """Sort eviction candidates lowest trust/recency score first."""
+        now = time.time()
+        return sorted(
+            rows,
+            key=lambda row: score_trust_recency_candidate(
+                self.retrieval_policy,
+                created_at=float(row["created_at"]),
+                now=now,
+                base_trust=float(row["base_trust"]),
+                generation=int(row["generation"]),
+                written_at_drift=float(row["written_at_drift"]) if row["written_at_drift"] is not None else 0.0,
+            ),
+        )
 
     def _enforce_retention(self, connection: sqlite3.Connection, *, pipeline_id: str | None) -> None:
         cap = self.max_working_chunks_per_pipeline
@@ -4546,18 +4668,7 @@ class SQLiteStore(BaseStore):
             f" FROM chunks WHERE {clause}",
             params,
         ).fetchall()
-        now = time.time()
-        scored = sorted(
-            rows,
-            key=lambda row: score_trust_recency_candidate(
-                self.retrieval_policy,
-                created_at=float(row["created_at"]),
-                now=now,
-                base_trust=float(row["base_trust"]),
-                generation=int(row["generation"]),
-                written_at_drift=float(row["written_at_drift"]) if row["written_at_drift"] is not None else 0.0,
-            ),
-        )
+        scored = self._eviction_order(rows)
         overflow = int(count) - cap
         evict_ids = [str(row["chunk_id"]) for row in scored[:overflow]]
         if evict_ids:

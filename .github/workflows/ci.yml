@@ -128,3 +128,4 @@ jobs:
           tests/test_memo_correctness.py
           tests/test_value_correction_dedup.py
           tests/test_async_redis_coordination.py
+          tests/test_store_lifecycle_postgres.py

@@ -32,6 +32,35 @@ def _is_superseded_progress(payload: dict[str, str], newer: Whisper) -> bool:
     )
 
 
+def _delivery_ttl_seconds(payload: dict[str, str], *, now: float) -> int:
+    """TTL for a broadcast's delivery hash: the payload's remaining life + 5s.
+
+    Matches the payload key's own ``EXPIRE ttl_seconds + 5`` so the receipts
+    disappear with the whisper instead of living forever.
+    """
+    try:
+        expires_at = float(payload.get("expires_at") or 0.0)
+    except ValueError:
+        expires_at = 0.0
+    if expires_at <= 0.0:
+        try:
+            expires_at = float(payload["created_at"]) + int(payload.get("ttl_seconds", 1800))
+        except (KeyError, ValueError):
+            expires_at = now + 1800
+    return max(1, int(expires_at - now) + 5)
+
+
+def _may_consume(payload: dict[str, str], agent_id: str | None) -> bool:
+    """Whether ``agent_id`` may delete this targeted whisper.
+
+    ``None`` is the unattributed library path and stays unchecked; an
+    attributed ack must come from the whisper's target or its sender.
+    """
+    if agent_id is None:
+        return True
+    return agent_id in (payload.get("target"), payload.get("from_agent"))
+
+
 def _default_redis_factory(url: str) -> Any:
     try:
         import redis
@@ -112,7 +141,24 @@ class RedisCoordination:
             },
         )
         client.expire(payload_key, whisper.ttl_seconds + 5)
+        self._prune_index(client, whisper.target)
         client.zadd(index_key, {whisper.whisper_id: whisper.created_at})
+
+    def _prune_index(self, client: Any, target: str) -> None:
+        """Drop index entries whose payload has expired (and their receipts).
+
+        Run on emit so a target that never peeks still has its index zset
+        trimmed whenever anyone writes to it, instead of growing forever.
+        """
+        index_key = self._target_index_key(target)
+        indexed_ids = [str(whisper_id) for whisper_id in client.zrange(index_key, 0, -1)]
+        payloads = self._hgetall_many(client, [self._payload_key(whisper_id) for whisper_id in indexed_ids])
+        for whisper_id, payload in zip(indexed_ids, payloads, strict=True):
+            if payload:
+                continue
+            client.zrem(index_key, whisper_id)
+            if target == "*":
+                client.delete(self._delivery_key(whisper_id))
 
     def peek_whispers(
         self,
@@ -189,8 +235,14 @@ class RedisCoordination:
                         # Cannot attribute a broadcast acknowledgement to a specific
                         # recipient; skip rather than deleting it for every recipient.
                         continue
-                    client.hset(self._delivery_key(whisper_id), mapping={agent_id: str(time.time())})
+                    now = time.time()
+                    delivery_key = self._delivery_key(whisper_id)
+                    client.hset(delivery_key, mapping={agent_id: str(now)})
+                    client.expire(delivery_key, _delivery_ttl_seconds(payload, now=now))
                     deleted += 1
+                    continue
+                if not _may_consume(payload, agent_id):
+                    # Only the target (or the sender) may delete a targeted whisper.
                     continue
                 if target:
                     client.zrem(self._target_index_key(target), whisper_id)
@@ -492,7 +544,19 @@ class AsyncRedisCoordination:
             },
         )
         await client.expire(payload_key, whisper.ttl_seconds + 5)
+        await self._async_prune_index(client, whisper.target)
         await client.zadd(index_key, {whisper.whisper_id: whisper.created_at})
+
+    async def _async_prune_index(self, client: Any, target: str) -> None:
+        """Async counterpart of ``RedisCoordination._prune_index``."""
+        index_key = self._target_index_key(target)
+        for raw_id in await client.zrange(index_key, 0, -1):
+            whisper_id = str(raw_id)
+            if await client.hgetall(self._payload_key(whisper_id)):
+                continue
+            await client.zrem(index_key, whisper_id)
+            if target == "*":
+                await client.delete(self._delivery_key(whisper_id))
 
     async def drain_whispers(
         self,
@@ -585,9 +649,18 @@ class AsyncRedisCoordination:
             payload = await client.hgetall(self._payload_key(whisper_id))
             if payload:
                 target = payload.get("target", "")
-                if target == "*" and agent_id is not None:
-                    await client.hset(self._delivery_key(whisper_id), mapping={agent_id: str(time.time())})
+                if target == "*":
+                    if agent_id is None:
+                        # Same as the sync path: an unattributed broadcast ack
+                        # must not delete the whisper for every recipient.
+                        continue
+                    now = time.time()
+                    delivery_key = self._delivery_key(whisper_id)
+                    await client.hset(delivery_key, mapping={agent_id: str(now)})
+                    await client.expire(delivery_key, _delivery_ttl_seconds(payload, now=now))
                     deleted += 1
+                    continue
+                if not _may_consume(payload, agent_id):
                     continue
                 if target:
                     await client.zrem(self._target_index_key(target), whisper_id)

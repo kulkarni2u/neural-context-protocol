@@ -5,6 +5,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from functools import partial
+import time
 from typing import Any
 
 import anyio
@@ -56,6 +57,41 @@ def merge_outcome_chunk_rows(*row_groups: Sequence[object]) -> list[str]:
             if value:
                 merged.setdefault(str(value), None)
     return list(merged)
+
+
+DEFAULT_MAX_WORKING_CHUNKS = 500
+DEFAULT_GC_THRESHOLD = 400
+
+
+def resolve_gc_limits(
+    max_working_chunks: int | None,
+    gc_threshold: int | None,
+    config: Any | None,
+) -> tuple[int, int]:
+    """Resolve a store's hard-GC ``(max_working_chunks, gc_threshold)``.
+
+    An explicit constructor argument wins; otherwise the ``[pipeline]``
+    values of the ``config`` passed to the store (not one loaded from disk);
+    otherwise the 500/400 defaults. ``gc_threshold`` is clamped to
+    ``[0, max_working_chunks]`` so an inverted pair can never turn an
+    overflow into a non-positive eviction count.
+    """
+    if max_working_chunks is None:
+        max_working_chunks = int(
+            getattr(config, "pipeline_max_working_chunks", DEFAULT_MAX_WORKING_CHUNKS)
+        )
+    if gc_threshold is None:
+        gc_threshold = int(getattr(config, "pipeline_gc_threshold", DEFAULT_GC_THRESHOLD))
+    max_working_chunks = max(1, int(max_working_chunks))
+    return max_working_chunks, min(max(0, int(gc_threshold)), max_working_chunks)
+
+
+def _vacuum_cutoff(older_than_seconds: float) -> float:
+    """Validate ``vacuum``'s age argument and return the absolute cutoff."""
+    seconds = float(older_than_seconds)
+    if not seconds >= 0.0:  # also rejects NaN
+        raise ValueError(f"older_than_seconds must be >= 0, got {older_than_seconds!r}")
+    return time.time() - seconds
 
 
 class NCPStoreError(RuntimeError):
@@ -524,7 +560,14 @@ class BaseStore(ABC):
 
     @abstractmethod
     def acknowledge_whispers(self, whisper_ids: Sequence[str], *, agent_id: str | None = None) -> int:
-        """Delete already-processed whispers by id. Returns count deleted."""
+        """Delete already-processed whispers by id. Returns count acknowledged.
+
+        With ``agent_id`` set, a targeted whisper is deleted only when
+        ``agent_id`` is its target or its sender (other ids are skipped and
+        not counted), and a broadcast is marked delivered for that agent only.
+        ``agent_id=None`` deletes targeted whispers unchecked and skips
+        broadcasts.
+        """
 
     @abstractmethod
     def whisper_pending(self, whisper_id: str) -> bool:
@@ -717,6 +760,27 @@ class BaseStore(ABC):
         """Asynchronously attach an outcome id to a decision using thread pool."""
         fn = partial(self.link_decision_outcome, decision_id, outcome_id)
         return await anyio.to_thread.run_sync(fn)
+
+    # ------------------------------------------------------------------
+    # Retention for append-only tables
+
+    def vacuum(self, older_than_seconds: float, dry_run: bool = False) -> dict[str, int]:
+        """Delete rows older than ``older_than_seconds`` from append-only tables.
+
+        Covers ``conscious_log`` (always keeping the newest row per agent and
+        pipeline), ``cost_log``, ``embedding_cost_log``, ``drift_history``,
+        ``turn_chunks``, ``outcomes`` (consumed only),
+        ``outcome_applications`` (not those of unconsumed outcomes),
+        ``dissent_log`` (only rows whose chunk is gone) and terminal
+        ``tasks`` (not a parent of a live task). Also removes ``chunk_edges``
+        and ``turn_chunks`` rows pointing at chunks that no longer exist,
+        regardless of age. Returns the per-table row count, keyed by table
+        name; with ``dry_run=True`` returns the same counts without deleting.
+
+        Never called automatically. Trimming ``cost_log`` lowers the spend
+        the per-pipeline budget governor reads.
+        """
+        raise NotImplementedError(f"vacuum is not implemented for {type(self).__name__}")
 
     # ------------------------------------------------------------------
     # Task ledger (coordination primitives C, spec section 5)
