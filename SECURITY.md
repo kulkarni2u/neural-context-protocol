@@ -23,8 +23,11 @@ This summarizes what the repository documents; the authoritative text is
 `docs/NCP_PROTOCOL_SPEC.md` (section 5.1) and `docs/NCP_HTTP_API.md`.
 
 - **Loopback by default.** `ncp serve` binds to `127.0.0.1` and requires no
-  token on loopback. Binding to a non-loopback host without
-  `[server].auth_token` logs a warning and leaves the endpoint open.
+  token on loopback. It refuses to start on a non-loopback
+  host unless an auth token is configured. On a loopback bind it rejects
+  requests whose `Host` header is not `localhost`, `127.0.0.1` or `[::1]`
+  (DNS rebinding), requests whose `Origin` is neither same-origin nor passed
+  with `--cors-origin`, and POSTs that are not `application/json`.
 - **One shared bearer token.** When `[server].auth_token` is set (config
   file, `NCP_AUTH_TOKEN`, or `--auth-token`), every `/mcp`, `/sse` and
   `/events` request must present it. There is a single token for the server,

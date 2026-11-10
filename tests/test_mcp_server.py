@@ -210,7 +210,9 @@ class TestInitialize:
         thread.start()
         try:
             with httpx.Client(base_url=f"http://127.0.0.1:{port}", timeout=5.0) as client:
-                response = client.post("/mcp", content=b"0123456789")
+                response = client.post(
+                    "/mcp", content=b"0123456789", headers={"Content-Type": "application/json"}
+                )
                 assert response.status_code == 413
                 assert response.json()["error"] == "request_too_large"
         finally:

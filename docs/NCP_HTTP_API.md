@@ -34,6 +34,23 @@ Unauthenticated requests receive `401 {"error": "unauthorized"}`. Request
 bodies over 10 MB receive `413`. CORS headers are only emitted for origins
 passed via `--cors-origin` (none by default — browsers cannot call the API).
 
+`ncp serve` refuses to start on a non-loopback host without a token. The server
+also rejects, before any tool runs:
+
+| Condition | Response |
+|-----------|----------|
+| `POST` whose `Content-Type` is not `application/json` | `415 {"error": "unsupported_media_type"}` |
+| `Origin` header that is neither same-origin nor allowed by `--cors-origin`, on `POST`, `/api/*`, `/events` and `/sse` | `403 {"error": "forbidden_origin"}` |
+| Loopback bind and a `Host` header other than `localhost`, `127.0.0.1` or `[::1]` | `403 {"error": "forbidden_host"}` |
+| Negative or non-numeric `Content-Length` | `400 {"error": "invalid_content_length"}` |
+
+Requests with no `Origin` header (curl, MCP hosts) are unaffected. A connection
+that sends or reads nothing for 30 seconds is closed; `/sse`, `/events` and a
+blocking `ncp_wait_whispers` are not subject to that limit.
+
+`ncp_record_outcome` requires `0 < weight <= 1`. A caller-supplied `base_trust`
+is capped at the default trust for the declared `src`.
+
 ## Health check
 
 ```bash
