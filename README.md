@@ -744,6 +744,8 @@ ncp trust-drift # trust-drift observability: rising, falling, and feedback summa
 ncp precedents  # query past decisions: 'show me decisions like this one'
 ncp overview    # ranked cross-pipeline summary: failed tasks, waiting results, expiring claims
 ncp consolidate # merge and compact memory
+ncp vacuum      # delete aged rows from append-only tables (--older-than 30d; previews unless --yes)
+ncp forget      # permanently delete specific chunks (--chunk / --agent / --pipeline; previews unless --yes)
 ncp calibrate   # recalibrate trust (add --feedback for the self-improvement pass)
 ncp refine      # evidence-backed procedural self-refinement: ingest/show/propose/apply/rollback
 ncp handoff     # cross-agent handoff coordination
@@ -753,6 +755,25 @@ ncp reputation  # per-identity reputation: score, confidence, observation count
 ncp emit        # emit a whisper from the CLI
 ncp demo        # run a self-contained demo pipeline
 ```
+
+### Retention and deletion
+
+`ncp vacuum --older-than 30d` trims the append-only bookkeeping tables
+(`cost_log`, `drift_history`, `turn_chunks`, consumed `outcomes`, terminal `tasks`,
+and so on; the newest `conscious_log` snapshot per agent is kept) and never touches
+memory chunks, whispers, identities or decisions. Trimming `cost_log` lowers the spend
+the budget governor reads. `ncp forget --chunk <id>` (repeatable), `--agent <written_by>`
+and `--pipeline <id>` (combined as AND) permanently delete chunks, their `raw_ref`
+backups, edges and turn links, and leave a permanent tombstone so the same `chunk_id`
+cannot be written again. `--pipeline` never matches `scope='global'` chunks, and
+`user_verified` chunks are deleted when you select them. Both commands only preview
+unless you pass `--yes` (or confirm at the prompt on a terminal); `--dry-run` never
+deletes and `--json` emits the counts. Both are supported on SQLite and sync
+pgvector; other backends report that they are not implemented.
+
+Back up the SQLite store with `sqlite3 .ncp/store.db ".backup backup.db"`, or stop
+`ncp serve` first. The store runs in WAL mode, so copying `store.db` alone while the
+server is running can miss recent writes that still sit in `store.db-wal`.
 
 ### Web UI
 
@@ -807,7 +828,7 @@ ncp explain --cwd /path/to/project
 | Block            | Controls                                                                                  |
 |------------------|-------------------------------------------------------------------------------------------|
 | `[budget]`       | Context token budget and per-pressure chunk/whisper caps (default → high → critical)       |
-| `[pipeline]`     | Working-set size and GC (`max_working_chunks`, `gc_threshold`, default TTL)                |
+| `[pipeline]`     | Working-set size and GC (`max_working_chunks`, `gc_threshold`, default TTL); eviction is lowest trust/recency first and never removes `user_verified` chunks |
 | `[whispers]`     | Whisper TTL, max per drain, and `min_confidence` to deliver                                |
 | `[retrieval]`    | Signal weights, `generation_penalty_base`, `edge_expansion`, rerank, trust propagation, `reduce_fanin_enabled` |
 | `[embedding]`    | Semantic vector retrieval — on by default (local, no API key); provider, model, graceful lexical-only fallback if `fastembed` is absent |

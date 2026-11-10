@@ -1878,6 +1878,177 @@ def consolidate_command(
         console.print(f"[green]Consolidated {report.merged} group(s), {report.tombstoned} chunk(s) tombstoned.[/green]")
 
 
+def _stdin_is_tty() -> bool:
+    return sys.stdin.isatty()
+
+
+def _confirm_or_preview(*, assume_yes: bool, dry_run: bool, json_output: bool, prompt: str) -> bool:
+    """Decide whether a destructive command should apply after its preview.
+
+    ``--dry-run`` never applies; ``--yes`` always does. Otherwise the command
+    prompts on a TTY and stays a dry run when stdin is not interactive (or the
+    output is machine-readable), so scripts must opt in with ``--yes``.
+    """
+    if dry_run:
+        return False
+    if assume_yes:
+        return True
+    if json_output or not _stdin_is_tty():
+        return False
+    return click.confirm(prompt, default=False)
+
+
+def _print_counts(title: str, counts: dict[str, int]) -> None:
+    table = Table(title=title, box=box.SIMPLE)
+    table.add_column("Rows", style="cyan")
+    table.add_column("Count", style="green", justify="right")
+    for name, count in counts.items():
+        table.add_row(name, str(count))
+    console.print(table)
+
+
+@main.command("vacuum")
+@click.option("--older-than", "older_than", required=True, help="Age cutoff: seconds, or 90s / 45m / 12h / 30d.")
+@click.option("--dry-run", is_flag=True, default=False, help="Only count what would be deleted.")
+@click.option("--yes", "-y", "assume_yes", is_flag=True, default=False, help="Delete without prompting.")
+@click.option("--json", "--json-output", "json_output", is_flag=True, help="Emit machine-readable JSON.")
+@click.option("--cwd", default=None, type=click.Path(exists=True, file_okay=False, path_type=Path))
+def vacuum_command(older_than: str, dry_run: bool, assume_yes: bool, json_output: bool, cwd: Path | None) -> None:
+    """Delete aged rows from the store's append-only tables.
+
+    Trims conscious_log (keeping the newest snapshot per agent and pipeline),
+    cost_log, embedding_cost_log, drift_history, turn_chunks, consumed
+    outcomes, outcome_applications (not those of unconsumed outcomes),
+    dissent_log (only rows whose chunk is gone) and terminal tasks. Also drops
+    chunk_edges and turn_chunks rows pointing at chunks that no longer exist,
+    whatever their age.
+
+    Memory chunks, whispers, identities and decisions are never removed here
+    (use `ncp forget` for chunks). Trimming cost_log lowers the spend the
+    per-pipeline budget governor reads.
+
+    Without --yes this only previews: it prompts on a terminal and stays a dry
+    run when stdin is not interactive.
+    """
+    from ncp.config import load_config
+
+    seconds = _parse_duration_seconds(older_than)
+    config = load_config(cwd=cwd or Path.cwd())
+    store = _resolve_runtime_store(config)
+    try:
+        counts = store.vacuum(seconds, dry_run=True)
+        apply = _confirm_or_preview(
+            assume_yes=assume_yes,
+            dry_run=dry_run,
+            json_output=json_output,
+            prompt=f"Delete {sum(counts.values())} row(s) older than {older_than}?",
+        )
+        if apply:
+            counts = store.vacuum(seconds, dry_run=False)
+    except (NotImplementedError, ValueError, NCPStoreUnavailableError) as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    if json_output:
+        click.echo(json.dumps({
+            "mode": "applied" if apply else "dry-run",
+            "older_than_seconds": seconds,
+            "counts": counts,
+            "total": sum(counts.values()),
+        }, indent=2, sort_keys=True))
+        return
+    _print_counts("Vacuum" if apply else "Vacuum (dry run)", counts)
+    if apply:
+        console.print(f"[green]Deleted {sum(counts.values())} row(s).[/green]")
+    else:
+        console.print("[yellow]Dry run: nothing deleted. Pass --yes to apply.[/yellow]")
+
+
+@main.command("forget")
+@click.option("--chunk", "chunk_ids", multiple=True, help="Chunk id to delete (repeatable).")
+@click.option("--agent", "written_by", default=None, help="Delete chunks written by this agent (written_by).")
+@click.option("--pipeline", "pipeline_id", default=None, help="Delete chunks of this pipeline (never scope='global' ones).")
+@click.option("--dry-run", is_flag=True, default=False, help="List what would be deleted without deleting.")
+@click.option("--yes", "-y", "assume_yes", is_flag=True, default=False, help="Delete without prompting.")
+@click.option("--json", "--json-output", "json_output", is_flag=True, help="Emit machine-readable JSON.")
+@click.option("--cwd", default=None, type=click.Path(exists=True, file_okay=False, path_type=Path))
+def forget_command(
+    chunk_ids: tuple[str, ...],
+    written_by: str | None,
+    pipeline_id: str | None,
+    dry_run: bool,
+    assume_yes: bool,
+    json_output: bool,
+    cwd: Path | None,
+) -> None:
+    """Permanently delete specific memory chunks on request.
+
+    Give at least one of --chunk, --agent or --pipeline; when several are
+    given a chunk must match all of them. --pipeline never matches
+    scope='global' chunks or other pipelines' chunks.
+
+    Selected chunks are removed so no retrieval path returns them, together
+    with their raw_ref backup chunks (the original text a noise-filtered chunk
+    was derived from), edges, turn links, aliases, outcome applications,
+    dissent rows, memo entries and full-text index rows. A permanent tombstone
+    is left behind: the deletion is auditable and the same chunk_id cannot be
+    written again. user_verified chunks ARE deleted when selected here; an
+    operator's request outranks their eviction protection.
+
+    Not removed: chunks derived from a deleted one that were not selected, and
+    stored turn records (they expire on their own TTL). Back up the store
+    first if unsure; this cannot be undone.
+
+    Without --yes this only previews: it prompts on a terminal and stays a dry
+    run when stdin is not interactive.
+    """
+    from ncp.config import load_config
+
+    if not chunk_ids and written_by is None and pipeline_id is None:
+        raise click.UsageError("Give at least one of --chunk, --agent or --pipeline.")
+    config = load_config(cwd=cwd or Path.cwd())
+    store = _resolve_runtime_store(config)
+    selectors = {"chunk_ids": list(chunk_ids), "written_by": written_by, "pipeline_id": pipeline_id}
+    try:
+        candidates = store.forget_candidates(**selectors)
+        counts = store.forget(**selectors, dry_run=True)
+        apply = bool(candidates) and _confirm_or_preview(
+            assume_yes=assume_yes,
+            dry_run=dry_run,
+            json_output=json_output,
+            prompt=f"Permanently delete {len(candidates)} chunk(s)?",
+        )
+        if apply:
+            counts = store.forget(**selectors)
+    except (NotImplementedError, ValueError, NCPStoreUnavailableError) as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    if json_output:
+        click.echo(json.dumps({
+            "mode": "applied" if apply else "dry-run",
+            "selectors": selectors,
+            "candidates": candidates,
+            "counts": counts,
+        }, indent=2, sort_keys=True, default=str))
+        return
+    if not candidates:
+        console.print("[dim]No chunks match.[/dim]")
+        return
+    listing = Table(title="Forget" if apply else "Forget (dry run)", box=box.SIMPLE)
+    for column in ("Chunk", "Kind", "Pipeline", "Layer", "Src", "Agent", "Content"):
+        listing.add_column(column)
+    for item in candidates:
+        listing.add_row(
+            item["chunk_id"], item["kind"], str(item["pipeline_id"] or "-"), item["layer"],
+            item["src"], item["written_by"], item["preview"],
+        )
+    console.print(listing)
+    _print_counts("Rows removed" if apply else "Rows that would be removed", counts)
+    if apply:
+        console.print(f"[green]Forgot {counts['chunks'] + counts['raw_ref_chunks']} chunk(s).[/green]")
+    else:
+        console.print("[yellow]Dry run: nothing deleted. Pass --yes to apply.[/yellow]")
+
+
 @main.command("calibrate")
 @click.option("--cwd", default=None, type=click.Path(exists=True, file_okay=False, path_type=Path))
 @click.option("--pipeline-id", default=None, help="Scope batch decay to one pipeline.")

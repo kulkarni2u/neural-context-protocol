@@ -93,6 +93,11 @@ class _FakeCursor:
             return
         if "UPDATE" in normalized and "chunks SET retrieval_count = retrieval_count + 1" in normalized:
             return  # retrieval tracking update — no-op in fake store
+        if normalized.startswith("SELECT 1 FROM") and "tombstones WHERE chunk_id = %s AND expires_at >= %s" in normalized:
+            row = self._db.tombstones.get(str(params[0]))
+            forgotten = row is not None and float(row["expires_at"]) >= float(params[1])
+            self._rows = [{"?column?": 1}] if forgotten else []
+            return
         if "DELETE FROM" in normalized and "chunks WHERE chunk_id = %s" in normalized:
             self._db.chunks.pop(str(params[0]), None)
             return

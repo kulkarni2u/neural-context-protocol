@@ -42,6 +42,16 @@ accept are now rejected.
 - `vacuum(older_than_seconds, dry_run=False)` on the SQLite and sync pgvector
   stores: removes aged rows from the append-only tables and edge or turn-link
   rows that point at chunks that no longer exist.
+- `ncp vacuum --older-than <30d|12h|...> [--dry-run] [--yes] [--json]`: the
+  operator command for `vacuum`. It previews unless `--yes` is passed or a
+  terminal prompt is confirmed.
+- `ncp forget [--chunk ID ...] [--agent WRITTEN_BY] [--pipeline ID]`: deletes
+  the selected chunks on request, with their `raw_ref` backups, edges, turn
+  links, aliases and memo entries, and leaves a non-expiring tombstone. A
+  forgotten `chunk_id` cannot be written again. `--pipeline` never reaches
+  `scope='global'` chunks; `user_verified` chunks are deleted when selected.
+  Backed by `forget()` and `forget_candidates()` on the SQLite and sync
+  pgvector stores.
 - Indexes on the expiry columns that soft GC deletes on (created on open for
   SQLite; migration `019_add_expiry_indexes.sql` for Postgres).
 - A plain BM25 RAG baseline (`ncp.bench.baselines.PlainRagBaseline`) as an
@@ -79,6 +89,9 @@ accept are now rejected.
 - `ncp migrate` and `ncp init --store pgvector` imported `psycopg2`, which the
   `pgvector` extra does not install. They now use psycopg v3, and a missing
   driver is reported as an error instead of being skipped.
+- The pgvector stores wrote an empty `meta`, so a chunk's `raw_ref` was never
+  persisted on Postgres. They now store it as SQLite does. Chunks written
+  before this have no stored `raw_ref`.
 - A POST body that is not valid UTF-8 returns `400` instead of dropping the
   connection.
 - SQLite no longer leaves `whisper_deliveries` rows behind when a broadcast

@@ -129,3 +129,4 @@ jobs:
           tests/test_value_correction_dedup.py
           tests/test_async_redis_coordination.py
           tests/test_store_lifecycle_postgres.py
+          tests/test_store_forget_postgres.py

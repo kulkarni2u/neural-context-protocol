@@ -65,6 +65,29 @@ Expected behavior:
 - no external services are required
 - MCP is available at `http://127.0.0.1:4242/mcp`
 
+### Retention, deletion and backup
+
+```bash
+ncp vacuum --older-than 30d --dry-run        # count aged rows in append-only tables
+ncp vacuum --older-than 30d --yes            # delete them (30d, 12h, 45m, 90s)
+ncp forget --chunk <chunk_id> --dry-run      # list what would be deleted
+ncp forget --agent <written_by> --pipeline <id> --yes
+```
+
+Both commands preview unless you pass `--yes` or confirm at the prompt on a
+terminal, and accept `--json`. `forget` selectors (`--chunk` repeatable, `--agent`,
+`--pipeline`) combine as AND; at least one is required. It permanently removes the
+chunks, their `raw_ref` backups, edges and turn links and leaves a tombstone so the
+`chunk_id` cannot be written again. `--pipeline` skips `scope='global'` chunks;
+`user_verified` chunks are deleted when selected. Supported on SQLite and sync
+pgvector. Stored turn records expire on their own TTL, and SQLite does not scrub
+freed pages, so run `sqlite3 .ncp/store.db "VACUUM"` while the server is stopped if the
+file itself must not retain deleted text.
+
+The SQLite store runs in WAL mode, so copying `.ncp/store.db` alone while
+`ncp serve` is running can lose recent writes held in `store.db-wal`. Take a backup
+with `sqlite3 .ncp/store.db ".backup backup.db"`, or stop the server first.
+
 ## pgvector + Redis Setup
 
 This is the scalable local path.

@@ -18,9 +18,11 @@ from uuid import uuid4
 
 from ncp.config import NCPConfig
 from ncp.stores.base import (
+    FORGET_TOMBSTONE_EXPIRES_AT,
     BaseStore,
     NCPStoreError,
     NCPStoreUnavailableError,
+    _forget_selector,
     _validate_turn_chunk_relation,
     _vacuum_cutoff,
     merge_outcome_chunk_rows,
@@ -67,6 +69,7 @@ from ncp.types import CalibrationReport, ChunkEdge, ConsolidationReport, Conscio
 logger = logging.getLogger("ncp")
 
 _IN_BATCH = 500  # ids per IN (...) query
+_FORGET_BATCH = 200  # forget's per-table queries bind each id up to twice
 
 
 def calibration_lock_key(schema: str, table_prefix: str) -> int:
@@ -621,6 +624,8 @@ class PgvectorStore(BaseStore):
             raise ValueError(f"embedding must have 1536 dimensions, got {len(chunk.embedding)}")
         with self._connect() as connection:
             self._soft_gc(connection)
+            if self._is_forgotten(connection, chunk.chunk_id):
+                return False
             self._assert_src_immutable(connection, chunk)
             if not allow_duplicate and self._is_duplicate(connection, chunk):
                 return False
@@ -707,7 +712,7 @@ class PgvectorStore(BaseStore):
                         chunk.valid_while,
                         chunk.expiry,
                         chunk.owner,
-                        json.dumps({}),
+                        json.dumps({"raw_ref": chunk.raw_ref} if chunk.raw_ref else {}),
                         embedding_val,
                         chunk.written_at_drift,
                         bool(chunk.verified),
@@ -4149,6 +4154,171 @@ class PgvectorStore(BaseStore):
                         counts[table] = int(row["count"]) if row is not None else 0
                     else:
                         counts[table] = max(0, int(getattr(cursor, "rowcount", 0) or 0))
+                finally:
+                    self._close_cursor(cursor)
+        return counts
+
+    def _is_forgotten(self, connection: Any, chunk_id: str) -> bool:
+        """True when ``forget`` left its non-expiring tombstone for ``chunk_id``."""
+        cursor = connection.cursor()
+        try:
+            cursor.execute(
+                self._sql("SELECT 1 FROM {schema}.{prefix}tombstones WHERE chunk_id = %s AND expires_at >= %s"),
+                (chunk_id, FORGET_TOMBSTONE_EXPIRES_AT),
+            )
+            return cursor.fetchone() is not None
+        finally:
+            self._close_cursor(cursor)
+
+    def _forget_targets(
+        self,
+        connection: Any,
+        chunk_ids: Sequence[str],
+        written_by: str | None,
+        pipeline_id: str | None,
+    ) -> list[tuple[dict[str, Any], str]]:
+        """Selected chunks plus their raw_ref backups, as ``(row, kind)``."""
+        ids, written_by, pipeline_id = _forget_selector(chunk_ids, written_by, pipeline_id)
+        clauses: list[str] = []
+        params: list[object] = []
+        if written_by is not None:
+            clauses.append("written_by = %s")
+            params.append(written_by)
+        if pipeline_id is not None:
+            # A pipeline selector never reaches cross-pipeline (global) memory.
+            clauses.append("pipeline_id = %s AND COALESCE(scope, 'pipeline') <> 'global'")
+            params.append(pipeline_id)
+        chunks = self._table_name("chunks")
+
+        def select(where: list[str], where_params: list[object]) -> list[dict[str, Any]]:
+            cursor = connection.cursor()
+            try:
+                cursor.execute(
+                    f"SELECT chunk_id, pipeline_id, scope, layer, src, written_by, content, meta"
+                    f" FROM {chunks} WHERE {' AND '.join(where)} ORDER BY created_at, chunk_id",
+                    where_params,
+                )
+                return self._fetchall(cursor)
+            finally:
+                self._close_cursor(cursor)
+
+        selected: dict[str, dict[str, Any]] = {}
+        batches: list[list[str] | None] = (
+            [ids[i:i + _FORGET_BATCH] for i in range(0, len(ids), _FORGET_BATCH)] if ids else [None]
+        )
+        for batch in batches:
+            where = list(clauses)
+            batch_params = list(params)
+            if batch is not None:
+                where.append(f"chunk_id IN ({', '.join(['%s'] * len(batch))})")
+                batch_params.extend(batch)
+            for row in select(where, batch_params):
+                selected[str(row["chunk_id"])] = row
+        targets: list[tuple[dict[str, Any], str]] = [(row, "chunk") for row in selected.values()]
+        # The backup holding the original text a noise-filtered chunk came from.
+        backups: dict[str, object] = {}
+        for row in selected.values():
+            meta = row.get("meta")
+            if isinstance(meta, str):
+                try:
+                    meta = json.loads(meta)
+                except ValueError:
+                    meta = None
+            raw_ref = meta.get("raw_ref") if isinstance(meta, dict) else None
+            if isinstance(raw_ref, str) and raw_ref and raw_ref not in selected:
+                backups.setdefault(raw_ref, row["pipeline_id"])
+        for backup_id, owner_pipeline in backups.items():
+            for row in select(["chunk_id = %s"], [backup_id]):
+                if row["pipeline_id"] == owner_pipeline:
+                    targets.append((row, "raw_ref"))
+        return targets
+
+    def forget_candidates(
+        self,
+        *,
+        chunk_ids: Sequence[str] = (),
+        written_by: str | None = None,
+        pipeline_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """List what ``forget`` would delete; see ``BaseStore.forget_candidates``."""
+        with self._connect() as connection:
+            targets = self._forget_targets(connection, chunk_ids, written_by, pipeline_id)
+        return [
+            {
+                "chunk_id": str(row["chunk_id"]),
+                "kind": kind,
+                "pipeline_id": row["pipeline_id"],
+                "scope": row["scope"],
+                "layer": row["layer"],
+                "src": row["src"],
+                "written_by": row["written_by"],
+                "preview": " ".join(str(row["content"]).split())[:80],
+            }
+            for row, kind in targets
+        ]
+
+    def forget(
+        self,
+        *,
+        chunk_ids: Sequence[str] = (),
+        written_by: str | None = None,
+        pipeline_id: str | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, int]:
+        """Delete chunks on request and tombstone them; mirrors ``SQLiteStore.forget``."""
+        counts = {
+            name: 0
+            for name in (
+                "chunks", "raw_ref_chunks", "chunk_edges", "turn_chunks", "chunk_aliases",
+                "outcome_applications", "dissent_log", "memo_entries", "tombstones",
+            )
+        }
+        with self._connect() as connection:
+            targets = self._forget_targets(connection, chunk_ids, written_by, pipeline_id)
+            ids = [str(row["chunk_id"]) for row, _ in targets]
+            counts["chunks"] = sum(1 for _, kind in targets if kind == "chunk")
+            counts["raw_ref_chunks"] = len(targets) - counts["chunks"]
+            counts["tombstones"] = len(ids)
+            now = time.time()
+            for start in range(0, len(ids), _FORGET_BATCH):
+                batch = ids[start:start + _FORGET_BATCH]
+                marks = ", ".join(["%s"] * len(batch))
+                memo_where = " OR ".join("position(%s in chunk_ids) > 0" for _ in batch)
+                plan: list[tuple[str, str, list[object]]] = [
+                    ("chunk_edges", f"src_chunk_id IN ({marks}) OR dst_chunk_id IN ({marks})", batch + batch),
+                    ("turn_chunks", f"chunk_id IN ({marks})", batch),
+                    ("chunk_aliases", f"alias_id IN ({marks}) OR target_id IN ({marks})", batch + batch),
+                    ("outcome_applications", f"chunk_id IN ({marks})", batch),
+                    ("dissent_log", f"chunk_id IN ({marks})", batch),
+                    ("memo_entries", memo_where, [f'"{chunk_id}"' for chunk_id in batch]),
+                ]
+                for table, where, params in plan:
+                    verb = "SELECT COUNT(*) AS count FROM" if dry_run else "DELETE FROM"
+                    cursor = connection.cursor()
+                    try:
+                        cursor.execute(f"{verb} {self._table_name(table)} WHERE {where}", params)
+                        if dry_run:
+                            row = self._fetchone(cursor)
+                            counts[table] += int(row["count"]) if row is not None else 0
+                        else:
+                            counts[table] += max(0, int(getattr(cursor, "rowcount", 0) or 0))
+                    finally:
+                        self._close_cursor(cursor)
+                if dry_run:
+                    continue
+                cursor = connection.cursor()
+                try:
+                    cursor.execute(f"DELETE FROM {self._table_name('chunks')} WHERE chunk_id IN ({marks})", batch)
+                    for chunk_id in batch:
+                        cursor.execute(
+                            self._sql(
+                                "INSERT INTO {schema}.{prefix}tombstones"
+                                " (chunk_id, forward_ref, tombstoned_at, expires_at) VALUES (%s, NULL, %s, %s)"
+                                " ON CONFLICT (chunk_id) DO UPDATE SET forward_ref = NULL,"
+                                " tombstoned_at = EXCLUDED.tombstoned_at, expires_at = EXCLUDED.expires_at"
+                            ),
+                            (chunk_id, now, FORGET_TOMBSTONE_EXPIRES_AT),
+                        )
                 finally:
                     self._close_cursor(cursor)
         return counts

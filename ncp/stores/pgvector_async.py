@@ -28,6 +28,7 @@ import structlog
 
 from ncp.config import NCPConfig
 from ncp.stores.base import (
+    FORGET_TOMBSTONE_EXPIRES_AT,
     BaseStore,
     NCPStoreError,
     NCPStoreUnavailableError,
@@ -401,6 +402,8 @@ class AsyncPgvectorStore(BaseStore):
         )
         async with self._aconnect() as conn:
             await self._async_soft_gc(conn)
+            if await self._async_is_forgotten(conn, chunk.chunk_id):
+                return False
             await self._async_assert_src_immutable(conn, chunk)
             if await self._async_is_duplicate(conn, chunk):
                 return False
@@ -479,7 +482,7 @@ class AsyncPgvectorStore(BaseStore):
                         chunk.valid_while,
                         chunk.expiry,
                         chunk.owner,
-                        json.dumps({}),
+                        json.dumps({"raw_ref": chunk.raw_ref} if chunk.raw_ref else {}),
                         embedding_val,
                         chunk.valid_from,
                         chunk.valid_to,
@@ -580,6 +583,15 @@ class AsyncPgvectorStore(BaseStore):
                 ),
                 (now,),
             )
+
+    async def _async_is_forgotten(self, conn: Any, chunk_id: str) -> bool:
+        """True when ``forget`` (sync stores) left its non-expiring tombstone."""
+        async with conn.cursor() as cur:
+            await cur.execute(
+                self._sql("SELECT 1 FROM {schema}.{prefix}tombstones WHERE chunk_id = %s AND expires_at >= %s"),
+                (chunk_id, FORGET_TOMBSTONE_EXPIRES_AT),
+            )
+            return await cur.fetchone() is not None
 
     async def _async_assert_src_immutable(self, conn: Any, chunk: SubconsciousChunk) -> None:
         """Raise ValueError if src, written_by, or pipeline_id changes for an existing
