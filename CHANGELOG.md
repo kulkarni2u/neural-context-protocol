@@ -43,6 +43,8 @@ accept are now rejected.
 - **Trust inputs are validated**: `ncp_record_outcome` requires a finite
   `weight` with `0 < weight <= 1` (it was unbounded, and `NaN` was accepted). A
   caller-supplied `base_trust` is capped at the default for the declared `src`.
+- `ncp_remember` stored its source chunk as `tool_result` at trust 0.95,
+  above the 0.80 ceiling for that `src`. It now uses 0.80.
 - **Whisper ack ownership** (`ncp/stores/sqlite.py`,
   `ncp/stores/redis_coordination.py`): a targeted whisper can be acknowledged
   only by its target or its sender. Any agent could previously delete another
