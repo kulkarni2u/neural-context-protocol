@@ -1227,7 +1227,13 @@ ONTOLOGY_MCP_TOOLS: list[dict[str, object]] = [
                         "attributes{}, evidence[], schema_pack, schema_version, relation_id."
                     ),
                     "properties": {
-                        "relation_id": {"type": "string"},
+                        "relation_id": {
+                            "type": "string",
+                            "description": (
+                                "Only to re-assert an existing relation in this namespace; "
+                                "new relations get an id derived from idempotency_key."
+                            ),
+                        },
                         "src_entity_id": {"type": "string"},
                         "dst_entity_id": {"type": "string"},
                         "relation_type": {"type": "string"},

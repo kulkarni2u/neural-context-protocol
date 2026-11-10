@@ -543,6 +543,28 @@ class TestAuthMapping:
         with pytest.raises(AuthorizationError, match="pipeline_id is required"):
             authorizer.check_call(limited, "ncp_ontology_query", {"key": "api"})
 
+    def test_explicit_relation_id_cannot_probe_or_squat_other_scopes(self, tmp_path: Path) -> None:
+        root = _project(tmp_path, ENABLED_TOML)
+        alice = InProcess(root, principal=_principal("alice", pipelines={"p1"}))
+        bob = InProcess(root, principal=_principal("bob", pipelines={"p2"}))
+        a_src, a_dst = put_entity(alice, "p1", service("checkout")), put_entity(alice, "p1", database("ledger"))
+        b_src, b_dst = put_entity(bob, "p2", service("search")), put_entity(bob, "p2", database("index"))
+        hidden = put_relation(alice, "p1", "deploy-1", relation(a_src, a_dst))["relation"]["relation_id"]
+        # An id that exists in p1 and one that exists nowhere look the same from p2.
+        probe_hidden = put_relation(bob, "p2", "probe-1", relation(b_src, b_dst, relation_id=hidden))
+        probe_absent = put_relation(bob, "p2", "probe-2", relation(
+            b_src, b_dst, relation_id="00000000-0000-0000-0000-000000000001"))
+        assert probe_hidden == probe_absent
+        _error(probe_hidden, "not_found")
+        # p2 cannot pre-claim the id p1 derives from its idempotency key.
+        own = put_relation(bob, "p2", "deploy-2", relation(b_src, b_dst))
+        assert own["ok"]
+        derived_p1 = put_relation(alice, "p1", "deploy-2", relation(a_src, a_dst))
+        assert derived_p1["ok"] and derived_p1["relation"]["relation_id"] != own["relation"]["relation_id"]
+        # Re-asserting an existing relation of the caller's own scope by id still works.
+        again = put_relation(alice, "p1", "deploy-3", relation(a_src, a_dst, relation_id=hidden, confidence=0.5))
+        assert again["ok"] and again["relation"]["revision"] == 2
+
     def test_principal_comes_from_dispatcher_not_arguments(self, tmp_path: Path) -> None:
         root = _project(tmp_path, ENABLED_TOML)
         verifier = InProcess(root, principal=_principal("checker", caps={"verify"}))

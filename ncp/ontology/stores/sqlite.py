@@ -800,6 +800,17 @@ class SQLiteOntologyStore:
                     found[entity_id] = entity
         return found
 
+    def relation_in_scope(self, relation_id: UUID, *, auth: AuthContext) -> bool:
+        """Whether ``relation_id`` names a relation in exactly the caller's scope."""
+        _require(auth, "read")
+        with self._transaction(write=False) as connection:
+            return self._row(
+                connection,
+                "SELECT 1 FROM ontology_relations WHERE relation_id = ? AND tenant_id = ?"
+                " AND namespace = ?",
+                (str(relation_id), auth.scope.tenant_id, auth.scope.namespace),
+            ) is not None
+
     def resolve_entities(
         self, key: str, *, auth: AuthContext, entity_type: str | None = None,
         schema_pack: str | None = None, limit: int = 20,

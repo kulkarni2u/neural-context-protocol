@@ -553,7 +553,8 @@ class OntologyFacade:
         ``created_by`` is always the authenticated principal. ``observed_at``
         is required and ``valid_from`` defaults to it, so the payload (and its
         idempotency fingerprint) is the same on replay. Without an explicit
-        ``relation_id`` one is derived from the scope and ``idempotency_key``.
+        ``relation_id`` one is derived from the scope and ``idempotency_key``;
+        an explicit one must name a relation already in the caller's scope.
         """
         store = self._require_enabled()
         if not isinstance(relation, Mapping):
@@ -571,11 +572,23 @@ class OntologyFacade:
         )
         if relation.get("observed_at") is None:
             raise OntologyError("invalid", "relation.observed_at is required")
+        derived = uuid5(NAMESPACE_URL, "ncp:ontology:v1:relation:" + json.dumps(
+            [auth.scope.tenant_id, auth.scope.namespace, key],
+        ))
         relation_id = relation.get("relation_id")
         if relation_id is None:
-            relation_id = uuid5(NAMESPACE_URL, "ncp:ontology:v1:relation:" + json.dumps(
-                [auth.scope.tenant_id, auth.scope.namespace, key],
-            ))
+            relation_id = derived
+        else:
+            # An explicit relation_id only re-asserts a relation already in the
+            # caller's own scope (or names its derived id). Creating arbitrary
+            # ids would let a caller probe other scopes' relation ids (an
+            # out-of-scope id was not_found, an unused one was created) and
+            # squat the id another scope derives from its idempotency key.
+            relation_id = _uuid(relation_id, "relation.relation_id")
+            with _translate_errors():
+                known = relation_id == derived or store.relation_in_scope(relation_id, auth=auth)
+            if not known:
+                raise OntologyError("not_found", "relation_id is not available")
         payload = {
             "valid_from": relation["observed_at"],
             **relation,
