@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 from typing import Any, get_args
 
+from ncp.ontology.policy import OntologyConfig
+
 try:
     import tomllib
 except ModuleNotFoundError:  # pragma: no cover
@@ -352,6 +354,10 @@ class NCPConfig:
 
     values: dict[str, Any]
     project_root: Path
+
+    @property
+    def ontology(self) -> OntologyConfig:
+        return OntologyConfig.model_validate(self.values.get("ontology", {}))
 
     @property
     def store_type(self) -> str:
@@ -875,7 +881,10 @@ def load_config(
     if not Path(str(values["store"]["path"])).is_absolute():
         values["store"]["path"] = str(project_root / str(values["store"]["path"]))
 
-    return NCPConfig(values=values, project_root=project_root)
+    config = NCPConfig(values=values, project_root=project_root)
+    if "ontology" in values:
+        config.ontology  # Validate an explicitly configured ontology section at startup.
+    return config
 
 
 def find_project_root(start: str | Path) -> Path:

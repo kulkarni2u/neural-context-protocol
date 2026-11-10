@@ -1,0 +1,19 @@
+{
+  "id": "infrastructure",
+  "version": 1,
+  "entity_types": {
+    "Service": {"required": ["name", "environment"]},
+    "KafkaTopic": {"required": ["cluster", "name"]},
+    "Database": {"required": ["name"]},
+    "API": {"required": ["name"]},
+    "Incident": {"required": ["incident_key"]},
+    "Team": {"required": ["name"]}
+  },
+  "relation_types": {
+    "PRODUCES": {"from": ["Service"], "to": ["KafkaTopic"]},
+    "CONSUMES": {"from": ["Service"], "to": ["KafkaTopic"]},
+    "DEPENDS_ON": {"from": ["Service"], "to": ["Service", "Database", "API"]},
+    "EXPOSES": {"from": ["Service"], "to": ["API"]},
+    "OWNS": {"from": ["Team"], "to": ["Service"]}
+  }
+}
