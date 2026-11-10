@@ -85,10 +85,11 @@ accept are now rejected.
 - A conflicting and low-trust memory benchmark (`benchmarks/conflict_trust`,
   `docs/NCP_BENCHMARK_CONFLICT_TRUST.md`): contradicting claims that differ
   only by value, resolved by source trust, `supersedes`, outcomes, dissent or
-  repetition. NCP ranks the true claim first in 0.87 of the resolvable tasks
-  against 0.33 for plain RAG. It also shows that write-time dedup drops a
-  contradicting non-numeric claim (8 of 84 tasks), and that NCP surfaces the
-  wrong claim when the wrong claim is the trusted one. Gated in CI.
+  repetition. NCP ranks the true claim first in 0.98 of the resolvable tasks
+  against 0.33 for plain RAG (seed 7; 0.98 on seeds 1, 2, 3, 7 and 11). It
+  found the write-time dedup defect listed under Fixed, and shows that NCP
+  surfaces the wrong claim when the wrong claim is the trusted one. Gated in
+  CI.
 - `Dockerfile` and a `server` compose profile for `ncp serve`
   (`docs/NCP_DOCKER.md`).
 - `CONTRIBUTING.md`, `SECURITY.md`, a `py.typed` marker, Dependabot config,
@@ -119,6 +120,19 @@ accept are now rejected.
 
 ### Fixed
 
+- Write-time near-duplicate detection discarded contradicting claims. Two
+  sentences that differed only in a non-numeric value ("deploy window is on
+  Friday morning" / "...on Tuesday morning") were treated as duplicates, so
+  `write()` returned `False` and the correction was never stored, even when the
+  new chunk set `supersedes` to the stored one. A chunk that declares
+  `supersedes` is now never a duplicate of the chunk it supersedes (SQLite,
+  pgvector, async pgvector; `ncp_write_memory` now sets the chunk's `supersedes`
+  from its `supersedes` argument and `supersedes` edges before writing), and `is_near_duplicate` treats same-length texts
+  that differ by one or two substituted content words as different claims
+  (case, punctuation, stopwords, numbers and inflections such as retry/retries
+  do not count). Consolidation and fan-in merging keep the previous rule and can
+  still merge two claims that differ by a single word. Found by
+  `benchmarks/conflict_trust`.
 - `ncp migrate` and `ncp init --store pgvector` imported `psycopg2`, which the
   `pgvector` extra does not install. They now use psycopg v3, and a missing
   driver is reported as an error instead of being skipped.

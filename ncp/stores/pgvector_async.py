@@ -643,7 +643,7 @@ class AsyncPgvectorStore(BaseStore):
             await cur.execute(
                 self._sql(
                     """
-                    SELECT content FROM {schema}.{prefix}chunks
+                    SELECT content, chunk_id FROM {schema}.{prefix}chunks
                     WHERE zone = %s AND layer = %s
                       AND COALESCE(pipeline_id, '') = COALESCE(%s, '')
                       AND chunk_id != %s
@@ -656,10 +656,13 @@ class AsyncPgvectorStore(BaseStore):
             raw_rows = await cur.fetchall()
             description = cur.description
         rows = [self._normalize_row(r, description) for r in raw_rows]
-        for row in rows:
-            if is_near_duplicate(chunk.content, str(row["content"])):
-                return True
-        return False
+        # A declared correction is never a duplicate of the chunk it supersedes.
+        superseded = set(parse_supersedes_ids(chunk.supersedes))
+        return any(
+            is_near_duplicate(chunk.content, str(row["content"]))
+            for row in rows
+            if row.get("chunk_id") not in superseded
+        )
 
     async def _async_hard_gc(self, conn: Any, *, pipeline_id: str | None) -> None:
         """Cap one pipeline's working zone; see ``SQLiteStore._hard_gc``.

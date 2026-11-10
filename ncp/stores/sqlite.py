@@ -4709,7 +4709,7 @@ class SQLiteStore(BaseStore):
         limit = self.config.dedup_scan_limit if self.config is not None else 200
         rows = connection.execute(
             """
-            SELECT content FROM chunks
+            SELECT content, chunk_id FROM chunks
             WHERE zone = ? AND layer = ? AND IFNULL(pipeline_id, '') = IFNULL(?, '')
               AND chunk_id != ?
             ORDER BY created_at DESC
@@ -4717,7 +4717,13 @@ class SQLiteStore(BaseStore):
             """,
             (chunk.zone, chunk.layer, chunk.pipeline_id, chunk.chunk_id, max(0, int(limit))),
         ).fetchall()
-        return any(is_near_duplicate(chunk.content, str(row["content"])) for row in rows)
+        # A declared correction is never a duplicate of the chunk it supersedes.
+        superseded = set(parse_supersedes_ids(chunk.supersedes))
+        return any(
+            is_near_duplicate(chunk.content, str(row["content"]))
+            for row in rows
+            if row["chunk_id"] not in superseded
+        )
 
     def _soft_gc(self, connection: sqlite3.Connection) -> None:
         now = time.time()

@@ -1882,6 +1882,14 @@ def make_handlers(
             kwargs["caused_by"] = str(caused_by)
         if (chunk_type := args.get("chunk_type")) is not None:
             kwargs["chunk_type"] = str(chunk_type)
+        # Declare the correction on the chunk itself, so write-time dedup knows it
+        # must not suppress this chunk as a duplicate of what it supersedes (a
+        # 'supersedes' edge in `edges` is only written after the chunk is stored).
+        declared = [str(supersedes)] if supersedes is not None else []
+        declared += [str(item["dst"]) for item in raw_edges if item["type"] == "supersedes"]
+        declared = [target for target in dict.fromkeys(declared) if target != kwargs.get("chunk_id")]
+        if declared:
+            kwargs["supersedes"] = declared[0] if len(declared) == 1 else json.dumps(declared)
 
         raw_ref: str | None = None
         if will_produce_raw_ref:

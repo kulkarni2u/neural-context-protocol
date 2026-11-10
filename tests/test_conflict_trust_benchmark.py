@@ -53,7 +53,15 @@ def test_raw_replay_always_contains_the_answer_and_the_conflict(artifact: dict) 
 def test_ncp_beats_plain_rag_where_the_store_holds_a_trust_signal(artifact: dict) -> None:
     summary = artifact["summary"]
     assert summary["ncp_beats_plain_rag_on_resolvable"] is True
-    assert summary["ncp_top1_minus_plain_rag_top1"] >= 0.25
+    assert summary["ncp_top1_minus_plain_rag_top1"] >= 0.4
+
+
+def test_store_never_drops_the_true_fact_at_write(artifact: dict) -> None:
+    # A contradicting claim is the same sentence with a different value. The
+    # write-time near-duplicate filter used to discard some of them (including
+    # an explicit supersedes correction); it must not.
+    assert artifact["summary"]["tasks_where_ncp_dropped_the_true_fact_at_write"] == 0
+    assert artifact["summary"]["resolvable"]["ncp"]["top1_correct"] >= 0.95
 
 
 def test_misplaced_trust_is_reported_as_a_loss_not_hidden(artifact: dict) -> None:

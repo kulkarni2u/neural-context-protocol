@@ -4125,7 +4125,7 @@ class PgvectorStore(BaseStore):
             cursor.execute(
                 self._sql(
                     """
-                    SELECT content FROM {schema}.{prefix}chunks
+                    SELECT content, chunk_id FROM {schema}.{prefix}chunks
                     WHERE zone = %s AND layer = %s AND COALESCE(pipeline_id, '') = COALESCE(%s, '')
                       AND chunk_id != %s
                     ORDER BY created_at DESC
@@ -4137,7 +4137,13 @@ class PgvectorStore(BaseStore):
             rows = self._fetchall(cursor)
         finally:
             self._close_cursor(cursor)
-        return any(is_near_duplicate(chunk.content, str(row["content"])) for row in rows)
+        # A declared correction is never a duplicate of the chunk it supersedes.
+        superseded = set(parse_supersedes_ids(chunk.supersedes))
+        return any(
+            is_near_duplicate(chunk.content, str(row["content"]))
+            for row in rows
+            if row.get("chunk_id") not in superseded
+        )
 
     def vacuum(self, older_than_seconds: float, dry_run: bool = False) -> dict[str, int]:
         """Delete aged rows from append-only tables; mirrors ``SQLiteStore.vacuum``."""

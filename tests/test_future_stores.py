@@ -66,7 +66,7 @@ class _FakeCursor:
                 ]
             )
             return
-        if "SELECT content FROM" in normalized and "COALESCE(pipeline_id, '') = COALESCE(%s, '')" in normalized:
+        if "SELECT content, chunk_id FROM" in normalized and "COALESCE(pipeline_id, '') = COALESCE(%s, '')" in normalized:
             zone, layer, pipeline_id, exclude_chunk_id, limit = params
             matches = [
                 row
@@ -76,7 +76,9 @@ class _FakeCursor:
                 and row["chunk_id"] != exclude_chunk_id
             ]
             matches.sort(key=lambda row: row["created_at"], reverse=True)
-            self._rows = [{"content": row["content"]} for row in matches[: int(limit)]]
+            self._rows = [
+                {"content": row["content"], "chunk_id": row["chunk_id"]} for row in matches[: int(limit)]
+            ]
             return
         if "INSERT INTO" in normalized and "chunks (" in normalized:
             self._insert_chunk(params)

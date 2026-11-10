@@ -58,16 +58,16 @@ Six unrelated filler notes are written after the claims in every task.
 | Scenario | NCP | plain RAG | sliding window | raw replay |
 |---|---:|---:|---:|---:|
 | `no_conflict` (control) | 1.00 | 1.00 | 0.00 | 1.00 |
-| `low_trust_distractor` | 0.75 | 0.00 | 0.00 | 0.25 |
-| `superseded` | 0.83 | 0.42 | 0.00 | 0.00 |
-| `outcome_feedback` | 0.83 | 0.50 | 0.00 | 0.17 |
+| `low_trust_distractor` | 0.92 | 0.00 | 0.00 | 0.25 |
+| `superseded` | 1.00 | 0.42 | 0.00 | 0.00 |
+| `outcome_feedback` | 1.00 | 0.50 | 0.00 | 0.17 |
 | `dissent` | 1.00 | 0.42 | 0.00 | 0.67 |
-| `repetition_flood` | 0.92 | 0.33 | 0.00 | 0.08 |
-| **Five resolvable scenarios** | **0.87** | **0.33** | 0.00 | 0.23 |
-| `misplaced_trust` | 0.08 | 0.58 | 0.00 | 0.67 |
+| `repetition_flood` | 1.00 | 0.33 | 0.00 | 0.08 |
+| **Five resolvable scenarios** | **0.98** | **0.33** | 0.00 | 0.23 |
+| `misplaced_trust` | 0.00 | 0.58 | 0.00 | 0.67 |
 
-Across seeds 1, 2, 3, 7 and 11 the resolvable figure is 0.83 to 0.90 for NCP
-and 0.33 to 0.52 for plain RAG. Plain RAG's figure is what a random choice
+Across seeds 1, 2, 3, 7 and 11 the resolvable figure is 0.98 for NCP (59 of
+60 tasks, every seed) and 0.33 to 0.52 for plain RAG. Plain RAG's figure is what a random choice
 among equally scored claims gives; raw replay always contains the answer and
 always contains the contradiction too.
 
@@ -80,28 +80,42 @@ from the features the other benchmarks do not exercise.
 
 ## What it also shows
 
-**NCP does not score 1.00, and the cause is a defect.** In 8 of the 84 tasks
-the store refused to write the true fact at all. Write-time near-duplicate
-detection (`is_near_duplicate` in `ncp/stores/consolidation.py`) treats two
-sentences that differ only in a non-numeric value as duplicates, so
-"...is on Tuesday morning." is dropped when "...is on Friday morning." is
-already stored. `write()` returns `False` and the contradiction is never
-recorded. This happens even when the new chunk declares that it `supersedes`
-the stored one, so a correction can be silently discarded. Numeric values are
-not affected. Every NCP miss in the `superseded`, `outcome_feedback` and
-`repetition_flood` scenarios, and two of the three in `low_trust_distractor`,
-is this. The summary reports it as
-`tasks_where_ncp_dropped_the_true_fact_at_write`.
+**NCP does not score 1.00, and the one miss is retrieval, not storage.** In
+every seed the same task fails: `low_trust_distractor` on the `oncall_rota`
+fact at `k = 1`. The store holds the true fact, but the query ("which rota is
+paged for webhook delivery failures") ranks an unrelated filler note first. The
+lexical scorer has no stopword handling, and the five near-identical claims
+share every topical term, which makes those terms common and low-weight; the
+word "for", which also appears in a filler note, then outweighs them. Dropping
+"for" from the query puts the true fact first. At `k = 3` the task passes.
+This is a property of BM25-style scoring on a tiny corpus, not a defect in the
+store's trust logic, and it is left as is.
+
+**Write-time dedup used to drop contradictions, and no longer does.** An
+earlier version of this benchmark found that `is_near_duplicate` treated two
+sentences that differ only in a non-numeric value ("...on Friday morning." and
+"...on Tuesday morning.") as duplicates, so `write()` returned `False` and the
+contradiction was never stored, even when the new chunk declared that it
+`supersedes` the stored one. That was 6 to 10 of 84 tasks per seed and held NCP
+at 0.83 to 0.90 on the resolvable scenarios. Write-time dedup now (a) never
+treats a chunk as a duplicate of the chunk it `supersedes`, and (b) treats two
+texts of the same length as different claims when one or two content words are
+substituted at the same positions (not case, punctuation, a stopword, a number
+or an inflection such as retry/retries). `tasks_where_ncp_dropped_the_true_fact_at_write`
+is now 0 in every seed. Consolidation and fan-in merging keep their previous,
+looser rule, so they can still merge two claims that differ by one word.
 
 **Trust weighting follows trust, not truth.** In `misplaced_trust` the wrong
-claim is the trusted one and nothing corrects it, and NCP surfaces it in 11 of
-12 tasks while plain RAG, choosing at random, is right about half the time. A
-store that has been told something false with high trust is worse off than one
-with no trust signal.
+claim is the trusted one and nothing corrects it, and NCP surfaces it in all 12
+tasks while plain RAG, choosing at random, is right about half the time. This
+score fell from 0.08 because, before the dedup fix, the store sometimes
+dropped the trusted wrong claim and so by accident ranked the true one first.
+A store that has been told something false with high trust is worse off than
+one with no trust signal.
 
 **A larger budget lets the contradiction back in.** At `k = 2` and `k = 3` NCP
-still ranks the true claim first (0.88), but its context then also holds a
-contradicting claim in most tasks: `clean` falls to 0.23, against 0.00 for
+still ranks the true claim first (1.00), but its context then also holds a
+contradicting claim in most tasks: `clean` falls to 0.20, against 0.00 for
 plain RAG. NCP labels each chunk with `src` and `trust`; this benchmark does
 not measure whether a model uses those labels. `superseded` is the exception:
 the replaced chunk stays out at every budget.
