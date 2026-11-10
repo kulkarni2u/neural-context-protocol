@@ -33,6 +33,9 @@ accept are now rejected.
   no self-crediting for outcomes, rejects overwriting or superseding another
   agent's chunk, keys the `ncp_fetch` budget by principal, and returns `403`
   for unscoped `/api/*` reads unless the principal is an unrestricted admin.
+  `ncp_improve` needs `admin`, an existing `turn_id` can be re-posted only by
+  its own agent, and `recent` refs, `retrieved_chunk_ids`, a dissent `ref` and
+  a task's `parent_task_id` must point inside the allowed pipelines.
   A token is then required on loopback too, and the bundled UI needs an admin
   token. `[server].auth_token` acts as an implicit admin while both are set.
   Nothing changes when no principals are configured, and stdio is not
@@ -115,6 +118,9 @@ accept are now rejected.
 - The pgvector stores wrote an empty `meta`, so a chunk's `raw_ref` was never
   persisted on Postgres. They now store it as SQLite does. Chunks written
   before this have no stored `raw_ref`.
+- `ncp serve --cwd <project> --store-path <path>` read `.ncp/config.toml` from
+  the process directory, not the project, so run from elsewhere it ignored the
+  project's auth token and `[principals]`. It now honours `--cwd`.
 - A POST body that is not valid UTF-8 returns `400` instead of dropping the
   connection.
 - SQLite no longer leaves `whisper_deliveries` rows behind when a broadcast

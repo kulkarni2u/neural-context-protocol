@@ -135,14 +135,23 @@ non-loopback host without `[server].auth_token`.
    memo tools must use `task`/`context`/`pipeline_id` rather than an explicit
    `signature`; `ncp_get_decision` returns `{"found": false}` for a decision in
    another pipeline; `ncp_record_outcome` chunks (and a linked `decision_id`)
-   must be in allowed pipelines.
+   must be in allowed pipelines. The same holds for ids that reach another
+   record: an `ncp_get_context` `recent` ref must name a turn in an allowed
+   pipeline; `ncp_post_turn` `retrieved_chunk_ids` must be chunks in allowed
+   pipelines (global-scope chunks excepted); a `dissent` whisper's `ref` must
+   be a chunk in an allowed pipeline; and an `ncp_task` `parent_task_id` must
+   be a task in an allowed pipeline.
 4. **Capabilities.** `src="user_verified"` needs `verify`; `ncp_record_outcome`
    needs `record_outcome`. A non-admin principal must name explicit
    `chunk_ids` (turn-only outcomes are resolved inside the store, where
    authorship cannot be checked first), every id must be a live chunk, and
    none may have been written by the principal itself; nor may it link an
    outcome to its own `decision_id`. A pipeline-limited admin must also pass
-   explicit `chunk_ids`.
+   explicit `chunk_ids`. `ncp_improve` needs `admin`: consolidation merges
+   near-duplicate chunks across authors, deleting the losers and aliasing
+   their ids (and their outcome credit) to the keeper. `ncp_post_turn` with a
+   `turn_id` that already exists replaces that turn record, so only the turn's
+   own agent (or an admin) may post it again.
 5. **Fetch budget.** `ncp_get_context` and `ncp_fetch` ignore the caller's
    `session_id`: the 3-per-turn `ncp_fetch` budget is keyed by principal
    (`principal:<name>`, or `principal:<name>:<pipeline>:<agent>` for admin).
@@ -169,7 +178,12 @@ principal; it is not per-message signing (combine with
 `[identity].require_signatures` for that), and anyone holding a token is that
 principal. It does not stop a principal from writing false or persuasive
 content under its own name, and within an allowed pipeline the read APIs
-(`/api/whispers`, `/api/chunks`, ...) show every agent's data. When no
+(`/api/whispers`, `/api/chunks`, ...) show every agent's data. An agent
+chooses its own `retrieved_chunk_ids`, so an admin recording a turn-only
+outcome credits whatever chunks that turn declared, the agent's own included.
+`target` on a whisper and `assign_to` on a task may name any agent. A
+misspelled table name (for example `[principal.x]`) is not detected and leaves
+principals off; `ncp doctor` does not check for it. When no
 principal is configured, everything above is off and the server behaves
 exactly as described in [Authentication](#authentication).
 

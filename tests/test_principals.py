@@ -387,3 +387,87 @@ class TestReadAuthorization:
             authorize_events(_p(pipelines={"p1"}), agent_id=None, pipeline_id=None)
         assert authorize_events(_p(caps={"admin"}), agent_id="bob", pipeline_id=None) == "bob"
         assert authorize_events(_p(caps={"admin"}), agent_id=None, pipeline_id=None) is None
+
+
+# ── bypasses found by adversarial review ─────────────────────────────────────
+
+
+def _turn(store: SQLiteStore, turn_id: str, *, by: str, pipeline: str | None) -> None:
+    from ncp.types import TurnRecord
+
+    store.log_turn_record(
+        TurnRecord(turn_id=turn_id, agent_id=by, pipeline_id=pipeline, task="t", slot="s", result="r", result_full="r")
+    )
+
+
+class TestReviewFindings:
+    def test_improve_requires_admin(self, store: SQLiteStore) -> None:
+        auth = ToolAuthorizer(store)
+        with pytest.raises(AuthorizationError, match="ncp_improve requires the 'admin'"):
+            auth.check_call(_p(pipelines={"p1"}), "ncp_improve", {"pipeline_id": "p1"})
+        with pytest.raises(AuthorizationError, match="ncp_improve requires the 'admin'"):
+            auth.check_call(_p(caps={"record_outcome", "verify"}), "ncp_improve", {})
+        auth.check_call(_p(caps={"admin"}), "ncp_improve", {"pipeline_id": "p1"})
+
+    def test_post_turn_cannot_replace_another_agents_turn(self, store: SQLiteStore) -> None:
+        _turn(store, "turn_bob", by="bob", pipeline="p1")
+        _turn(store, "turn_alice", by="alice", pipeline="p1")
+        _turn(store, "turn_alice_p2", by="alice", pipeline="p2")
+        auth = ToolAuthorizer(store)
+        alice = _p(pipelines={"p1"})
+        with pytest.raises(AuthorizationError, match="only its author"):
+            auth.check_call(alice, "ncp_post_turn", {"pipeline_id": "p1", "turn_id": "turn_bob"})
+        with pytest.raises(AuthorizationError, match="may not access"):
+            auth.check_call(alice, "ncp_post_turn", {"pipeline_id": "p1", "turn_id": "turn_alice_p2"})
+        auth.check_call(alice, "ncp_post_turn", {"pipeline_id": "p1", "turn_id": "turn_alice"})
+        auth.check_call(alice, "ncp_post_turn", {"pipeline_id": "p1", "turn_id": "turn_new"})
+        # Unrestricted non-admin principals are still bound to their own turns.
+        with pytest.raises(AuthorizationError, match="only its author"):
+            auth.check_call(_p(), "ncp_post_turn", {"turn_id": "turn_bob"})
+        auth.check_call(_p(caps={"admin"}), "ncp_post_turn", {"turn_id": "turn_bob"})
+
+    def test_post_turn_retrieved_chunk_ids_must_be_in_allowed_pipelines(self, store: SQLiteStore) -> None:
+        _write(store, "sub_p1", by="bob", pipeline="p1")
+        _write(store, "sub_p2", by="bob", pipeline="p2")
+        auth = ToolAuthorizer(store)
+        alice = _p(pipelines={"p1"})
+        with pytest.raises(AuthorizationError, match="retrieved_chunk_ids"):
+            auth.check_call(alice, "ncp_post_turn", {"pipeline_id": "p1", "retrieved_chunk_ids": ["sub_p1", "sub_p2"]})
+        auth.check_call(alice, "ncp_post_turn", {"pipeline_id": "p1", "retrieved_chunk_ids": ["sub_p1", "sub_missing"]})
+
+    def test_recent_refs_cannot_read_another_pipelines_turn(self, store: SQLiteStore) -> None:
+        _turn(store, "turn_p2", by="bob", pipeline="p2")
+        _turn(store, "turn_p1", by="bob", pipeline="p1")
+        auth = ToolAuthorizer(store)
+        alice = _p(pipelines={"p1"})
+        with pytest.raises(AuthorizationError, match="recent ref"):
+            auth.check_call(alice, "ncp_get_context", {"pipeline_id": "p1", "recent": ["r:sub/turn_p2"]})
+        auth.check_call(alice, "ncp_get_context", {"pipeline_id": "p1", "recent": ["r:sub/turn_p1", "r:sub/nope"]})
+        auth.check_call(_p(), "ncp_get_context", {"recent": ["r:sub/turn_p2"]})
+
+    def test_dissent_ref_must_be_in_allowed_pipelines(self, store: SQLiteStore) -> None:
+        _write(store, "sub_p1", by="bob", pipeline="p1")
+        _write(store, "sub_p2", by="bob", pipeline="p2")
+        auth = ToolAuthorizer(store)
+        alice = _p(pipelines={"p1"})
+        with pytest.raises(AuthorizationError, match="dissent ref"):
+            auth.check_call(alice, "ncp_emit_whisper", {"pipeline_id": "p1", "type": "dissent", "ref": "sub_p2"})
+        auth.check_call(alice, "ncp_emit_whisper", {"pipeline_id": "p1", "type": "dissent", "ref": "sub_p1"})
+        auth.check_call(alice, "ncp_emit_whisper", {"pipeline_id": "p1", "type": "share", "ref": "sub_p2"})
+
+
+def test_server_config_honours_cwd_when_store_path_is_given(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from ncp.mcp.server import _load_server_config
+
+    project = tmp_path / "proj"
+    (project / ".ncp").mkdir(parents=True)
+    (project / ".ncp" / "config.toml").write_text(
+        '[principals.alice]\ntoken_sha256 = "' + hash_token("tok") + '"\nagent_id = "alice"\n'
+    )
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    config = _load_server_config(store_path=project / ".ncp" / "store.db", cwd=project)
+
+    assert "alice" in config.principals_config

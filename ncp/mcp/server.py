@@ -3394,7 +3394,9 @@ def _create_handlers_with_store(
 
 def _load_server_config(*, store_path: str | Path | None = None, cwd: Path | None = None) -> NCPConfig:
     if store_path:
-        return load_config(env={"NCP_STORE_PATH": str(store_path)})
+        # Keep ``cwd``: dropping it read the config (and so [principals] and
+        # the auth token) from the process directory instead of the project.
+        return load_config(cwd=cwd or Path.cwd(), env={"NCP_STORE_PATH": str(store_path)})
     return load_config(cwd=cwd or Path.cwd())
 
 

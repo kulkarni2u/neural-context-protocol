@@ -350,6 +350,19 @@ class ToolAuthorizer:
             if principal.is_admin:
                 key = f"{key}:{_str_or_none(args.get('pipeline_id')) or '-'}:{_str_or_none(args.get('agent_id')) or '-'}"
             args["session_id"] = key
+        if tool == "ncp_get_context":
+            self._check_recent_refs(principal, args.get("recent"))
+        elif tool == "ncp_improve":
+            # Consolidation merges near-duplicate chunks across authors: it
+            # deletes the losers, marks the keeper as superseding them and
+            # aliases their ids to it, which also moves outcome credit.
+            if not principal.is_admin:
+                raise AuthorizationError(
+                    f"ncp_improve requires the 'admin' capability (principal {principal.name!r} does not have it): "
+                    "consolidation can delete or supersede other agents' chunks"
+                )
+        elif tool == "ncp_emit_whisper":
+            self._check_dissent_ref(principal, args)
         elif tool == "ncp_write_memory":
             self._require_verify_for_src(principal, args.get("src"), where=tool)
             self._check_chunk_id_not_foreign(principal, args.get("chunk_id"), where=tool)
@@ -404,7 +417,73 @@ class ToolAuthorizer:
                     "a principal may only supersede its own chunks"
                 )
 
+    def _lookup_turn(self, turn_id: str) -> Any:
+        try:
+            return self.store.resolve_recent_ref(f"r:sub/{turn_id}")
+        except Exception as exc:  # noqa: BLE001 - fail closed when the lookup cannot run
+            raise AuthorizationError(f"cannot verify turn {turn_id!r}: {exc}") from exc
+
+    def _check_recent_refs(self, principal: Principal, recent: object) -> None:
+        """A recent ref resolves a turn record by id with no pipeline filter."""
+        if principal.pipelines is None or not isinstance(recent, (list, tuple)):
+            return
+        for ref in recent:
+            text = _str_or_none(ref)
+            if text is None or not text.startswith("r:sub/"):
+                continue
+            record = self._lookup_turn(text.split("/", 1)[1])
+            if record is not None and not principal.pipeline_allowed(record.pipeline_id):
+                raise AuthorizationError(
+                    f"ncp_get_context: recent ref {text!r} names a turn outside the pipelines "
+                    f"principal {principal.name!r} may access"
+                )
+
+    def _check_dissent_ref(self, principal: Principal, args: dict[str, object]) -> None:
+        """A dissent whisper raises the dissent count of the chunk named by ``ref``."""
+        if principal.pipelines is None or str(args.get("type", "")) != "dissent":
+            return
+        ref = _str_or_none(args.get("ref"))
+        if ref is None:
+            return
+        for chunk in self.store.get_chunks_by_ids([ref]):
+            if not principal.pipeline_allowed(chunk.pipeline_id):
+                raise AuthorizationError(
+                    f"ncp_emit_whisper: dissent ref {ref!r} is outside the pipelines "
+                    f"principal {principal.name!r} may access"
+                )
+
+    def _check_turn_ownership(self, principal: Principal, args: dict[str, object]) -> None:
+        """Posting with an existing turn_id replaces that turn record and its chunk links."""
+        turn_id = _str_or_none(args.get("turn_id"))
+        if turn_id is not None:
+            record = self._lookup_turn(turn_id)
+            if record is not None:
+                if not principal.is_admin and record.agent_id != principal.agent_id:
+                    raise AuthorizationError(
+                        f"ncp_post_turn: turn_id {turn_id!r} already exists and belongs to "
+                        f"{record.agent_id!r}; only its author may post it again"
+                    )
+                if not principal.pipeline_allowed(record.pipeline_id):
+                    raise AuthorizationError(
+                        f"ncp_post_turn: turn_id {turn_id!r} belongs to a pipeline principal "
+                        f"{principal.name!r} may not access"
+                    )
+        retrieved = args.get("retrieved_chunk_ids")
+        if principal.pipelines is None or not isinstance(retrieved, (list, tuple)):
+            return
+        ids = [text for text in (_str_or_none(item) for item in retrieved) if text is not None]
+        for chunk in self.store.get_chunks_by_ids(ids) if ids else ():
+            # Global-scope chunks are legitimately retrieved from any pipeline.
+            if getattr(chunk, "scope", "pipeline") == "global":
+                continue
+            if not principal.pipeline_allowed(chunk.pipeline_id):
+                raise AuthorizationError(
+                    f"ncp_post_turn: retrieved_chunk_ids names {chunk.chunk_id!r}, which is outside "
+                    f"the pipelines principal {principal.name!r} may access"
+                )
+
     def _check_post_turn(self, principal: Principal, args: dict[str, object]) -> None:
+        self._check_turn_ownership(principal, args)
         raw_items = args.get("memory_chunks")
         if not isinstance(raw_items, list):
             return
@@ -427,6 +506,17 @@ class ToolAuthorizer:
         if principal.pipelines is None:
             return
         action = str(args.get("action", ""))
+        parent_id = _str_or_none(args.get("parent_task_id"))
+        if parent_id is not None:
+            try:
+                parent = self.store.get_task(parent_id)
+            except Exception as exc:  # noqa: BLE001 - store without a ledger
+                raise AuthorizationError(f"ncp_task: cannot verify parent task {parent_id!r}: {exc}") from exc
+            if parent is not None and not principal.pipeline_allowed(parent.pipeline_id):
+                raise AuthorizationError(
+                    f"ncp_task: parent_task_id {parent_id!r} is outside the pipelines "
+                    f"principal {principal.name!r} may access"
+                )
         if action not in _TASK_ID_ACTIONS:
             return
         task_id = _str_or_none(args.get("task_id"))
