@@ -27,7 +27,8 @@ jobs:
       - name: Import package
         run: python -c "import ncp; print(ncp.__version__)"
 
-  test:
+  tests:
+    name: test (${{ matrix.python-version }})
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
@@ -69,6 +70,19 @@ jobs:
       - name: Build artifacts
         if: matrix.python-version == '3.11'
         run: python -m build
+
+  # One check with the stable name "test", so a branch rule that requires
+  # "test" keeps working while the suite runs as a version matrix.
+  test:
+    if: always()
+    needs: tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every matrix job to pass
+        run: |
+          echo "tests result: ${{ needs.tests.result }}"
+          test "${{ needs.tests.result }}" = "success"
 
   pgvector-redis:
     runs-on: ubuntu-latest
