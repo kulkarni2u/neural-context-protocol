@@ -6,6 +6,10 @@ on:
       - main
   pull_request:
 
+# Every job only checks out and tests the code.
+permissions:
+  contents: read
+
 jobs:
   minimum-python-import:
     runs-on: ubuntu-latest
