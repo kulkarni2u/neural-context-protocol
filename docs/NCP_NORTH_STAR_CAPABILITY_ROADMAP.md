@@ -1,10 +1,27 @@
 # NCP North-Star Capability Roadmap
 
+> **Status note (2026-11-10, against v1.8.0).** The "Today" column and the
+> scorecard below describe NCP as it was when this roadmap was written
+> (before 1.0), and only a few entries carry an "implemented" marker. They
+> have not been updated. Per `CHANGELOG.md`, these capabilities have since
+> shipped: CAP-C1 (MMR selection), CAP-C2 (distillation), CAP-C3
+> (memoization), CAP-C4 (embeddings), CAP-C5 (bi-temporal memory), CAP-C6
+> (adaptive budget), CAP-C7 (edge inference at write time), CAP-C8
+> (procedural refinement), CAP-C9 v1 (skill caching), CAP-T1 (authenticated
+> authorship), CAP-T2 (grounded claims), CAP-T3 (outcome calibration),
+> CAP-T4 (reputation-weighted retrieval and whisper gating), CAP-T5 (computed
+> drift and dissent integrity; the entry's own text below still lists
+> residual gaps), CAP-E1 (per-provider token and cost accounting), CAP-E2
+> (cost governor), CAP-E3 (tier hints) and CAP-E4 (provider-real efficacy
+> benchmark). Several are opt-in or off by default; check the config
+> reference before assuming they are active. For the current list of open work
+> see `NCP_NEXT_PHASE_GAP_MATRIX.md`.
+
 > **Goal.** Make NCP the best-in-class agent-to-agent communication substrate,
 > measured by one thing: **more useful work per token dollar** across a
 > multi-agent system, with trust you can rely on.
 >
-> **Relationship to the audit.** `NCP_AUDIT_AND_REMEDIATION_PLAN.md` makes NCP
+> **Relationship to the audit.** `archive/NCP_AUDIT_AND_REMEDIATION_PLAN.md` makes NCP
 > *correct and honest* (fix bugs, align claims). This document makes it
 > *powerful and differentiated* (new capability). They compose: remediation is
 > the floor, this is the ceiling. Ship the P0 remediation items first — a

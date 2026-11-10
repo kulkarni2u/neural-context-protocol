@@ -6,7 +6,7 @@
 ![PyPI](https://img.shields.io/pypi/v/neural-context-protocol)
 
 **Bounded, trust-weighted memory for multi-agent systems.**
-MCP-native. Agents share context without replaying full transcripts. Around 13x fewer tokens than raw replay — see [Benchmarks](#benchmarks).
+MCP-native. Agents share context without replaying full transcripts. Fewer tokens than replaying history: about 1.44x fewer than a sliding window and about 13x fewer than raw replay in the 4-agent coding benchmark. The raw-replay figure is a worst-case floor that grows with turn count — see [Benchmarks](#benchmarks).
 
 -----
 

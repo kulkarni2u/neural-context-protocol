@@ -10,9 +10,11 @@ smaller while tool interfaces and progressive disclosure do the work.
 NCP is squarely in scope for that thesis, because NCP is not only a runtime — it is a
 *context-artifact generator*. `ncp init` always creates a basic
 `CLAUDE.md`, while provider hooks and skills are installed only when detected and
-accepted interactively. NCP owns an immutable catalog of twelve MCP tools. With
-memoization disabled by default, the full profile advertises ten of those tools; the two
-memo tools remain hidden until enabled. Every advertised definition is the kind of
+accepted interactively. NCP owns an immutable catalog of MCP tools (`MCP_TOOLS` in
+`ncp/mcp/server.py`). The `core` profile advertises only five of them; the full profile
+advertises the rest except the memo tools (hidden until memoization is enabled),
+`ncp_wait_whispers` (hidden when `[notify].enabled = false`) and `ncp_task` (hidden unless
+`[tasks].enabled = true`). Every advertised definition is the kind of
 artifact the article says to rightsize.
 
 The short version: NCP's **runtime design is validated** by the article, and NCP's

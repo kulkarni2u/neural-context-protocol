@@ -1,7 +1,7 @@
 # NCP 0.6.x — Slice 1: Streaming `ncp_get_context`
 
 **Date:** 2026-05-27
-**Status:** Approved — ready for implementation
+**Status:** Implemented in 0.6.0 (see CHANGELOG 0.6.0)
 **Release target:** 0.6.0
 
 ---

@@ -49,12 +49,20 @@ curl -s $BASE/mcp -H "$AUTH" -H 'Content-Type: application/json' -d '{
 }'
 ```
 
-Returns the enabled tool catalog — `ncp_get_context`, `ncp_write_memory`,
-`ncp_emit_whisper`, `ncp_post_turn`, `ncp_fetch`, `ncp_record_decision`,
-`ncp_get_decision`, `ncp_compile_decision_query`, `ncp_record_outcome`,
-`ncp_wait_whispers` (unless `[notify].enabled = false`), `ncp_task` (only
-when `[tasks].enabled = true`), `ncp_overview` and the
-memo tools when enabled — each with a JSON Schema under `inputSchema`.
+Returns the enabled tool catalog, each tool with a JSON Schema under
+`inputSchema`. The `core` profile advertises `ncp_get_context`,
+`ncp_write_memory`, `ncp_emit_whisper`, `ncp_post_turn` and `ncp_fetch`. The
+full profile adds `ncp_record_outcome`, `ncp_record_decision`,
+`ncp_get_decision`, `ncp_compile_decision_query`, `ncp_overview`,
+`ncp_remember`, `ncp_recall` and `ncp_improve`, plus these conditional tools:
+
+- `ncp_wait_whispers` — unless `[notify].enabled = false`.
+- `ncp_task` — only when `[tasks].enabled = true`.
+- `ncp_lookup_memo`, `ncp_record_memo`, `ncp_verify_memo` — only when
+  memoization is enabled (`[memoization].enabled`, off by default).
+
+The authoritative list is `MCP_TOOLS` in `ncp/mcp/server.py`;
+`tests/test_docs_tool_catalog.py` fails if a tool is missing from this file.
 
 ## Tool calls
 
