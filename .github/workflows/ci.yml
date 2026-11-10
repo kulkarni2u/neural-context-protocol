@@ -64,6 +64,7 @@ jobs:
           python benchmarks/coding_pipeline/run.py --turns 40 | python -c "import json,sys; artifact=json.load(sys.stdin); summary=artifact['summary']; assert summary['pass'], summary; print('coding gate OK', summary['reduction_factor'])"
           python benchmarks/needle/run.py --turns 24 --needles 6 --budget 4 | python -c "import json,sys; artifact=json.load(sys.stdin); assert artifact['summary']['ncp_beats_sliding_window'], artifact['summary']; print('needle gate OK')"
           python benchmarks/memo_reuse/run.py | python -c "import json,sys; artifact=json.load(sys.stdin); assert artifact['summary']['pass'], artifact['summary']; print('memo reuse gate OK', artifact['summary']['cost_per_verified_success_reduction'])"
+          python benchmarks/conflict_trust/run.py --k 1 --summary-only | python -c "import json,sys; summary=json.load(sys.stdin)['summary']; assert summary['control_all_bounded_arms_find_answer'] and summary['ncp_beats_plain_rag_on_resolvable'], summary; print('conflict/trust gate OK', summary['ncp_top1_minus_plain_rag_top1'])"
 
       - name: Build artifacts
         if: matrix.python-version == '3.11'

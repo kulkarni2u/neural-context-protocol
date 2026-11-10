@@ -82,6 +82,13 @@ accept are now rejected.
 - A plain BM25 RAG baseline (`ncp.bench.baselines.PlainRagBaseline`) as an
   additional arm in the needle, task-success, efficacy, HotpotQA-style and
   pipeline benchmarks.
+- A conflicting and low-trust memory benchmark (`benchmarks/conflict_trust`,
+  `docs/NCP_BENCHMARK_CONFLICT_TRUST.md`): contradicting claims that differ
+  only by value, resolved by source trust, `supersedes`, outcomes, dissent or
+  repetition. NCP ranks the true claim first in 0.87 of the resolvable tasks
+  against 0.33 for plain RAG. It also shows that write-time dedup drops a
+  contradicting non-numeric claim (8 of 84 tasks), and that NCP surfaces the
+  wrong claim when the wrong claim is the trusted one. Gated in CI.
 - `Dockerfile` and a `server` compose profile for `ncp serve`
   (`docs/NCP_DOCKER.md`).
 - `CONTRIBUTING.md`, `SECURITY.md`, a `py.typed` marker, Dependabot config,
