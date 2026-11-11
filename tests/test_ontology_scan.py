@@ -282,3 +282,398 @@ def test_scan_yaml_regexes_are_linear():
     assert _service_name("k8s/deploy.yaml", "kind: Deployment\nmetadata:\n" + payload + "x") is not None
     assert list(_kafka_usages("application.yml", "orders-in-0:\n" + payload + "x")) == []
     assert time.perf_counter() - started < 1.0
+
+
+# -- Spring topic resolution and coverage --------------------------------------------------
+
+
+def _write(root: Path, files: dict[str, str]) -> Path:
+    for rel, text in files.items():
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    return root
+
+
+def _spring(tmp_path: Path, files: dict[str, str]) -> Path:
+    """One Gradle module ``svc`` with a Dockerfile, plus ``files`` under it."""
+    base = {"svc/build.gradle": "plugins { id 'java' }\n", "svc/Dockerfile": "FROM x\n"}
+    return _write(tmp_path / "repo", {**base, **{f"svc/{k}": v for k, v in files.items()}})
+
+
+def _topic(manifest, key: str):
+    return next(e for e in manifest.entities if e.type == "KafkaTopic" and e.key == key)
+
+
+def _edges(manifest) -> dict[tuple[str, str, str], object]:
+    return {(r.src, r.type, r.dst): r for r in manifest.relations
+            if r.type in ("PRODUCES", "CONSUMES")}
+
+
+JAVA = "src/main/java/com/acme/K.java"
+KT = "src/main/kotlin/com/acme/K.kt"
+
+
+class TestSpringResolution:
+    def test_property_placeholder_from_properties(self, tmp_path: Path) -> None:
+        root = _spring(tmp_path, {
+            "src/main/resources/application.properties": "app.topic=orders.v1\n",
+            JAVA: 'class K { @KafkaListener(topics = "${app.topic}") void f() {} }\n',
+        })
+        result = scan_repository(root)
+        topic = _topic(result.manifest, "orders.v1")
+        assert topic.attributes["resolved_from"] == "property:app.topic"
+        edge = _edges(result.manifest)[("Service:svc", "CONSUMES", "KafkaTopic:orders.v1")]
+        assert edge.status == "candidate"
+        kafka = result.summary["kafka"]
+        assert kafka["resolved_via_property"] == 1 and kafka["matched_sites"] == 1
+
+    def test_nested_yaml_default_and_list_forms(self, tmp_path: Path) -> None:
+        root = _spring(tmp_path, {
+            "src/main/resources/application.yml": (
+                "messaging:\n  orders-topic: \"mgr.topic\"  # comment\n  other: 'x'\n"
+                "list:\n  - a: b\nmulti: a.one,a.two\n---\nsecond: \"${messaging.orders-topic}\"\n"
+            ),
+            JAVA: (
+                "class K {\n"
+                '  @KafkaListener(topics = "${messaging.orders-topic}")\n  void a() {}\n'
+                '  @KafkaListener(topics = {"${second}", "${missing.key:fallback.topic}", "plain"})\n'
+                "  void b() {}\n"
+                '  @KafkaListener(topics = "${multi}")\n  void c() {}\n}\n'
+            ),
+        })
+        manifest = scan_repository(root).manifest
+        names = _keys(manifest, "KafkaTopic")
+        assert names == {"mgr.topic", "fallback.topic", "plain", "a.one", "a.two"}
+        assert _topic(manifest, "mgr.topic").attributes["resolved_from"] == "property:messaging.orders-topic"
+        assert _topic(manifest, "fallback.topic").attributes["resolved_from"] == "default:missing.key"
+        assert _topic(manifest, "plain").attributes["resolved_from"] == "literal"
+
+    def test_nested_placeholder_and_cycle(self, tmp_path: Path) -> None:
+        root = _spring(tmp_path, {
+            "src/main/resources/application.properties": (
+                "env=prod\nbase=${env}.orders\nloop.a=${loop.b}\nloop.b=${loop.a}\n"),
+            JAVA: (
+                'class K {\n  @KafkaListener(topics = "${base}") void a() {}\n'
+                '  @KafkaListener(topics = "${loop.a}") void b() {}\n}\n'),
+        })
+        manifest = scan_repository(root).manifest
+        assert "prod.orders" in _keys(manifest, "KafkaTopic")
+        assert _topic(manifest, "unresolved:loop.a").attributes["unresolved"] is True
+
+    def test_profile_precedence(self, tmp_path: Path) -> None:
+        root = _spring(tmp_path, {
+            "src/main/resources/application.properties": "both=base.topic\n",
+            "src/main/resources/application-prod.properties": "both=prod.topic\nonly=prod.only\n",
+            "src/main/resources/application-dev.yml": "only: dev.only\n",
+            JAVA: (
+                'class K {\n  @KafkaListener(topics = "${both}") void a() {}\n'
+                '  @KafkaListener(topics = "${only}") void b() {}\n}\n'),
+        })
+        manifest = scan_repository(root).manifest
+        assert _keys(manifest, "KafkaTopic") == {"base.topic", "dev.only"}  # base wins; dev < prod
+        assert _topic(manifest, "dev.only").attributes["profile"] == "dev"
+        assert "profile" not in _topic(manifest, "base.topic").attributes
+
+    def test_module_scope_then_repo_fallback(self, tmp_path: Path) -> None:
+        root = _spring(tmp_path, {
+            "src/main/resources/application.properties": "t=local.topic\n",
+            JAVA: 'class K { @KafkaListener(topics = "${t}") void a() {} '
+                  '@KafkaListener(topics = "${shared}") void b() {} }\n',
+        })
+        _write(root, {
+            "other/build.gradle": "plugins {}\n", "other/Dockerfile": "FROM x\n",
+            "other/src/main/resources/application.properties": "t=other.topic\nshared=shared.topic\n",
+        })
+        assert _keys(scan_repository(root).manifest, "KafkaTopic") == {"local.topic", "shared.topic"}
+
+    def test_java_constants_and_class_name(self, tmp_path: Path) -> None:
+        root = _spring(tmp_path, {
+            "src/main/java/com/acme/Topics.java": (
+                "public final class Topics {\n"
+                '  public static final String ORDERS = "orders.const";\n'
+                '  static public final String PROP = "${app.t}";\n}\n'),
+            "src/main/resources/application.properties": "app.t=from.prop\n",
+            JAVA: (
+                "class K {\n"
+                "  @KafkaListener(topics = Topics.ORDERS) void a() {}\n"
+                "  @KafkaListener(topics = {Topics.PROP, ORDERS}) void b() {}\n"
+                "  void c() { kafkaTemplate.send(Topics.ORDERS, x); }\n}\n"),
+        })
+        manifest = scan_repository(root).manifest
+        assert _keys(manifest, "KafkaTopic") == {"orders.const", "from.prop"}
+        assert _topic(manifest, "orders.const").attributes["resolved_from"] == "constant:ORDERS"
+        assert ("Service:svc", "PRODUCES", "KafkaTopic:orders.const") in _edges(manifest)
+
+    def test_kotlin_const_val_and_object_val(self, tmp_path: Path) -> None:
+        root = _spring(tmp_path, {
+            "src/main/kotlin/com/acme/Topics.kt": (
+                'const val TOP_LEVEL = "top.level"\n'
+                "object Topics {\n  const val ORDERS = \"orders.kt\"\n"
+                '  val audit = "audit.kt"\n  val PLACE = "\\${kt.place}"\n}\n'),
+            "src/main/resources/application.yaml": "kt:\n  place: kt.resolved\n",
+            KT: (
+                "class K {\n"
+                "  @KafkaListener(topics = [Topics.ORDERS, Topics.audit, TOP_LEVEL, Topics.PLACE])\n"
+                "  fun a() {}\n}\n"),
+        })
+        assert _keys(scan_repository(root).manifest, "KafkaTopic") == {
+            "orders.kt", "audit.kt", "top.level", "kt.resolved"}
+
+    def test_value_field_used_in_send(self, tmp_path: Path) -> None:
+        root = _spring(tmp_path, {
+            "src/main/resources/application.properties": "out.topic=out.events\nk.topic=kt.out\n",
+            JAVA: (
+                "class K {\n"
+                '  @Value("${out.topic}")\n  private String outTopic;\n'
+                "  void f() { this.kafkaTemplate.send(outTopic, k, v); }\n}\n"),
+            KT: (
+                "class KK(private val template: KafkaTemplate<String, String>) {\n"
+                '  @Value("\\${k.topic}") lateinit var ktTopic: String\n'
+                "  fun f() { template.send(ktTopic, v) }\n}\n"),
+        })
+        manifest = scan_repository(root).manifest
+        assert _keys(manifest, "KafkaTopic") == {"out.events", "kt.out"}
+        assert _topic(manifest, "out.events").attributes["resolved_from"] == "property:out.topic"
+
+    def test_producer_record_with_constant(self, tmp_path: Path) -> None:
+        root = _spring(tmp_path, {
+            JAVA: (
+                "import org.apache.kafka.clients.producer.ProducerRecord;\n"
+                "class K {\n"
+                '  static final String T = "rec.topic";\n'
+                "  void f(ProducerRecord<String, String> unused) {}\n"
+                "  void g() { var r = new ProducerRecord<String, String>(T, k, v); }\n"
+                '  void h() { var r = new ProducerRecord<>("lit.topic", v); }\n}\n'),
+        })
+        manifest = scan_repository(root).manifest
+        assert _keys(manifest, "KafkaTopic") == {"rec.topic", "lit.topic"}
+        assert _topic(manifest, "rec.topic").attributes["resolved_from"] == "constant:T"
+
+    def test_concatenation(self, tmp_path: Path) -> None:
+        root = _spring(tmp_path, {
+            JAVA: ('class K {\n  static final String P = "pre";\n'
+                   '  @KafkaListener(topics = P + ".events") void a() {}\n}\n'),
+        })
+        assert _keys(scan_repository(root).manifest, "KafkaTopic") == {"pre.events"}
+
+    def test_unresolved_placeholder_is_a_candidate_even_in_verified_mode(self, tmp_path: Path) -> None:
+        root = _spring(tmp_path, {
+            JAVA: ('class K {\n  @KafkaListener(topics = "${messaging.orders-topic}") void a() {}\n'
+                   "  void b() { kafkaTemplate.send(topicVar, v); }\n}\n"),
+        })
+        for mode in ("candidate", "verified"):
+            result = scan_repository(root, heuristics=mode)  # type: ignore[arg-type]
+            topic = _topic(result.manifest, "unresolved:messaging.orders-topic")
+            assert topic.attributes["unresolved"] is True
+            assert topic.attributes["expression"] == "${messaging.orders-topic}"
+            edges = _edges(result.manifest)
+            unresolved = [e for (_s, _t, dst), e in edges.items() if dst.startswith("KafkaTopic:unresolved:")]
+            assert len(unresolved) == 2 and {e.status for e in unresolved} == {"candidate"}
+        assert _topic(result.manifest, "unresolved:topicVar").attributes["expression"] == "topicVar"
+        assert result.summary["kafka"]["unresolved_placeholders"] == 2
+        assert any("could not be resolved" in w for w in result.summary["warnings"])
+
+    def test_spel_is_unresolved(self, tmp_path: Path) -> None:
+        root = _spring(tmp_path, {
+            JAVA: """class K {\n  @KafkaListener(topics = "#{'${a}'.split(',')}") void a() {}\n}\n""",
+        })
+        manifest = scan_repository(root).manifest
+        (key,) = _keys(manifest, "KafkaTopic")
+        assert key.startswith("unresolved:#{")
+        assert _topic(manifest, key).attributes["unresolved"] is True
+
+    def test_topic_pattern(self, tmp_path: Path) -> None:
+        root = _spring(tmp_path, {
+            JAVA: ('class K {\n  @KafkaListener(topicPattern = "orders\\\\..*") void a() {}\n'
+                   '  @KafkaListener(topicPattern = "plain.topic") void b() {}\n}\n'),
+        })
+        manifest = scan_repository(root).manifest
+        assert _keys(manifest, "KafkaTopic") == {"pattern:orders\\..*", "plain.topic"}
+        assert _topic(manifest, "pattern:orders\\..*").attributes["pattern"] == "orders\\..*"
+
+    def test_resolved_manifest_seeds_in_dry_run(self, tmp_path: Path) -> None:
+        root = _spring(tmp_path, {JAVA: 'class K { @KafkaListener(topics = "${x.y}") void a() {} }\n'})
+        out = tmp_path / "m.json"
+        runner = CliRunner()
+        assert runner.invoke(main, ["ontology", "scan", str(root), "-o", str(out)]).exit_code == 0
+        project = tmp_path / "proj"
+        project.mkdir()
+        seeded = runner.invoke(main, ["ontology", "seed", str(out), "--dry-run", "--pipeline-id", "p",
+                                      "--cwd", str(project), "--json"])
+        assert seeded.exit_code == 0, seeded.output
+
+
+class TestKafkaCoverage:
+    def test_counts_and_examples(self, tmp_path: Path) -> None:
+        root = _spring(tmp_path, {
+            "src/main/resources/application.properties": "p.t=prop.topic\n",
+            JAVA: (
+                "class K {\n"
+                '  static final String C = "const.topic";\n'
+                '  @KafkaListener(topics = "${p.t}") void a() {}\n'
+                "  @KafkaListener(topics = C) void b() {}\n"
+                '  @KafkaListener(topics = "lit") void c() {}\n'
+                "  void d() { kafkaTemplate.send(unknownVar, v); }\n"
+                "  void e() { kafkaTemplate.send(buildTopic(), v); }\n"
+                "  void f() { kafkaTemplate.send(msg); }\n}\n"),
+        })
+        kafka = scan_repository(root).summary["kafka"]
+        assert kafka["kafka_like_sites"] == 6
+        assert kafka["matched_sites"] == 3
+        assert (kafka["resolved_via_property"], kafka["resolved_via_constant"]) == (1, 1)
+        assert kafka["unresolved_placeholders"] == 2  # unknownVar, msg (bare identifiers)
+        assert kafka["unmatched_sites"] == 1  # buildTopic(): a method call is not understood
+        assert kafka["files_examined"] == 2 and kafka["skipped_no_owner"] == 0
+        assert len(kafka["unmatched_examples"]) <= 5
+
+    def test_counts_are_per_site_not_per_line(self, tmp_path: Path) -> None:
+        root = _spring(tmp_path, {
+            "src/main/resources/application.properties": "mgr.topic=mgr\n",
+            "src/main/java/com/acme/Topics.java": 'class Topics { static final String ORDERS = "orders"; }\n',
+            JAVA: (
+                "class K {\n"
+                '  @KafkaListener(topics = {Topics.ORDERS, "${missing.key}"}) void a() {}\n'
+                '  void b() { kafkaTemplate.send("${mgr.topic}", "x"); kafkaTemplate.send(buildTopic(), "y"); }\n}\n'),
+        })
+        result = scan_repository(root)
+        kafka = result.summary["kafka"]
+        assert kafka["kafka_like_sites"] == 3  # one listener + two sends
+        assert kafka["matched_sites"] == 2  # the listener (one resolved element) + the first send
+        assert kafka["unresolved_placeholders"] == 1  # missing.key, on a matched site
+        assert kafka["unmatched_sites"] == 1
+        assert any("K.java:3: " in e and "buildTopic()" in e for e in kafka["unmatched_examples"])
+        assert any("could not be resolved" in w for w in result.summary["warnings"])
+        assert "unresolved:missing.key" in _keys(result.manifest, "KafkaTopic")
+
+    def test_zero_topic_warning_names_the_cause(self, tmp_path: Path) -> None:
+        root = _spring(tmp_path, {
+            JAVA: ("class K {\n  void a() { kafkaTemplate.send(build(), v); }\n"
+                   "  void b() { kafkaTemplate.send(other(), v); }\n}\n"),
+        })
+        result = scan_repository(root)
+        assert result.summary["topics"] == 0
+        (warning,) = result.summary["warnings"]
+        assert "0 topics" in warning and "method call" in warning
+        assert "svc/src/main/java/com/acme/K.java:2:" in warning
+        examples = result.summary["kafka"]["unmatched_examples"]
+        assert examples[0].startswith("svc/src/main/java/com/acme/K.java:2: ")
+
+    def test_skipped_no_owner_explains_zero_topics(self, tmp_path: Path) -> None:
+        root = _write(tmp_path / "repo", {
+            "lib/K.java": 'class K { @KafkaListener(topics = "t") void a() {} }\n',
+            "lib/L.java": 'class L { void a() { kafkaTemplate.send("u", v); } }\n',
+        })
+        result = scan_repository(root)
+        kafka = result.summary["kafka"]
+        assert kafka["skipped_no_owner"] == 2 and kafka["kafka_like_sites"] == 2
+        assert kafka["unmatched_sites"] == 2 and result.summary["topics"] == 0
+        assert any("no module" in w and "skipped" in w for w in result.summary["warnings"])
+
+    def test_v1_without_service_is_skipped(self, tmp_path: Path) -> None:
+        root = _write(tmp_path / "repo", {
+            "svc/build.gradle": "plugins {}\n",  # a module but no Dockerfile: no service
+            "svc/K.java": 'class K { @KafkaListener(topics = "t") void a() {} }\n',
+        })
+        assert scan_repository(root, schema_version=1).summary["kafka"]["skipped_no_owner"] == 1
+        assert scan_repository(root).summary["kafka"]["skipped_no_owner"] == 0
+
+    def test_majority_unmatched_warns_even_with_topics(self, tmp_path: Path) -> None:
+        root = _spring(tmp_path, {
+            JAVA: ('class K {\n  @KafkaListener(topics = "ok") void a() {}\n'
+                   "  void b() { kafkaTemplate.send(f(), v); }\n"
+                   "  void c() { kafkaTemplate.send(g(), v); }\n}\n"),
+        })
+        result = scan_repository(root)
+        assert result.summary["topics"] == 1
+        assert any("2 of 3" in w for w in result.summary["warnings"])
+
+    def test_clean_scan_has_no_kafka_warning(self, repo: Path) -> None:
+        result = scan_repository(repo)
+        assert result.summary["warnings"] == []
+        assert result.summary["kafka"]["unmatched_sites"] == 0
+
+    def test_heuristics_off_skips_everything(self, tmp_path: Path) -> None:
+        root = _spring(tmp_path, {JAVA: 'class K { @KafkaListener(topics = "t") void a() {} }\n'})
+        result = scan_repository(root, heuristics="off")
+        assert result.summary["kafka"]["kafka_like_sites"] == 0 and result.summary["warnings"] == []
+
+
+def test_spring_parsers_are_linear():
+    started = time.perf_counter()
+    payload = "a: " + "${" * 20_000 + "\n" + "  " * 50_000 + "\n" + "x" * 100_000
+    from ncp.ontology.scan import _CONFIG_FILE, _extract_constants, _parse_yaml_props, _split_top
+    assert _CONFIG_FILE.fullmatch("application-" + "-" * 50_000 + "x") is None
+    _parse_yaml_props(payload)
+    _extract_constants("static String " * 20_000 + "\n" + "val " * 20_000, ".kt")
+    _extract_constants("String " * 50_000 + "static\n", ".java")
+    _split_top('("' * 20_000, ",")
+    assert time.perf_counter() - started < 3.0
+
+
+class TestCli:
+    def test_scan_prints_coverage_and_warnings(self, tmp_path: Path) -> None:
+        root = _spring(tmp_path, {
+            JAVA: "class K {\n  void a() { kafkaTemplate.send(build(), v); }\n}\n"})
+        out = tmp_path / "m.json"
+        result = CliRunner().invoke(main, ["ontology", "scan", str(root), "-o", str(out)])
+        assert result.exit_code == 0, result.output
+        assert "Kafka coverage" in result.output and "kafka-like sites" in result.output
+        assert "warning: found 1 Kafka-like site(s) but extracted 0 topics" in result.output
+        assert "K.java:2:" in result.output
+
+    def test_scan_json_includes_kafka_summary(self, tmp_path: Path) -> None:
+        root = _spring(tmp_path, {JAVA: 'class K { @KafkaListener(topics = "t") void a() {} }\n'})
+        result = CliRunner().invoke(main, ["ontology", "scan", str(root), "--json"])
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        assert payload["summary"]["kafka"]["matched_sites"] == 1
+        assert payload["manifest"]["entities"] and payload["output"] is None
+
+    def test_scan_never_opens_the_store(self, tmp_path: Path, monkeypatch) -> None:
+        import ncp.cli as cli_module
+
+        def boom(*_a, **_k):
+            raise AssertionError("scan must not open the store")
+        monkeypatch.setattr(cli_module, "create_store", boom)
+        root = _spring(tmp_path, {JAVA: 'class K { @KafkaListener(topics = "t") void a() {} }\n'})
+        result = CliRunner().invoke(main, ["ontology", "scan", str(root), "-o", str(tmp_path / "m.json")])
+        assert result.exit_code == 0, result.output
+
+    def test_seed_dry_run_with_ontology_disabled_needs_no_store(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        import ncp.cli as cli_module
+
+        def boom(*_a, **_k):
+            raise AssertionError("dry run must not open the store / embedding adapter")
+        monkeypatch.setattr(cli_module, "create_store", boom)
+        root = _spring(tmp_path, {JAVA: 'class K { @KafkaListener(topics = "t") void a() {} }\n'})
+        out = tmp_path / "m.json"
+        assert CliRunner().invoke(main, ["ontology", "scan", str(root), "-o", str(out),
+                                         "--pipeline-id", "p"]).exit_code == 0
+        project = tmp_path / "proj"
+        project.mkdir()
+        result = CliRunner().invoke(main, ["ontology", "seed", str(out), "--dry-run",
+                                           "--cwd", str(project)])
+        assert result.exit_code == 0, result.output
+        assert "offline" in result.output and "disabled" in result.output.split("offline", 1)[1]
+        assert "fastembed" not in result.output.lower()
+        assert not (project / ".ncp").exists()
+
+    def test_seed_dry_run_reports_invalid_manifest_offline(self, tmp_path: Path) -> None:
+        bad = tmp_path / "bad.json"
+        bad.write_text(json.dumps({"pipeline": "p", "entities": [{"type": "Nope", "key": "x"}]}))
+        project = tmp_path / "proj"
+        project.mkdir()
+        result = CliRunner().invoke(main, ["ontology", "seed", str(bad), "--dry-run",
+                                           "--cwd", str(project)])
+        assert result.exit_code != 0 and "unknown entity type" in result.output
+
+    def test_seed_without_dry_run_still_needs_ontology(self, tmp_path: Path) -> None:
+        manifest = tmp_path / "m.json"
+        manifest.write_text(json.dumps({"pipeline": "p", "entities": []}))
+        project = tmp_path / "proj"
+        project.mkdir()
+        result = CliRunner().invoke(main, ["ontology", "seed", str(manifest), "--cwd", str(project)])
+        assert result.exit_code != 0 and "disabled" in result.output

@@ -4,6 +4,76 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [Unreleased]
 
+## [1.9.2] - 2026-11-11
+
+### Release scope
+
+Cuts NCP's fixed per-turn token overhead and makes `ncp ontology scan`
+work on Spring/Kafka repositories. The MCP tool catalog is sent to the
+model every turn and had become the largest fixed cost (~7.1k tokens by
+chars/4 under the old default), larger than the 840-token context budget;
+the new default catalog is ~3.9k.
+
+### Upgrade notes
+
+- **The default tool profile is now `standard`.** Agents that call
+  `ncp_overview`, `ncp_remember`, `ncp_recall`, `ncp_improve`, `ncp_task`
+  or the memo tools get an unknown-tool error (-32601) until you set
+  `[tools] profile = "full"` (or `NCP_TOOL_PROFILE=full`).
+- **Adaptive budget no longer grows past `context_token_budget`.** Set
+  `[budget] adaptive_allow_expand = true` to keep the 1.9.1 behaviour.
+- `ncp_emit_whisper`'s input schema no longer carries per-type payload
+  `allOf` branches; payload validation is unchanged (server-side).
+- Remove any `[skill_cache]` block from config; it is ignored.
+- Re-run `ncp ontology scan` on Spring repos: topics previously dropped now
+  appear, and unresolved ones appear as candidate `unresolved:*` topics.
+
+### Changed
+
+- **Breaking default:** `[tools] profile` now defaults to a new `standard`
+  profile (10 tools): the 5 core tools plus `ncp_record_outcome`,
+  `ncp_record_decision`, `ncp_get_decision`, `ncp_compile_decision_query`
+  and `ncp_wait_whispers`. Set `profile = "full"` (or `NCP_TOOL_PROFILE=full`)
+  to restore `ncp_overview`, `ncp_remember`, `ncp_recall`, `ncp_improve`,
+  `ncp_task` and the memo tools. Unknown profile values fall back to
+  `standard`. Default `tools/list` drops from ~28.4k to ~15.6k chars (-45%).
+- Trimmed MCP tool definitions (descriptions, and `ncp_emit_whisper`'s nested
+  per-type payload `allOf` schemas, which were documentation only; payloads
+  are still validated server-side). Full-profile `tools/list` drops from
+  ~28.3k to ~17.8k chars (-37%). Removed detail lives in the "Tool schema
+  notes" section of `docs/NCP_HTTP_API.md`; a test guards the size.
+- Adaptive context budget now only shrinks by default and never exceeds
+  `[budget].context_token_budget` (previously up to 1.5x). Set
+  `adaptive_allow_expand = true` (or `NCP_ADAPTIVE_ALLOW_EXPAND=1`) to restore
+  upward scaling to `adaptive_budget_ceiling_tokens`.
+
+### Fixed
+
+- `ncp ontology scan` found zero Kafka topics in Spring repos because it
+  only matched string literals. It now resolves `${key}` / `${key:default}`
+  placeholders from `application*` / `bootstrap*` properties and YAML
+  (per module, base file over profiles), `static final` / `const val`
+  constants (`NAME` and `Class.NAME`), `@Value` fields, and `+`
+  concatenations in `@KafkaListener` (`topics`, `topicPattern`),
+  `kafkaTemplate.send` and `ProducerRecord`. Unresolvable topics become
+  candidate `unresolved:*` topics (confidence 0.4, never verified) instead
+  of being dropped; resolved topics carry `resolved_from`.
+- `ncp ontology seed --dry-run` works with the ontology disabled and no
+  store: it validates offline and builds no embedding adapter.
+
+### Added
+
+- `ncp ontology scan` reports Kafka coverage per call site
+  (`summary["kafka"]`, a CLI table and `--json`) and warns when Kafka usage
+  was found but no topics were extracted, when most sites are unmatched, or
+  when placeholders stayed unresolved.
+
+### Removed
+
+- The unused `ncp.skill_cache` module (no runtime callers) and the
+  `[skill_cache]` config keys. The `skill_ref` chunk source value is kept for
+  stored-data compatibility; the design doc moved to `docs/archive/`.
+
 ## [1.9.1] - 2026-11-11
 
 ### Release scope

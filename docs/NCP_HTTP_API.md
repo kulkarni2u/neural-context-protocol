@@ -203,16 +203,19 @@ curl -s $BASE/mcp -H "$AUTH" -H 'Content-Type: application/json' -d '{
 ```
 
 Returns the enabled tool catalog, each tool with a JSON Schema under
-`inputSchema`. The `core` profile advertises `ncp_get_context`,
+`inputSchema`. `[tools] profile` selects the surface (`NCP_TOOL_PROFILE`
+overrides it). The `core` profile advertises `ncp_get_context`,
 `ncp_write_memory`, `ncp_emit_whisper`, `ncp_post_turn` and `ncp_fetch`. The
-full profile adds `ncp_record_outcome`, `ncp_record_decision`,
-`ncp_get_decision`, `ncp_compile_decision_query`, `ncp_overview`,
-`ncp_remember`, `ncp_recall` and `ncp_improve`, plus these conditional tools:
+`standard` profile (the default) adds `ncp_record_outcome`,
+`ncp_record_decision`, `ncp_get_decision`, `ncp_compile_decision_query` and
+`ncp_wait_whispers` (unless `[notify].enabled = false`). The `full` profile
+additionally adds `ncp_overview`, `ncp_remember`, `ncp_recall` and
+`ncp_improve`, plus these conditional tools:
 
-- `ncp_wait_whispers` — unless `[notify].enabled = false`.
-- `ncp_task` — only when `[tasks].enabled = true`.
-- `ncp_lookup_memo`, `ncp_record_memo`, `ncp_verify_memo` — only when
-  memoization is enabled (`[memoization].enabled`, off by default).
+- `ncp_wait_whispers` — unless `[notify].enabled = false` (standard and full).
+- `ncp_task` — only in the `full` profile with `[tasks].enabled = true`.
+- `ncp_lookup_memo`, `ncp_record_memo`, `ncp_verify_memo` — only in the `full`
+  profile when memoization is enabled (`[memoization].enabled`, off by default).
 
 The authoritative list is `MCP_TOOLS` in `ncp/mcp/server.py`;
 `tests/test_docs_tool_catalog.py` fails if a tool is missing from this file.
@@ -528,7 +531,7 @@ Notes:
 
 ### ncp_overview — ranked cross-pipeline overview
 
-Read-only and token-bounded; in the `full` profile, absent from `core`. It
+Read-only and token-bounded; requires `profile = "full"` (absent from `core` and `standard`). It
 peeks the viewer's inbox and never acknowledges whispers, changes retrieval
 counts or logs a turn.
 
@@ -682,7 +685,7 @@ Compilation suppresses automatic embedding calls on every store backend.
 Operational guide (configuration, auth model, rollout, limitations):
 [`NCP_ONTOLOGY.md`](./NCP_ONTOLOGY.md).
 
-Listed only with `[ontology] enabled = true` and the `full` tool profile.
+Listed only with `[ontology] enabled = true` and a non-`core` tool profile (`standard` or `full`).
 Storage is the NCP store itself (`[ontology] store = "inherit"`): SQLite or
 PostgreSQL/pgvector (see [Ontology storage backends](#ontology-storage-backends));
 on any other backend the tools answer `{"ok": false, "error": {"code": "disabled"}}`. With the ontology disabled (the default) `tools/list` and every
@@ -881,6 +884,92 @@ Responses are plain JSON objects (no JSON-RPC envelope, no
 superseded rows flagged as such rather than hiding them, matching the
 store's bi-temporal honesty model. All endpoints are read-only: the UI
 cannot write memory, emit whispers, or mutate trust.
+
+## Tool schema notes (trimmed from `tools/list`)
+
+`tools/list` descriptions are kept short because they are re-sent to the model
+every turn. The detail removed from them lives here. Schemas are advisory: the
+server does not validate arguments against `inputSchema`; handlers validate
+(e.g. `normalize_whisper_payload` for whisper payloads).
+
+- **`ncp_get_context`**: `max_tokens` is honored as-is unless `context_policy`
+  is set (then capped at `[budget].max_tokens_per_call`); when omitted and
+  `[budget].adaptive_budget_enabled`, it is computed per turn (see
+  `budget_tokens`; by default it never exceeds `context_token_budget`, see
+  `adaptive_allow_expand`). `compact` returns non-zero counts, flags and
+  contradicting ids only, omits tier-hint factors and adds `context_sha256`.
+  `response_max_tokens` bounds the whole response: optional diagnostics drop
+  first, then context is re-fitted; `retrieved_chunk_ids`,
+  `pending_whisper_ids`, `session_id` and the policy identity are always kept
+  and a `truncated` block is added. `drift_score` is ignored (and reported as
+  `self_reported`) when `[drift].drift_computed_enabled`. `as_of` assembles
+  the bi-temporal view: chunks recorded by then, not superseded by then, and
+  valid (`valid_from`/`valid_to`) at that instant. With
+  `[retrieval].reduce_fanin_enabled` the response includes
+  `fanin_merged_count` and `fanin_contradictions` (surfaced, not resolved).
+  `recent`, `tried`, `failed`, `slot_age`, `slot_confidence`, `goal_version`,
+  `escalate_to`, `calibration_id` override hydrated conscious state.
+- **`ncp_write_memory`**: `base_trust` can lower trust below the `src`
+  default, never raise it. `signature` is base64 Ed25519 over
+  `written_by | sha256(content) | pipeline_id`; required only if
+  `[identity].require_signatures`. `valid_to` is independent of `supersedes`,
+  which sets the *previous* chunk's `valid_to` (to this chunk's `valid_from`,
+  or now) and sets its `superseded_by`; the old chunk is not deleted and an
+  `as_of` read before the supersession still returns it. `edges` items are
+  `{dst, type, weight?}` with `type` one of `caused_by`, `supersedes`,
+  `supports`, `contradicts`, `refines`, `derived_from`, written with `src` =
+  the new chunk. With `[graph].infer_edges` the response includes
+  `edges_inferred` (count of automatic `refines` edges; 0 is valid).
+- **`ncp_emit_whisper`**: the former per-type nested `allOf` payload schemas
+  are now listed in the tool description. Payload max is 600 normalized
+  chars. `share`/`request` take HandoffPayload `{ask, files?, slice?}`;
+  `dissent` DissentPayload `{issue, alternatives?}`; `alert`
+  `{alert_code, description}`; `world_check` `{anchor_intent,
+  detected_drift}`; `progress` `{status: working|blocked|waiting, pct 0-100?,
+  note <= 200?}`; `result` `{status: succeeded|failed|partial|declined,
+  summary <= 300, result_chunk_ids <= 10?, turn_id?}`; `nudge` and
+  `consolidation_ready` are strings only. Legacy strings stay accepted
+  (plain share/request/dissent text is wrapped). For `dissent`, `ref` is the
+  disputed chunk: it debits that chunk's trust and propagates along its
+  `caused_by` edge in feedback calibration. `thread_id` defaults to the
+  parent's thread for a reply, else the whisper's own id for share/request;
+  signatures cover only the payload. `signature` covers
+  `from | sha256(payload) | pipeline_id`.
+- **`ncp_wait_whispers`**: peeks only; never drains, acknowledges or returns
+  payloads.
+- **`ncp_task`**: `create` makes an open task (optional `assign_to` emits a
+  request whisper); `claim` leases it; `heartbeat` extends the lease (optional
+  `checkpoint_chunk_id` and `progress`); `release` hands it back; `complete`
+  finishes as `done|failed` and emits a linked result whisper; `cancel` is
+  creator-only; `get`/`list` read. Owner actions must present the current
+  `lease_token`; a stale token returns `{ok:false, reason:'lease_lost'}` and
+  the worker must stop. `complete` does not record an outcome.
+- **`ncp_overview`**: peeks only (never acknowledges whispers, changes
+  retrieval counts or logs a turn); quoted `last:"..."` snippets are
+  agent-written data marked `\u2039data\u203a`.
+- **`ncp_post_turn`**: `memory_chunks` writes suppressed as near-duplicates
+  are listed in `suppressed_chunk_ids`; `signature` is verified as in
+  `ncp_write_memory`; `evidence_id` must be an existing same-pipeline chunk.
+- **`ncp_record_decision`**: stored as a `reasoning_trace` chunk with
+  `caused_by` edges. `schema_id` + `choice` persist a typed DecisionRecord
+  (omitted: adapted as `schema_id='legacy.untyped'`); `choice` is validated
+  against a registered schema and is the precedent match key, not the
+  rationale. `probs` must sum to 1.0 +/- 0.02 and use only keys from
+  `options`. `confidence_source` defaults to `self_reported`, `backend` to
+  `unknown` (NCP never chooses).
+- **`ncp_compile_decision_query`**: pure function of the conscious block plus
+  the store; zero provider calls; never names a model in `escalate_reasons`.
+  `drift_score` feeds `joint_confidence` and the `high_drift` reason;
+  `pressure: critical` raises `critical_budget`; `k` is clamped to
+  `[decisions].max_evidence` (12).
+- **`ncp_record_outcome`**: `weight` must satisfy 0 < weight <= 1; 0,
+  negative, >1, NaN and infinity are rejected. `decision_id` sets
+  `DecisionRecord.outcome_id`.
+- **Memo tools**: when any of `pipeline_id`/`model`/`provider` is set, the
+  task+context signature also covers them; use the same values on record,
+  lookup and verify. `kind` on `ncp_record_memo` requires `result_summary` to
+  parse as Python (and contain a matching top-level def/class for
+  `function`/`class`) or the memo is rejected; it is a structural check only.
 
 ## Errors
 

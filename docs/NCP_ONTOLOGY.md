@@ -187,7 +187,7 @@ filtered directory walk outside git, and always skips `node_modules`,
 | `package.json`, `pyproject.toml`, `go.mod`, `Cargo.toml`, `pom.xml`, `build.gradle(.kts)` | one `Module` per directory (key = repo path, aliases = package names), `Repo CONTAINS Module`, and in-repo dependencies as `Module DEPENDS_ON Module`. Workspace roots, Maven aggregators and Gradle root projects are not modules. | verified |
 | `Chart.yaml`, k8s `Deployment`/`StatefulSet`/`DaemonSet`, `Dockerfile` | a `Service` per module (named by the chart, then the workload, then the directory) and `Module BUILDS Service` | verified |
 | `CODEOWNERS` (root, `.github/`, `docs/`, `.gitlab/`; last match wins) | `Team OWNS Module` and `Team OWNS Service` | verified |
-| Kafka clients: Spring `@KafkaListener` / `KafkaTemplate.send` / `ProducerRecord`, kafka-python / confluent / aiokafka, kafkajs, kafka-go / sarama, Spring Cloud Stream bindings | `PRODUCES` / `CONSUMES` `KafkaTopic` (literal topic names only; test files skipped unless `--include-tests`) | candidate (`--heuristics verified\|off`) |
+| Kafka clients: Spring `@KafkaListener` / `KafkaTemplate.send` / `ProducerRecord`, kafka-python / confluent / aiokafka, kafkajs, kafka-go / sarama, Spring Cloud Stream bindings | `PRODUCES` / `CONSUMES` `KafkaTopic` (literals, Spring `${...}` placeholders and string constants are resolved, see below; test files skipped unless `--include-tests`) | candidate (`--heuristics verified\|off`) |
 | `ncp-ontology.{toml,json,yaml,yml}` anywhere | hand-written facts (databases, tables, external APIs) merged in; they win over a scanned entity with the same type and key | as written |
 
 Every scanned relation cites `attestation = "path#Lnn"`. Options:
@@ -200,10 +200,72 @@ are dropped, module dependencies are lifted to `Service DEPENDS_ON Service`
 where both modules build a service, and Kafka edges and ownership attach to
 services.
 
-The scan is static: it sees literal names only and follows no code paths,
-and CODEOWNERS matching approximates GitHub's gitignore-style rules. Review
-the manifest before seeding it as verified. A repo with its own conventions
-can skip `scan` and emit a manifest from its own script instead.
+The scan is static: it follows no code paths, and CODEOWNERS matching
+approximates GitHub's gitignore-style rules. Review the manifest before
+seeding it as verified. A repo with its own conventions can skip `scan` and
+emit a manifest from its own script instead.
+
+#### Spring topics: placeholders and constants
+
+In Java, Kotlin and Scala sources the topic argument of `@KafkaListener`
+(`topics`, `topicPattern`), `<kafkaTemplate>.send(...)` and
+`new ProducerRecord<>(...)` may be a literal, a `"${key}"` /
+`"${key:default}"` placeholder, a constant (`NAME` or `Class.NAME`, from
+`static final String`, Kotlin `const val`, or `val` in an `object` /
+`companion object`), a `@Value("${key}")` field of the same file, or a `+`
+concatenation of those. Placeholders are looked up in
+`application*.properties|yml|yaml` and `bootstrap*` files (scalars only,
+nested YAML flattened to dotted keys; test paths skipped unless
+`--include-tests`), first in the owning module and then repo-wide (a
+repo-wide match must be unambiguous). `application.*` wins over
+`application-<profile>.*`; if only profile files define a key, the
+alphabetically first profile is used and recorded as the topic's `profile`
+attribute. Values nest (up to 4 levels, cycle-guarded) and comma-separated
+values expand to several topics.
+
+Resolved topics carry `resolved_from` = `literal`, `property:<key>`,
+`default:<key>` (the `${key:default}` default was used) or `constant:<NAME>`.
+A topic that cannot be resolved (unknown property, SpEL `#{...}`, a local
+variable, a constant defined elsewhere) becomes a `KafkaTopic` keyed
+`unresolved:<expression>` (e.g. `unresolved:messaging.orders-topic`)
+with attributes `unresolved = true` and `expression`; its edge is always
+`candidate`, even with `--heuristics verified`. A non-plain `topicPattern`
+becomes `pattern:<regex>` with a `pattern` attribute. Expressions the scan
+does not understand (method calls, ...) produce no topic and show up as
+unmatched in the coverage report.
+
+#### Coverage report and warnings
+
+`summary["kafka"]` (and a table printed by `ncp ontology scan`; `--json`
+prints the whole summary as JSON, with the manifest under `manifest` unless
+`-o` is given) counts what the scan saw: `files_examined`,
+`kafka_like_sites` (call sites: each `@KafkaListener`, each Kafka
+`.send(...)` and each `ProducerRecord(...)` occurrence, plus any other line
+that looks like a client call, e.g. `subscribe`), `matched_sites` (sites that
+yielded at least one resolved topic; `resolved_via_property` /
+`resolved_via_constant` break these down), `unresolved_placeholders` (number
+of `unresolved:*` topic elements emitted; a matched site can contribute, e.g.
+`topics = {Topics.A, "${missing}"}`), `unmatched_sites` (sites that yielded
+nothing at all), `skipped_no_owner` (files with Kafka usage that no module,
+or with `--schema-version 1` no service, owns, so they are not attributed;
+their sites count as unmatched) and up to 5 `unmatched_examples` as
+`path:line: snippet`. A site that yielded only unresolved topics is neither
+matched nor unmatched, so `matched_sites + unmatched_sites <=
+kafka_like_sites`. The scan
+warns when Kafka-like sites exist but no topic was extracted, when more than
+half of the sites are unmatched, and when placeholders stayed unresolved,
+naming the likely cause.
+
+#### No store needed
+
+`scan` only reads files: it opens no store or database and builds no
+embedding adapter, so it works with the ontology disabled. So does
+`ncp ontology seed --dry-run` while `[ontology]` is disabled: it validates
+the manifest against the built-in schema in a throw-away in-memory database
+(no project store, no embedding adapter) and reports every entity and
+relation as new; references to entities that already exist in a store are not
+checked. A real seed, or a dry run with the ontology enabled (which diffs
+against the store), is unchanged.
 
 ### Schema pack v2 (repos, modules, tables)
 
