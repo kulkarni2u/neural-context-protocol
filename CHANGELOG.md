@@ -4,7 +4,7 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [Unreleased]
 
-## [1.10.0] - 2026-11-11
+## [1.9.3] - 2026-11-11
 
 ### Release scope
 
