@@ -4,8 +4,21 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [Unreleased]
 
-Read **Changed** before upgrading: several requests the HTTP server used to
-accept are now rejected.
+## [1.9.0] - 2026-11-11
+
+### Release scope
+
+This release adds an opt-in, evidence-backed domain ontology and hardens the
+HTTP server. The ontology (`[ontology] enabled = true`, off by default and a
+byte-for-byte no-op when off) stores services, databases, APIs, Kafka topics,
+incidents and teams with typed, evidence-cited relations on SQLite or
+PostgreSQL. `ncp_get_context` can append a compact `[NCP:ONTOLOGY]` block of
+verified paths, and six `ncp_ontology_*` tools answer explicit graph
+questions. The hardening work adds opt-in authenticated principals,
+`Content-Type`/`Origin`/`Host` checks on HTTP, `ncp doctor`, `ncp vacuum` and
+`ncp forget`. Read **Changed** before upgrading: several HTTP requests the
+server used to accept are now rejected (`415`/`403`), and a non-loopback bind
+without a token now exits instead of warning.
 
 ### Security
 
@@ -55,6 +68,51 @@ accept are now rejected.
 
 ### Added
 
+- **Opt-in domain ontology** (`ncp/ontology/`, `docs/NCP_ONTOLOGY.md`):
+  an evidence-backed graph of typed entities and relations, off by default
+  (`[ontology] enabled = true`). Ships the versioned `infrastructure` v1
+  schema pack (`Service`, `Database`, `API`, `KafkaTopic`, `Incident`,
+  `Team`; `DEPENDS_ON`, `PRODUCES`, `CONSUMES`, `EXPOSES`, `OWNS`) with
+  endpoint types, cardinality and cycle rules. A relation carries a status
+  (`candidate`, `verified`, `disputed`, `revoked`), confidence, a validity
+  window and evidence refs (an NCP chunk id or an external attestation);
+  only relations with live, caller-readable evidence are traversed.
+  Namespaces follow `pipeline_id` plus `global`, and capabilities come from
+  `[principals]` (`verify` to assert verified relations, `admin` for
+  `global` writes and others' relations). Disabled, tool lists, responses
+  and context are unchanged.
+- **Ontology tools** (full profile, listed only when enabled):
+  `ncp_ontology_capabilities`, `ncp_ontology_query`, `ncp_ontology_explain`,
+  `ncp_ontology_assert`, `ncp_ontology_revoke` and `ncp_ontology_evidence`
+  (exact-id text of at most 16 cited chunks that are still live and
+  readable). The read tools reject `as_of` with `invalid`. In-process hosts
+  can use `ncp.ontology.facade.OntologyFacade`.
+- **Ontology-aware context**: in `retrieval_mode = "auto"` an unchanged
+  `ncp_get_context` call appends a verified-only `[NCP:ONTOLOGY]` block when
+  the request resolves one entity exactly and shows relationship or
+  diagnostic intent. Request words pick relation types, direction and hops;
+  path selection stops on marginal value, and `max_graph_tokens` (default
+  500) is a ceiling taken from the caller's budget. The `v:2` block groups
+  facts with `ev:` citations, and memory chunks a shown fact cites are not
+  repeated as text (they stay in `retrieved_chunk_ids`). Responses carry
+  `ontology` metadata (trigger reason, paths, tokens, latency, fallback).
+  Timeouts and backend errors fall back to ordinary context unless
+  `fail_mode = "closed"`. A request with `as_of` skips enrichment
+  (`as_of_unsupported`).
+- **Ontology storage** on SQLite (`ontology_*` tables in the NCP database)
+  and PostgreSQL (`{schema}.{table_prefix}ontology_*` in the pgvector
+  store's schema, created by an additive, versioned migration on first use;
+  nothing is created while the ontology is off). A shared parity suite
+  requires identical results from both backends.
+- Ontology harness examples for Claude Code, Codex and Sarathi
+  (`examples/13_ontology/`) and an ontology benchmark
+  (`benchmarks/ontology`, `docs/NCP_BENCHMARK_ONTOLOGY.md`). On the SQLite
+  dependency tasks the ontology arm reaches fact recall 1.00 against 0.38 for
+  the baseline at an 800-token budget, at about +7 ms p95; at matched recall
+  it needs 20.4% fewer tokens on the default budget ladder, a gain that holds
+  only on the low-budget frontier (+1.0% on the older 200-token-minimum
+  ladder). At a fixed 800-token budget it still uses more prompt tokens
+  (162 against 137).
 - `ncp doctor [--json]`: checks config, store reachability, pending
   migrations, the server, the auth header in agent configs, embeddings and
   optional extras.
