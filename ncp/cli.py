@@ -3565,6 +3565,8 @@ def ontology_demote_command(
     show_default=True, help="Status for Kafka edges inferred from code, or 'off' to skip them.",
 )
 @click.option("--include-tests", is_flag=True, help="Also read test files for Kafka usage.")
+@click.option("--summary-out", default=None, type=click.Path(dir_okay=False, path_type=Path),
+              help="Also write the scan summary (coverage report) here as JSON, for `ncp ontology wiki --summary`.")
 @click.option(
     "--json", "--json-output", "json_output", is_flag=True,
     help="Print the scan summary (with the Kafka coverage report) as JSON instead of the "
@@ -3581,6 +3583,7 @@ def ontology_scan_command(
     schema_version: str,
     heuristics: str,
     include_tests: bool,
+    summary_out: Path | None,
     json_output: bool,
 ) -> None:
     """Scan a (mono)repo at ROOT and write a seed manifest for `ncp ontology seed`.
@@ -3607,6 +3610,9 @@ def ontology_scan_command(
         raise click.ClickException(f"[{exc.code}] {exc.message}") from exc
     text = result.to_json()
     summary = result.summary
+    if summary_out is not None:
+        summary_out.parent.mkdir(parents=True, exist_ok=True)
+        summary_out.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     if json_output:
         if output is not None:
             output.parent.mkdir(parents=True, exist_ok=True)
@@ -3656,6 +3662,64 @@ def ontology_scan_command(
         )
     for warning in summary["warnings"]:  # type: ignore[union-attr]
         click.echo(f"warning: {warning}", err=True)
+
+
+@ontology_group.command("wiki")
+@click.argument("manifest", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--summary", "summary_path", default=None, type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              help="Scan summary JSON (from `ncp ontology scan --summary-out`) for the coverage page.")
+@click.option("--compare", "compare_path", default=None, type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              help="Baseline (older) manifest; adds compare.md showing what changed.")
+@click.option("--out", "out_dir", default=Path(".ncp/ontology-wiki"), show_default=True,
+              type=click.Path(file_okay=False, path_type=Path), help="Output directory.")
+@click.option("--format", "fmt", type=click.Choice(["md"]), default="md", show_default=True)
+@click.option("--title", default="Ontology wiki", show_default=True, help="Title of index.md.")
+@click.option("--stdout-summary", is_flag=True, help="Print a one-line plain summary instead of the table.")
+def ontology_wiki_command(
+    manifest: Path,
+    summary_path: Path | None,
+    compare_path: Path | None,
+    out_dir: Path,
+    fmt: str,
+    title: str,
+    stdout_summary: bool,
+) -> None:
+    """Render a scan MANIFEST as a markdown wiki to review before promoting.
+
+    Writes index, per-service and per-destination pages (producers vs
+    consumers side by side), a messaging matrix, coverage, a candidate review
+    checklist for `ncp ontology promote --from-checklist`, and with --compare
+    a diff against an older manifest. Reads files only; no store is opened.
+    """
+    from ncp.ontology.wiki import build_wiki, problem_count, write_wiki
+
+    def load(path: Path) -> dict[str, object]:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise click.ClickException(f"cannot read {path}: {exc}") from exc
+        if not isinstance(data, dict):
+            raise click.ClickException(f"{path}: expected a JSON object")
+        return data
+
+    data = load(manifest)
+    pages = build_wiki(
+        data,
+        summary=load(summary_path) if summary_path else None,
+        baseline=load(compare_path) if compare_path else None,
+        title=title,
+    )
+    write_wiki(pages, out_dir)
+    problems = problem_count(data)
+    if stdout_summary:
+        click.echo(f"wrote {len(pages)} pages to {out_dir}; {problems} destination(s) with problems")
+        return
+    table = Table(title=f"Ontology wiki -> {out_dir}", box=box.SIMPLE_HEAVY, show_header=False)
+    table.add_row("pages written", str(len(pages)))
+    table.add_row("destinations with problems", str(problems))
+    console.print(table)
+    console.print(f"Open {out_dir / 'index.md'}; tick verified lines in {out_dir / 'candidates.md'}, then "
+                  "ncp ontology promote --from-checklist.")
 
 
 @main.group("infra")

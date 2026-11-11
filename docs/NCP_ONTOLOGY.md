@@ -273,6 +273,44 @@ relation as new; references to entities that already exist in a store are not
 checked. A real seed, or a dry run with the ontology enabled (which diffs
 against the store), is unchanged.
 
+### Reviewing a scan: the ontology wiki
+
+A manifest is hard to verify as JSON. `ncp ontology wiki` renders it as linked
+markdown pages (files only, no store needed, deterministic output):
+
+```bash
+ncp ontology scan . -o scan.json --summary-out scan-summary.json
+ncp ontology wiki scan.json --summary scan-summary.json \
+    --compare previous-scan.json --out .ncp/ontology-wiki
+```
+
+- `index.md`: totals, warnings, what changed, links to every page.
+- `services/`, `modules/`: per service, what it produces and consumes (status,
+  confidence, `resolved_from`, `via_module`, evidence `path#L12`), dependencies.
+- `destinations/`: one page per topic, queue or exchange, with producers and
+  consumers side by side. Flags: `⚠ no consumer in repo`, `⚠ no producer in
+  repo`, `⚠ unresolved name`, `pattern subscription`; `pattern:` subscriptions
+  that match the name are listed as potential consumers.
+- `messaging.md` (matrix, problems first), `coverage.md` (per-broker scan
+  coverage and every unresolved value), `compare.md` (only with `--compare`:
+  added/removed entities and relations, status/confidence changes, destinations
+  whose producers or consumers changed).
+- `candidates.md`: a checklist of candidate relations grouped by service.
+
+```markdown
+## Producers vs consumers
+
+| Producers | Consumers |
+| --- | --- |
+| [Service:billing](../services/billing.md) (candidate, 0.60, billing/K.java#L12) | [Service:shop](../services/shop.md) (candidate, 0.60, shop/L.java#L40) |
+```
+
+Workflow: scan, build the wiki, read the `compare.md` and the flagged
+destinations, tick (`[x]`) the lines in `candidates.md` you verified, then
+`ncp ontology promote --from-checklist candidates.md`. Checklist lines look like
+``- [ ] `Service:billing -PRODUCES-> KafkaTopic:orders.v1` — conf 0.60 · `billing/K.java#L12` ``;
+do not edit the text inside the first backticks.
+
 ### Promoting candidates
 
 `ncp ontology scan` emits heuristic messaging edges as `candidate` relations
