@@ -20,6 +20,7 @@ Graph results are context, not execution authorization. Full reference:
 | `config.toml` | `[ontology]` section to merge into `.ncp/config.toml` |
 | `mcp_http.py` | Small standard-library JSON-RPC-over-HTTP client used by both scripts |
 | `seed_graph.py` | Seeds a small estate: evidence chunks via `ncp_write_memory`, entities and verified relations via `ncp_ontology_assert` |
+| `manifest.toml` | The same kind of graph as a declarative manifest for `ncp ontology seed` (in-process, idempotent, `--prune` to stay in sync; see [Seeding the graph](../../docs/NCP_ONTOLOGY.md#seeding-the-graph)) |
 | `mcp_client.py` | Generic MCP client: discovery, automatic mode, explicit query + explain |
 | `claude_code/` | `.mcp.json` and usage notes for Claude Code |
 | `codex/` | `config.toml` MCP entry and usage notes for Codex CLI |

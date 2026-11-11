@@ -4,6 +4,21 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`ncp ontology seed <manifest>`** (`ncp/ontology/seed.py`): declarative
+  seeding of the ontology from a JSON/TOML/YAML manifest of entities and
+  relations exported from an authoritative source (entity registry, service
+  catalog, CODEOWNERS). Validates the whole manifest against the enabled
+  schema pack before writing; writes each relation's `evidence` text as a
+  memory chunk and cites it (or an `attestation`); idempotent and diff-based
+  (unchanged re-runs write nothing); reports relations dropped from the
+  manifest as stale and, with `--prune`, closes their validity window
+  without touching other principals' relations. `--dry-run`,
+  `--status candidate` and `--json` are supported. Previously the only way to
+  populate the graph was hand-written `ncp_ontology_assert` calls.
+- `relations_asserted_by` on the SQLite and PostgreSQL ontology stores.
+
 ## [1.9.0] - 2026-11-11
 
 ### Release scope

@@ -945,6 +945,22 @@ class SQLiteOntologyStore:
                 (str(relation_id), auth.scope.tenant_id, auth.scope.namespace),
             ) is not None
 
+    def relations_asserted_by(
+        self, principal_id: str, *, auth: AuthContext,
+    ) -> list[Relation]:
+        """Every relation (any status) in exactly the caller's scope that
+        ``principal_id`` asserted, oldest first. Used by the seeder to diff a
+        manifest against what it wrote before."""
+        _require(auth, "read")
+        with self._transaction(write=False) as connection:
+            rows = self._rows(
+                connection,
+                "SELECT * FROM ontology_relations WHERE tenant_id = ? AND namespace = ?"
+                " AND asserted_by = ? ORDER BY created_at, relation_id",
+                (auth.scope.tenant_id, auth.scope.namespace, principal_id),
+            )
+            return [self._relation_from_row(connection, row) for row in rows]
+
     def resolve_entities(
         self, key: str, *, auth: AuthContext, entity_type: str | None = None,
         schema_pack: str | None = None, limit: int = 20,

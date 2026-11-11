@@ -66,6 +66,82 @@ refresh.
 | `fallback_to_memory` | `true` | bool | With `fail_mode = "fallback"`, return ordinary context on timeout or backend error. When false, those failures fail the call. |
 | `unauthenticated_capabilities` | `["read", "write"]` | subset of `read`, `write`, `verify`, `admin` | Capabilities for callers without a principal (stdio, or HTTP without `[principals]`). Granting `verify` or `admin` here gives them to every local caller; do this only on a loopback demo. |
 
+## Seeding the graph
+
+NCP does not extract graph facts from memory writes, so a new ontology is
+empty. Populate it from an authoritative source (entity registry, service
+catalog, CODEOWNERS, deploy manifests) with `ncp ontology seed`. Export that
+source as a small manifest (`.json`, `.toml`, or `.yaml`/`.yml` with PyYAML
+installed):
+
+```toml
+pipeline = "shop"                  # target namespace (or pass --pipeline-id)
+source = "entity_registry"        # asserting principal becomes seed:entity_registry
+observed_at = "2026-11-01T00:00:00Z"   # optional; defaults to first-seen time
+
+[[entities]]
+type = "Service"                  # must exist in the enabled schema pack
+key = "order-api"
+aliases = ["orders-api"]
+attributes = { environment = "prod" }   # `name` defaults to the key
+
+[[entities]]
+type = "KafkaTopic"
+key = "order.events"
+attributes = { cluster = "main" }
+
+[[relations]]
+src = "order-api"            # entity key, or "Type:key" when a key is ambiguous
+type = "PRODUCES"
+dst = "KafkaTopic:order.events"
+evidence = "order-api publishes OrderPlaced to order.events (registry row 12)."
+# attestation = "entity-registry.yaml#order-api"   # and/or an external reference
+# revision = "a1b2c3"             # attestation source revision (default "1")
+# status = "candidate"            # default "verified"
+# confidence = 0.95
+```
+
+```bash
+ncp ontology seed registry.toml --dry-run   # validate + show what would change
+ncp ontology seed registry.toml             # apply
+ncp ontology seed registry.toml --prune     # also close relations dropped from the manifest
+ncp ontology seed registry.toml --status candidate   # stage everything unverified
+```
+
+Behaviour:
+
+- **Validated up front, all-or-nothing.** Entity types, required attributes,
+  relation triples (`Service -PRODUCES-> KafkaTopic`), endpoint references and
+  evidence are checked against the enabled pack before anything is written.
+  Relations may only reference entities declared in the same manifest.
+- **Every relation cites evidence.** `evidence` text is written as an
+  ordinary memory chunk (`layer: semantic`, `src: tool_result`, in the
+  target pipeline) and cited as `chunk` evidence; `attestation` is cited as
+  `external_attestation`. A `verified` relation needs at least one.
+  Chunk-cited facts let graph-first context substitute the fact for the
+  chunk's text.
+- **Idempotent, diff-based.** Ids derive from the namespace, the `source` and
+  the triple, so a re-run of an unchanged manifest writes nothing and a
+  changed relation is updated in place (revision + 1).
+- **Staying in sync.** Relations this `source` seeded earlier that the
+  manifest no longer lists are reported as *stale*. With `--prune` they are
+  closed (`valid_until` = now): they leave traversal and automatic context
+  at once, keep their history, and reopen if they come back. Relations
+  asserted by any other principal (another `source`, or agents over MCP) are
+  never touched. Entities are not pruned. Run the seed from the same job that
+  updates the source (CI, a cron, a post-merge hook) so the graph follows it.
+- **Trust.** The CLI runs in-process with direct store access, so it asserts
+  as a trusted operator with `verify` (and `admin` for the `global`
+  namespace). `verified` therefore means "the source of this manifest said
+  so": seed only from sources you would trust unreviewed, and use
+  `--status candidate` for anything else. To seed a remote `ncp serve`
+  instead, call `ncp_ontology_assert` with a `verify` principal, as in
+  `examples/13_ontology/seed_graph.py`.
+
+From Python, `ncp.ontology.seed.load_manifest` / `parse_manifest` and
+`seed_ontology(facade, manifest, write_chunk=memory_chunk_writer(store))`
+do the same thing and return a `SeedReport`.
+
 ## Tools
 
 All six tools are listed only when `enabled = true` under the `full` tool
@@ -332,7 +408,8 @@ Measured on the benchmark corpus with default limits (see
   code change.
 - **No automatic extraction.** NCP does not stage candidate relations from
   memory writes asynchronously. Ingestion happens only through explicit
-  `ncp_ontology_assert`.
+  `ncp_ontology_assert` or a declarative `ncp ontology seed` manifest
+  (see [Seeding the graph](#seeding-the-graph)).
 - **Verification.** `verified` status relies on the caller holding
   `verify`. NCP does not check the source deterministically, so keep
   `verify` for trusted ingestion principals.
@@ -375,8 +452,9 @@ Measured on the benchmark corpus with default limits (see
    is a byte-for-byte no-op and creates no tables.
 2. **Read-only pilot.** Set `enabled = true`, `retrieval_mode = "off"`, and
    keep the default `unauthenticated_capabilities`. Explicit tools only.
-   Ingest the graph with one `verify` principal, as in
-   `examples/13_ontology/seed_graph.py`.
+   Ingest the graph with `ncp ontology seed` (see
+   [Seeding the graph](#seeding-the-graph)), or over MCP with one `verify`
+   principal, as in `examples/13_ontology/seed_graph.py`.
 3. **Automatic enrichment.** Switch to `retrieval_mode = "auto"`. Watch the
    `ontology` metadata (`reason_code`, `fallback_reason`, `latency_ms`,
    `graph_tokens`), and tune `max_graph_tokens`, `graph_timeout_ms` and

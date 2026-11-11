@@ -3145,6 +3145,86 @@ def doctor_command(cwd: Path, host: str, port: int, json_output: bool) -> None:
         raise SystemExit(1)
 
 
+@main.group("ontology")
+def ontology_group() -> None:
+    """Manage the opt-in ontology (typed entity/relation graph)."""
+
+
+@ontology_group.command("seed")
+@click.argument("manifest", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--cwd", default=None, type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("--pipeline-id", default=None, help="Target namespace (overrides the manifest's 'pipeline').")
+@click.option("--prune", is_flag=True, help="Close relations this source seeded earlier that the manifest no longer lists.")
+@click.option("--dry-run", is_flag=True, help="Validate and report the changes without writing anything.")
+@click.option(
+    "--status", "status_override", type=click.Choice(["verified", "candidate"]), default=None,
+    help="Force every relation to this status (e.g. 'candidate' to stage a manifest unverified).",
+)
+@click.option("--json", "--json-output", "json_output", is_flag=True, help="Emit the report as JSON.")
+def ontology_seed_command(
+    manifest: Path,
+    cwd: Path | None,
+    pipeline_id: str | None,
+    prune: bool,
+    dry_run: bool,
+    status_override: str | None,
+    json_output: bool,
+) -> None:
+    """Seed entities and relations from a JSON/TOML/YAML MANIFEST.
+
+    Idempotent: re-running an unchanged manifest writes nothing. Every
+    relation cites evidence (text stored as a memory chunk, or an external
+    attestation). See docs/NCP_ONTOLOGY.md#seeding.
+    """
+    from ncp.config import load_config
+    from ncp.ontology.facade import OntologyError, OntologyFacade
+    from ncp.ontology.seed import load_manifest, memory_chunk_writer, seed_ontology
+
+    config = load_config(cwd=cwd or Path.cwd())
+    store = _resolve_runtime_store(config)
+    try:
+        facade = OntologyFacade.from_config(config, store)
+        if not facade.enabled:
+            raise click.ClickException(
+                f"{facade.disabled_reason or 'ontology is disabled'}: add an [ontology] section "
+                "with enabled = true to .ncp/config.toml (see examples/13_ontology/config.toml)."
+            )
+        report = seed_ontology(
+            facade, load_manifest(manifest), namespace=pipeline_id,
+            write_chunk=memory_chunk_writer(store), prune=prune, dry_run=dry_run,
+            status_override=status_override,  # type: ignore[arg-type]
+        )
+    except OntologyError as exc:
+        raise click.ClickException(f"[{exc.code}] {exc.message}") from exc
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    if json_output:
+        click.echo(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+        return
+    summary = report.to_dict()
+    entities, relations = summary["entities"], summary["relations"]
+    prefix = "[yellow]dry run[/yellow] — would seed" if dry_run else "[green]Seeded[/green]"
+    console.print(
+        f"{prefix} [bold]{report.namespace}[/bold] as {report.principal_id}: "
+        f"entities {entities['created']} new / {entities['updated']} updated / "  # type: ignore[index]
+        f"{entities['unchanged']} unchanged; relations {relations['created']} new / "  # type: ignore[index]
+        f"{relations['updated']} updated / {relations['reopened']} reopened / "  # type: ignore[index]
+        f"{relations['unchanged']} unchanged / {relations['pruned']} pruned"  # type: ignore[index]
+    )
+    for line in report.pruned:
+        console.print(f"  pruned: {line}")
+    if report.stale:
+        console.print(
+            f"[yellow]{len(report.stale)} relation(s) seeded earlier are no longer in the manifest "
+            "(re-run with --prune to close them):[/yellow]"
+        )
+        for line in report.stale:
+            console.print(f"  stale: {line}")
+    for warning in report.warnings:
+        console.print(f"[yellow]warning:[/yellow] {warning}")
+
+
 @main.group("infra")
 def infra_group() -> None:
     """Manage local Postgres + Redis containers (Docker or Podman)."""
