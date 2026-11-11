@@ -13,6 +13,7 @@ import json
 import os
 import secrets
 import shutil
+import sqlite3
 import subprocess
 import time
 
@@ -3193,9 +3194,23 @@ def ontology_seed_command(
     )
 
     config = load_config(cwd=cwd or Path.cwd())
-    store = _resolve_runtime_store(config)
+    # A dry run with the ontology disabled only validates: check the manifest against
+    # the built-in schema in a throw-away in-memory database. It never opens the
+    # project store or builds an embedding adapter.
+    offline = dry_run and not config.ontology.enabled
+    memory_db = sqlite3.connect(":memory:") if offline else None
     try:
-        facade = OntologyFacade.from_config(config, store)
+        if memory_db is not None:
+            from ncp.ontology.registry import SchemaRegistry
+            from ncp.ontology.stores.sqlite import SQLiteOntologyStore
+
+            facade = OntologyFacade(
+                config.ontology, SQLiteOntologyStore(memory_db, SchemaRegistry.builtin()),
+            )
+            store = None
+        else:
+            store = _resolve_runtime_store(config)
+            facade = OntologyFacade.from_config(config, store)
         if not facade.enabled:
             raise click.ClickException(
                 f"{facade.disabled_reason or 'ontology is disabled'}: add an [ontology] section "
@@ -3207,14 +3222,20 @@ def ontology_seed_command(
         )
         report = seed_ontology(
             facade, merged.manifest, namespace=pipeline_id,
-            write_chunk=memory_chunk_writer(store), prune=prune, dry_run=dry_run,
+            write_chunk=memory_chunk_writer(store) if store is not None else None,
+            prune=prune, dry_run=dry_run,
             status_override=status_override,  # type: ignore[arg-type]
             where=merged.where,
         )
     except OntologyError as exc:
-        raise click.ClickException(f"[{exc.code}] {exc.message}") from exc
+        hint = (" (offline dry run: only entities declared in the manifests are known)"
+                if offline and "existing entity" in exc.message else "")
+        raise click.ClickException(f"[{exc.code}] {exc.message}{hint}") from exc
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
+    finally:
+        if memory_db is not None:
+            memory_db.close()
 
     if json_output:
         click.echo(json.dumps(report.to_dict(), indent=2, sort_keys=True))
@@ -3222,6 +3243,8 @@ def ontology_seed_command(
     summary = report.to_dict()
     entities, relations = summary["entities"], summary["relations"]
     prefix = "[yellow]dry run[/yellow] — would seed" if dry_run else "[green]Seeded[/green]"
+    if offline:
+        prefix = "[yellow]dry run (offline, no store)[/yellow] — would seed"
     console.print(
         f"{prefix} [bold]{report.namespace}[/bold] as {report.principal_id}: "
         f"entities {entities['created']} new / {entities['updated']} updated / "  # type: ignore[index]
@@ -3241,6 +3264,11 @@ def ontology_seed_command(
             console.print(f"  stale: {line}")
     for warning in report.warnings:
         console.print(f"[yellow]warning:[/yellow] {warning}")
+    if offline:
+        console.print(
+            "[dim]ontology is disabled: validated against the built-in schema only; "
+            "counts assume an empty store and references to existing entities are not checked.[/dim]"
+        )
 
 
 @ontology_group.command("scan")
@@ -3261,6 +3289,11 @@ def ontology_seed_command(
     show_default=True, help="Status for Kafka edges inferred from code, or 'off' to skip them.",
 )
 @click.option("--include-tests", is_flag=True, help="Also read test files for Kafka usage.")
+@click.option(
+    "--json", "--json-output", "json_output", is_flag=True,
+    help="Print the scan summary (with the Kafka coverage report) as JSON instead of the "
+         "text summary; the manifest goes to -o, or is embedded under 'manifest' without it.",
+)
 def ontology_scan_command(
     root: Path,
     output: Path | None,
@@ -3272,13 +3305,17 @@ def ontology_scan_command(
     schema_version: str,
     heuristics: str,
     include_tests: bool,
+    json_output: bool,
 ) -> None:
     """Scan a (mono)repo at ROOT and write a seed manifest for `ncp ontology seed`.
 
     Reads build files (package.json, pyproject.toml, go.mod, Cargo.toml,
     pom.xml, build.gradle), Dockerfile / Chart.yaml / k8s workloads,
     CODEOWNERS, Kafka client usage and hand-written ncp-ontology.* files.
-    Writes nothing to the store; review the manifest, then seed it.
+    Spring topic placeholders (${...}) and string constants are resolved; a
+    coverage report shows what was matched and warns when nothing was.
+    Reads files only: no store, database or embedding model is opened.
+    Review the manifest, then seed it.
     """
     from ncp.ontology.facade import OntologyError
     from ncp.ontology.scan import scan_repository
@@ -3294,6 +3331,16 @@ def ontology_scan_command(
         raise click.ClickException(f"[{exc.code}] {exc.message}") from exc
     text = result.to_json()
     summary = result.summary
+    if json_output:
+        if output is not None:
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(text, encoding="utf-8")
+        payload: dict[str, object] = {"summary": summary,
+                                      "output": str(output) if output else None}
+        if output is None:
+            payload["manifest"] = json.loads(text)
+        click.echo(json.dumps(payload, indent=2))
+        return
     relations = summary["relations"]
     statuses = summary["statuses"]
     line = (
@@ -3303,6 +3350,7 @@ def ontology_scan_command(
         f"({', '.join(f'{k} {v}' for k, v in sorted(relations.items()))}); "  # type: ignore[union-attr]
         f"{statuses.get('candidate', 0)} candidate"  # type: ignore[union-attr]
     )
+    report_console = console if output is not None else Console(stderr=True)
     if output is None:
         click.echo(text, nl=False)
         click.echo(line, err=True)
@@ -3311,6 +3359,20 @@ def ontology_scan_command(
         output.write_text(text, encoding="utf-8")
         console.print(line)
         console.print(f"Wrote {output}. Review it, then: ncp ontology seed {output} --prune")
+    kafka = summary["kafka"]
+    if kafka["kafka_like_sites"] or kafka["files_examined"]:  # type: ignore[index]
+        table = Table(title="Kafka coverage", box=box.SIMPLE_HEAVY, show_header=False)
+        for label, key in (
+            ("files examined", "files_examined"), ("kafka-like sites", "kafka_like_sites"),
+            ("matched", "matched_sites"), ("  via property", "resolved_via_property"),
+            ("  via constant", "resolved_via_constant"),
+            ("unresolved placeholders", "unresolved_placeholders"),
+            ("unmatched", "unmatched_sites"), ("skipped (no owner)", "skipped_no_owner"),
+        ):
+            table.add_row(label, str(kafka[key]))  # type: ignore[index]
+        report_console.print(table)
+        for example in kafka["unmatched_examples"]:  # type: ignore[index]
+            report_console.print(f"  unmatched: {example}", markup=False, highlight=False)
     if summary["schema_version"] == 2:
         click.echo(
             "note: schema v2 (Repo/Module) — the manifest pins schema_version = 2; seed it into "

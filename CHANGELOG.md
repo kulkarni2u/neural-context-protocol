@@ -27,6 +27,27 @@ chars/4 under the old default), larger than the 840-token context budget.
   `adaptive_allow_expand = true` (or `NCP_ADAPTIVE_ALLOW_EXPAND=1`) to restore
   upward scaling to `adaptive_budget_ceiling_tokens`.
 
+### Fixed
+
+- `ncp ontology scan` found zero Kafka topics in Spring repos because it
+  only matched string literals. It now resolves `${key}` / `${key:default}`
+  placeholders from `application*` / `bootstrap*` properties and YAML
+  (per module, base file over profiles), `static final` / `const val`
+  constants (`NAME` and `Class.NAME`), `@Value` fields, and `+`
+  concatenations in `@KafkaListener` (`topics`, `topicPattern`),
+  `kafkaTemplate.send` and `ProducerRecord`. Unresolvable topics become
+  candidate `unresolved:*` topics (confidence 0.4, never verified) instead
+  of being dropped; resolved topics carry `resolved_from`.
+- `ncp ontology seed --dry-run` works with the ontology disabled and no
+  store: it validates offline and builds no embedding adapter.
+
+### Added
+
+- `ncp ontology scan` reports Kafka coverage per call site
+  (`summary["kafka"]`, a CLI table and `--json`) and warns when Kafka usage
+  was found but no topics were extracted, when most sites are unmatched, or
+  when placeholders stayed unresolved.
+
 ### Removed
 
 - The unused `ncp.skill_cache` module (no runtime callers) and the
