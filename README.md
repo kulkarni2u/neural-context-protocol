@@ -752,6 +752,7 @@ ncp overview    # ranked cross-pipeline summary: failed tasks, waiting results, 
 ncp consolidate # merge and compact memory
 ncp vacuum      # delete aged rows from append-only tables (--older-than 30d; previews unless --yes)
 ncp forget      # permanently delete specific chunks (--chunk / --agent / --pipeline; previews unless --yes)
+ncp ontology seed # load/sync the opt-in ontology from a JSON/TOML/YAML manifest (--dry-run, --prune)
 ncp calibrate   # recalibrate trust (add --feedback for the self-improvement pass)
 ncp refine      # evidence-backed procedural self-refinement: ingest/show/propose/apply/rollback
 ncp handoff     # cross-agent handoff coordination

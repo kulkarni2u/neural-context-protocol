@@ -4,6 +4,28 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [Unreleased]
 
+## [1.9.1] - 2026-11-11
+
+### Release scope
+
+A patch release that makes the 1.9.0 ontology usable without custom code.
+NCP never extracts graph facts from memory writes, so an ontology enabled in
+1.9.0 started empty and had to be filled with hand-written
+`ncp_ontology_assert` calls. 1.9.1 adds `ncp ontology seed`, which loads a
+declarative manifest exported from an entity registry or service catalog and
+keeps the graph in sync with it on every run. Nothing changes for
+deployments that leave `[ontology]` disabled, there are no schema
+migrations, and no existing tool, request or response changes shape.
+
+Upgrade notes:
+
+- Seeding runs in-process as a trusted local operator and can mark relations
+  `verified`. Seed only from sources you would trust unreviewed; use
+  `--status candidate` to stage anything else.
+- `--prune` only closes relations asserted by the same manifest `source`
+  (principal `seed:<source>`); relations written by agents over MCP or by
+  other sources are never touched. Entities are not pruned.
+
 ### Added
 
 - **`ncp ontology seed <manifest>`** (`ncp/ontology/seed.py`): declarative
@@ -17,7 +39,11 @@ All notable changes to Neural Context Protocol will be documented in this file.
   without touching other principals' relations. `--dry-run`,
   `--status candidate` and `--json` are supported. Previously the only way to
   populate the graph was hand-written `ncp_ontology_assert` calls.
-- `relations_asserted_by` on the SQLite and PostgreSQL ontology stores.
+- `relations_asserted_by` on the SQLite and PostgreSQL ontology stores: the
+  relations one principal asserted in a namespace (any status), used by the
+  seeder to diff and prune.
+- `examples/13_ontology/manifest.toml`: a sample seed manifest, and a
+  "Seeding the graph" section in `docs/NCP_ONTOLOGY.md`.
 
 ## [1.9.0] - 2026-11-11
 
