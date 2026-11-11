@@ -1,0 +1,21 @@
+{
+  "schema_version": 2,
+  "eval": {"ignore_entity_types": ["Team"], "ignore_relation_types": ["OWNS"]},
+  "entities": [
+    {"type": "Repo", "key": "repo"},
+    {"type": "Module", "key": "payments", "aliases": ["com.acme:payments"]},
+    {"type": "Service", "key": "payments"},
+    {"type": "KafkaTopic", "key": "order.events"},
+    {"type": "KafkaTopic", "key": "payment.events"}
+  ],
+  "relations": [
+    {"src": "Repo:repo", "type": "CONTAINS", "dst": "Module:payments",
+     "evidence": "Hand-checked: payments/pom.xml lives in the repo."},
+    {"src": "Module:payments", "type": "BUILDS", "dst": "Service:payments",
+     "evidence": "Hand-checked: payments/Dockerfile builds the payments service."},
+    {"src": "Service:payments", "type": "CONSUMES", "dst": "KafkaTopic:order.events",
+     "evidence": "Hand-checked: @KafkaListener(topics = \"order.events\") in Payments.java."},
+    {"src": "Service:payments", "type": "PRODUCES", "dst": "KafkaTopic:payment.events",
+     "evidence": "Hand-checked: kafkaTemplate.send(\"payment.events\", ...) in Payments.java."}
+  ]
+}

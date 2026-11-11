@@ -52,6 +52,7 @@ refresh.
 | `fail_mode` | `"fallback"` | `fallback`, `closed` | For optional enrichment: `fallback` degrades to ordinary context; `closed` fails the `ncp_get_context` call. |
 | `packs` | `["infrastructure"]` | registered pack ids | Packs enabled for writes, queries and automatic context. An unregistered id is a startup error. |
 | `pack_versions` | `{}` | pack id → registered version | Version used by writes that name no `schema_version`, e.g. `{ infrastructure = 2 }`. Unpinned packs stay on their stable default (`infrastructure` → 1), so new built-in versions never apply silently. An unregistered pin is a startup error. |
+| `pack_paths` | `[]` | JSON file paths | Custom schema pack files, relative to the project root (or absolute); env `NCP_ONTOLOGY_PACK_PATHS` (`os.pathsep`-separated) overrides. See [Custom packs](#custom-packs). A custom pack id must also be listed in `packs`. |
 | `retrieval_mode` | `"auto"` | `off`, `auto`, `always` | Automatic enrichment policy (see [Automatic trigger](#automatic-trigger-policy)). |
 | `max_hops` | `2` | 0–5 | Traversal depth ceiling. Larger requests are clamped with a `clamped:` warning. |
 | `max_nodes` | `30` | 1–100 | Node ceiling per traversal (clamped). |
@@ -281,6 +282,70 @@ v2 is **opt-in**: writes that name no `schema_version` stay on v1 unless
 change while live relations reference it, so a namespace already seeded on
 v1 cannot be re-seeded as v2 in place: `seed` refuses up front and says so.
 Use a new namespace for v2, or revoke the v1 relations first.
+
+### Custom packs
+
+Define your own entity and relation types in a JSON pack file and list it
+under `[ontology].pack_paths`. Files load wherever the ontology is built
+(`serve`, the Python API, `seed`). Example: `examples/13_ontology/packs/payments.v1.json`.
+
+```toml
+[ontology]
+enabled = true
+packs = ["infrastructure", "payments"]          # a custom id must be listed here to be active
+pack_paths = ["ontology/packs/payments.v1.json"]  # relative to the project root
+pack_versions = { payments = 1 }                # optional pin
+```
+
+A pack file is either a **new pack id** (`id`, `version`, `entity_types`,
+`relation_types`, same format as the built-ins) or an **extension** of a
+registered pack:
+
+```json
+{"id": "infrastructure", "version": 9,
+ "extends": {"id": "infrastructure", "version": 2},
+ "entity_types": {"Queue": {"required": ["name"], "tag": "queue"}},
+ "relation_types": {"PRODUCES": {"from": ["Queue"], "to": ["KafkaTopic"]}}}
+```
+
+An extension must use an unused version. The result is the base plus the new
+types; for relation types the base already defines, only extra `from`/`to`
+endpoints may be added. Types cannot be removed or redefined, and every
+endpoint must name an entity type of the merged pack. Errors name the file.
+Extensions are opt-in like any other version (pin it with `pack_versions`
+or set `schema_version` on writes). Inspect and check packs with:
+
+```bash
+ncp ontology pack list                       # id, version, source, type counts, active/pinned
+ncp ontology pack validate FILE...           # offline, exit 1 on error
+ncp ontology pack show infrastructure --version 9   # merged schema as JSON
+```
+
+### Evaluating scan accuracy
+
+`ncp ontology eval` scores a scan against a hand-curated golden manifest
+(a normal seed manifest, optionally with a top-level `eval` table):
+
+```json
+{"eval": {"ignore_entity_types": ["Team"], "ignore_relation_types": ["OWNS"]},
+ "entities": [...], "relations": [...]}
+```
+
+```bash
+ncp ontology eval expected.json --scan . --by-type --show 20
+ncp ontology eval expected.json --actual scan.json --json --min-recall 0.9 --min-precision 0.8
+```
+
+Entities match on `(type, canonical key)` (aliases on either side count);
+relations match on `(src, type, dst)` after refs are resolved through the
+matched entities. Output: precision/recall/F1 overall, per type (`--by-type`),
+missing (FN) and unexpected (FP) examples, and an `unresolved` bucket for
+`unresolved:*` destinations (never FP; the expected relation with the same
+source and type is listed beside it and counts as a miss). `--strict-status`
+also reports status mismatches (expected `verified`, got `candidate`). The
+`--min-*` thresholds apply to relations and exit 1 when missed, for CI.
+A tiny fixture lives in `examples/13_ontology/eval/`. From Python:
+`ncp.ontology.scan_eval.evaluate(expected, actual)`.
 
 ### From Python
 

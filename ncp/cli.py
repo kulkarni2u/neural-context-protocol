@@ -3205,7 +3205,9 @@ def ontology_seed_command(
             from ncp.ontology.stores.sqlite import SQLiteOntologyStore
 
             facade = OntologyFacade(
-                config.ontology, SQLiteOntologyStore(memory_db, SchemaRegistry.builtin()),
+                config.ontology, SQLiteOntologyStore(
+                    memory_db, SchemaRegistry.builtin(config.ontology.pack_paths),
+                ),
             )
             store = None
         else:
@@ -3380,6 +3382,161 @@ def ontology_scan_command(
         )
     for warning in summary["warnings"]:  # type: ignore[union-attr]
         click.echo(f"warning: {warning}", err=True)
+
+
+@ontology_group.group("pack")
+def ontology_pack_group() -> None:
+    """Inspect and validate schema packs (built-in and custom)."""
+
+
+def _pack_registry(cwd: Path | None):  # type: ignore[no-untyped-def]
+    from ncp.config import load_config
+    from ncp.ontology.registry import PackError, SchemaRegistry
+
+    config = load_config(cwd=cwd or Path.cwd())
+    try:
+        return config, SchemaRegistry.builtin(config.ontology.pack_paths)
+    except PackError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+@ontology_pack_group.command("list")
+@click.option("--cwd", default=None, type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("--json", "--json-output", "json_output", is_flag=True, help="Emit JSON.")
+def ontology_pack_list_command(cwd: Path | None, json_output: bool) -> None:
+    """List registered schema packs (built-in plus [ontology].pack_paths)."""
+    config, registry = _pack_registry(cwd)
+    ontology = config.ontology
+    rows = [
+        {
+            "id": pack.id, "version": pack.version,
+            "source": registry.source(pack.id, pack.version),
+            "entity_types": len(pack.entity_types), "relation_types": len(pack.relation_types),
+            "active": pack.id in ontology.packs,
+            "pinned": ontology.pack_versions.get(pack.id) == pack.version,
+        }
+        for pack in registry.packs()
+    ]
+    if json_output:
+        click.echo(json.dumps(rows, indent=2))
+        return
+    for row in rows:
+        flags = [name for name in ("active", "pinned") if row[name]]
+        click.echo(
+            f"{row['id']} v{row['version']}  source={row['source']}  "
+            f"entities={row['entity_types']} relations={row['relation_types']}  "
+            f"[{', '.join(flags) or 'inactive'}]"
+        )
+
+
+@ontology_pack_group.command("validate")
+@click.argument("files", nargs=-1, required=True, type=click.Path(dir_okay=False, path_type=Path))
+def ontology_pack_validate_command(files: tuple[Path, ...]) -> None:
+    """Validate pack FILES offline (no store). Files are loaded in order on top of
+    the built-in packs, so a later file may extend an earlier one. Exit 1 on error."""
+    from ncp.ontology.registry import PackError, SchemaRegistry
+
+    registry = SchemaRegistry.builtin()
+    failed = False
+    for file in files:
+        try:
+            pack = registry.load_file(file)
+        except PackError as exc:
+            failed = True
+            click.echo(f"FAIL {exc}", err=True)
+            continue
+        click.echo(f"OK   {file}: {pack.id} v{pack.version}")
+        click.echo(f"     entity types: {', '.join(sorted(pack.entity_types))}")
+        click.echo(f"     relation types: {', '.join(sorted(pack.relation_types))}")
+    if failed:
+        raise SystemExit(1)
+
+
+@ontology_pack_group.command("show")
+@click.argument("pack_id")
+@click.option("--version", "version", type=int, default=None, help="Default: the pack's default version.")
+@click.option("--cwd", default=None, type=click.Path(exists=True, file_okay=False, path_type=Path))
+def ontology_pack_show_command(pack_id: str, version: int | None, cwd: Path | None) -> None:
+    """Print the merged schema of PACK_ID as JSON."""
+    _config, registry = _pack_registry(cwd)
+    chosen = version if version is not None else registry.default_version(pack_id)
+    if chosen is None or not registry.has_version(pack_id, chosen):
+        raise click.ClickException(f"unknown schema pack {pack_id}" + (f" v{chosen}" if chosen else ""))
+    pack = next(p for p in registry.packs() if p.id == pack_id and p.version == chosen)
+    click.echo(json.dumps(pack.model_dump(mode="json", by_alias=True), indent=2))
+
+
+@ontology_group.command("eval")
+@click.argument("expected", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--actual", default=None, type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              help="A scanned manifest (or `scan --json` payload) to score.")
+@click.option("--scan", "scan_root", default=None,
+              type=click.Path(exists=True, file_okay=False, path_type=Path),
+              help="Scan this directory and score the result.")
+@click.option("--schema-version", type=int, default=2, show_default=True, help="With --scan.")
+@click.option("--include-tests", is_flag=True, help="With --scan: also read test files.")
+@click.option("--repo-name", default=None, help="With --scan: Repo entity name.")
+@click.option("--json", "--json-output", "json_output", is_flag=True, help="Emit the report as JSON.")
+@click.option("--min-precision", type=float, default=None, help="Exit 1 if relation precision is lower.")
+@click.option("--min-recall", type=float, default=None, help="Exit 1 if relation recall is lower.")
+@click.option("--show", type=int, default=10, show_default=True, help="Examples of FN/FP to list.")
+@click.option("--by-type", is_flag=True, help="Break metrics down per entity/relation type.")
+@click.option("--strict-status", is_flag=True, help="Also report status mismatches (verified vs candidate).")
+def ontology_eval_command(
+    expected: Path,
+    actual: Path | None,
+    scan_root: Path | None,
+    schema_version: int,
+    include_tests: bool,
+    repo_name: str | None,
+    json_output: bool,
+    min_precision: float | None,
+    min_recall: float | None,
+    show: int,
+    by_type: bool,
+    strict_status: bool,
+) -> None:
+    """Score a scan against a hand-curated EXPECTED manifest (precision/recall/F1).
+
+    EXPECTED is a normal seed manifest with an optional top-level "eval"
+    table (ignore_entity_types / ignore_relation_types). Thresholds apply to
+    relations. See docs/NCP_ONTOLOGY.md#evaluating-scan-accuracy.
+    """
+    from ncp.ontology.facade import OntologyError
+    from ncp.ontology.scan import scan_repository
+    from ncp.ontology.scan_eval import evaluate, load_raw, render_text
+
+    if (actual is None) == (scan_root is None):
+        raise click.UsageError("pass exactly one of --actual or --scan")
+    try:
+        if scan_root is not None:
+            actual_manifest = scan_repository(
+                scan_root, repo_name=repo_name, schema_version=schema_version,
+                include_tests=include_tests,
+            ).manifest
+            actual_raw: object = actual_manifest
+        else:
+            assert actual is not None
+            actual_raw = load_raw(actual)
+        report = evaluate(load_raw(expected), actual_raw, ignore_status=not strict_status)  # type: ignore[arg-type]
+    except OntologyError as exc:
+        raise click.ClickException(f"[{exc.code}] {exc.message}") from exc
+
+    failures = []
+    if min_precision is not None and report.relations.precision < min_precision:
+        failures.append(f"relation precision {report.relations.precision:.3f} < {min_precision}")
+    if min_recall is not None and report.relations.recall < min_recall:
+        failures.append(f"relation recall {report.relations.recall:.3f} < {min_recall}")
+    if json_output:
+        payload = report.to_dict()
+        payload["failures"] = failures
+        click.echo(json.dumps(payload, indent=2))
+    else:
+        click.echo(render_text(report, show=show, by_type=by_type))
+        for failure in failures:
+            click.echo(f"FAIL {failure}", err=True)
+    if failures:
+        raise SystemExit(1)
 
 
 @main.group("infra")

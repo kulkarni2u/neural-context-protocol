@@ -19,6 +19,9 @@ class OntologyConfig(Contract):
     pack_versions: dict[Identifier, Annotated[int, Field(strict=True, ge=1)]] = Field(
         default_factory=dict,
     )
+    # Custom schema pack JSON files (relative to the project root when loaded
+    # via ``load_config``); a custom pack id must still be listed in ``packs``.
+    pack_paths: tuple[str, ...] = ()
     retrieval_mode: RetrievalMode = "auto"
     max_hops: Annotated[int, Field(strict=True, ge=0, le=5)] = 2
     max_nodes: Annotated[int, Field(strict=True, ge=1, le=100)] = 30

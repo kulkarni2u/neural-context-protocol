@@ -1,0 +1,13 @@
+{
+  "id": "payments",
+  "version": 1,
+  "entity_types": {
+    "Service": {"required": ["name"], "tag": "svc"},
+    "PaymentProvider": {"required": ["name"], "tag": "psp"},
+    "Ledger": {"required": ["name"], "tag": "ledger"}
+  },
+  "relation_types": {
+    "SETTLES_WITH": {"from": ["Service"], "to": ["PaymentProvider"], "intents": ["dependency"]},
+    "WRITES_LEDGER": {"from": ["Service"], "to": ["Ledger"], "intents": ["dependency"]}
+  }
+}
