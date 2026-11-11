@@ -1,0 +1,56 @@
+# Declarative seed for the ontology example: `ncp ontology seed examples/13_ontology/manifest.toml`
+# (needs the [ontology] section from config.toml). Same graph shape as
+# seed_graph.py, but applied in-process and idempotently. See
+# docs/NCP_ONTOLOGY.md#seeding-the-graph.
+
+pipeline = "demo"
+source = "service_catalog"
+observed_at = "2026-01-15T09:00:00+00:00"
+
+[[entities]]
+type = "Service"
+key = "checkout"
+attributes = { environment = "prod", version = "2.14.0" }
+
+[[entities]]
+type = "Service"
+key = "payments"
+attributes = { environment = "prod", version = "7.3.2" }
+
+[[entities]]
+type = "Database"
+key = "ledger-db"
+attributes = { engine = "postgres" }
+
+[[entities]]
+type = "KafkaTopic"
+key = "order-events"
+attributes = { cluster = "main" }
+
+[[entities]]
+type = "Team"
+key = "team-payments"
+
+[[relations]]
+src = "checkout"
+type = "DEPENDS_ON"
+dst = "payments"
+evidence = "deploy/checkout.yaml sets PAYMENTS_URL; checkout calls payments to authorize every order."
+
+[[relations]]
+src = "payments"
+type = "DEPENDS_ON"
+dst = "ledger-db"
+evidence = "payments records every capture in ledger-db; ledger-db outages stop payments."
+
+[[relations]]
+src = "checkout"
+type = "PRODUCES"
+dst = "order-events"
+attestation = "service-catalog.yaml#checkout"
+
+[[relations]]
+src = "team-payments"
+type = "OWNS"
+dst = "payments"
+attestation = "CODEOWNERS#payments"

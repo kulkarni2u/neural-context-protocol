@@ -16,7 +16,10 @@ CLAUDE.md
 .ncp/run.py
 .sarathi
 .gstack/
-.claude/
+# .claude/: local by default; the shared brain/worker setup is tracked.
+.claude/*
+!.claude/agents/
+!.claude/settings.json
 .codex/
 policy-pack/
 SARATHI.md
