@@ -36,6 +36,52 @@ curl -s http://127.0.0.1:4242/mcp -H 'Content-Type: application/json' -d '{
   }}}'
 ```
 
+## Model tiering: brain and workers — MANDATORY
+
+Every NCP task runs as one **brain** plus **workers**:
+
+- **Brain** — the top-tier model (Opus; the session model set in
+  `.claude/settings.json`). It owns the plan, the decisions, the specs it
+  hands out, integration, final verification, commits/PRs and everything
+  said to the user. It reads worker reports, not raw transcripts.
+- **Workers** — cheaper models doing bounded, well-specified work. Delegate
+  by default: the brain edits directly only for trivial changes it already
+  has in context (a few lines), where writing the spec would cost more than
+  the edit.
+
+| Role | Claude Code agent (`.claude/agents/`) | Model | Use for |
+|---|---|---|---|
+| `vichara` | `vichara` | haiku | Finding code, reading files, mapping call sites, answering "where/how does X work" with `file:line` citations. Read-only. |
+| `pravaha` | `pravaha` | sonnet | Implementing a spec: code, tests, docs, version bumps. Runs the checks for what it touched. |
+| `nirnaya` | `nirnaya` | sonnet | Reviewing a diff against its spec for correctness, missing tests and regressions. Read-only. |
+| `parikshaka` | `parikshaka` | haiku | Running test/lint/type suites and returning a distilled pass/fail summary, never full logs. |
+
+Codex or OpenCode can stand in for `pravaha`/`nirnaya` (same role names,
+dispatched with the template below).
+
+Rules for the brain:
+
+1. **Spec before dispatch.** Every worker prompt states the goal, the files
+   in scope, the acceptance criteria (which tests/checks must pass), what is
+   out of scope, and the NCP `task`/`slot`/`intent` slugs to use.
+2. **Parallelize independent work.** Send independent workers in one turn;
+   chain only real dependencies (research → implement → review → test).
+3. **Verify, don't trust.** A worker's "done" is a claim. The brain checks
+   the diff and the `parikshaka`/test result before committing.
+4. **Workers never** commit, push, open or comment on PRs, change git
+   history, or talk to external services. Those stay with the brain.
+5. **Escalate, don't guess.** A worker that finds the spec ambiguous or
+   wrong stops and reports back; the brain decides.
+6. **Size it right.** Split work so each worker finishes in one pass; give
+   it the facts it needs instead of making it rediscover them.
+
+Workflow engines: when **Sarathi** is orchestrating, it dispatches these
+same roles and owns sequencing; NCP stays the context and memory substrate
+(see `examples/13_ontology/sarathi/`). Without Sarathi, the brain session is
+the orchestrator. Either way every worker starts with `ncp_get_context` and
+ends with `ncp_write_memory`, so findings survive across workers and
+sessions.
+
 ## Subagent Dispatch Template — MANDATORY
 
 When dispatching ANY external subagent (OpenCode via `ncp handoff opencode`,

@@ -4,8 +4,187 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [Unreleased]
 
-Read **Changed** before upgrading: several requests the HTTP server used to
-accept are now rejected.
+## [1.9.2] - 2026-11-11
+
+### Release scope
+
+Cuts NCP's fixed per-turn token overhead and makes `ncp ontology scan`
+work on Spring/Kafka repositories. The MCP tool catalog is sent to the
+model every turn and had become the largest fixed cost (~7.1k tokens by
+chars/4 under the old default), larger than the 840-token context budget;
+the new default catalog is ~3.9k.
+
+### Upgrade notes
+
+- **The default tool profile is now `standard`.** Agents that call
+  `ncp_overview`, `ncp_remember`, `ncp_recall`, `ncp_improve`, `ncp_task`
+  or the memo tools get an unknown-tool error (-32601) until you set
+  `[tools] profile = "full"` (or `NCP_TOOL_PROFILE=full`).
+- **Adaptive budget no longer grows past `context_token_budget`.** Set
+  `[budget] adaptive_allow_expand = true` to keep the 1.9.1 behaviour.
+- `ncp_emit_whisper`'s input schema no longer carries per-type payload
+  `allOf` branches; payload validation is unchanged (server-side).
+- Remove any `[skill_cache]` block from config; it is ignored.
+- Re-run `ncp ontology scan` on Spring repos: topics previously dropped now
+  appear, and unresolved ones appear as candidate `unresolved:*` topics.
+
+### Changed
+
+- **Breaking default:** `[tools] profile` now defaults to a new `standard`
+  profile (10 tools): the 5 core tools plus `ncp_record_outcome`,
+  `ncp_record_decision`, `ncp_get_decision`, `ncp_compile_decision_query`
+  and `ncp_wait_whispers`. Set `profile = "full"` (or `NCP_TOOL_PROFILE=full`)
+  to restore `ncp_overview`, `ncp_remember`, `ncp_recall`, `ncp_improve`,
+  `ncp_task` and the memo tools. Unknown profile values fall back to
+  `standard`. Default `tools/list` drops from ~28.4k to ~15.6k chars (-45%).
+- Trimmed MCP tool definitions (descriptions, and `ncp_emit_whisper`'s nested
+  per-type payload `allOf` schemas, which were documentation only; payloads
+  are still validated server-side). Full-profile `tools/list` drops from
+  ~28.3k to ~17.8k chars (-37%). Removed detail lives in the "Tool schema
+  notes" section of `docs/NCP_HTTP_API.md`; a test guards the size.
+- Adaptive context budget now only shrinks by default and never exceeds
+  `[budget].context_token_budget` (previously up to 1.5x). Set
+  `adaptive_allow_expand = true` (or `NCP_ADAPTIVE_ALLOW_EXPAND=1`) to restore
+  upward scaling to `adaptive_budget_ceiling_tokens`.
+
+### Fixed
+
+- `ncp ontology scan` found zero Kafka topics in Spring repos because it
+  only matched string literals. It now resolves `${key}` / `${key:default}`
+  placeholders from `application*` / `bootstrap*` properties and YAML
+  (per module, base file over profiles), `static final` / `const val`
+  constants (`NAME` and `Class.NAME`), `@Value` fields, and `+`
+  concatenations in `@KafkaListener` (`topics`, `topicPattern`),
+  `kafkaTemplate.send` and `ProducerRecord`. Unresolvable topics become
+  candidate `unresolved:*` topics (confidence 0.4, never verified) instead
+  of being dropped; resolved topics carry `resolved_from`.
+- `ncp ontology seed --dry-run` works with the ontology disabled and no
+  store: it validates offline and builds no embedding adapter.
+
+### Added
+
+- `ncp ontology scan` reports Kafka coverage per call site
+  (`summary["kafka"]`, a CLI table and `--json`) and warns when Kafka usage
+  was found but no topics were extracted, when most sites are unmatched, or
+  when placeholders stayed unresolved.
+
+### Removed
+
+- The unused `ncp.skill_cache` module (no runtime callers) and the
+  `[skill_cache]` config keys. The `skill_ref` chunk source value is kept for
+  stored-data compatibility; the design doc moved to `docs/archive/`.
+
+## [1.9.1] - 2026-11-11
+
+### Release scope
+
+Makes the 1.9.0 ontology usable without custom code. NCP never extracts
+graph facts from memory writes, so an ontology enabled in 1.9.0 started
+empty and had to be filled with hand-written `ncp_ontology_assert` calls.
+1.9.1 adds `ncp ontology scan`, a static exporter that turns a (mono)repo's
+build files, CODEOWNERS, deploy manifests and Kafka usage into a reviewable
+manifest, and `ncp ontology seed`, which loads one or more manifests and
+keeps the graph in sync with them on every run. An opt-in `infrastructure`
+v2 schema pack adds repos, modules and tables, and contributors get a
+brain/worker model-tiering workflow for agents. Nothing changes for
+deployments that leave `[ontology]` disabled, there are no store schema
+migrations, and no existing tool, request or response changes shape.
+
+Upgrade notes:
+
+- Seeding runs in-process as a trusted local operator and can mark relations
+  `verified`. Seed only from sources you would trust unreviewed; use
+  `--status candidate` to stage anything else. `scan` marks its Kafka edges
+  (inferred from code) `candidate` by default.
+- `--prune` only closes relations asserted by the same `source` (principal
+  `seed:<source>`); relations written by agents over MCP or by other sources
+  are never touched. Entities are not pruned. Seed a monorepo's per-module
+  manifests in one run, or give each module its own `source`.
+- `infrastructure` v2 is registered but **not** the default: writes that
+  name no `schema_version` stay on v1 unless `[ontology].pack_versions = {
+  infrastructure = 2 }`. `ncp_ontology_capabilities` now lists both versions,
+  each with a `default` flag. A namespace already on v1 cannot be re-seeded
+  as v2 in place.
+
+### Added
+
+- **`ncp ontology seed <manifests...>`** (`ncp/ontology/seed.py`): declarative
+  seeding of the ontology from a JSON/TOML/YAML manifest of entities and
+  relations exported from an authoritative source (entity registry, service
+  catalog, CODEOWNERS). Validates the whole manifest against the enabled
+  schema pack before writing; writes each relation's `evidence` text as a
+  memory chunk and cites it (or an `attestation`); idempotent and diff-based
+  (unchanged re-runs write nothing); reports relations dropped from the
+  manifest as stale and, with `--prune`, closes their validity window
+  without touching other principals' relations. `--dry-run`,
+  `--status candidate`, `--pipeline-id` and `--json` are supported.
+  Previously the only way to populate the graph was hand-written
+  `ncp_ontology_assert` calls.
+  - **Several manifests in one run** (e.g. one per monorepo module): merged
+    under one `source` (`--source`), so cross-file references resolve and
+    `--prune` covers them together; conflicting redeclarations are errors
+    that name both files.
+  - **References to existing entities**: a relation endpoint not declared in
+    the manifests resolves against entities already in the store (namespace,
+    then `global`), so a module's manifest need not redeclare its
+    dependencies. Referenced entities are never rewritten.
+- **`ncp ontology scan [ROOT]`** (`ncp/ontology/scan.py`): a reference
+  exporter that writes a seed manifest from a repository (via `git ls-files`)
+  without touching the store (`-o/--output`, `--pipeline-id`, `--source`,
+  `--repo-name`, `--environment`, `--kafka-cluster`). Modules from
+  `package.json`, `pyproject.toml`, `go.mod`, `Cargo.toml`, `pom.xml` and
+  `build.gradle(.kts)` with in-repo `DEPENDS_ON` edges; services from
+  `Chart.yaml`, k8s `Deployment`/`StatefulSet`/`DaemonSet` workloads and
+  `Dockerfile`s; `Team OWNS` from `CODEOWNERS`; `PRODUCES`/`CONSUMES` from
+  Kafka client usage in Java/Kotlin, Python, JS/TS and Go and Spring Cloud
+  Stream bindings (`candidate` by default; `--heuristics verified|off`
+  changes or skips them); hand-written `ncp-ontology.*` files merged in. Every relation cites `path#Lnn`. `--schema-version 1`
+  emits v1-only facts.
+- **`infrastructure` v2 schema pack** (`ncp/ontology/packs/infrastructure.v2.json`,
+  opt-in): a superset of v1 adding `Repo`, `Module` and `Table` with
+  `CONTAINS`, `BUILDS`, `READS` and `WRITES`, and `Module` endpoints on
+  `DEPENDS_ON`/`PRODUCES`/`CONSUMES`/`OWNS`.
+- **`[ontology].pack_versions`**: pins the schema version used by writes
+  that name none. `SchemaRegistry.default_version` keeps unpinned packs on
+  their stable version, so new built-in versions never apply silently.
+- `relations_asserted_by` on the SQLite and PostgreSQL ontology stores: the
+  relations one principal asserted in a namespace (any status), used by the
+  seeder to diff and prune.
+- `examples/13_ontology/manifest.toml`: a sample seed manifest, and a
+  "Seeding the graph" section in `docs/NCP_ONTOLOGY.md`.
+
+### Changed
+
+- **Contributor workflow: brain/worker model tiering** (no runtime change).
+  `AGENTS.md` gains a "Model tiering: brain and workers" section. The new
+  tracked `.claude/settings.json` sets the session model to `opus` (the
+  brain), and `.claude/agents/` defines four workers: `vichara` (haiku,
+  read-only research), `pravaha` (sonnet, implementation), `nirnaya`
+  (sonnet, read-only review) and `parikshaka` (haiku, test/lint summaries).
+  Each worker starts with `ncp_get_context` and ends with
+  `ncp_write_memory`. `.gitignore` now ignores `.claude/*` except
+  `.claude/agents/` and `.claude/settings.json`; it ignored all of `.claude/`
+  before.
+- Upgrade note for contributors: a pre-existing local `.claude/settings.json`
+  now shows as tracked and modified. Merge it, or move personal settings to
+  `.claude/settings.local.json`. Claude Code versions that only read
+  `CLAUDE.md` can add `@AGENTS.md` to their local `CLAUDE.md`.
+
+## [1.9.0] - 2026-11-11
+
+### Release scope
+
+This release adds an opt-in, evidence-backed domain ontology and hardens the
+HTTP server. The ontology (`[ontology] enabled = true`, off by default and a
+byte-for-byte no-op when off) stores services, databases, APIs, Kafka topics,
+incidents and teams with typed, evidence-cited relations on SQLite or
+PostgreSQL. `ncp_get_context` can append a compact `[NCP:ONTOLOGY]` block of
+verified paths, and six `ncp_ontology_*` tools answer explicit graph
+questions. The hardening work adds opt-in authenticated principals,
+`Content-Type`/`Origin`/`Host` checks on HTTP, `ncp doctor`, `ncp vacuum` and
+`ncp forget`. Read **Changed** before upgrading: several HTTP requests the
+server used to accept are now rejected (`415`/`403`), and a non-loopback bind
+without a token now exits instead of warning.
 
 ### Security
 
@@ -55,6 +234,51 @@ accept are now rejected.
 
 ### Added
 
+- **Opt-in domain ontology** (`ncp/ontology/`, `docs/NCP_ONTOLOGY.md`):
+  an evidence-backed graph of typed entities and relations, off by default
+  (`[ontology] enabled = true`). Ships the versioned `infrastructure` v1
+  schema pack (`Service`, `Database`, `API`, `KafkaTopic`, `Incident`,
+  `Team`; `DEPENDS_ON`, `PRODUCES`, `CONSUMES`, `EXPOSES`, `OWNS`) with
+  endpoint types, cardinality and cycle rules. A relation carries a status
+  (`candidate`, `verified`, `disputed`, `revoked`), confidence, a validity
+  window and evidence refs (an NCP chunk id or an external attestation);
+  only relations with live, caller-readable evidence are traversed.
+  Namespaces follow `pipeline_id` plus `global`, and capabilities come from
+  `[principals]` (`verify` to assert verified relations, `admin` for
+  `global` writes and others' relations). Disabled, tool lists, responses
+  and context are unchanged.
+- **Ontology tools** (full profile, listed only when enabled):
+  `ncp_ontology_capabilities`, `ncp_ontology_query`, `ncp_ontology_explain`,
+  `ncp_ontology_assert`, `ncp_ontology_revoke` and `ncp_ontology_evidence`
+  (exact-id text of at most 16 cited chunks that are still live and
+  readable). The read tools reject `as_of` with `invalid`. In-process hosts
+  can use `ncp.ontology.facade.OntologyFacade`.
+- **Ontology-aware context**: in `retrieval_mode = "auto"` an unchanged
+  `ncp_get_context` call appends a verified-only `[NCP:ONTOLOGY]` block when
+  the request resolves one entity exactly and shows relationship or
+  diagnostic intent. Request words pick relation types, direction and hops;
+  path selection stops on marginal value, and `max_graph_tokens` (default
+  500) is a ceiling taken from the caller's budget. The `v:2` block groups
+  facts with `ev:` citations, and memory chunks a shown fact cites are not
+  repeated as text (they stay in `retrieved_chunk_ids`). Responses carry
+  `ontology` metadata (trigger reason, paths, tokens, latency, fallback).
+  Timeouts and backend errors fall back to ordinary context unless
+  `fail_mode = "closed"`. A request with `as_of` skips enrichment
+  (`as_of_unsupported`).
+- **Ontology storage** on SQLite (`ontology_*` tables in the NCP database)
+  and PostgreSQL (`{schema}.{table_prefix}ontology_*` in the pgvector
+  store's schema, created by an additive, versioned migration on first use;
+  nothing is created while the ontology is off). A shared parity suite
+  requires identical results from both backends.
+- Ontology harness examples for Claude Code, Codex and Sarathi
+  (`examples/13_ontology/`) and an ontology benchmark
+  (`benchmarks/ontology`, `docs/NCP_BENCHMARK_ONTOLOGY.md`). On the SQLite
+  dependency tasks the ontology arm reaches fact recall 1.00 against 0.38 for
+  the baseline at an 800-token budget, at about +7 ms p95; at matched recall
+  it needs 20.4% fewer tokens on the default budget ladder, a gain that holds
+  only on the low-budget frontier (+1.0% on the older 200-token-minimum
+  ladder). At a fixed 800-token budget it still uses more prompt tokens
+  (162 against 137).
 - `ncp doctor [--json]`: checks config, store reachability, pending
   migrations, the server, the auth header in agent configs, embeddings and
   optional extras.

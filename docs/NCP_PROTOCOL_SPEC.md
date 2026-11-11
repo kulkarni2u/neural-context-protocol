@@ -600,6 +600,13 @@ Config gate ([budget] table):
                                    ever present in the response.
   adaptive_budget_floor_tokens:    int (default 300)  -- hard lower bound.
   adaptive_budget_ceiling_tokens:  int (default 2000) -- hard upper bound.
+  adaptive_allow_expand:           bool (default false) -- when false,
+                                   adaptation may only shrink: floor and
+                                   ceiling are both capped at
+                                   [budget].context_token_budget, so the
+                                   adjusted value never exceeds it. When
+                                   true, the 0.5x-1.5x scaling may exceed
+                                   context_token_budget, up to the ceiling.
 
 Precedence (never violated): an explicit caller max_tokens argument always
 wins. When present, no adaptive computation is applied to the value actually
@@ -1311,8 +1318,8 @@ PRECISION` timestamps). A backend without ledger support raises
 `ncp_overview` gives a router one bounded, ranked view of many pipelines, so
 it can decide where to spend a turn without replaying any of them. It is a
 read-only MCP tool (plus `ncp overview`, `GET /api/overview` and
-`ncp.api.overview`). It is available in the `full` tool profile and absent from
-`core`; it has no config flag of its own.
+`ncp.api.overview`). It requires `profile = "full"` and is absent from
+`core` and `standard`; it has no config flag of its own.
 
 **Arguments.** `agent_id` (required; the viewer), `pipelines?` (list of ids) or
 `pipeline_prefix?`, `since_seconds?` (default 86400), `max_pipelines?`
@@ -1827,6 +1834,7 @@ budget_enforcement = "warn"    # CAP-E2: off | warn | block
 adaptive_budget_enabled = true         # CAP-C6: on by default
 adaptive_budget_floor_tokens = 300     # CAP-C6
 adaptive_budget_ceiling_tokens = 2000  # CAP-C6
+adaptive_allow_expand = false          # CAP-C6: true lets adaptation exceed context_token_budget
 
 [tiering]
 tier_hints_enabled = true      # CAP-E3
@@ -1866,7 +1874,7 @@ max_wait_seconds = 60    # ceiling for ncp_wait_whispers
 poll_interval_seconds = 2.0  # in-process backend only: re-peek the store so other processes' whispers are found; 0 = off, min 0.25
 
 [tasks]                  # leased task ledger (ncp_task), see section 4j
-enabled = false          # opt-in; ncp_task hidden when false or tools.profile = "core"
+enabled = false          # opt-in; ncp_task hidden when false or tools.profile != "full"
 default_lease_seconds = 300
 max_lease_seconds = 3600
 default_max_attempts = 3
