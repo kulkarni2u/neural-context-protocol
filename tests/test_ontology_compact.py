@@ -56,6 +56,22 @@ def test_classify_intent(text: str, name: str, direction: str) -> None:
         assert profile.relation_types == () and profile.hops == 1 and profile.path_cap == 12
 
 
+@pytest.mark.parametrize(("text", "entity", "direction"), [
+    ("tell me what checkout depends on", "checkout", "out"),
+    ("list what payments uses", "payments", "out"),
+    ("what fraud-check needs", "fraud-check", "out"),
+    ("what services depend on checkout", "checkout", "in"),
+    ("who uses payments", "payments", "in"),
+])
+def test_wh_question_with_entity_subject_asks_for_dependencies(
+    text: str, entity: str, direction: str,
+) -> None:
+    # "what X depends on": X (a resolved seed) is the subject, so outgoing.
+    profile = classify_intent([text], relation_intents=_pack_intents(), max_hops=2,
+                              max_paths=16, entity_terms=[entity])
+    assert profile.direction == direction
+
+
 def test_intent_hops_and_caps_respect_config() -> None:
     intents = _pack_intents()
     assert classify_intent(["depends"], relation_intents=intents, max_hops=0, max_paths=16).hops == 0
@@ -149,6 +165,18 @@ def test_v2_labels_cannot_inject_headers_or_lines() -> None:
     text = serialize(ranked, max_tokens=500, tags=TAGS).text
     assert text is not None and text.count("\n") == 1
     assert text.count("[NCP:") == 1 and "," not in text.split(" ev:")[0].split(" ")[-1]
+
+
+def test_only_verbatim_citations_are_substitutable() -> None:
+    long_id = "ev-" + "x" * 80
+    ranked = [_path(0.9, [CHECKOUT, CART], [R_CART], [(long_id,)]),
+              _path(0.8, [CHECKOUT, PAY], [R_PAY], [("ev#pay",)]),
+              _path(0.7, [PAY, DB], [R_DB], [("ev+db", "ev-db2")])]
+    out = serialize(ranked, max_tokens=500, tags=TAGS)
+    # Truncated / folded ids cannot be fetched back, so their text must stay;
+    # a ``+`` inside an id is folded so it cannot fake an extra-refs count.
+    assert out.cited_chunk_ids == frozenset()
+    assert "ev_db+1" in (out.text or "")
 
 
 def test_default_tag_falls_back_to_type_name() -> None:

@@ -23,7 +23,7 @@ class OntologyConfig(Contract):
     # (smaller or equal) cap, see ncp.ontology.trigger.INTENT_PATH_CAPS.
     max_graph_paths: Annotated[int, Field(strict=True, ge=1, le=100)] = 16
     # Selection stops at the first ranked path scoring below this.
-    min_path_score: Annotated[float, Field(ge=0.0, le=1.0)] = 0.25
+    min_path_score: Annotated[float, Field(strict=True, ge=0.0, le=1.0)] = 0.25
     # Map relationship intent to relation types / direction / hops (schema
     # pack ``intents``); false walks every type both ways (v1 behaviour).
     intent_directed: bool = Field(default=True, strict=True)

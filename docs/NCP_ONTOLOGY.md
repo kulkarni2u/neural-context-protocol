@@ -184,7 +184,7 @@ relation `intents` categories, not hardcoded type names; in
 | Request words (examples) | Profile | Relation types | Direction | Hops |
 |---|---|---|---|---|
 | depends on, dependencies, uses, calls, requires, needs, upstream | `dependency` | `dependency` types | outgoing | `max_hops` |
-| impact, blast radius, what breaks, dependents, downstream, consumers, "who/what/which … uses/calls/depends" | `impact` | `dependency` types | incoming | `max_hops` |
+| impact, blast radius, what breaks, dependents, downstream, consumers, "who/what/which [noun] uses/calls/depends" (unless the word before the verb is the resolved entity: "what checkout depends on" is `dependency`) | `impact` | `dependency` types | incoming | `max_hops` |
 | owner, owns, ownership, team, maintainers | `ownership` | `ownership` types | both | 1 |
 | deployed, hosted, runs, cluster, region | `deployment` | `deployment` types | both | 1 |
 | diagnostic words only (why, slow, outage, lag, …) | `dependency` | `dependency` types | outgoing | `max_hops` |
@@ -225,7 +225,10 @@ svc:billing <-OWNS- team:platform ev:att
   usual cap and trim rules. If statements are later shed to fit a tighter
   ceiling (budget refit, `response_max_tokens`), a chunk that loses its last
   citing statement comes back as text, so memory is never lost to keep graph
-  data. The chunk's text can be pulled with `ncp_fetch` using the fact's
+  data. Only a chunk whose id appears verbatim in `ev:` is substituted: an
+  id longer than 64 characters or with characters outside the safe set
+  (including `+`, which marks extra refs) is cited folded or truncated, and
+  its text stays in memory. The chunk's text can be pulled with `ncp_fetch` using the fact's
   entity names (the chunk id is not a search key), and the relation with
   `ncp_ontology_explain` using `ontology.paths[].relation_ids`.
 - **Outcome credit.** A chunk is credited in `retrieved_chunk_ids` when
@@ -287,8 +290,11 @@ Measured on the benchmark corpus with default limits (see
 - Primary token metric, tokens at matched recall: **20.4% fewer** prompt
   tokens than the baseline on SQLite (5 tasks with baseline recall to
   match; 25.3% at full recall on 2 tasks), with no recall loss. On Postgres
-  this is not measurable (1 task). At a fixed budget the context is still
-  larger than the baseline's, because the baseline omits most facts.
+  this is not measurable (1 task). The saving is on the low-budget frontier:
+  with the PR 6 budget ladder (lowest rung 200) it is 1.0%, and at a fixed
+  800-token budget the context is still larger than the baseline's, because
+  the baseline omits most facts. Recall counts facts shown only as graph
+  statements; answer quality with a model in the loop is not measured.
 
 ## Known limitations
 

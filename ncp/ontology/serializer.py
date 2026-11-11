@@ -97,15 +97,21 @@ def _facts(path: RankedPath, tags: Mapping[str, str], context: Collection[str]) 
         chunks = candidate.chunk_evidence[position]
         external = candidate.external_evidence[position]
         chosen = next((chunk for chunk in chunks if chunk in context), chunks[0] if chunks else None)
+        cited: str | None = None
         if chosen is not None:
             extra = len(chunks) - 1 + external
-            citation = _safe(chosen)[:MAX_CITATION_CHARS] + (f"+{extra}" if extra else "")
+            # ``+`` is the extra-refs marker, so it is folded inside the id.
+            shown = _safe(chosen).replace("+", "_")[:MAX_CITATION_CHARS]
+            citation = shown + (f"+{extra}" if extra else "")
+            # Only a chunk whose id is cited verbatim may lose its text to the
+            # fact (substitution): a folded or truncated id no longer names it.
+            cited = chosen if shown == chosen else None
         else:
             citation = "att" + (f"+{external - 1}" if external > 1 else "")
         facts.append(_Fact(
             relation_id=str(relation.relation_id), anchor=short_label(here, tags),
             relation_type=_safe(relation.relation_type), forward=forward,
-            target=short_label(there, tags), citation=citation, cited_chunk=chosen,
+            target=short_label(there, tags), citation=citation, cited_chunk=cited,
         ))
     return facts
 

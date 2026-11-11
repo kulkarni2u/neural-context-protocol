@@ -194,9 +194,11 @@ DEPLOYMENT_TERMS = frozenset({
     "cluster", "deployed", "deployment", "hosted", "hosting", "hosts", "region", "runs",
 })
 # "who uses X" / "what services depend on X" ask for dependents (incoming),
-# while "what does X depend on" asks for dependencies (outgoing).
+# while "what does X depend on" asks for dependencies (outgoing). When the
+# word between the question word and the verb is a resolved entity ("what
+# checkout depends on"), X is the subject: dependencies, not dependents.
 _DEPENDENT_QUESTION = re.compile(
-    r"\b(?:who|what|which)(?: (?!does\b|do\b|did\b|is\b)[\w-]+)?"
+    r"\b(?:who|what|which)(?: ((?!does\b|do\b|did\b|is\b)[\w-]+))?"
     r" (call|calls|consume|consumes|depend|depends|need|needs|relies|rely|require|requires"
     r"|use|uses)\b"
 )
@@ -217,15 +219,22 @@ class IntentProfile:
     categories: tuple[str, ...] = ()
 
 
-def intent_categories(texts: Sequence[str]) -> tuple[str, ...]:
-    """Relationship-intent categories named by the request words (sorted)."""
+def intent_categories(
+    texts: Sequence[str], *, entity_terms: Iterable[str] = (),
+) -> tuple[str, ...]:
+    """Relationship-intent categories named by the request words (sorted).
+    ``entity_terms`` are the normalized terms that resolved to seed entities."""
     words: list[str] = []
     for text in texts:
         words.extend(tokenize(text))
     vocabulary = set(words)
     joined = " ".join(words)
     found: set[str] = set()
-    dependent_verbs = {match.group(1) for match in _DEPENDENT_QUESTION.finditer(joined)}
+    entity_words = {word for term in entity_terms for word in tokenize(term)}
+    dependent_verbs = {
+        match.group(2) for match in _DEPENDENT_QUESTION.finditer(joined)
+        if match.group(1) not in entity_words  # None: no word in between
+    }
     if dependent_verbs or vocabulary & IMPACT_TERMS:
         found.add("impact")
     if (vocabulary - dependent_verbs) & DEPENDENCY_TERMS:
@@ -245,10 +254,12 @@ def classify_intent(
     relation_intents: Mapping[str, Iterable[str]],
     max_hops: int,
     max_paths: int,
+    entity_terms: Iterable[str] = (),
 ) -> IntentProfile:
     """The traversal profile for ``texts``. ``relation_intents`` maps each
-    enabled relation type to its schema-pack ``intents`` categories."""
-    categories = intent_categories(texts)
+    enabled relation type to its schema-pack ``intents`` categories;
+    ``entity_terms`` are the terms that resolved to seeds."""
+    categories = intent_categories(texts, entity_terms=entity_terms)
 
     def types_for(category: str) -> tuple[str, ...]:
         return tuple(sorted(

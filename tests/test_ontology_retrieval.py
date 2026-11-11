@@ -906,6 +906,11 @@ class TestGraphFirst:
         assert relations <= {"CONSUMES", "DEPENDS_ON", "PRODUCES"}
         assert "Service:portal" not in labels and "Team:people-ops" not in labels
 
+    def test_what_entity_depends_on_walks_outgoing(self, world: World) -> None:
+        world.payroll()
+        meta = world.get_context(task="list_what_payroll_depends_on", slot="x")["ontology"]
+        assert meta["intent"]["name"] == "dependency" and meta["intent"]["direction"] == "out"
+
     def test_impact_and_ownership_intents(self, world: World) -> None:
         facts = world.payroll()
         team = world.entity("Team", "people-ops")
@@ -947,6 +952,7 @@ class TestGraphFirst:
         assert config.intent_directed is True and config.substitute_evidence is True
         for bad in ({"max_graph_paths": 0}, {"max_graph_paths": 101}, {"min_path_score": -0.1},
                     {"min_path_score": 1.5}, {"intent_directed": "yes"},
-                    {"substitute_evidence": 1}, {"min_path_score": float("nan")}):
+                    {"substitute_evidence": 1}, {"min_path_score": float("nan")},
+                    {"min_path_score": True}, {"min_path_score": "0.5"}):
             with pytest.raises(ValidationError):
                 OntologyConfig(**bad)

@@ -47,7 +47,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
@@ -464,7 +464,7 @@ class OntologyEnricher:
         if not decision.should_expand:
             return self._result(started, decision.reason_code, **common)
 
-        profile = self._profile(texts, packs)
+        profile = self._profile(texts, packs, resolution.resolved.values())
         common["intent"] = profile
         graph_deadline = self._clock() + self.config.graph_timeout_ms / 1000.0
         try:
@@ -506,7 +506,9 @@ class OntologyEnricher:
             **common,
         )
 
-    def _profile(self, texts: Sequence[str], packs: Sequence[Any]) -> IntentProfile:
+    def _profile(
+        self, texts: Sequence[str], packs: Sequence[Any], entity_terms: Iterable[str] = (),
+    ) -> IntentProfile:
         """The traversal profile: intent-directed, or the v1 walk (every type,
         both directions, ``max_hops``) when ``intent_directed`` is off."""
         if not self.config.intent_directed:
@@ -519,7 +521,7 @@ class OntologyEnricher:
                 relation_intents.setdefault(name, set()).update(definition.intents)
         return classify_intent(
             texts, relation_intents=relation_intents, max_hops=self.config.max_hops,
-            max_paths=self.config.max_graph_paths,
+            max_paths=self.config.max_graph_paths, entity_terms=entity_terms,
         )
 
     def _expand(

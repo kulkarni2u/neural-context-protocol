@@ -69,10 +69,10 @@ about 3 s.
 |---|---|
 | latency p50/p95 | Wall-clock time of the handler call. Measured after one warm-up call per task, over 15 rounds (120 dependency and 90 control samples per arm), with tracing off. |
 | prompt tokens | `estimate_tokens(context)` (`chars_div4`), measured at `max_tokens=800` |
-| fact recall | Share of ground-truth relations covered. A relation counts as covered when its evidence chunk is in context, or when the relation appears in the `[NCP:ONTOLOGY]` block. |
+| fact recall | Share of ground-truth relations covered. A relation counts as covered when its evidence chunk is in context, or when the relation appears in the `[NCP:ONTOLOGY]` block. A fact shown **only as a graph statement** (verified, with its evidence chunk id in `ev:` but no evidence text) counts as recalled. This is the design's notion of recall (a verified, cited, fetchable fact); whether a model answers as well from the statement as from the prose is not measured. |
 | evidence precision / recall | Over surfaced chunk ids, which are `retrieved_chunk_ids` plus the graph block's `ev:` citations |
 | tokens to full recall | Prompt tokens at the smallest budget on the ladder that reaches fact recall 1.0. Unset when no budget on the ladder reaches it. The v2 ladder is 100, 150, 200, 300, 400, 600, 800, 1200, 1600, 2400 (v1 started at 200); both arms run the same ladder. |
-| **tokens at matched recall** (primary) | Per dependency task and target recall R, each arm is charged its cheapest ladder rung whose fact recall ≥ R. R is the baseline's best recall anywhere on the ladder ("R = baseline max"; tasks where that is 0 are skipped) or 1.0. Only tasks both arms reach count. Reported as the pooled reduction `1 − Σ ontology / Σ baseline`. The hypothesis is only evaluated with at least max(3, half the tasks) pairs; otherwise it is reported as not measurable. |
+| **tokens at matched recall** (primary) | Per dependency task and target recall R, each arm is charged its cheapest ladder rung whose fact recall ≥ R. R is the baseline's best recall anywhere on the ladder ("R = baseline max"; tasks where that is 0 are skipped) or 1.0. Only tasks both arms reach count. Reported as the pooled reduction `1 − Σ ontology / Σ baseline`: **positive = the ontology arm needs fewer tokens**, negative = it needs more (−5.9% means 5.9% more tokens). The hypothesis is only evaluated with at least max(3, half the tasks) pairs (4 of 8 here); otherwise it is reported as not measurable. The R = 1.0 figure has no pair minimum and is reported for information only. |
 | recall guard | Flags a config that saves tokens by losing recall: a task where the ontology arm has lower fact recall than the baseline at the fixed budget while using fewer tokens, or a lower mean recall with fewer mean tokens. |
 | oracle evidence tokens | Tokens needed to show exactly the ground-truth evidence chunks as `[NCP:SUBCONSCIOUS]` lines, i.e. a perfect memory retriever. Computed, not run. |
 | unsupported assertion rate | Relations in the graph block that are not verified with live evidence, divided by all relations in the block. Separately, every path's `ev:` citations are checked: each relation on the path must cite its own live evidence chunk, and no superseded or unrelated chunk may be cited (`unsupported_citations`). |
@@ -115,14 +115,17 @@ the v1 code.
 
 ### Headline: tokens at matched recall (dependency tasks, default ladder)
 
+Sign convention for every "reduction" on this page: `1 − ontology / baseline`,
+so **positive = fewer tokens than the baseline**, negative = more.
+
 | | SQLite v1 | SQLite v2 | Postgres v1 | Postgres v2 |
 |---|---:|---:|---:|---:|
 | R = baseline max: pairs (of 8) | 5 | 5 | 1 | 1 |
 | baseline tokens (mean) | 106.0 | 106.0 | 132.0 | 132.0 |
 | ontology tokens (mean) | 112.2 | **84.4** | 98.0 | 88.0 |
-| **reduction** | −5.9% | **+20.4%** | (+25.8%, 1 pair) | (+33.3%, 1 pair) |
-| R = 1.0: pairs | 2 | 2 | 0 | 0 |
-| R = 1.0: reduction | −35.4% | **+25.3%** | — | — |
+| **reduction** (positive = fewer tokens) | −5.9% | **+20.4%** | (+25.8%, 1 pair) | (+33.3%, 1 pair) |
+| R = 1.0: pairs (below the 4-pair minimum) | 2 | 2 | 0 | 0 |
+| R = 1.0: reduction (2 tasks, informational) | −35.4% | +25.3% | — | — |
 | recall guard (tokens cut by losing recall) | no | no | no | no |
 
 SQLite v2 per task at R = baseline max (baseline → ontology tokens):
@@ -131,9 +134,23 @@ checkout 138 → 97 (R 0.18), shipping 98 → 93 (R 0.33), pricing 96 → 84
 three tasks have baseline recall 0 everywhere on the ladder, so there is
 nothing to match.
 
-Ladder sensitivity (SQLite, finer rungs 60, 70, …, 175, 200, … 2400): v2
-+29.4% at R = baseline max and +25.8% at R = 1.0; v1 +2.1% and −23.7%. The
-default ladder is the reported number.
+Ladder sensitivity (SQLite, reduction at R = baseline max / R = 1.0; both
+arms always run the same ladder):
+
+| Ladder | v1 | v2 |
+|---|---:|---:|
+| PR 6 ladder (200, 300, … 2400) | −30.4% / −26.8% | **+1.0%** / +14.1% |
+| default (100, 150, 200, … 2400) | −5.9% / −35.4% | **+20.4%** / +25.3% |
+| finer (60, 70, …, 170, 175, 200, … 2400) | +2.1% / −23.7% | +29.4% / +25.8% |
+| dense (50, 55, …, 395, 400, … 2400) | +1.9% / −23.7% | +30.6% / +25.8% |
+
+The result exists only on the low-budget frontier. With the PR 6 ladder the
+cheapest rung is 200, where the baseline is already saturated (about 138
+tokens) and the ontology arm spends the freed budget on more memory, so v2
+saves only 1.0%. Finer ladders converge on v2 ≈ +30% and v1 ≈ +2%, so the
+ladder change measures the frontier more precisely rather than favouring an
+arm (v1 does not reach 15% on any ladder). The default ladder is the
+reported number.
 
 ### Dependency tasks (8 tasks, default config, fixed budget 800)
 
@@ -157,7 +174,8 @@ default ladder is the reported number.
 
 (v1 latency/token columns are the published PR 6 run; v1 tokens to full
 recall used the old ladder starting at 200.) At a fixed budget v2 still uses
-more tokens than the baseline (+18% SQLite, +39% Postgres), because the
+more tokens than the baseline (18% more on SQLite, 39% more on Postgres;
+the artifact's `dependency_fixed_budget_token_reduction` is −0.18), because the
 baseline's 137 tokens carry only 38% (SQLite) or 1% (Postgres) of the facts;
 v2 carries all of them for +25 / +48 tokens.
 
@@ -197,7 +215,7 @@ not surface these chunks); the ontology has no effect on that.
   `max_graph_tokens = 150` changes nothing, because selection stops on value
   long before the 500-token ceiling.
 - **Substitution** cuts the fixed-budget context by 17% (194 → 162 tokens):
-  5 cited memory chunks across the 8 tasks are shown only as facts. It does
+  6 cited memory chunks across the 8 tasks are shown only as facts. It does
   not move the matched-recall numbers, because on the cheapest rungs memory
   has no room anyway.
 - `min_path_score = 0.25` never binds on this corpus (path scores are
@@ -220,7 +238,7 @@ not surface these chunks); the ontology has no effect on that.
 | Design hypothesis (§11) | v1 | v2 | Verdict (v2) |
 |---|---|---|---|
 | Graph overhead < 50 ms p95 on a controlled local corpus | +11.3 ms SQLite, +34.8 ms Postgres | **+7.4 ms** SQLite, **+15.9 ms** Postgres | **Met** on both backends, with more Postgres headroom. |
-| 15–25% token reduction on dependency-rich tasks | Not met (tokens +293% at fixed budget; −5.9% at matched recall) | **+20.4%** at matched recall on SQLite (5 tasks), +25.3% at full recall (2 tasks) | **Met on SQLite**, on the primary metric, with no recall loss. **Not measurable on Postgres**: the lexical pgvector baseline reaches non-zero recall on only 1 of 8 tasks (+33.3% there), below the 3-pair minimum. At a fixed budget tokens still rise (+18% / +39%) because the baseline is missing most facts. |
+| 15–25% token reduction on dependency-rich tasks | Not met (3.9× the baseline's tokens at a fixed budget; −5.9% reduction, i.e. 5.9% more tokens, at matched recall) | **+20.4%** reduction at matched recall on SQLite (5 of 8 tasks); +25.3% at full recall on 2 tasks (below the pair minimum) | **Met on SQLite**, on the primary metric, with no recall loss, on the low-budget frontier only: with the PR 6 ladder (lowest rung 200) it is +1.0%, and at the default `max_tokens = 800` v2 uses 18% more tokens than the baseline. **Not measurable on Postgres**: the lexical pgvector baseline reaches non-zero recall on only 1 of 8 tasks (+33.3% there), below the 3-pair minimum. At a fixed budget tokens still rise (+18% / +39%) because the baseline is missing most facts. |
 | No meaningful regression on non-graph tasks | Met | Context identical, +2.5 ms (SQLite) / +5.5 ms (Postgres) p95, +8 SQL statements | **Met** for context quality and tokens; a small measured trigger cost remains. |
 | Zero verified-without-evidence assertions | 0 / 111 | **0 / 36**, 0 unsupported `ev:` citations, neither planted hazard surfaced | **Met** |
 
@@ -229,9 +247,12 @@ not surface these chunks); the ontology has no effect on that.
 - The SQLite headline rests on 5 tasks, and 3 of the 8 dependency tasks have
   no baseline recall to match at all. The result is real for this corpus but
   small-sample.
-- It depends on the ladder's granularity (20.4% default, 29.4% with finer
-  low rungs), because each arm is charged a whole rung. Both arms always run
-  the same ladder.
+- It depends on the ladder's granularity (1.0% with the PR 6 ladder, 20.4%
+  default, 29.4–30.6% with finer low rungs), because each arm is charged a
+  whole rung. Both arms always run the same ladder.
+- Recall counts graph statements as recalled facts. A substituted evidence
+  chunk may say more than the one relation it backs; that extra content is
+  not shown, and its loss is not measured here.
 - The cheapest matching ontology contexts are mostly "header + graph block,
   no memory": a model gets verified facts with chunk ids, not the evidence
   prose. Whether that is enough for a given task is not measured here (no
