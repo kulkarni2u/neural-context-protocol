@@ -203,7 +203,7 @@ Rules that keep the loop honest:
 | `ncp_compile_decision_query` | before a classify/route/score/choose call | Bounded decision packet: state, questions, `state_hash`, precedents, advisory confidence, `escalate`. No provider calls. |
 | `ncp_get_decision` | any | Read one typed decision by id. |
 | `ncp_record_outcome` | after task completes | Success/failure evidence that feeds reputation calibration (CAP-T3). Pass `decision_id` to close the decision loop. |
-| `ncp_overview` | router, before picking where to work | Read-only, token-bounded ranked view of many pipelines (spec §4k). Peeks your inbox; acknowledges nothing. |
+| `ncp_overview` | router, before picking where to work (needs `profile = "full"`) | Read-only, token-bounded ranked view of many pipelines (spec §4k). Peeks your inbox; acknowledges nothing. |
 | `ncp_lookup_memo` / `ncp_record_memo` | around expensive work | Semantic memoization: skip work already done for the same task signature (CAP-C3). |
 
 Normative details for each: [`docs/NCP_PROTOCOL_SPEC.md`](./NCP_PROTOCOL_SPEC.md).
@@ -378,7 +378,7 @@ the last `checkpoint_chunk_id` through `ncp_fetch`. A `dedupe_key` such as
 safe: a repeat `create` returns the existing task with `created: false`.
 
 **Router loop with the overview.** A router that watches many pipelines adds
-one cheap step between the doorbell and `ncp_get_context`: ask `ncp_overview`
+one cheap step between the doorbell and `ncp_get_context`: ask `ncp_overview` (needs `[tools] profile = "full"`)
 where the attention is, then spend the turn there (spec §4k):
 
 ```text

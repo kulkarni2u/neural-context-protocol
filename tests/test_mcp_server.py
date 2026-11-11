@@ -22,6 +22,7 @@ from ncp.mcp.server import (
     create_http_server,
     make_handlers,
     serve_streams,
+    tools_for_config,
 )
 from ncp.stores.base import BaseStore
 from ncp.stores.sqlite import SQLiteStore
@@ -38,6 +39,20 @@ FULL_NON_MEMO_TOOL_NAMES = [
     "ncp_remember",
     "ncp_recall",
     "ncp_improve",
+    "ncp_fetch",
+    "ncp_record_decision",
+    "ncp_get_decision",
+    "ncp_compile_decision_query",
+    "ncp_record_outcome",
+]
+
+
+STANDARD_TOOL_NAMES = [
+    "ncp_get_context",
+    "ncp_write_memory",
+    "ncp_emit_whisper",
+    "ncp_wait_whispers",
+    "ncp_post_turn",
     "ncp_fetch",
     "ncp_record_decision",
     "ncp_get_decision",
@@ -108,7 +123,7 @@ class TestInitialize:
 
         framed_response = _read_message(io.BytesIO(output_stream.getvalue()))
         assert framed_response is not None
-        assert [tool["name"] for tool in framed_response["result"]["tools"]] == FULL_NON_MEMO_TOOL_NAMES
+        assert [tool["name"] for tool in framed_response["result"]["tools"]] == STANDARD_TOOL_NAMES
 
     def test_malformed_message_shape_does_not_kill_the_server_loop(self, tmp_path: Path) -> None:
         """Bug bounty finding (docs/NCP_SILENT_DISCONNECT_AUDIT.md finding 9):
@@ -128,7 +143,7 @@ class TestInitialize:
 
         framed_response = _read_message(io.BytesIO(output_stream.getvalue()))
         assert framed_response is not None
-        assert [tool["name"] for tool in framed_response["result"]["tools"]] == FULL_NON_MEMO_TOOL_NAMES
+        assert [tool["name"] for tool in framed_response["result"]["tools"]] == STANDARD_TOOL_NAMES
 
     def test_http_transport_handles_initialize_and_tools_list(self, tmp_path: Path) -> None:
         port = _free_port()
@@ -160,7 +175,7 @@ class TestInitialize:
 
                 tools = client.post("/mcp", json=_req("tools/list"))
                 assert tools.status_code == 200
-                assert [tool["name"] for tool in tools.json()["result"]["tools"]] == FULL_NON_MEMO_TOOL_NAMES
+                assert [tool["name"] for tool in tools.json()["result"]["tools"]] == STANDARD_TOOL_NAMES
         finally:
             server._shutdown_event.set()
             server.shutdown()
@@ -288,8 +303,9 @@ class TestToolsList:
         schema = emit_tool["inputSchema"]
         properties = schema["properties"]  # type: ignore[index]
         assert "ttl_seconds" in properties
-        assert "share/request" in properties["payload"]["description"]
-        assert "dissent" in properties["payload"]["description"]
+        description = emit_tool["description"]
+        assert "share/request" in description
+        assert "dissent" in description
 
     def test_emit_whisper_payload_schema_is_additive_for_structured_payloads(self) -> None:
         emit_tool = next(tool for tool in MCP_TOOLS if tool["name"] == "ncp_emit_whisper")
@@ -302,28 +318,30 @@ class TestToolsList:
             {"type": "object"},
         ]
 
-    def test_emit_whisper_schema_discriminates_structured_payloads_by_type(self) -> None:
+    def test_emit_whisper_description_lists_per_type_payload_keys(self) -> None:
+        # Per-type payload shapes are documented in the description (the nested
+        # allOf schemas were dropped to save tokens); the handler validates them.
         emit_tool = next(tool for tool in MCP_TOOLS if tool["name"] == "ncp_emit_whisper")
-        schema = emit_tool["inputSchema"]
-        conditionals = schema["allOf"]  # type: ignore[index]
+        description = emit_tool["description"]
 
-        payload_titles_by_types = {
-            tuple(branch["if"]["properties"]["type"]["enum"]): [
-                option.get("title", option["type"])
-                for option in branch["then"]["properties"]["payload"]["oneOf"]
-            ]
-            for branch in conditionals
-        }
+        assert "allOf" not in emit_tool["inputSchema"]  # type: ignore[operator]
+        for fragment in (
+            "share/request {ask",
+            "dissent {issue",
+            "alert {alert_code, description}",
+            "world_check {anchor_intent, detected_drift}",
+            "progress {status",
+            "result {status",
+            "nudge/consolidation_ready",
+        ):
+            assert fragment in description
 
-        assert payload_titles_by_types == {
-            ("share", "request"): ["string", "HandoffPayload"],
-            ("dissent",): ["string", "DissentPayload"],
-            ("alert",): ["string", "AlertPayload"],
-            ("world_check",): ["string", "WorldCheckPayload"],
-            ("progress",): ["ProgressPayload"],
-            ("result",): ["ResultPayload"],
-            ("nudge", "consolidation_ready"): ["string"],
-        }
+    def test_full_profile_tool_definitions_stay_compact(self, tmp_path: Path) -> None:
+        # Tool definitions are re-sent to the model every turn; growth must be justified.
+        config = load_config(cwd=tmp_path)
+        config.values["tools"]["profile"] = "full"
+        size = len(json.dumps(tools_for_config(config)))
+        assert size < 19_600, f"full-profile tools/list grew to {size} chars"
 
     def test_tool_profile_core_tools_list_advertises_only_context_lifecycle(self, tmp_path: Path) -> None:
         project = tmp_path / "repo"
@@ -344,6 +362,32 @@ class TestToolsList:
             "ncp_post_turn",
             "ncp_fetch",
         ]
+
+    def test_tool_profile_standard_is_default_and_excludes_full_only_tools(self, tmp_path: Path) -> None:
+        project = tmp_path / "repo"
+        (project / ".git").mkdir(parents=True)
+        for toml in (None, '[tools]\nprofile = "standard"\n'):
+            root = project if toml is None else tmp_path / "explicit"
+            if toml is not None:
+                (root / ".git").mkdir(parents=True)
+                (root / ".ncp").mkdir()
+                (root / ".ncp" / "config.toml").write_text(toml)
+            output_stream = io.BytesIO()
+            serve_streams(io.BytesIO(_frame(_req("tools/list"))), output_stream, cwd=root)
+            response = _read_message(io.BytesIO(output_stream.getvalue()))
+            assert response is not None
+            assert [t["name"] for t in response["result"]["tools"]] == STANDARD_TOOL_NAMES
+
+    def test_standard_profile_rejects_overview_as_unknown_tool(self, tmp_path: Path) -> None:
+        project = tmp_path / "repo"
+        (project / ".git").mkdir(parents=True)
+        output_stream = io.BytesIO()
+
+        serve_streams(io.BytesIO(_frame(_call("ncp_overview", {"agent_id": "router"}))), output_stream, cwd=project)
+
+        response = _read_message(io.BytesIO(output_stream.getvalue()))
+        assert response is not None
+        assert response["error"]["code"] == -32601
 
     def test_tool_profile_full_tools_list_hides_disabled_memo_tools(self, tmp_path: Path) -> None:
         project = tmp_path / "repo"
@@ -2393,6 +2437,53 @@ class TestAdaptiveBudget:
             "reason_factors": {"explicit_override": True},
         }
         assert estimate_tokens(result["context"]) <= 200
+
+    def _hard_args(self, pipeline_id: str) -> dict[str, object]:
+        return self._args(
+            pipeline_id=pipeline_id,
+            task="x" * 200,
+            slot="y" * 100,
+            drift_score=1.0,
+            ctx_used=0.95,
+        )
+
+    def test_default_never_exceeds_configured_context_token_budget(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "adaptive_noexpand.db")
+        config = load_config(cwd=tmp_path)
+        assert config.adaptive_allow_expand is False
+        config.values["budget"]["adaptive_budget_enabled"] = True
+        handlers = make_handlers(store, config=config)
+
+        hard = _content(_handle_request(
+            _call("ncp_get_context", self._hard_args("pipe_noexpand")), handlers,
+        ))
+
+        assert hard["budget_tokens"]["adjusted"] <= config.context_token_budget
+
+    def test_allow_expand_restores_upward_scaling(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "adaptive_expand.db")
+        config = load_config(cwd=tmp_path)
+        config.values["budget"]["adaptive_budget_enabled"] = True
+        config.values["budget"]["adaptive_allow_expand"] = True
+        handlers = make_handlers(store, config=config)
+
+        hard = _content(_handle_request(
+            _call("ncp_get_context", self._hard_args("pipe_expand")), handlers,
+        ))
+
+        assert hard["budget_tokens"]["adjusted"] > config.context_token_budget
+
+    def test_explicit_max_tokens_unaffected_by_expand_setting(self, tmp_path: Path) -> None:
+        store = SQLiteStore(tmp_path / "adaptive_explicit_expand.db")
+        config = load_config(cwd=tmp_path)
+        config.values["budget"]["adaptive_budget_enabled"] = True
+        handlers = make_handlers(store, config=config)
+        args = self._hard_args("pipe_explicit_expand")
+        args["max_tokens"] = config.context_token_budget * 2
+
+        result = _content(_handle_request(_call("ncp_get_context", args), handlers))
+
+        assert result["budget_tokens"]["adjusted"] == config.context_token_budget * 2
 
     def test_adjusted_always_within_configured_floor_and_ceiling(self, tmp_path: Path) -> None:
         store = SQLiteStore(tmp_path / "adaptive_bounds.db")
