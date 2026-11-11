@@ -3559,19 +3559,21 @@ def ontology_demote_command(
 @click.option("--environment", default="prod", show_default=True, help="'environment' attribute for detected services.")
 @click.option("--kafka-cluster", default="main", show_default=True, help="'cluster' attribute for detected Kafka topics.")
 @click.option(
-    "--schema-version", type=click.Choice(["1", "2"]), default="2", show_default=True,
-    help="2 emits Repo/Module nodes (infrastructure v2); 1 emits services, topics and teams only.",
+    "--schema-version", type=click.Choice(["1", "2", "3"]), default="3", show_default=True,
+    help="3 adds Queue / Exchange nodes (SQS, SNS, RabbitMQ, JMS; infrastructure v3); 2 emits "
+         "Repo/Module nodes (infrastructure v2) and Kafka topics only; 1 emits services, "
+         "topics and teams only.",
 )
 @click.option(
     "--heuristics", type=click.Choice(["candidate", "verified", "off"]), default="candidate",
-    show_default=True, help="Status for Kafka edges inferred from code, or 'off' to skip them.",
+    show_default=True, help="Status for messaging edges inferred from code, or 'off' to skip them.",
 )
-@click.option("--include-tests", is_flag=True, help="Also read test files for Kafka usage.")
+@click.option("--include-tests", is_flag=True, help="Also read test files for messaging usage.")
 @click.option("--summary-out", default=None, type=click.Path(dir_okay=False, path_type=Path),
               help="Also write the scan summary (coverage report) here as JSON, for `ncp ontology wiki --summary`.")
 @click.option(
     "--json", "--json-output", "json_output", is_flag=True,
-    help="Print the scan summary (with the Kafka coverage report) as JSON instead of the "
+    help="Print the scan summary (with the messaging coverage report) as JSON instead of the "
          "text summary; the manifest goes to -o, or is embedded under 'manifest' without it.",
 )
 def ontology_scan_command(
@@ -3592,9 +3594,12 @@ def ontology_scan_command(
 
     Reads build files (package.json, pyproject.toml, go.mod, Cargo.toml,
     pom.xml, build.gradle), Dockerfile / Chart.yaml / k8s workloads,
-    CODEOWNERS, Kafka client usage and hand-written ncp-ontology.* files.
-    Spring topic placeholders (${...}) and string constants are resolved; a
-    coverage report shows what was matched and warns when nothing was.
+    CODEOWNERS, messaging client usage (Kafka, SQS/SNS, RabbitMQ/AMQP, JMS in
+    JS/TS, Python, Go and JVM code) and hand-written ncp-ontology.* files.
+    Destinations are resolved from literals, constants, Spring ${...}
+    placeholders, simple SpEL and environment defaults; edges start at the
+    deployable service. A coverage report shows what was matched per broker
+    and warns when nothing was.
     Reads files only: no store, database or embedding model is opened.
     Review the manifest, then seed it.
     """
@@ -3644,6 +3649,7 @@ def ontology_scan_command(
         console.print(line)
         console.print(f"Wrote {output}. Review it, then: ncp ontology seed {output} --prune")
     kafka = summary["kafka"]
+    messaging = summary.get("messaging") or {}
     if kafka["kafka_like_sites"] or kafka["files_examined"]:  # type: ignore[index]
         table = Table(title="Kafka coverage", box=box.SIMPLE_HEAVY, show_header=False)
         for label, key in (
@@ -3657,10 +3663,36 @@ def ontology_scan_command(
         report_console.print(table)
         for example in kafka["unmatched_examples"]:  # type: ignore[index]
             report_console.print(f"  unmatched: {example}", markup=False, highlight=False)
-    if summary["schema_version"] == 2:
+    others = {name: item for name, item in messaging.items() if name != "kafka"}  # type: ignore[attr-defined]
+    if others:
+        table = Table(title="Messaging coverage", box=box.SIMPLE_HEAVY)
+        for column in ("broker", "sites", "produce", "consume", "matched", "unresolved",
+                       "unmatched", "no owner", "skipped schema"):
+            table.add_column(column, justify="left" if column == "broker" else "right")
+        for name, item in sorted(others.items()):
+            table.add_row(
+                name, str(item["sites"]), str(item["producer_sites"]),
+                str(item["consumer_sites"]), str(item["matched_sites"]), str(item["unresolved"]),
+                str(item["unmatched_sites"]), str(item["skipped_no_owner"]),
+                str(item["skipped_schema"]))
+        report_console.print(table)
+        for name, item in sorted(others.items()):
+            for example in item["unmatched_examples"]:
+                report_console.print(f"  unmatched ({name}): {example}", markup=False,
+                                     highlight=False)
+    attribution = summary.get("attribution") or {}
+    if any(attribution.values()):  # type: ignore[union-attr]
+        report_console.print(
+            "edges from: "
+            f"{attribution['edges_from_service']} service(s), "  # type: ignore[index]
+            f"{attribution['edges_via_dependency']} via dependency, "  # type: ignore[index]
+            f"{attribution['edges_from_module']} module(s)", markup=False, highlight=False)  # type: ignore[index]
+    if summary["schema_version"] >= 2:  # type: ignore[operator]
         click.echo(
-            "note: schema v2 (Repo/Module) — the manifest pins schema_version = 2; seed it into "
-            "a namespace that is not already on v1.", err=True,
+            f"note: schema v{summary['schema_version']} (Repo/Module) — the manifest pins "
+            f"schema_version = {summary['schema_version']}; seed it into a namespace that is "
+            "not already on an older version (pin [ontology] pack_versions = "
+            f"{{ infrastructure = {summary['schema_version']} }}).", err=True,
         )
     for warning in summary["warnings"]:  # type: ignore[union-attr]
         click.echo(f"warning: {warning}", err=True)
