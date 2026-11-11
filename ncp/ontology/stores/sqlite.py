@@ -73,6 +73,25 @@ _LIVE_CHUNK = (
 )
 # Added when the chunks table carries CAP-C5 ``valid_from``: future facts are not live yet.
 _LIVE_CHUNK_STARTED = " AND (c.valid_from IS NULL OR c.valid_from <= :now_epoch)"
+# Any non-revoked relation touching the entity whose pack version would no
+# longer match it after an upgrade (``SchemaRegistry.validate_relation``'s
+# same-version rule). Deliberately unscoped and reported without a count:
+# the message never reveals relations outside the caller's scope.
+_INCOMPATIBLE_INCIDENT = (
+    "SELECT 1 FROM ontology_relations WHERE (src_entity_id = :entity_id"
+    " OR dst_entity_id = :entity_id) AND status != 'revoked'"
+    " AND (schema_pack != :schema_pack OR schema_version != :schema_version) LIMIT 1"
+)
+_SCHEMA_UPGRADE_CONFLICT = (
+    "entity schema_version cannot change while non-revoked relations reference it;"
+    " revoke those relations first"
+)
+# Relation and both endpoints on the same schema pack version (defensive read
+# predicate: an incompatible edge is never returned as a live graph path).
+_SAME_SCHEMA = (
+    "r.schema_pack = s.schema_pack AND r.schema_version = s.schema_version"
+    " AND r.schema_pack = d.schema_pack AND r.schema_version = d.schema_version"
+)
 # Progress-handler granularity (SQLite VM instructions) for deadline checks.
 _PROGRESS_STEPS = 1000
 
@@ -500,7 +519,8 @@ class SQLiteOntologyStore:
         with self._transaction(write=True) as connection:
             row = self._row(
                 connection,
-                "SELECT revision, created_at FROM ontology_entities WHERE entity_id = ?",
+                "SELECT revision, created_at, schema_version FROM ontology_entities"
+                " WHERE entity_id = ?",
                 (entity_id,),
             )
             current = 0 if row is None else int(row["revision"])
@@ -508,6 +528,13 @@ class SQLiteOntologyStore:
                 raise OntologyConflictError(
                     f"entity revision conflict: expected {expected_version}, found {current}"
                 )
+            if row is not None and int(row["schema_version"]) != entity.schema_version and (
+                self._row(connection, _INCOMPATIBLE_INCIDENT, {
+                    "entity_id": entity_id, "schema_pack": entity.schema_pack,
+                    "schema_version": entity.schema_version,
+                }) is not None
+            ):
+                raise OntologyConflictError(_SCHEMA_UPGRADE_CONFLICT)
             revision = current + 1
             created = stamp if row is None else str(row["created_at"])
             values = (
@@ -839,7 +866,7 @@ class SQLiteOntologyStore:
 
         clauses = [
             visible("r"), visible("s"), visible("d"),
-            "s.deleted_at IS NULL", "d.deleted_at IS NULL", _ACTIVE,
+            "s.deleted_at IS NULL", "d.deleted_at IS NULL", _ACTIVE, _SAME_SCHEMA,
         ]
         if request.relation_types:
             names = [f":type{index}" for index in range(len(request.relation_types))]
@@ -1040,6 +1067,41 @@ class SQLiteOntologyStore:
                 )
                 live.update(chunk_id for (chunk_id,) in rows)
         return live
+
+    def evidence_chunks(
+        self, chunk_ids: Sequence[str], *, auth: AuthContext, deadline: float | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        """Text of the ``chunk_ids`` that are live and readable by the caller.
+
+        Same liveness and readability as :meth:`live_chunk_evidence` with the
+        caller's own namespace (a ``global``-scope chunk or one in the
+        caller's pipeline). Missing, expired, superseded and out-of-scope ids
+        are all simply absent (indistinguishable).
+        """
+        _require(auth, "read")
+        ids = sorted({str(chunk_id) for chunk_id in chunk_ids})
+        found: dict[str, dict[str, Any]] = {}
+        if not ids:
+            return found
+        now = datetime.now(timezone.utc)
+        with self._transaction(write=False, deadline=deadline) as connection:
+            predicate = self._live_chunk_sql(connection, ":caller")
+            if predicate is None:
+                return found
+            for start in range(0, len(ids), _IN_BATCH):
+                batch = ids[start:start + _IN_BATCH]
+                names = {f"id{index}": value for index, value in enumerate(batch)}
+                for row in self._rows(
+                    connection,
+                    "SELECT c.chunk_id, c.content, c.layer, c.src FROM chunks c WHERE c.chunk_id IN"
+                    f" ({','.join(':' + name for name in names)}) AND {predicate}",
+                    {**names, "caller": auth.scope.namespace, "now_epoch": now.timestamp()},
+                ):
+                    found[row["chunk_id"]] = {
+                        "chunk_id": row["chunk_id"], "layer": row["layer"], "src": row["src"],
+                        "content": row["content"],
+                    }
+        return found
 
     @staticmethod
     def initialized(path: str | Path) -> bool:

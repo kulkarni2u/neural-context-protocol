@@ -301,6 +301,7 @@ class Assembler:
                 query_text=query_text,
                 chunks=combined_chunks,
                 max_tokens=effective_max_tokens,
+                as_of=as_of,
             )
             if graph.text is not None and self._ontology.config.substitute_evidence:
                 # Graph-first substitution: a memory chunk whose fact is shown
@@ -387,9 +388,11 @@ class Assembler:
         query_text: str | None,
         chunks: list[SubconsciousChunk],
         max_tokens: int | None,
+        as_of: float | None = None,
     ) -> GraphContext:
         """Run the ontology enricher with what the budget leaves after the
-        conscious block and budget header (which are never evicted)."""
+        conscious block and budget header (which are never evicted). A
+        point-in-time request (``as_of``) gets no graph data at all."""
         assert self._ontology is not None
         token_limit: int | None = None
         if max_tokens is not None:
@@ -404,6 +407,7 @@ class Assembler:
             token_limit = max(0, max_tokens - fixed - 2)
         return self._ontology.enrich(
             conscious=conscious, query_text=query_text, chunks=chunks, token_limit=token_limit,
+            as_of=as_of,
         )
 
     def _encode_with_graph(

@@ -30,8 +30,9 @@ categories), direction and hops (:func:`ncp.ontology.trigger.classify_intent`).
 
 Graph-first substitution (``substitute_evidence``, applied by the assembler):
 a memory chunk cited by a shown fact's ``ev:`` loses its text in
-``[NCP:SUBCONSCIOUS]``; its id stays in the citation (``ncp_fetch`` can
-retrieve it) and in ``retrieved_chunk_ids``. Outcome-credit rule: a chunk is
+``[NCP:SUBCONSCIOUS]``; its id stays in the citation (``ncp_ontology_evidence``
+returns its text while it is still live and readable) and in
+``retrieved_chunk_ids``. Outcome-credit rule: a chunk is
 credited when memory retrieval selected it and its content reached the turn,
 verbatim or as a verified fact it evidences. Chunks cited *only* by the graph
 (never selected by memory retrieval) are not credited, exactly as in v1.
@@ -397,16 +398,24 @@ class OntologyEnricher:
         query_text: str | None,
         chunks: Sequence[SubconsciousChunk],
         token_limit: int | None,
+        as_of: float | None = None,
     ) -> GraphContext:
         """Run eligibility, trigger and bounded expansion for one request.
 
         ``token_limit`` is what remains of the caller's budget after the
         conscious block and budget header (``None``: no caller budget); the
         graph never takes more than ``min(max_graph_tokens, token_limit)``.
+
+        ``as_of`` (a historical, point-in-time request) skips enrichment
+        entirely with ``reason_code = "as_of_unsupported"``: graph reads only
+        know the current state, so a historical context must not carry
+        present-day facts or evidence substitution.
         """
         started = self._clock()
         namespace = conscious.pipeline_id or GLOBAL_NAMESPACE
         auth = self._auth(namespace)  # fail closed before any lookup
+        if as_of is not None:
+            return self._result(started, "as_of_unsupported")
         slice_tokens = self.config.max_graph_tokens
         if token_limit is not None:
             slice_tokens = min(slice_tokens, token_limit)

@@ -66,8 +66,8 @@ from ncp.ontology.models import (
 from ncp.ontology.registry import RelationType, SchemaRegistry
 from ncp.ontology.stores._traversal import breadth_first
 from ncp.ontology.stores.sqlite import (
-    OntologyConflictError, OntologyNotFoundError, OntologyTimeoutError, _check_deadline, _require,
-    _require_write, _ts,
+    _SAME_SCHEMA, _SCHEMA_UPGRADE_CONFLICT, OntologyConflictError, OntologyNotFoundError,
+    OntologyTimeoutError, _check_deadline, _require, _require_write, _ts,
 )
 
 if TYPE_CHECKING:
@@ -626,8 +626,8 @@ class PostgresOntologyStore:
         with self._transaction(write=True) as tx:
             self._lock(tx, "entity", entity_id)  # also covers the not-yet-existing row
             row = tx.row(
-                f"SELECT revision, created_at FROM {self._t('entities')} WHERE entity_id = %s"
-                " FOR UPDATE",
+                f"SELECT revision, created_at, schema_version FROM {self._t('entities')}"
+                " WHERE entity_id = %s FOR UPDATE",
                 (entity_id,),
             )
             current = 0 if row is None else int(row["revision"])
@@ -635,6 +635,17 @@ class PostgresOntologyStore:
                 raise OntologyConflictError(
                     f"entity revision conflict: expected {expected_version}, found {current}"
                 )
+            # The FOR UPDATE row lock serializes this against relation asserts,
+            # which read their endpoints FOR SHARE.
+            if row is not None and int(row["schema_version"]) != entity.schema_version and tx.row(
+                f"SELECT 1 FROM {self._t('relations')} WHERE (src_entity_id = %(entity_id)s"
+                " OR dst_entity_id = %(entity_id)s) AND status != 'revoked'"
+                " AND (schema_pack != %(schema_pack)s OR schema_version != %(schema_version)s)"
+                " LIMIT 1",
+                {"entity_id": entity_id, "schema_pack": entity.schema_pack,
+                 "schema_version": entity.schema_version},
+            ) is not None:
+                raise OntologyConflictError(_SCHEMA_UPGRADE_CONFLICT)
             revision = current + 1
             created = now if row is None else _utc(row["created_at"])
             values = (
@@ -935,7 +946,7 @@ class PostgresOntologyStore:
 
         clauses = [
             visible("r"), visible("s"), visible("d"),
-            "s.deleted_at IS NULL", "d.deleted_at IS NULL", _ACTIVE,
+            "s.deleted_at IS NULL", "d.deleted_at IS NULL", _ACTIVE, _SAME_SCHEMA,
         ]
         if request.relation_types:
             clauses.append("r.relation_type = ANY(%(relation_types)s)")
@@ -1114,6 +1125,31 @@ class PostgresOntologyStore:
             ))
         return live
 
+    def evidence_chunks(
+        self, chunk_ids: Sequence[str], *, auth: AuthContext, deadline: float | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        """Live, caller-readable chunk text; see ``SQLiteOntologyStore.evidence_chunks``."""
+        _require(auth, "read")
+        ids = sorted({str(chunk_id) for chunk_id in chunk_ids if not _has_nul(str(chunk_id))})
+        found: dict[str, dict[str, Any]] = {}
+        if not ids:
+            return found
+        now = datetime.now(timezone.utc)
+        with self._transaction(write=False, deadline=deadline) as tx:
+            predicate = self._live_chunk_sql(tx, "%(caller)s")
+            if predicate is None:
+                return found
+            for row in tx.rows(
+                f"SELECT c.chunk_id, c.content, c.layer, c.src FROM {self.chunks_table} c"
+                f" WHERE c.chunk_id = ANY(%(ids)s) AND {predicate}",
+                {"ids": ids, "caller": auth.scope.namespace, "now_epoch": now.timestamp()},
+            ):
+                found[row["chunk_id"]] = {
+                    "chunk_id": row["chunk_id"], "layer": row["layer"], "src": row["src"],
+                    "content": row["content"],
+                }
+        return found
+
     def explain_relation(
         self, relation_id: UUID, *, auth: AuthContext,
     ) -> tuple[Relation, list[dict[str, Any]]] | None:
@@ -1252,7 +1288,7 @@ class AsyncPostgresOntologyStore:
     _METHODS = (
         "upsert_entity", "get_entity", "assert_relation", "traverse", "get_entities",
         "relation_in_scope", "resolve_entities", "resolve_terms", "live_chunk_evidence",
-        "explain_relation", "invalidate_evidence", "revoke_relation",
+        "evidence_chunks", "explain_relation", "invalidate_evidence", "revoke_relation",
     )
 
     def __init__(self, store: PostgresOntologyStore) -> None:

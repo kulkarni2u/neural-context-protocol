@@ -795,6 +795,111 @@ def sc_nul_lookups_match_nothing(b: Backend) -> list:
     return out
 
 
+def _infrastructure_v2(store: Any) -> None:
+    """Register a version-2 copy of the infrastructure pack (review P2 repro)."""
+    if store.registry.latest_version("infrastructure") == 1:
+        v1 = next(pack for pack in store.registry.packs() if pack.id == "infrastructure")
+        store.registry.register(v1.model_copy(update={"version": 2}))
+
+
+def _v2(entity: Entity) -> Entity:
+    return entity.model_copy(update={"schema_version": 2})
+
+
+def sc_schema_upgrade_requires_no_live_edges(b: Backend) -> list:
+    # Review P2: an entity's id excludes schema_version, so an upgrade keeps
+    # the id. It must not leave v1 edges attached to a v2 endpoint.
+    s, out = b.store, []
+    _infrastructure_v2(s)
+    api, db, cache = service("api"), database("db"), database("cache")
+    put(s, api, db, cache)
+    s.assert_relation(rel("r", api, db, status="verified", evidence=(attestation(),)),
+                      auth=auth(), idempotency_key="r")
+    s.assert_relation(rel("gone", api, cache), auth=auth(), idempotency_key="gone")
+    s.revoke_relation(rid("gone"), auth=auth(), reason="moved")
+    before = s.get_entity(api.entity_id, auth=auth())
+    for entity in (api, db):  # either endpoint
+        outcome = attempt(lambda entity=entity: s.upsert_entity(_v2(entity), auth=auth(PROD, ALL)))
+        assert raised(outcome) and outcome[1] == "OntologyConflictError", outcome
+        assert "relation" in outcome[2] and "cache" not in outcome[2]
+        out.append(outcome)
+    # Rolled back: the entity is unchanged (version, revision) and still traversable.
+    assert s.get_entity(api.entity_id, auth=auth()) == before
+    assert s.get_entity(db.entity_id, auth=auth()).schema_version == 1
+    out.append(norm(verified(s, api)))
+    assert len(verified(s, api).paths) == 1
+    # A revoked edge alone does not block: cache upgrades freely.
+    out.append(norm(s.upsert_entity(_v2(cache), auth=auth(PROD, ALL))))
+    # Revoke the live edge, then both endpoints upgrade.
+    s.revoke_relation(rid("r"), auth=auth(), reason="schema v2")
+    for entity in (api, db):
+        upgraded = s.upsert_entity(_v2(entity), auth=auth(PROD, ALL))
+        assert upgraded.entity_id == entity.entity_id and upgraded.schema_version == 2
+    # A stale v1 assertion against the upgraded entities is rejected.
+    stale = attempt(lambda: s.assert_relation(
+        rel("stale", api, db, status="verified", evidence=(attestation(),)),
+        auth=auth(), idempotency_key="stale"))
+    assert raised(stale) and "schema pack version" in stale[2], stale
+    out.append(stale)
+    out.append(norm(s.assert_relation(
+        rel("r2", api, db, status="verified", evidence=(attestation(),), schema_version=2),
+        auth=auth(), idempotency_key="r2")))
+    graph = verified(s, api)
+    assert [r.schema_version for p in graph.paths for r in p.relations] == [2]
+    out.append(norm(graph))
+    return out
+
+
+def sc_schema_mismatched_rows_are_not_live(b: Backend) -> list:
+    # Defensive read predicate: a row whose versions disagree (e.g. written
+    # before the upgrade guard existed) never comes back as a graph path.
+    s, out = b.store, []
+    _infrastructure_v2(s)
+    api, db = service("api"), database("db")
+    put(s, api, db)
+    s.assert_relation(rel("r", api, db, status="verified", evidence=(attestation(),)),
+                      auth=auth(), idempotency_key="r")
+    assert len(verified(s, api).paths) == 1
+    facade = OntologyFacade(OntologyConfig(enabled=True), s)
+    for table, key, value in (("entities", "entity_id", str(api.entity_id)),
+                              ("relations", "relation_id", str(rid("r")))):
+        b.sql(f"UPDATE {{t:{table}}} SET schema_version = 2 WHERE {key} = ?", (value,))
+        out.append(norm(verified(s, api)))
+        out.append(norm(all_paths(s, api)))
+        out.append(norm(all_paths(s, db)))
+        assert not verified(s, api).paths and not all_paths(s, db).paths
+        validity = facade.explain(auth(), str(rid("r")))["validity"]
+        assert validity["active"] is False and validity["schema_consistent"] is False
+        assert validity["inactive_reason"] == "schema_version_mismatch"
+        assert validity["verified_and_supported"] is False
+        out.append(validity)
+        b.sql(f"UPDATE {{t:{table}}} SET schema_version = 1 WHERE {key} = ?", (value,))
+    validity = facade.explain(auth(), str(rid("r")))["validity"]
+    assert validity["schema_consistent"] is True and validity["inactive_reason"] is None
+    assert len(verified(s, api).paths) == 1
+    return out
+
+
+def sc_evidence_chunks_exact_id(b: Backend) -> list:
+    s = b.store
+    mine = b.chunk("mine", "api writes orders")
+    shared = b.chunk("shared", "global runbook", pipeline=None, scope="global")
+    other = b.chunk("other", "staging secret", pipeline="staging")
+    expired = b.chunk("expired", "old fact", expiry=_epoch(-timedelta(hours=1)))
+    future = b.chunk("future", "not yet", valid_from=_epoch(timedelta(hours=1)))
+    ids = [mine, shared, other, expired, future, "sub_unknown"]
+    found = s.evidence_chunks(ids, auth=auth())
+    assert sorted(found) == sorted([mine, shared])
+    assert found[mine] == {"chunk_id": mine, "layer": "semantic", "src": "tool_result",
+                           "content": "api writes orders"}
+    staging = s.evidence_chunks(ids, auth=auth(STAGING))
+    assert sorted(staging) == sorted([shared, other])
+    assert s.evidence_chunks([], auth=auth()) == {}
+    denied = attempt(lambda: s.evidence_chunks([mine], auth=auth(caps=frozenset())))
+    assert raised(denied)
+    return [norm(found), norm(staging), denied]
+
+
 SCENARIOS: dict[str, Callable[[Backend], list]] = {
     name.removeprefix("sc_"): value for name, value in dict(globals()).items()
     if name.startswith("sc_")
@@ -1316,3 +1421,89 @@ def test_pg_failed_construction_closes_private_pool(monkeypatch: pytest.MonkeyPa
     with pytest.raises(RuntimeError, match="migration failed"):
         PostgresOntologyStore(_pg_dsn(), registry(), schema="ncp_ont_unused")
     assert len(opened) == 1 and opened[0].closed
+
+
+# -- review follow-ups: as_of suppression and async wrapper -------------------------
+
+
+def _assembled(b: Backend, *, as_of: float | None) -> Any:
+    """Enrichment as the assembler runs it (the full pgvector assembler also
+    needs Redis for whisper coordination; the SQLite assembler path is
+    covered in test_ontology_retrieval.TestAsOf)."""
+    from ncp.ontology.enrichment import build_enricher
+    from ncp.types import ConsciousBlock
+
+    config = OntologyConfig(enabled=True, retrieval_mode="always", trigger_max_ms=1000,
+                            graph_timeout_ms=5000)
+    enricher = build_enricher(config, b.ncp, facade_provider=lambda: OntologyFacade(config, b.store))
+    assert enricher is not None
+    conscious = ConsciousBlock(owns=[], must_not=[], agent_id="a1", role="b",
+                               task="api_dependencies", slot="api",
+                               intent="dependency_analysis", pipeline_id="prod")
+    return enricher.enrich(conscious=conscious, query_text=None, chunks=[], token_limit=None,
+                           as_of=as_of)
+
+
+def _seed_default_tenant(b: Backend) -> str:
+    scope = Scope(tenant_id="default", namespace="prod")
+    api, db = service("api", scope), database("db", scope)
+    put(b.store, api, db)
+    chunk_id = b.chunk("dep", "api depends on db for orders")
+    b.store.assert_relation(
+        rel("dep", api, db, status="verified", evidence=(chunk_ref(chunk_id),)),
+        auth=auth(scope), idempotency_key="dep",
+    )
+    return chunk_id
+
+
+def test_as_of_suppresses_graph_on_both_backends(backend: Backend) -> None:
+    _seed_default_tenant(backend)
+    current = _assembled(backend, as_of=None)
+    assert current.text is not None and current.metadata()["verified_path_count"] == 1
+    for as_of in (_epoch(-timedelta(days=3650)), _epoch(timedelta(hours=1))):
+        historical = _assembled(backend, as_of=as_of)
+        meta = historical.metadata()
+        assert historical.text is None and not historical.cited_chunk_ids
+        assert meta["reason_code"] == "as_of_unsupported" and meta["paths"] == []
+        assert meta["entities"] == [] and meta["substituted_chunk_ids"] == []
+
+
+@requires_pg
+def test_as_of_suppression_backends_agree(sqlite_backend: SQLiteBackend,
+                                          postgres_backend: PostgresBackend) -> None:
+    def transcript(b: Backend) -> dict:
+        _seed_default_tenant(b)
+        meta = _assembled(b, as_of=_epoch(timedelta(hours=1))).metadata()
+        meta.pop("latency_ms")
+        return meta
+
+    assert transcript(postgres_backend) == transcript(sqlite_backend)
+
+
+@requires_pg
+def test_pg_async_wrapper_schema_upgrade_and_evidence(postgres_backend: PostgresBackend) -> None:
+    b = postgres_backend
+    wrapped = AsyncPostgresOntologyStore.inherit(b.ncp, registry())
+    _infrastructure_v2(wrapped.sync)
+    _infrastructure_v2(b.store)
+    api, db = service("api"), database("db")
+    chunk_id = b.chunk("dep", "api depends on db")
+
+    async def scenario() -> list:
+        for entity in (api, db):
+            await wrapped.upsert_entity(entity, auth=auth(PROD, ALL))
+        await wrapped.assert_relation(rel("r", api, db), auth=auth(), idempotency_key="r")
+        try:
+            await wrapped.upsert_entity(_v2(api), auth=auth(PROD, ALL))
+            upgrade: Any = "accepted"
+        except OntologyConflictError as exc:
+            upgrade = ["OntologyConflictError", str(exc)]
+        entity = await wrapped.get_entity(api.entity_id, auth=auth())
+        evidence = await wrapped.evidence_chunks([chunk_id, "sub_x"], auth=auth())
+        return [upgrade, entity.schema_version, sorted(evidence)]
+
+    upgrade, version, evidence = asyncio.run(scenario())
+    sync_outcome = attempt(lambda: b.store.upsert_entity(_v2(api), auth=auth(PROD, ALL)))
+    assert upgrade == sync_outcome[1:]
+    assert version == 1 and evidence == [chunk_id]
+    assert sorted(b.store.evidence_chunks([chunk_id, "sub_x"], auth=auth())) == evidence

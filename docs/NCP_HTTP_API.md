@@ -693,9 +693,15 @@ returns the ordinary `-32601 Tool not found` error.
 |------|---------|
 | `ncp_ontology_capabilities` | enabled flag, provider, packs with versions and entity/relation types, limits, tool names. Disabled: `{"ok": true, "enabled": false, "version": "1"}` |
 | `ncp_ontology_query` | resolve one seed (`entity_id`, or exact `key`: canonical key, then alias; `entity_type` narrows), then bounded traversal. Several matches → `resolved: false` with `ambiguity.candidates`, never a guess. `max_hops`/`max_nodes`/`max_edges` are clamped to the config (with a `clamped:` warning); `verified_only` defaults to the config |
-| `ncp_ontology_explain` | one relation, every evidence row (`status`, `live`) and `validity` (`active`, `evidence_supported`, `verified_and_supported`). Read-only |
+| `ncp_ontology_explain` | one relation, every evidence row (`status`, `live`) and `validity` (`active`, `schema_consistent`, `inactive_reason`, `evidence_supported`, `verified_and_supported`). Read-only |
 | `ncp_ontology_assert` | `kind: "entity"` (+ `expected_version`) or `kind: "relation"` (requires `idempotency_key` and `observed_at`; `created_by` is always the caller) |
 | `ncp_ontology_revoke` | revoke a relation (idempotent, audited) |
+| `ncp_ontology_evidence` | `chunk_ids` (1-16): `{"ok": true, "chunks": [{chunk_id, layer, src, content}], "missing": [...]}`. Dereferences `ev:` citations. Only chunks still live and readable in `pipeline_id` are returned; unknown, expired, superseded and out-of-scope ids are all listed in `missing`. A cited chunk is not guaranteed to stay fetchable. Read-only |
+
+`ncp_ontology_query`, `ncp_ontology_explain` and `ncp_ontology_evidence` read
+current state only: passing `as_of` returns `invalid`. An `ncp_get_context`
+call with `as_of` skips ontology enrichment (`ontology.reason_code:
+"as_of_unsupported"`).
 
 ```bash
 curl -s $BASE/mcp -H "$AUTH" -H 'Content-Type: application/json' -d '{

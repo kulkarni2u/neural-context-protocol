@@ -956,3 +956,72 @@ class TestGraphFirst:
                     {"min_path_score": True}, {"min_path_score": "0.5"}):
             with pytest.raises(ValidationError):
                 OntologyConfig(**bad)
+
+
+# ── review P1: historical (as_of) requests carry no current graph facts ──────
+
+
+def _no_graph(meta: dict, context: str) -> None:
+    assert meta["reason_code"] == "as_of_unsupported"
+    assert meta["ontology_triggered"] is False and meta["verified_path_count"] == 0
+    assert meta["paths"] == [] and meta["entities"] == [] and meta["graph_tokens"] == 0
+    assert meta["substituted_chunk_ids"] == [] and meta["fact_count"] == 0
+    assert HEADER not in context and "[NCP:ONTOLOGY]" not in context
+
+
+class TestAsOf:
+    ARGS = {"task": "payroll_dependencies", "slot": "payroll", "intent": "dependency_analysis"}
+
+    def test_reviewer_repro_historical_request_has_no_graph(self, world: World) -> None:
+        world.payroll()
+        assert world.get_context(**self.ARGS)["ontology"]["verified_path_count"] == 2  # control
+        response = world.get_context(**self.ARGS, as_of="2020-01-01T00:00:00Z")
+        _no_graph(response["ontology"], response["context"])
+
+    def test_no_evidence_substitution_under_as_of(self, world: World) -> None:
+        facts = world.payroll()
+        args = {"task": "payroll_upstream_dependencies", "slot": "payroll", "max_tokens": 800}
+        current = world.get_context(**args)
+        assert facts["ledger_chunk"] in current["ontology"]["substituted_chunk_ids"]
+        # A snapshot that already contains the memory: its text stays verbatim.
+        later = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        response = world.get_context(**args, as_of=later)
+        _no_graph(response["ontology"], response["context"])
+        assert "payroll reads the ledger database" in response["context"]
+        assert facts["ledger_chunk"] in response["retrieved_chunk_ids"]
+
+    def test_stream_and_refit_paths(self, world: World) -> None:
+        world.payroll()
+        as_of = "2020-01-01T00:00:00Z"
+        streamed = world.get_context(**self.ARGS, as_of=as_of, stream=True)
+        assert "ontology" not in [label for label, _ in streamed.sections]
+        _no_graph(streamed.handler_result["ontology"], streamed.handler_result["context"])
+        refit = world.get_context(**self.ARGS, as_of=as_of, max_tokens=800, response_max_tokens=300)
+        _no_graph(refit["ontology"], refit["context"])
+
+    def test_assembler_and_enricher_skip_graph_reads(self, world: World, monkeypatch) -> None:
+        world.payroll()
+        calls: list[str] = []
+        original = SQLiteOntologyStore.traverse
+
+        def spy(self, *args, **kwargs):
+            calls.append("traverse")
+            return original(self, *args, **kwargs)
+
+        monkeypatch.setattr(SQLiteOntologyStore, "traverse", spy)
+        enricher = build_enricher(world.config, world.store)
+        assert isinstance(enricher, OntologyEnricher)
+        conscious = ConsciousBlock(owns=[], must_not=[], agent_id="a1", role="b",
+                                   task="payroll_dependencies", slot="payroll",
+                                   intent="dependency_analysis", pipeline_id="p1")
+        assembler = Assembler(store=world.store, config=world.config, ontology=enricher)
+        result = assembler.assemble(conscious=conscious, budget=BudgetContext(), as_of=1_577_836_800.0)
+        assert result.graph is not None and result.graph.text is None
+        _no_graph(result.ontology, result.context)  # type: ignore[arg-type]
+        sections = list(assembler.assemble_incremental(
+            conscious=conscious, budget=BudgetContext(), as_of=1_577_836_800.0,
+        ))
+        assert "ontology" not in [label for label, _ in sections]
+        assert calls == []
+        assert assembler.assemble(conscious=conscious, budget=BudgetContext()).graph.text  # type: ignore[union-attr]
+        assert calls == ["traverse"]

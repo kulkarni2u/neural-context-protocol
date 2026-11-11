@@ -1273,6 +1273,26 @@ ONTOLOGY_MCP_TOOLS: list[dict[str, object]] = [
             "required": ["pipeline_id", "relation_id", "reason"],
         },
     },
+    {
+        "name": "ncp_ontology_evidence",
+        "description": (
+            "Read-only: exact-id text of evidence chunks cited in [NCP:ONTOLOGY] ev: (graph-first "
+            "substitution drops their text from [NCP:SUBCONSCIOUS]). Returns only chunks that are "
+            "still live and readable in pipeline_id; any other id (unknown, expired, superseded or "
+            "out of scope) is listed in 'missing'. A cited chunk is not guaranteed to stay fetchable."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pipeline_id": _ONTOLOGY_PIPELINE_ARG,
+                "chunk_ids": {
+                    "type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 16,
+                    "description": "Cited chunk ids (at most 16).",
+                },
+            },
+            "required": ["chunk_ids"],
+        },
+    },
 ]
 
 CORE_TOOL_NAMES = frozenset({

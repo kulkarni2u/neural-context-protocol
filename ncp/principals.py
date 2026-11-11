@@ -80,6 +80,7 @@ PIPELINE_SCOPED_TOOLS = frozenset({
     "ncp_ontology_explain",
     "ncp_ontology_assert",
     "ncp_ontology_revoke",
+    "ncp_ontology_evidence",
 })
 
 # Ontology tools whose ``pipeline_id`` may also be the reserved ``global``
@@ -90,6 +91,7 @@ ONTOLOGY_NAMESPACE_TOOLS = frozenset({
     "ncp_ontology_explain",
     "ncp_ontology_assert",
     "ncp_ontology_revoke",
+    "ncp_ontology_evidence",
 })
 ONTOLOGY_GLOBAL_NAMESPACE = "global"
 

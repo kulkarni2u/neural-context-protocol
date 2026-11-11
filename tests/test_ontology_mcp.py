@@ -11,6 +11,7 @@ from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone
 import io
 import json
+import time
 import socket
 import sqlite3
 import threading
@@ -746,3 +747,88 @@ class TestHttpPrincipals:
             assert created["relation"]["created_by"] == "local"
             _error(put_relation(anonymous, "p1", "v", relation(api_id, db_id, status="verified",
                                                                 evidence=[attestation()])), "forbidden")
+
+
+# ── review follow-ups: exact-id evidence and as_of on read tools ─────────────
+
+
+def _memory(store: SQLiteStore, content: str, pipeline: str | None, **extra: object) -> str:
+    chunk = SubconsciousChunk(layer="semantic", content=content, src="tool_result",
+                              pipeline_id=pipeline, **extra)
+    assert store.write(chunk)
+    return chunk.chunk_id
+
+
+class TestEvidenceTool:
+    def test_listed_only_when_enabled(self, tmp_path: Path) -> None:
+        enabled = tools_for_config(load_config(cwd=_project(tmp_path / "on", ENABLED_TOML)))
+        disabled = tools_for_config(load_config(cwd=_project(tmp_path / "off", None)))
+        assert "ncp_ontology_evidence" in {tool["name"] for tool in enabled}
+        assert "ncp_ontology_evidence" not in {tool["name"] for tool in disabled}
+        assert "ncp_ontology_evidence" in FACADE_TOOL_NAMES
+
+    def test_returns_live_readable_text_and_hides_the_rest(self, tmp_path: Path) -> None:
+        root = _project(tmp_path, ENABLED_TOML)
+        alice = InProcess(root, principal=_principal("alice", pipelines={"p1"}))
+        bob = InProcess(root, principal=_principal("bob", pipelines={"p2"}))
+        mine = _memory(alice.store, "checkout writes the ledger", "p1")
+        shared = _memory(alice.store, "global runbook", None, scope="global")
+        secret = _memory(alice.store, "p2 secret", "p2")
+        expired = _memory(alice.store, "old", "p1", expiry=time.time() - 60)
+        ids = [mine, shared, secret, expired, "sub_nope", mine]
+        result = alice("ncp_ontology_evidence", {"pipeline_id": "p1", "chunk_ids": ids})
+        assert result["ok"]
+        assert [c["chunk_id"] for c in result["chunks"]] == [mine, shared]
+        assert result["chunks"][0]["content"] == "checkout writes the ledger"
+        # Unknown, expired and out-of-scope ids are indistinguishable.
+        assert result["missing"] == [secret, expired, "sub_nope"]
+        from_bob = bob("ncp_ontology_evidence", {"pipeline_id": "p2", "chunk_ids": ids})
+        assert [c["chunk_id"] for c in from_bob["chunks"]] == [shared, secret]
+        assert from_bob["missing"] == [mine, expired, "sub_nope"]
+        # global reads only global-scope chunks; another pipeline is refused.
+        glob = bob("ncp_ontology_evidence", {"pipeline_id": "global", "chunk_ids": ids})
+        assert [c["chunk_id"] for c in glob["chunks"]] == [shared]
+        denied = bob.raw("ncp_ontology_evidence", {"pipeline_id": "p1", "chunk_ids": [mine]})
+        assert denied["error"]["code"] == -32003 and "may not access pipeline 'p1'" in denied[
+            "error"]["message"]
+
+    def test_bounds_and_input_errors(self, tmp_path: Path) -> None:
+        client = InProcess(_project(tmp_path, ENABLED_TOML))
+        _error(client("ncp_ontology_evidence", {"pipeline_id": "p1", "chunk_ids": []}), "invalid")
+        _error(client("ncp_ontology_evidence", {"pipeline_id": "p1", "chunk_ids": "sub_x"}), "invalid")
+        _error(client("ncp_ontology_evidence", {"pipeline_id": "p1", "chunk_ids": [""]}), "invalid")
+        _error(client("ncp_ontology_evidence", {
+            "pipeline_id": "p1", "chunk_ids": [f"sub_{index}" for index in range(17)],
+        }), "limit")
+        sixteen = client("ncp_ontology_evidence", {
+            "pipeline_id": "p1", "chunk_ids": [f"sub_{index}" for index in range(16)],
+        })
+        assert sixteen["ok"] and sixteen["chunks"] == [] and len(sixteen["missing"]) == 16
+
+    def test_python_facade_method(self, tmp_path: Path) -> None:
+        root = _project(tmp_path, ENABLED_TOML)
+        store = SQLiteStore(root / ".ncp" / "store.db")
+        facade = OntologyFacade.from_config(load_config(cwd=root), store)
+        chunk_id = _memory(store, "api uses orders", "p1")
+        auth = auth_context_for(None, "p1", config=facade.config)
+        assert facade.evidence(auth, [chunk_id, "sub_x"]) == {
+            "ok": True, "missing": ["sub_x"],
+            "chunks": [{"chunk_id": chunk_id, "layer": "semantic", "src": "tool_result",
+                        "content": "api uses orders"}],
+        }
+        with pytest.raises(OntologyError) as excinfo:
+            OntologyFacade.disabled().evidence(auth, [chunk_id])
+        assert excinfo.value.code == "disabled"
+
+    def test_read_tools_reject_as_of(self, tmp_path: Path) -> None:
+        client = InProcess(_project(tmp_path, ENABLED_TOML))
+        api = put_entity(client, "p1", service("checkout"))
+        as_of = "2020-01-01T00:00:00Z"
+        for name, args in (
+            ("ncp_ontology_query", {"entity_id": api}),
+            ("ncp_ontology_explain", {"relation_id": "00000000-0000-0000-0000-000000000001"}),
+            ("ncp_ontology_evidence", {"chunk_ids": ["sub_x"]}),
+        ):
+            message = _error(client(name, {"pipeline_id": "p1", "as_of": as_of, **args}), "invalid")
+            assert "as_of" in message and "current" in message
+        assert client("ncp_ontology_query", {"pipeline_id": "p1", "entity_id": api})["ok"]

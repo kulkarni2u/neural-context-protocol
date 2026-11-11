@@ -60,6 +60,7 @@ ONTOLOGY_TOOL_NAMES = (
     "ncp_ontology_explain",
     "ncp_ontology_assert",
     "ncp_ontology_revoke",
+    "ncp_ontology_evidence",
 )
 
 ERROR_CODES = frozenset({"conflict", "forbidden", "invalid", "not_found", "disabled", "limit"})
@@ -70,6 +71,7 @@ MAX_EVIDENCE_REFS = 32
 MAX_ATTRIBUTES_BYTES = 16_384
 MAX_ALIASES = 64
 MAX_CANDIDATES = 20
+MAX_EVIDENCE_CHUNKS = 16
 
 _ENTITY_FIELDS = frozenset({
     "entity_type", "canonical_key", "display_name", "aliases", "attributes",
@@ -510,10 +512,24 @@ class OntologyFacade:
         in_window = relation.valid_from <= now and (
             relation.valid_until is None or relation.valid_until > now
         )
-        active = relation.status != "revoked" and in_window
-        supported = any(item["live"] for item in evidence)
         source = endpoints.get(str(relation.src_entity_id))
         target = endpoints.get(str(relation.dst_entity_id))
+        # Defensive: an edge whose endpoints moved to another pack version is
+        # never live (traversal filters it the same way).
+        schema_consistent = all(
+            (entity.schema_pack, entity.schema_version)
+            == (relation.schema_pack, relation.schema_version)
+            for entity in (source, target) if entity is not None
+        )
+        active = relation.status != "revoked" and in_window and schema_consistent
+        supported = any(item["live"] for item in evidence)
+        inactive_reason = None
+        if relation.status == "revoked":
+            inactive_reason = "revoked"
+        elif not in_window:
+            inactive_reason = "outside_validity_window"
+        elif not schema_consistent:
+            inactive_reason = "schema_version_mismatch"
         return {
             "ok": True,
             "relation": self._relation_view(relation, auth),
@@ -522,11 +538,40 @@ class OntologyFacade:
                 "status": relation.status,
                 "in_validity_window": in_window,
                 "active": active,
+                "schema_consistent": schema_consistent,
+                "inactive_reason": inactive_reason,
                 "evidence_supported": supported,
                 "verified_and_supported": relation.status == "verified" and supported and active,
             },
             "source": None if source is None else entity_summary(source),
             "target": None if target is None else entity_summary(target),
+        }
+
+    def evidence(self, auth: AuthContext, chunk_ids: object) -> dict[str, object]:
+        """Exact-id text of cited evidence chunks that are live and readable.
+
+        At most :data:`MAX_EVIDENCE_CHUNKS` ids. Ids that are unknown, expired,
+        superseded or outside the caller's readable scope are omitted from
+        ``chunks`` and listed in ``missing`` (indistinguishable). A cited
+        chunk is not guaranteed to stay fetchable.
+        """
+        store = self._require_enabled()
+        if not isinstance(chunk_ids, (list, tuple)) or not chunk_ids:
+            raise OntologyError("invalid", "chunk_ids must be a non-empty array of strings")
+        requested: list[str] = []
+        for item in chunk_ids:
+            if not isinstance(item, str) or not item.strip():
+                raise OntologyError("invalid", "chunk_ids must be non-empty strings")
+            if item.strip() not in requested:
+                requested.append(item.strip())
+        if len(requested) > MAX_EVIDENCE_CHUNKS:
+            raise OntologyError("limit", f"chunk_ids exceeds {MAX_EVIDENCE_CHUNKS} entries")
+        with _translate_errors():
+            found = store.evidence_chunks(requested, auth=auth)
+        return {
+            "ok": True,
+            "chunks": [found[chunk_id] for chunk_id in requested if chunk_id in found],
+            "missing": [chunk_id for chunk_id in requested if chunk_id not in found],
         }
 
     # -- write -----------------------------------------------------------
@@ -742,8 +787,17 @@ def make_tool_handlers(
     def capabilities(args: dict[str, object]) -> dict[str, object]:
         return {"ok": True, **provider().capabilities()}
 
+    def reject_as_of(args: Mapping[str, object]) -> None:
+        if args.get("as_of") is not None:
+            raise OntologyError(
+                "invalid",
+                "as_of is not supported: ontology reads return the current graph state only "
+                "(point-in-time graph reads are not implemented)",
+            )
+
     def query(args: dict[str, object]) -> dict[str, object]:
         context = auth(args, write=False)
+        reject_as_of(args)
         relation_types = args.get("relation_types")
         if relation_types is not None and not isinstance(relation_types, list):
             raise OntologyError("invalid", "relation_types must be an array")
@@ -761,7 +815,14 @@ def make_tool_handlers(
         )
 
     def explain(args: dict[str, object]) -> dict[str, object]:
-        return provider().explain(auth(args, write=False), args.get("relation_id"))
+        context = auth(args, write=False)
+        reject_as_of(args)
+        return provider().explain(context, args.get("relation_id"))
+
+    def evidence(args: dict[str, object]) -> dict[str, object]:
+        context = auth(args, write=False)
+        reject_as_of(args)
+        return provider().evidence(context, args.get("chunk_ids"))
 
     def assert_(args: dict[str, object]) -> dict[str, object]:
         kind = args.get("kind")
@@ -794,11 +855,12 @@ def make_tool_handlers(
         "ncp_ontology_explain": guarded(explain),
         "ncp_ontology_assert": guarded(assert_),
         "ncp_ontology_revoke": guarded(revoke),
+        "ncp_ontology_evidence": guarded(evidence),
     }
 
 
 __all__ = [
-    "DEFAULT_TENANT", "ERROR_CODES", "ONTOLOGY_API_VERSION", "ONTOLOGY_TOOL_NAMES",
+    "DEFAULT_TENANT", "ERROR_CODES", "MAX_EVIDENCE_CHUNKS", "ONTOLOGY_API_VERSION", "ONTOLOGY_TOOL_NAMES",
     "OntologyError", "OntologyFacade", "auth_context_for", "cached_facade", "entity_summary",
     "make_tool_handlers",
 ]

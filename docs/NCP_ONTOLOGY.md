@@ -68,7 +68,7 @@ refresh.
 
 ## Tools
 
-All five tools are listed only when `enabled = true` under the `full` tool
+All six tools are listed only when `enabled = true` under the `full` tool
 profile. The full arguments and result shapes are in
 [`NCP_HTTP_API.md`](./NCP_HTTP_API.md#ontology-tools-opt-in).
 
@@ -79,6 +79,20 @@ profile. The full arguments and result shapes are in
 | `ncp_ontology_explain` | `read` | One relation with all its evidence (liveness) and validity |
 | `ncp_ontology_assert` | `write` (`verify` for verified relations) | Upsert an entity, or assert a relation idempotently |
 | `ncp_ontology_revoke` | `write` (own relation) or `admin` | Revoke a relation (audited, idempotent) |
+| `ncp_ontology_evidence` | `read` | Exact-id text of cited evidence chunks (at most 16) that are still live and readable in `pipeline_id`; any other id is listed in `missing` |
+
+The read tools (`query`, `explain`, `evidence`) return current state only and
+reject an `as_of` argument with `invalid`.
+
+**Schema versions.** An entity's id does not include its `schema_version`,
+so upserting an entity with a new version keeps its id. Such an upgrade is
+rejected with `conflict` while any non-revoked relation still touches the
+entity (the message carries no count or ids). Revoke those relations, upgrade
+both endpoints, then re-assert them under the new version. As a defensive
+check, traversal, query and automatic context never return a relation whose
+pack version differs from either endpoint's current version. `explain` still
+shows such a relation, with `active: false`, `schema_consistent: false` and
+`inactive_reason: "schema_version_mismatch"`.
 
 Errors come back as `{"ok": false, "error": {"code": ...}}`, where `code` is
 one of `conflict`, `forbidden`, `invalid`, `not_found`, `disabled` or
@@ -228,9 +242,14 @@ svc:billing <-OWNS- team:platform ev:att
   data. Only a chunk whose id appears verbatim in `ev:` is substituted: an
   id longer than 64 characters or with characters outside the safe set
   (including `+`, which marks extra refs) is cited folded or truncated, and
-  its text stays in memory. The chunk's text can be pulled with `ncp_fetch` using the fact's
-  entity names (the chunk id is not a search key), and the relation with
-  `ncp_ontology_explain` using `ontology.paths[].relation_ids`.
+  its text stays in memory. A cited id in `ev:` can be dereferenced with
+  `ncp_ontology_evidence` (`chunk_ids`, same `pipeline_id`), and the relation
+  with `ncp_ontology_explain` using `ontology.paths[].relation_ids`. A cited
+  chunk is **not** guaranteed to stay fetchable: once it expires, is
+  superseded or is out of the caller's scope it comes back in `missing`.
+- **Historical requests.** A request with `as_of` gets no ontology enrichment:
+  no `[NCP:ONTOLOGY]` block, no paths or entities in metadata, no
+  substitution. Its metadata reports `reason_code: "as_of_unsupported"`.
 - **Outcome credit.** A chunk is credited in `retrieved_chunk_ids` when
   memory retrieval selected it *and* its content reached the turn, verbatim
   or as a verified fact it evidences. Substituted chunks are therefore
@@ -316,8 +335,14 @@ Measured on the benchmark corpus with default limits (see
   limits until they become active. A planned edge can therefore coexist
   with an active one that would violate `max_outgoing` or `max_incoming`
   once both are active.
-- **No point-in-time graph.** `as_of` (point-in-time memory retrieval) is
-  not applied to the graph: traversal always uses the current time.
+- **No point-in-time graph.** Graph reads only know the current state. A
+  context request with `as_of` therefore skips enrichment entirely
+  (`reason_code: "as_of_unsupported"`), so historical context never mixes in
+  present-day facts. The explicit read tools reject `as_of` with `invalid`.
+  Future work: propagate the snapshot through entity, relation and evidence
+  reads, with explicit validity and history semantics. Filtering relation
+  timestamps alone is not enough while endpoint versions and evidence
+  liveness are read from current state.
 - **NUL characters on Postgres.** Text containing NUL is rejected on
   writes, and lookups by a NUL-containing key match nothing, as on SQLite.
 - **Long `table_prefix` on Postgres.** PostgreSQL truncates identifiers
@@ -328,9 +353,10 @@ Measured on the benchmark corpus with default limits (see
   without the listed words falls back to `mixed` (all types, both
   directions, one hop fewer), and "what does X use" vs "who uses X" relies
   on the word order heuristic.
-- **Citation ids are not search keys.** A substituted chunk is cited by id,
-  but `ncp_fetch` searches content, not ids; fetch by the fact's entity
-  names instead.
+- **Citation ids are not search keys for `ncp_fetch`.** `ncp_fetch` searches
+  content, not ids. Dereference a cited id with `ncp_ontology_evidence`,
+  which may report it `missing` once the chunk is no longer live or
+  readable.
 - **No Deployment type.** The `infrastructure` v1 pack has no Deployment
   entity. Store environment and version as Service attributes or in
   evidence chunks.
