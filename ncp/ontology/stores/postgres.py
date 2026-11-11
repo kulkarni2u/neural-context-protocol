@@ -14,6 +14,8 @@ validity rules). Differences are confined to storage mechanics:
 * **Ordering and round-trips.** Key columns use ``COLLATE "C"`` (byte order,
   as in SQLite) and attributes are stored as ``JSON`` (verbatim canonical
   text), so ordered graph results and attribute payloads match SQLite exactly.
+  PostgreSQL text cannot hold NUL: lookups by a NUL-containing key match
+  nothing (as on SQLite), and writing one raises ``ValueError``.
 * **Concurrency.** Reads run in one ``REPEATABLE READ, READ ONLY`` transaction
   (a consistent snapshot across the traversal's statements). Writes run in
   ``READ COMMITTED`` behind transaction-scoped advisory locks, so every check
@@ -188,6 +190,24 @@ def _identifier(value: str, *, field: str) -> str:
     return cleaned
 
 
+def _has_nul(value: Any) -> bool:
+    if isinstance(value, str):
+        return "\x00" in value
+    if isinstance(value, dict):
+        return any(_has_nul(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_has_nul(item) for item in value)
+    return False
+
+
+def _check_params(params: Any) -> None:
+    # PostgreSQL text cannot hold NUL (SQLite can): reject it as invalid input
+    # instead of letting psycopg.DataError escape the store's error contract.
+    # Lookups drop NUL keys up front, since nothing stored can match them.
+    if _has_nul(params):
+        raise ValueError("ontology text values cannot contain NUL characters")
+
+
 def _utc(value: datetime | None) -> datetime | None:
     return None if value is None else value.astimezone(timezone.utc)
 
@@ -240,6 +260,7 @@ class _Tx:
 
     def rows(self, sql: str, params: Any = None) -> list[dict[str, Any]]:
         _check_deadline(self.deadline)
+        _check_params(params)
         with self.connection.cursor(row_factory=self._dict_row) as cursor:
             cursor.execute(sql, params)
             return cursor.fetchall() if cursor.description is not None else []
@@ -250,12 +271,14 @@ class _Tx:
 
     def tuples(self, sql: str, params: Any = None) -> list[tuple[Any, ...]]:
         _check_deadline(self.deadline)
+        _check_params(params)
         with self.connection.cursor(row_factory=self._tuple_row) as cursor:
             cursor.execute(sql, params)
             return cursor.fetchall() if cursor.description is not None else []
 
     def execute(self, sql: str, params: Any = None) -> int:
         _check_deadline(self.deadline)
+        _check_params(params)
         with self.connection.cursor() as cursor:
             cursor.execute(sql, params)
             return cursor.rowcount
@@ -292,7 +315,11 @@ class PostgresOntologyStore:
         if connection_source is None:
             connection_source = self._private_source(dsn, max_pool_connections)
         self._source = connection_source
-        self._migrate()
+        try:
+            self._migrate()
+        except BaseException:
+            self.close()  # a failed construction must not leak its private pool
+            raise
 
     def _private_source(self, dsn: str, max_size: int) -> ConnectionSource:
         try:
@@ -330,7 +357,9 @@ class PostgresOntologyStore:
         return f"{self.schema}.{self.table_prefix}chunks"
 
     def _lock_key(self, *parts: str) -> int:
-        identity = json.dumps([self.schema, self.table_prefix, "ontology", *parts])
+        # Unquoted identifiers fold to lower case in PostgreSQL ("NCP.x" is
+        # ncp.x), so the lock identity folds too: one graph, one key.
+        identity = json.dumps([self.schema.lower(), self.table_prefix.lower(), "ontology", *parts])
         return struct.unpack(">q", hashlib.sha256(identity.encode()).digest()[:8])[0]
 
     def _lock(self, tx: _Tx, *parts: str) -> None:
@@ -490,6 +519,8 @@ class PostgresOntologyStore:
         )
 
     def _chunk_live(self, tx: _Tx, chunk_id: str, namespace: str, now: datetime) -> bool:
+        if _has_nul(chunk_id):
+            return False  # no stored chunk id can contain NUL
         live = self._live_chunk_sql(tx, "%(namespace)s")
         if live is None:
             return False  # nothing to reconcile against: fail closed
@@ -972,6 +1003,8 @@ class PostgresOntologyStore:
         normalized = normalize_key(key)
         if not 1 <= len(normalized) <= 256:
             raise ValueError("lookup key must contain 1 to 256 characters")
+        if _has_nul(normalized):
+            return EntityMatch(entity_ids=(), matched_key=normalized), "none"
         params: dict[str, Any] = {
             "tenant": auth.scope.tenant_id, "namespace": auth.scope.namespace,
             "global": GLOBAL_NAMESPACE, "key": normalized, "limit": limit + 1,
@@ -1008,7 +1041,8 @@ class PostgresOntologyStore:
     ) -> dict[str, tuple[tuple[UUID, ...], str]]:
         """Batch exact lookup; see ``SQLiteOntologyStore.resolve_terms``."""
         _require(auth, "read")
-        keys = sorted({key for key in (normalize_key(term) for term in terms) if 1 <= len(key) <= 256})
+        keys = sorted({key for key in (normalize_key(term) for term in terms)
+                       if 1 <= len(key) <= 256 and not _has_nul(key)})
         found: dict[str, tuple[tuple[UUID, ...], str]] = {}
         if not keys:
             return found
@@ -1052,7 +1086,7 @@ class PostgresOntologyStore:
     ) -> set[str]:
         """Live, caller-readable subset; see ``SQLiteOntologyStore.live_chunk_evidence``."""
         _require(auth, "read")
-        ids = sorted({str(chunk_id) for chunk_id in chunk_ids})
+        ids = sorted({str(chunk_id) for chunk_id in chunk_ids if not _has_nul(str(chunk_id))})
         live: set[str] = set()
         if not ids:
             return live
@@ -1115,7 +1149,7 @@ class PostgresOntologyStore:
         _require_write(auth, auth.scope)
         if not reason.strip():
             raise ValueError("reason is required")
-        ids = sorted({str(chunk_id) for chunk_id in chunk_ids})
+        ids = sorted({str(chunk_id) for chunk_id in chunk_ids if not _has_nul(str(chunk_id))})
         now = datetime.now(timezone.utc)
         tenant, namespace = auth.scope.tenant_id, auth.scope.namespace
         with self._transaction(write=True) as tx:

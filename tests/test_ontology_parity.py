@@ -716,6 +716,25 @@ def sc_deleted_endpoints_and_expiry(b: Backend) -> list:
     return out
 
 
+def sc_nul_lookups_match_nothing(b: Backend) -> list:
+    # PostgreSQL text cannot hold NUL; lookups with it simply match nothing,
+    # exactly as on SQLite (which has no rows containing it either).
+    s, out = b.store, []
+    api, db = service("api"), database("db")
+    put(s, api, db)
+    s.assert_relation(rel("r", api, db), auth=auth(), idempotency_key="k")
+    out.append(attempt(lambda: s.resolve_entities("api\x00", auth=auth())))
+    out.append(attempt(lambda: s.resolve_terms(["api\x00", "api", "\x00"], auth=auth())))
+    out.append(attempt(lambda: s.live_chunk_evidence(["sub_\x00"], auth=auth(),
+                                                     relation_namespace="prod")))
+    out.append(attempt(lambda: s.invalidate_evidence(["sub_\x00"], auth=auth(), reason="gone")))
+    out.append(attempt(lambda: s.assert_relation(
+        rel("v", api, db, status="verified", evidence=(chunk_ref("sub_\x00"),)), auth=auth(),
+        idempotency_key="v")))
+    assert out[1] == {"api": [[str(api.entity_id)], "canonical_key"]}
+    return out
+
+
 SCENARIOS: dict[str, Callable[[Backend], list]] = {
     name.removeprefix("sc_"): value for name, value in dict(globals()).items()
     if name.startswith("sc_")
@@ -1177,3 +1196,62 @@ def test_async_pgvector_store_keeps_facade_disabled() -> None:
     store = AsyncPgvectorStore("postgresql://unused.invalid/ncp")  # never connects
     facade = OntologyFacade.from_config(ENABLED, store)
     assert not facade.enabled and "AsyncPgvectorStore" in (facade.disabled_reason or "")
+
+
+@requires_pg
+def test_pg_nul_text_is_invalid_input_not_a_driver_error(postgres_backend: PostgresBackend) -> None:
+    b = postgres_backend
+    nul = Entity(scope=PROD, entity_type="Node", canonical_key="n\x00", display_name="n",
+                 schema_pack="graph")
+    with pytest.raises(ValueError, match="NUL"):
+        b.store.upsert_entity(nul, auth=auth())
+    assert b.count("entities") == 0
+    call = make_tool_handlers(OntologyFacade.from_config(ENABLED, b.ncp, registry=registry()),
+                              lambda: None)
+    assert call["ncp_ontology_query"]({"pipeline_id": "p1", "key": "api\x00"})["error"][
+        "code"] == "not_found"
+    result = call["ncp_ontology_assert"]({"kind": "entity", "pipeline_id": "p1", "entity": {
+        "entity_type": "Service", "canonical_key": "api\x00", "display_name": "api",
+        "attributes": {"name": "api", "environment": "prod"},
+    }})
+    assert result["ok"] is False and result["error"]["code"] == "invalid"
+    put(b.store, node("ok"))  # the pooled connection is still usable
+
+
+@requires_pg
+def test_pg_lock_keys_fold_identifier_case(postgres_backend: PostgresBackend) -> None:
+    import psycopg
+
+    b = postgres_backend
+    upper = PostgresOntologyStore(b.dsn, registry(), schema=b.schema.upper(), table_prefix="IT_",
+                                  lock_timeout=0.3)
+    b._owned.append(upper)
+    assert upper._lock_key("scope", "acme", "prod") == b.store._lock_key("scope", "acme", "prod")
+    a, c = node("a"), node("c")
+    put(b.store, a, c)
+    with psycopg.connect(b.dsn) as holder:
+        holder.execute("SELECT pg_advisory_xact_lock(%s)",
+                       (b.store._lock_key("scope", "acme", "prod"),))
+        with pytest.raises(psycopg.errors.LockNotAvailable):
+            upper.assert_relation(rel("x", a, c, "LINKS"), auth=auth(), idempotency_key="x")
+    assert b.count("relations") == 0
+
+
+@requires_pg
+def test_pg_failed_construction_closes_private_pool(monkeypatch: pytest.MonkeyPatch) -> None:
+    opened: list[Any] = []
+    original = PostgresOntologyStore._private_source
+
+    def spy(self: PostgresOntologyStore, dsn: str, max_size: int) -> Any:
+        source = original(self, dsn, max_size)
+        opened.append(source)
+        return source
+
+    def fail(self: PostgresOntologyStore) -> None:
+        raise RuntimeError("migration failed")
+
+    monkeypatch.setattr(PostgresOntologyStore, "_private_source", spy)
+    monkeypatch.setattr(PostgresOntologyStore, "_migrate", fail)
+    with pytest.raises(RuntimeError, match="migration failed"):
+        PostgresOntologyStore(_pg_dsn(), registry(), schema="ncp_ont_unused")
+    assert len(opened) == 1 and opened[0].closed
