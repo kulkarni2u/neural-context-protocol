@@ -861,6 +861,13 @@ def load_config(
     if not Path(str(values["store"]["path"])).is_absolute():
         values["store"]["path"] = str(project_root / str(values["store"]["path"]))
 
+    ontology_values = values.get("ontology")
+    if isinstance(ontology_values, dict) and isinstance(ontology_values.get("pack_paths"), list):
+        ontology_values["pack_paths"] = [
+            str(item) if Path(str(item)).is_absolute() else str(project_root / str(item))
+            for item in ontology_values["pack_paths"]
+        ]
+
     config = NCPConfig(values=values, project_root=project_root)
     if "ontology" in values:
         config.ontology  # Validate an explicitly configured ontology section at startup.
@@ -880,6 +887,10 @@ def find_project_root(start: str | Path) -> Path:
 def _apply_env_overrides(values: dict[str, Any], env: dict[str, str]) -> None:
     if "NCP_STORE_PATH" in env:
         values["store"]["path"] = env["NCP_STORE_PATH"]
+    if env.get("NCP_ONTOLOGY_PACK_PATHS"):
+        values.setdefault("ontology", {})["pack_paths"] = [
+            item for item in env["NCP_ONTOLOGY_PACK_PATHS"].split(os.pathsep) if item
+        ]
     if "NCP_LOG_LEVEL" in env:
         values["observability"]["log_level"] = env["NCP_LOG_LEVEL"]
     if "NCP_STORE_TYPE" in env:

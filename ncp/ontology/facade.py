@@ -281,12 +281,12 @@ class OntologyFacade:
         if isinstance(store, (SQLiteOntologyStore, PostgresOntologyStore)):
             return cls(ontology, store)
         if isinstance(store, PgvectorStore):
-            registry = registry or SchemaRegistry.builtin()
+            registry = registry or SchemaRegistry.builtin(ontology.pack_paths)
             return cls(ontology, PostgresOntologyStore.inherit(store, registry))
         if not isinstance(store, SQLiteStore):
             backend = type(store).__name__
             return cls.disabled(f"ontology storage is not available for the {backend} backend")
-        registry = registry or SchemaRegistry.builtin()
+        registry = registry or SchemaRegistry.builtin(ontology.pack_paths)
         return cls(ontology, SQLiteOntologyStore.inherit(store, registry))
 
     # -- discovery -------------------------------------------------------
