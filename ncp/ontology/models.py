@@ -13,6 +13,12 @@ from pydantic import field_validator, model_validator
 Identifier = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=256)]
 PositiveInt = Annotated[int, Field(strict=True, ge=1)]
 RetrievalMode = Literal["off", "auto", "always"]
+# Which edges a traversal follows from a node: outgoing (node is the source),
+# incoming (node is the target) or both.
+TraversalDirection = Literal["both", "out", "in"]
+Capability = Literal["read", "write", "verify", "admin"]
+# Reserved namespace readable from every namespace of the same tenant.
+GLOBAL_NAMESPACE = "global"
 
 
 def normalize_key(value: str) -> str:
@@ -33,7 +39,7 @@ class AuthContext(Contract):
 
     principal_id: Identifier
     scope: Scope
-    capabilities: frozenset[Literal["read", "write", "admin"]] = frozenset()
+    capabilities: frozenset[Capability] = frozenset()
 
 
 class Entity(Contract):
@@ -122,6 +128,7 @@ class GraphQuery(Contract):
     max_nodes: Annotated[int, Field(strict=True, ge=1, le=100)] = 30
     max_edges: Annotated[int, Field(strict=True, ge=1, le=200)] = 60
     verified_only: bool = Field(default=True, strict=True)
+    direction: TraversalDirection = "both"
 
 
 class GraphPath(Contract):

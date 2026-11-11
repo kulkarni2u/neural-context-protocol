@@ -2,18 +2,18 @@
   "id": "infrastructure",
   "version": 1,
   "entity_types": {
-    "Service": {"required": ["name", "environment"]},
-    "KafkaTopic": {"required": ["cluster", "name"]},
-    "Database": {"required": ["name"]},
-    "API": {"required": ["name"]},
-    "Incident": {"required": ["incident_key"]},
-    "Team": {"required": ["name"]}
+    "Service": {"required": ["name", "environment"], "tag": "svc"},
+    "KafkaTopic": {"required": ["cluster", "name"], "tag": "topic"},
+    "Database": {"required": ["name"], "tag": "db"},
+    "API": {"required": ["name"], "tag": "api"},
+    "Incident": {"required": ["incident_key"], "tag": "inc"},
+    "Team": {"required": ["name"], "tag": "team"}
   },
   "relation_types": {
-    "PRODUCES": {"from": ["Service"], "to": ["KafkaTopic"]},
-    "CONSUMES": {"from": ["Service"], "to": ["KafkaTopic"]},
-    "DEPENDS_ON": {"from": ["Service"], "to": ["Service", "Database", "API"]},
+    "PRODUCES": {"from": ["Service"], "to": ["KafkaTopic"], "intents": ["dependency"]},
+    "CONSUMES": {"from": ["Service"], "to": ["KafkaTopic"], "intents": ["dependency"]},
+    "DEPENDS_ON": {"from": ["Service"], "to": ["Service", "Database", "API"], "intents": ["dependency"]},
     "EXPOSES": {"from": ["Service"], "to": ["API"]},
-    "OWNS": {"from": ["Team"], "to": ["Service"]}
+    "OWNS": {"from": ["Team"], "to": ["Service"], "intents": ["ownership"]}
   }
 }

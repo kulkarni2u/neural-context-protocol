@@ -73,6 +73,7 @@ class PidginEncoder:
         *,
         now: float | None = None,
         contradiction_notes: Sequence[tuple[str, str]] | None = None,
+        graph_text: str | None = None,
     ) -> str:
         """Assemble the wire-format block ordering for one provider turn."""
 
@@ -82,6 +83,7 @@ class PidginEncoder:
             whispers_text=self._encode_whispers(whispers, now=now) if whispers else None,
             budget_text=self._encode_budget(budget),
             contradiction_notes=contradiction_notes,
+            graph_text=graph_text,
         )
 
     def assemble_from_parts(
@@ -92,6 +94,7 @@ class PidginEncoder:
         whispers_text: str | None,
         budget_text: str,
         contradiction_notes: Sequence[tuple[str, str]] | None = None,
+        graph_text: str | None = None,
     ) -> str:
         """Assemble from already-encoded blocks/entries.
 
@@ -106,12 +109,18 @@ class PidginEncoder:
         drops duplicates itself, but a contradiction is a call for the
         reading model, not the bus -- so it's surfaced as a plain note
         appended to the subconscious block rather than resolved here.
+
+        ``graph_text`` is the opt-in ``[NCP:ONTOLOGY]`` block (verified domain
+        graph paths), placed after memory and before whispers. ``None`` (the
+        default) leaves the legacy layout untouched.
         """
 
         blocks = [conscious_text]
         if chunk_entries:
             note_lines = [f"note:contradicts {a}<->{b}" for a, b in contradiction_notes or []]
             blocks.append("\n".join(["[NCP:SUBCONSCIOUS]", *chunk_entries, *note_lines]))
+        if graph_text is not None:
+            blocks.append(graph_text)
         if whispers_text is not None:
             blocks.append(whispers_text)
         blocks.append(budget_text)

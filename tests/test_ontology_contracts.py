@@ -65,6 +65,7 @@ def test_schema_pack_validation(endpoints):
 
 @pytest.mark.parametrize("scope", [
     Scope(tenant_id="other", namespace="production"),
+    Scope(tenant_id="other", namespace="global"),
     Scope(tenant_id="payroll", namespace="staging"),
 ])
 def test_cross_scope_relationships_rejected(endpoints, scope):
@@ -73,6 +74,25 @@ def test_cross_scope_relationships_rejected(endpoints, scope):
     with pytest.raises(ValueError, match="share its scope"):
         SchemaRegistry.builtin().validate_relation(
             relation(source, target), source=source, target=target,
+        )
+
+
+def test_global_targets_follow_relation_namespace(endpoints):
+    source, target = endpoints
+    registry = SchemaRegistry.builtin()
+    global_scope = Scope(tenant_id="payroll", namespace="global")
+    global_target = target.model_copy(update={"scope": global_scope})
+    registry.validate_relation(
+        relation(source, global_target), source=source, target=global_target,
+    )
+    global_source = source.model_copy(update={"scope": global_scope})
+    with pytest.raises(ValueError, match="share its scope"):
+        registry.validate_relation(
+            relation(global_source, target), source=global_source, target=target,
+        )
+    with pytest.raises(ValueError, match="source must share its scope"):
+        registry.validate_relation(
+            relation(source, target, scope=global_scope), source=source, target=target,
         )
 
 

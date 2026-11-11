@@ -1,17 +1,26 @@
 """Versioned schema packs and structural validation for domain assertions."""
 
 from importlib.resources import files
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field, StringConstraints, model_validator
 
-from ncp.ontology.models import Contract, Entity, Identifier, PositiveInt, Relation
+from ncp.ontology.models import (
+    GLOBAL_NAMESPACE, Contract, Entity, Identifier, PositiveInt, Relation,
+)
+
+# Relationship-intent categories a relation type can serve during automatic
+# enrichment (see ``ncp.ontology.trigger.classify_intent``). A relation type
+# with no category is only reached by mixed/unknown-intent expansion.
+RelationIntent = Literal["dependency", "ownership", "deployment"]
 
 
 class EntityType(Contract):
     required: tuple[Identifier, ...] = ()
     sensitive: tuple[Identifier, ...] = ()
     alias_strategy: Literal["exact"] = "exact"
+    # Short label used by the compact context serializer (``svc:checkout``).
+    tag: Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9]{0,7}$")] | None = None
 
 
 class RelationType(Contract):
@@ -20,6 +29,9 @@ class RelationType(Contract):
     max_outgoing: PositiveInt | None = None
     max_incoming: PositiveInt | None = None
     allow_cycles: bool = Field(default=True, strict=True)
+    # Intent categories this relation type answers, e.g. ``dependency`` for
+    # "what does X depend on" (outgoing) and "what breaks if X fails" (incoming).
+    intents: tuple[RelationIntent, ...] = ()
 
 
 class SchemaPack(Contract):
@@ -53,11 +65,27 @@ class SchemaRegistry:
             raise ValueError("schema pack version is already registered")
         self._packs[key] = pack.model_copy(deep=True)
 
+    def packs(self) -> tuple[SchemaPack, ...]:
+        """Registered packs ordered by (id, version)."""
+        return tuple(self._packs[key] for key in sorted(self._packs))
+
+    def latest_version(self, pack_id: str) -> int | None:
+        versions = [version for (name, version) in self._packs if name == pack_id]
+        return max(versions) if versions else None
+
     def _pack(self, pack_id: str, version: int) -> SchemaPack:
         try:
             return self._packs[pack_id, version]
         except KeyError:
             raise ValueError("unknown schema pack version") from None
+
+    def relation_definition(self, relation: Relation) -> RelationType:
+        definition = self._pack(relation.schema_pack, relation.schema_version).relation_types.get(
+            relation.relation_type
+        )
+        if definition is None:
+            raise ValueError("relation triple is not allowed by the schema pack")
+        return definition
 
     def validate_entity(self, entity: Entity) -> None:
         pack = self._pack(entity.schema_pack, entity.schema_version)
@@ -71,8 +99,17 @@ class SchemaRegistry:
 
     def validate_relation(self, relation: Relation, *, source: Entity, target: Entity) -> None:
         """Check local invariants. Store-level checks must run inside the write transaction."""
-        if source.scope != relation.scope or target.scope != relation.scope:
-            raise ValueError("relation endpoints must share its scope")
+        # A relation lives in its source's namespace; its target shares that
+        # namespace or is global in the same tenant. A global relation
+        # therefore only reaches global targets.
+        target_global = (
+            target.scope.tenant_id == relation.scope.tenant_id
+            and target.scope.namespace == GLOBAL_NAMESPACE
+        )
+        if source.scope != relation.scope:
+            raise ValueError("relation source must share its scope")
+        if target.scope != relation.scope and not target_global:
+            raise ValueError("relation target must share its scope or be global in its tenant")
         if source.entity_id != relation.src_entity_id or target.entity_id != relation.dst_entity_id:
             raise ValueError("relation endpoint IDs do not match")
         pack_key = (relation.schema_pack, relation.schema_version)
