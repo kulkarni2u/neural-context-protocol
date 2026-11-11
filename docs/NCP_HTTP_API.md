@@ -677,11 +677,157 @@ or unreadable outcome blocks reuse, regardless of confidence or outcome age.
 The packet includes `schema_version` for clients recording the decision.
 Compilation suppresses automatic embedding calls on every store backend.
 
+### Ontology tools (opt-in)
+
+Operational guide (configuration, auth model, rollout, limitations):
+[`NCP_ONTOLOGY.md`](./NCP_ONTOLOGY.md).
+
+Listed only with `[ontology] enabled = true` and the `full` tool profile.
+Storage is the NCP store itself (`[ontology] store = "inherit"`): SQLite or
+PostgreSQL/pgvector (see [Ontology storage backends](#ontology-storage-backends));
+on any other backend the tools answer `{"ok": false, "error": {"code": "disabled"}}`. With the ontology disabled (the default) `tools/list` and every
+other tool response are byte-for-byte unchanged, and calling an ontology tool
+returns the ordinary `-32601 Tool not found` error.
+
+| Tool | Purpose |
+|------|---------|
+| `ncp_ontology_capabilities` | enabled flag, provider, packs with versions and entity/relation types, limits, tool names. Disabled: `{"ok": true, "enabled": false, "version": "1"}` |
+| `ncp_ontology_query` | resolve one seed (`entity_id`, or exact `key`: canonical key, then alias; `entity_type` narrows), then bounded traversal. Several matches → `resolved: false` with `ambiguity.candidates`, never a guess. `max_hops`/`max_nodes`/`max_edges` are clamped to the config (with a `clamped:` warning); `verified_only` defaults to the config |
+| `ncp_ontology_explain` | one relation, every evidence row (`status`, `live`) and `validity` (`active`, `schema_consistent`, `inactive_reason`, `evidence_supported`, `verified_and_supported`). Read-only |
+| `ncp_ontology_assert` | `kind: "entity"` (+ `expected_version`) or `kind: "relation"` (requires `idempotency_key` and `observed_at`; `created_by` is always the caller) |
+| `ncp_ontology_revoke` | revoke a relation (idempotent, audited) |
+| `ncp_ontology_evidence` | `chunk_ids` (1-16): `{"ok": true, "chunks": [{chunk_id, layer, src, content}], "missing": [...]}`. Dereferences `ev:` citations. Only chunks still live and readable in `pipeline_id` are returned (with `pipeline_id: "global"`, only global-scope chunks); unknown, expired, superseded and out-of-scope ids are all listed in `missing`. A cited chunk is not guaranteed to stay fetchable. Read-only |
+
+`ncp_ontology_query`, `ncp_ontology_explain` and `ncp_ontology_evidence` read
+current state only: passing `as_of` returns `invalid`. An `ncp_get_context`
+call with `as_of` skips ontology enrichment (`ontology.reason_code:
+"as_of_unsupported"`).
+
+```bash
+curl -s $BASE/mcp -H "$AUTH" -H 'Content-Type: application/json' -d '{
+  "jsonrpc": "2.0", "id": 11, "method": "tools/call",
+  "params": {"name": "ncp_ontology_query", "arguments": {
+    "pipeline_id": "pipe_demo", "key": "checkout", "entity_type": "Service", "max_hops": 2
+  }}}'
+```
+
+**Namespaces and permissions.** `pipeline_id` names the namespace (a pipeline,
+or `global`). Reads see that namespace plus `global` (default `global`); writes
+require `pipeline_id` and target exactly it. Permissions never come from tool
+arguments; they come from the authenticated principal:
+
+- read + write on pipelines in the principal's allowlist (any pipeline without
+  one); `global` is readable by every principal, writable only with `admin`;
+- `verify` (assert or change a `verified` relation) if the principal has
+  `verify`; `admin` (global writes, revoking another principal's relation) if
+  it has `admin`;
+- no principal (stdio, or HTTP without `[principals]`): principal `local` with
+  `[ontology] unauthenticated_capabilities` (default `["read", "write"]`, so
+  verified relations and global writes are denied).
+
+A pipeline outside the allowlist is rejected with `-32003 Forbidden` before the
+handler runs, like other pipeline-scoped tools.
+
+**Results.** Success: `{"ok": true, ...}`. Failure:
+`{"ok": false, "error": {"code": ..., "message": ...}}` with `code` one of
+`conflict` (idempotency key reused with another payload, revision mismatch),
+`forbidden`, `invalid`, `not_found`, `disabled`, `limit` (a hard bound such as
+more than 100 `relation_types` or 32 evidence refs). An object outside the
+caller's readable scope is reported exactly like a missing one (`not_found`);
+an authorization failure never falls back to an unscoped query.
+
+**Policy details.** A relation is active only inside
+`[valid_from, valid_until)`: future-dated relations are skipped by traversal,
+cardinality checks and automatic context, but `ncp_ontology_explain` still
+returns them (`in_validity_window: false`). Chunk evidence whose `valid_from`
+is in the future is not live. Only the original asserter or an `admin` may
+change an existing relation's `valid_from`/`valid_until` by re-asserting it.
+The asserter may revoke its own relation, even a verified one, without
+`verify`. `verified_only: false` is honored only when the server's
+`[ontology] verified_only` is false or the caller has `verify`/`admin`;
+otherwise it is forced to `true` with a `forced:` warning. Query/explain
+redact relation attribute values whose key looks like a credential
+(`password`, `secret`, `token`, `api_key`, `private_key`, `credential`) as
+`[REDACTED]` unless the caller has `admin`.
+
+### Ontology-aware context (opt-in)
+
+With `[ontology] enabled = true`, `ncp_get_context` may append a
+`[NCP:ONTOLOGY]` block of verified domain-graph paths (after memory, before
+whispers) and returns an `ontology` metadata object. Disabled, or when the
+request resolves to mode `off`, the response is byte-for-byte the legacy one
+and has no `ontology` key.
+
+- **Mode** (`[ontology] retrieval_mode`, default `auto`): `off`, `auto` (expand
+  only on a positive trigger) or `always`. A request may pass `"ontology":
+  false` (or `{"mode": "off"}`) to opt out; `{"mode": "auto"|"always"}` needs
+  `admin` and is otherwise ignored with a warning.
+- **Trigger (`auto`)**: entity keys/aliases/ids in `task`/`slot`/`intent` are
+  resolved exactly in the caller's scope. Expansion needs a uniquely resolved
+  entity plus relationship intent (depends, upstream, consumer, owner, impact,
+  pack relation names) or diagnostic intent (why, lag, outage, root cause), or
+  two supporting signals (matching type name, memory chunk mentioning the
+  entity). Ambiguous aliases are never guessed. Budgeted by `trigger_max_ms`.
+- **Expansion**: bounded traversal (`max_hops`/`max_nodes`/`max_edges`,
+  `graph_timeout_ms`), always verified-only; each relation needs a live chunk
+  readable by the caller or an external attestation. Paths are ranked
+  `0.40*query_relevance + 0.25*evidence_quality + 0.15*freshness +
+  0.10*distance + 0.10*diversity` and serialized as compact statements with
+  evidence chunk citations (`ev:`), never entity/relation attributes. The block
+  is limited to `max_graph_tokens` inside the caller's `max_tokens`; the
+  conscious block and budget header are never evicted for it. Cited chunks are
+  not added to `retrieved_chunk_ids`.
+- **Failures**: timeouts and backend errors return ordinary context with
+  `fallback_reason` (or fail the call when `fail_mode = "closed"` /
+  `fallback_to_memory = false`); an authorization failure fails closed.
+- **Metadata**: `ontology_triggered`, `reason_code`, `candidate_count`,
+  `verified_path_count`, `latency_ms`, `graph_tokens`, `fallback_reason`,
+  `signals`, `entities`, `paths` (ids, labels, relation types, evidence ids),
+  `omitted`, `warnings`. Raw query text is never included. Under
+  `response_max_tokens` the graph block is shed before memory, and once the
+  other diagnostics are gone the metadata is cut to its core telemetry
+  (`truncated.dropped` lists `ontology_detail`).
+- Enrichment reads an existing ontology but never creates its tables: under
+  the `core` tool profile the ontology store stays uninitialized
+  (`reason_code: "ontology_uninitialized"`) until an ontology tool runs.
+
+### Ontology storage backends
+
+Both backends implement the same store API with the same semantics: equal
+ordered graph results, status transitions, revisions, idempotency/conflict
+outcomes, cardinality and cycle rules, evidence liveness, scope isolation and
+error codes (`tests/test_ontology_parity.py` runs one scenario suite against
+both and requires identical transcripts).
+
+- **SQLite** (`SQLiteStore`): `ontology_*` tables in the NCP database file;
+  writers serialize on `BEGIN IMMEDIATE`.
+- **PostgreSQL** (`PgvectorStore`): `{schema}.{table_prefix}ontology_*` tables
+  in the pgvector store's own schema and prefix, created by an additive,
+  versioned migration the first time the ontology is used (a plain
+  `PgvectorStore` and a disabled ontology create nothing). Key columns use
+  `COLLATE "C"` so ordering matches SQLite byte order. Writes run in `READ
+  COMMITTED` behind transaction-scoped advisory locks -- one per
+  `(tenant, pipeline)` write scope for relation writes (so cardinality, cycle
+  and idempotency checks are race-free while pipelines write in parallel),
+  one per relation id and per entity id -- with a bounded `lock_timeout`.
+  Reads use one `REPEATABLE READ, READ ONLY` snapshot; `graph_timeout_ms` /
+  `trigger_max_ms` become `SET LOCAL statement_timeout` inside that
+  transaction. `ontology_events` is append-only (a trigger rejects `UPDATE`,
+  `DELETE` and `TRUNCATE`). Chunk evidence is checked against
+  `{schema}.{table_prefix}chunks` and fails closed if that table is absent.
+- **Async hosts**: NCP's async runtime (`AsyncPgvectorStore`) covers only the
+  post-turn write path and never assembles context, so the facade stays
+  disabled for it. In-process async code can use
+  `ncp.ontology.stores.AsyncPostgresOntologyStore`, a thin wrapper that runs
+  the PostgreSQL store in worker threads (`asyncio.to_thread`) with identical
+  results.
+
 ## Streaming
 
 Pass `"stream": true` to `ncp_get_context`. Over HTTP the response is NDJSON:
 one `{"type": "ncp_chunk", "section": ..., "index": ..., "text": ...}` line
-per section (`conscious`, `subconscious`, `whispers`, `budget_header`),
+per section (`conscious`, `subconscious`, `ontology` when enriched, `whispers`,
+`budget_header`),
 terminated by the standard JSON-RPC result line. All sections derive from a
 single assembly pass, so the concatenated stream matches the non-streaming
 `context` exactly.
