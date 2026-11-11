@@ -20,6 +20,10 @@ class OntologyStore(Protocol):
 
     def traverse(self, request: GraphQuery, *, auth: AuthContext) -> GraphResult: ...
 
+    def list_relations(
+        self, *, auth: AuthContext, status: str | None = None, limit: int = 1000,
+    ) -> list[Relation]: ...
+
     def invalidate_evidence(
         self, chunk_ids: Sequence[str], *, auth: AuthContext, reason: str,
     ) -> int: ...

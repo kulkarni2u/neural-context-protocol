@@ -3168,6 +3168,11 @@ def ontology_group() -> None:
     "--status", "status_override", type=click.Choice(["verified", "candidate"]), default=None,
     help="Force every relation to this status (e.g. 'candidate' to stage a manifest unverified).",
 )
+@click.option(
+    "--auto-promote/--no-auto-promote", "auto_promote", default=None,
+    help="Write candidates that meet [ontology.promotion] as verified (default: the config's "
+         "'auto'). Ignored with --status.",
+)
 @click.option("--json", "--json-output", "json_output", is_flag=True, help="Emit the report as JSON.")
 def ontology_seed_command(
     manifests: tuple[Path, ...],
@@ -3177,6 +3182,7 @@ def ontology_seed_command(
     prune: bool,
     dry_run: bool,
     status_override: str | None,
+    auto_promote: bool | None,
     json_output: bool,
 ) -> None:
     """Seed entities and relations from one or more JSON/TOML/YAML MANIFESTS.
@@ -3226,6 +3232,11 @@ def ontology_seed_command(
             prune=prune, dry_run=dry_run,
             status_override=status_override,  # type: ignore[arg-type]
             where=merged.where,
+            auto_promote=(
+                config.ontology.promotion
+                if (config.ontology.promotion.auto if auto_promote is None else auto_promote)
+                else None
+            ),
         )
     except OntologyError as exc:
         hint = (" (offline dry run: only entities declared in the manifests are known)"
@@ -3253,6 +3264,13 @@ def ontology_seed_command(
         f"{relations['updated']} updated / {relations['reopened']} reopened / "  # type: ignore[index]
         f"{relations['unchanged']} unchanged / {relations['pruned']} pruned"  # type: ignore[index]
     )
+    if report.auto_promote:
+        console.print(
+            f"auto-promote: {len(report.promoted)} candidate(s) written as verified, "
+            f"{len(report.held_back)} held back"
+        )
+        for line in report.held_back:
+            console.print(f"  held back: {line}")
     for line in report.pruned:
         console.print(f"  pruned: {line}")
     if report.stale:
@@ -3269,6 +3287,264 @@ def ontology_seed_command(
             "[dim]ontology is disabled: validated against the built-in schema only; "
             "counts assume an empty store and references to existing entities are not checked.[/dim]"
         )
+
+
+def _ontology_session(cwd: Path | None, pipeline_id: str):  # type: ignore[no-untyped-def]
+    """Config, enabled facade and local-operator auth (read/write/verify) for promote/demote."""
+    from ncp.config import load_config
+    from ncp.ontology.facade import OntologyError, OntologyFacade
+    from ncp.ontology.promotion import cli_auth
+
+    config = load_config(cwd=cwd or Path.cwd())
+    store = _resolve_runtime_store(config)
+    facade = OntologyFacade.from_config(config, store)
+    if not facade.enabled:
+        raise click.ClickException(
+            f"{facade.disabled_reason or 'ontology is disabled'}: add an [ontology] section "
+            "with enabled = true to .ncp/config.toml."
+        )
+    try:
+        return config, facade, cli_auth(pipeline_id)
+    except OntologyError as exc:
+        raise click.ClickException(f"[{exc.code}] {exc.message}") from exc
+
+
+def _relation_row(stored) -> dict[str, object]:  # type: ignore[no-untyped-def]
+    item = stored.item
+    return {
+        "id": item.key, "src": item.src, "type": item.type, "dst": item.dst,
+        "status": item.status, "confidence": item.confidence,
+        "evidence": [e.evidence_id for e in stored.relation.evidence],
+    }
+
+
+def _print_relation_rows(rows: list[dict[str, object]]) -> None:
+    for row in rows:
+        evidence = ", ".join(str(e) for e in row["evidence"])  # type: ignore[attr-defined]
+        click.echo(
+            f"{row['id']}  {float(row['confidence']):.2f}  "  # type: ignore[arg-type]
+            f"{row['src']} -{row['type']}-> {row['dst']}  [{evidence or 'no evidence'}]"
+        )
+
+
+def _select_by_ref(stored, ids, match, types):  # type: ignore[no-untyped-def]
+    """AND of the id / glob / type selectors; unknown ids are returned separately."""
+    import fnmatch
+
+    def hit(key: str, wanted: str) -> bool:
+        key = key.lower()
+        return key.startswith(wanted) if len(wanted) >= 8 else key == wanted
+
+    out = list(stored)
+    missing: list[str] = []
+    if ids:
+        wanted_ids = [i.strip().lower() for i in ids]
+        missing = [w for w in wanted_ids if not any(hit(s.item.key, w) for s in stored)]
+        out = [s for s in out if any(hit(s.item.key, w) for w in wanted_ids)]
+    if match:
+        out = [s for s in out if fnmatch.fnmatchcase(s.item.ref, match)]
+    if types:
+        wanted_types = {t.upper() for t in types}
+        out = [s for s in out if s.item.type in wanted_types]
+    return out, missing
+
+
+@ontology_group.command("promote")
+@click.argument("relation_ids", nargs=-1)
+@click.option("--pipeline-id", required=True, help="Namespace whose relations to promote.")
+@click.option("--cwd", default=None, type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("--list", "list_only", is_flag=True, help="List candidate relations (after any selectors) and exit.")
+@click.option("--match", default=None, help="Glob (fnmatch) on '<src> -<TYPE>-> <dst>', e.g. 'Service:order-* -PRODUCES-> *'.")
+@click.option("--type", "types", multiple=True, help="Relation type to include (repeatable).")
+@click.option("--min-confidence", type=click.FloatRange(0.0, 1.0), default=None, help="Only candidates at or above this confidence.")
+@click.option("--all", "select_all", is_flag=True, help="Select every candidate.")
+@click.option(
+    "--from-checklist", type=click.Path(exists=True, dir_okay=False, path_type=Path), default=None,
+    help="Markdown review file: promote relations on ticked '- [x] `src -TYPE-> dst`' lines.",
+)
+@click.option("--auto", "auto_rules", is_flag=True, help="Select by the [ontology.promotion] rules.")
+@click.option("--include-unresolved", is_flag=True, help="Also promote 'unresolved:*' / 'pattern:*' destinations.")
+@click.option("--dry-run", is_flag=True, help="Show what would change; write nothing.")
+@click.option("--allow-empty", is_flag=True, help="Exit 0 even when nothing matched.")
+@click.option("--json", "--json-output", "json_output", is_flag=True, help="Emit JSON.")
+def ontology_promote_command(
+    relation_ids: tuple[str, ...], pipeline_id: str, cwd: Path | None, list_only: bool,
+    match: str | None, types: tuple[str, ...], min_confidence: float | None, select_all: bool,
+    from_checklist: Path | None, auto_rules: bool, include_unresolved: bool, dry_run: bool,
+    allow_empty: bool, json_output: bool,
+) -> None:
+    """Promote reviewed candidate relations to verified so context can use them.
+
+    Context assembly only follows verified relations; `ncp ontology scan`
+    emits candidates. Selectors (ids, --match, --type, --min-confidence,
+    --from-checklist, --auto) combine with AND; --all takes every candidate.
+    Unresolved/pattern destinations are held back unless --include-unresolved.
+    Promotion keeps evidence/attestation, raises confidence to
+    [ontology.promotion].verified_confidence and records promoted_by/promoted_at.
+    Exit 1 when nothing was selected (unless --allow-empty). See
+    docs/NCP_ONTOLOGY.md#promoting-candidates.
+    """
+    from datetime import datetime, timezone
+
+    from ncp.ontology.facade import OntologyError
+    from ncp.ontology.promotion import (
+        checklist_matches, is_unresolved, load_relations, parse_checklist, promote_relation,
+        rule_label, select_promotions,
+    )
+
+    has_selector = bool(
+        relation_ids or match or types or min_confidence is not None or select_all
+        or from_checklist or auto_rules
+    )
+    if not has_selector and not list_only:
+        raise click.UsageError(
+            "nothing selected: pass relation ids, --match, --type, --min-confidence, "
+            "--from-checklist, --auto or --all (or --list to review)."
+        )
+    config, facade, auth = _ontology_session(cwd, pipeline_id)
+    rules = config.ontology.promotion
+    try:
+        everything = load_relations(facade, auth)
+    except OntologyError as exc:
+        raise click.ClickException(f"[{exc.code}] {exc.message}") from exc
+    candidates = [s for s in everything if s.item.status == "candidate"]
+    selected, missing = _select_by_ref(candidates, relation_ids, match, types)
+    for w in missing:
+        click.echo(f"warning: no candidate relation with id {w}", err=True)
+    if min_confidence is not None:
+        selected = [s for s in selected if s.item.confidence >= min_confidence]
+    if from_checklist is not None:
+        entries = parse_checklist(from_checklist.read_text(encoding="utf-8"))
+        selected = [s for s in selected if checklist_matches(entries, s.item)]
+    reasons: dict[str, str] = {}
+    if auto_rules:
+        plan = select_promotions(
+            [s.item for s in candidates], rules,
+            context=[s.item for s in everything], include_unresolved=include_unresolved,
+        )
+        allowed = {d.item.key for d in plan.promoted}
+        reasons = {d.item.key: d.reason for d in plan.held}
+        selected = [s for s in selected if s.item.key in allowed or s.item.key in reasons]
+    by = f"auto:{rule_label(rules)}" if auto_rules else "cli"
+
+    held = []
+    if not list_only:
+        unresolved_rule = rules.require_resolved if auto_rules else True
+        keep = []
+        for s in selected:
+            if s.item.key in reasons:
+                held.append((s, reasons[s.item.key]))
+            elif unresolved_rule and not include_unresolved and is_unresolved(s.item.dst):
+                held.append((s, "unresolved or pattern destination"))
+            else:
+                keep.append(s)
+        selected = keep
+
+    rows = [_relation_row(s) for s in selected]
+    if list_only:
+        if json_output:
+            click.echo(json.dumps({"candidates": rows}, indent=2, sort_keys=True))
+        else:
+            _print_relation_rows(rows)
+            click.echo(f"{len(rows)} candidate relation(s) in {pipeline_id}")
+        return
+
+    failed: list[dict[str, str]] = []
+    done: list[dict[str, object]] = []
+    if not dry_run:
+        now = datetime.now(timezone.utc)
+        for s in selected:
+            try:
+                promote_relation(facade, auth, s.relation, by=by,
+                                 verified_confidence=rules.verified_confidence, now=now)
+                done.append(_relation_row(s))
+            except OntologyError as exc:
+                failed.append({"id": s.item.key, "error": f"[{exc.code}] {exc.message}"})
+    held_rows = [{**_relation_row(s), "reason": why} for s, why in held]
+    if json_output:
+        click.echo(json.dumps({
+            "dry_run": dry_run, "promoted_by": by,
+            "selected": rows, "promoted": done, "held_back": held_rows, "failed": failed,
+        }, indent=2, sort_keys=True))
+    else:
+        verb = "would promote" if dry_run else "promoted"
+        _print_relation_rows(rows if dry_run else done)
+        click.echo(f"{verb} {len(rows) if dry_run else len(done)} relation(s) in {pipeline_id}")
+        if held:
+            unresolved_held = sum(1 for _, why in held if "unresolved" in why)
+            click.echo(
+                f"held back {len(held)} ({unresolved_held} unresolved/pattern; "
+                "pass --include-unresolved to promote those):"
+            )
+            for s, why in held:
+                click.echo(f"  {s.item.ref}: {why}")
+        for item in failed:
+            click.echo(f"failed {item['id']}: {item['error']}", err=True)
+    if failed or (not rows and not allow_empty):
+        if not rows and not failed:
+            click.echo("nothing matched the selection.", err=True)
+        raise SystemExit(1)
+
+
+@ontology_group.command("demote")
+@click.argument("relation_ids", nargs=-1)
+@click.option("--pipeline-id", required=True, help="Namespace whose relations to demote.")
+@click.option("--cwd", default=None, type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("--match", default=None, help="Glob (fnmatch) on '<src> -<TYPE>-> <dst>'.")
+@click.option("--type", "types", multiple=True, help="Relation type to include (repeatable).")
+@click.option("--reason", required=True, help="Why the relation is no longer trusted (recorded as an attribute).")
+@click.option("--dry-run", is_flag=True, help="Show what would change; write nothing.")
+@click.option("--allow-empty", is_flag=True, help="Exit 0 even when nothing matched.")
+@click.option("--json", "--json-output", "json_output", is_flag=True, help="Emit JSON.")
+def ontology_demote_command(
+    relation_ids: tuple[str, ...], pipeline_id: str, cwd: Path | None, match: str | None,
+    types: tuple[str, ...], reason: str, dry_run: bool, allow_empty: bool, json_output: bool,
+) -> None:
+    """Turn verified relations back into candidates (they leave context).
+
+    Implemented as a re-assert with status 'candidate': evidence and history
+    are kept and the reason is stored in the 'demote_reason' attribute. To
+    withdraw a relation entirely use the revoke tool instead. Exit 1 when
+    nothing matched (unless --allow-empty).
+    """
+    from ncp.ontology.facade import OntologyError
+    from ncp.ontology.promotion import demote_relation, load_relations
+
+    if not (relation_ids or match or types):
+        raise click.UsageError("nothing selected: pass relation ids, --match or --type.")
+    if not reason.strip():
+        raise click.UsageError("--reason must not be empty.")
+    _config, facade, auth = _ontology_session(cwd, pipeline_id)
+    try:
+        verified = [s for s in load_relations(facade, auth) if s.item.status == "verified"]
+    except OntologyError as exc:
+        raise click.ClickException(f"[{exc.code}] {exc.message}") from exc
+    selected, missing = _select_by_ref(verified, relation_ids, match, types)
+    for w in missing:
+        click.echo(f"warning: no verified relation with id {w}", err=True)
+    done: list[dict[str, object]] = []
+    failed: list[dict[str, str]] = []
+    if not dry_run:
+        for s in selected:
+            try:
+                demote_relation(facade, auth, s.relation, reason=reason.strip())
+                done.append(_relation_row(s))
+            except OntologyError as exc:
+                failed.append({"id": s.item.key, "error": f"[{exc.code}] {exc.message}"})
+    rows = [_relation_row(s) for s in selected]
+    if json_output:
+        click.echo(json.dumps({"dry_run": dry_run, "selected": rows, "demoted": done,
+                               "failed": failed}, indent=2, sort_keys=True))
+    else:
+        _print_relation_rows(rows if dry_run else done)
+        click.echo(f"{'would demote' if dry_run else 'demoted'} "
+                   f"{len(rows) if dry_run else len(done)} relation(s) in {pipeline_id}")
+        for item in failed:
+            click.echo(f"failed {item['id']}: {item['error']}", err=True)
+    if failed or (not rows and not allow_empty):
+        if not rows and not failed:
+            click.echo("nothing matched the selection.", err=True)
+        raise SystemExit(1)
 
 
 @ontology_group.command("scan")
