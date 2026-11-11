@@ -24,6 +24,8 @@ Successful operations return JSON-ready dicts with ``"ok": True``;
 from __future__ import annotations
 
 import json
+import threading
+import weakref
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -36,6 +38,7 @@ from ncp.ontology.models import (
     GLOBAL_NAMESPACE, AuthContext, Capability, Entity, GraphQuery, Relation, Scope,
 )
 from ncp.ontology.policy import OntologyConfig
+from ncp.ontology.redaction import redact_attributes
 from ncp.ontology.registry import SchemaRegistry
 from ncp.ontology.stores.sqlite import (
     OntologyConflictError, OntologyNotFoundError, SQLiteOntologyStore,
@@ -346,6 +349,15 @@ class OntologyFacade:
         if unknown:
             raise OntologyError("invalid", f"{what} has unsupported fields: {unknown}")
 
+    @staticmethod
+    def _relation_view(relation: Relation, auth: AuthContext) -> dict[str, object]:
+        """JSON relation for explicit reads; credential-like attribute keys are
+        redacted unless the caller is an admin."""
+        view = relation.model_dump(mode="json")
+        if "admin" not in auth.capabilities:
+            view["attributes"] = redact_attributes(view["attributes"])
+        return view
+
     # -- read ------------------------------------------------------------
 
     def query(
@@ -388,6 +400,13 @@ class OntologyFacade:
         if not isinstance(verified_only, bool):
             raise OntologyError("invalid", "verified_only must be a boolean")
         warnings: list[str] = []
+        if not verified_only and self.config.verified_only and not (
+            {"verify", "admin"} & auth.capabilities
+        ):
+            # Unverified (candidate/disputed) edges are only for callers who
+            # could verify them, unless the server itself opts out.
+            verified_only = True
+            warnings.append("forced: verified_only=true (requires the verify or admin capability)")
         limits: dict[str, int] = {}
         for field, value, ceiling, minimum in (
             ("max_hops", max_hops, self.config.max_hops, 0),
@@ -434,9 +453,12 @@ class OntologyFacade:
                         "warnings": warnings,
                         "limits": applied,
                     }
-                seed = store.get_entities([match.resolved_id], auth=auth)[
+                # The seed may vanish between the two read transactions.
+                seed = store.get_entities([match.resolved_id], auth=auth).get(
                     str(match.resolved_id)
-                ]
+                )
+                if seed is None or seed.deleted_at is not None:
+                    raise OntologyError("not_found", "entity is not available")
             request = GraphQuery(
                 seeds=(seed.entity_id,), relation_types=tuple(types),
                 verified_only=verified_only, **limits,
@@ -452,7 +474,7 @@ class OntologyFacade:
             "paths": [
                 {
                     "nodes": [str(node) for node in path.nodes],
-                    "relations": [relation.model_dump(mode="json") for relation in path.relations],
+                    "relations": [self._relation_view(relation, auth) for relation in path.relations],
                 }
                 for path in result.paths
             ],
@@ -485,7 +507,7 @@ class OntologyFacade:
         target = endpoints.get(str(relation.dst_entity_id))
         return {
             "ok": True,
-            "relation": relation.model_dump(mode="json"),
+            "relation": self._relation_view(relation, auth),
             "evidence": evidence,
             "validity": {
                 "status": relation.status,
@@ -616,6 +638,42 @@ class OntologyFacade:
         return {"ok": True, "kind": "relation", "relation": stored.model_dump(mode="json")}
 
 
+# -- facade cache ----------------------------------------------------------------
+
+_CACHE_LOCK = threading.Lock()
+_FACADE_CACHE: weakref.WeakKeyDictionary[object, tuple[OntologyConfig, OntologyFacade]] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def cached_facade(config: NCPConfig | OntologyConfig | None, store: object) -> OntologyFacade:
+    """``OntologyFacade.from_config`` memoized per NCP store object.
+
+    Building an enabled facade opens the ontology store and runs its
+    migration, so per-call construction (``ncp.api`` helpers build handlers
+    on every call) is avoided. A changed ``[ontology]`` section rebuilds the
+    entry; a disabled section never touches the cache or the database.
+    """
+    if config is None:
+        return OntologyFacade.disabled()
+    ontology = config if isinstance(config, OntologyConfig) else config.ontology
+    if not ontology.enabled or ontology.provider == "disabled":
+        return OntologyFacade.disabled()
+    try:
+        entry = _FACADE_CACHE.get(store)
+    except TypeError:  # unhashable / not weak-referenceable store: no caching
+        return OntologyFacade.from_config(ontology, store)
+    if entry is not None and entry[0] == ontology:
+        return entry[1]
+    with _CACHE_LOCK:
+        entry = _FACADE_CACHE.get(store)
+        if entry is not None and entry[0] == ontology:
+            return entry[1]
+        facade = OntologyFacade.from_config(ontology, store)
+        _FACADE_CACHE[store] = (ontology, facade)
+        return facade
+
+
 # -- MCP tool handlers ---------------------------------------------------------
 
 PrincipalProvider = Callable[[], "Principal | None"]
@@ -635,12 +693,24 @@ def _namespace(args: Mapping[str, object], *, write: bool) -> str:
 
 
 def make_tool_handlers(
-    facade: OntologyFacade, current_principal: PrincipalProvider,
+    facade: OntologyFacade | Callable[[], OntologyFacade], current_principal: PrincipalProvider,
 ) -> dict[str, Callable[[dict[str, object]], dict[str, object]]]:
     """MCP handlers. The principal comes only from ``current_principal`` (a
     trusted transport channel), never from tool arguments. Every failure is
     returned as ``{"ok": False, "error": {...}}``; nothing falls back to an
-    unscoped call."""
+    unscoped call.
+
+    ``facade`` may be a zero-argument provider, resolved on the first call:
+    building the handler table then never opens (or migrates) the ontology
+    store, e.g. under the core tool profile where these tools are unlisted.
+    """
+    if isinstance(facade, OntologyFacade):
+        fixed = facade
+
+        def provider() -> OntologyFacade:
+            return fixed
+    else:
+        provider = facade
 
     def guarded(
         operation: Callable[[dict[str, object]], dict[str, object]],
@@ -655,20 +725,20 @@ def make_tool_handlers(
         return handler
 
     def auth(args: Mapping[str, object], *, write: bool) -> AuthContext:
-        facade._require_enabled()  # disabled beats any auth/argument error
+        provider()._require_enabled()  # disabled beats any auth/argument error
         return auth_context_for(
-            current_principal(), _namespace(args, write=write), config=facade.config,
+            current_principal(), _namespace(args, write=write), config=provider().config,
         )
 
     def capabilities(args: dict[str, object]) -> dict[str, object]:
-        return {"ok": True, **facade.capabilities()}
+        return {"ok": True, **provider().capabilities()}
 
     def query(args: dict[str, object]) -> dict[str, object]:
         context = auth(args, write=False)
         relation_types = args.get("relation_types")
         if relation_types is not None and not isinstance(relation_types, list):
             raise OntologyError("invalid", "relation_types must be an array")
-        return facade.query(
+        return provider().query(
             context,
             entity_id=args.get("entity_id"),
             entity_type=args.get("entity_type"),
@@ -682,30 +752,30 @@ def make_tool_handlers(
         )
 
     def explain(args: dict[str, object]) -> dict[str, object]:
-        return facade.explain(auth(args, write=False), args.get("relation_id"))
+        return provider().explain(auth(args, write=False), args.get("relation_id"))
 
     def assert_(args: dict[str, object]) -> dict[str, object]:
         kind = args.get("kind")
         if kind not in ("entity", "relation"):
-            facade._require_enabled()
+            provider()._require_enabled()
             raise OntologyError("invalid", "kind must be 'entity' or 'relation'")
         context = auth(args, write=True)
         if kind == "entity":
             entity = args.get("entity")
             if not isinstance(entity, dict):
                 raise OntologyError("invalid", "entity must be an object")
-            return facade.assert_entity(
+            return provider().assert_entity(
                 context, entity, expected_version=args.get("expected_version"),
             )
         relation = args.get("relation")
         if not isinstance(relation, dict):
             raise OntologyError("invalid", "relation must be an object")
-        return facade.assert_relation(
+        return provider().assert_relation(
             context, relation, idempotency_key=args.get("idempotency_key"),
         )
 
     def revoke(args: dict[str, object]) -> dict[str, object]:
-        return facade.revoke_relation(
+        return provider().revoke_relation(
             auth(args, write=True), args.get("relation_id"), reason=args.get("reason"),
         )
 
@@ -720,6 +790,6 @@ def make_tool_handlers(
 
 __all__ = [
     "DEFAULT_TENANT", "ERROR_CODES", "ONTOLOGY_API_VERSION", "ONTOLOGY_TOOL_NAMES",
-    "OntologyError", "OntologyFacade", "auth_context_for", "entity_summary",
+    "OntologyError", "OntologyFacade", "auth_context_for", "cached_facade", "entity_summary",
     "make_tool_handlers",
 ]

@@ -209,10 +209,21 @@ class TestDisabledCompatibility:
         assert not names & ONTOLOGY_TOOL_NAMES
 
     def test_existing_tool_response_unchanged_when_enabled_elsewhere(self, tmp_path: Path) -> None:
-        # Enabling the ontology appends tools; the legacy entries stay identical.
+        # Enabling the ontology appends tools; the legacy entries stay identical
+        # except that ncp_get_context advertises the optional ``ontology``
+        # request extension (PR 4, design §6.1).
         off = tools_for_config(load_config(cwd=_project(tmp_path / "a", None)))
         on = tools_for_config(load_config(cwd=_project(tmp_path / "b", ENABLED_TOML)))
-        assert json.dumps(on[: len(off)]) == json.dumps(off)
+        legacy_view = []
+        for tool in on[: len(off)]:
+            if tool["name"] == "ncp_get_context":
+                schema = dict(tool["inputSchema"])
+                schema["properties"] = {
+                    key: value for key, value in schema["properties"].items() if key != "ontology"
+                }
+                tool = {**tool, "inputSchema": schema}
+            legacy_view.append(tool)
+        assert json.dumps(legacy_view) == json.dumps(off)
         assert [tool["name"] for tool in on[len(off):]] == list(FACADE_TOOL_NAMES)
 
 
@@ -221,7 +232,8 @@ class TestDisabledCompatibility:
 
 class TestStdioClient:
     def test_discover_assert_query_explain(self, tmp_path: Path) -> None:
-        root = _project(tmp_path, ENABLED_TOML)
+        # verify lets the caller ask for unverified (candidate) edges (PR 4 policy).
+        root = _project(tmp_path, ENABLED_TOML + 'unauthenticated_capabilities = ["read", "write", "verify"]\n')
         first = _stdio(root, _rpc("tools/list"), _call("ncp_ontology_capabilities", {}, req_id=2))
         listed, caps = _responses(first)
         names = [tool["name"] for tool in listed["result"]["tools"]]
@@ -370,7 +382,8 @@ class TestQuerySemantics:
         assert other["resolved"] and other["seed"]["namespace"] == "global"
 
     def test_limits_are_clamped_to_config(self, tmp_path: Path) -> None:
-        client = InProcess(_project(tmp_path, ENABLED_TOML + "max_hops = 1\nmax_nodes = 3\nmax_edges = 2\n"))
+        client = InProcess(_project(tmp_path, ENABLED_TOML + "max_hops = 1\nmax_nodes = 3\nmax_edges = 2\n"
+                                    'unauthenticated_capabilities = ["read", "write", "verify"]\n'))
         hub = put_entity(client, "p1", service("hub"))
         spokes = [put_entity(client, "p1", database(f"db{i}")) for i in range(4)]
         for index, spoke in enumerate(spokes):
@@ -469,7 +482,10 @@ class TestFacade:
             OntologyError("teapot", "no")
 
     def test_python_facade_in_process(self, tmp_path: Path) -> None:
-        facade = OntologyFacade.from_config(OntologyConfig(enabled=True), SQLiteStore(tmp_path / "s.db"))
+        facade = OntologyFacade.from_config(
+            OntologyConfig(enabled=True, unauthenticated_capabilities=("read", "write", "verify")),
+            SQLiteStore(tmp_path / "s.db"),
+        )
         auth = auth_context_for(None, "p1", config=facade.config)
         api = facade.assert_entity(auth, service("checkout"))["entity"]["entity_id"]
         db = facade.assert_entity(auth, database("ledger"))["entity"]["entity_id"]

@@ -32,7 +32,8 @@ from ncp.chunker import filter_content
 from ncp.config import NCPConfig, load_config
 from ncp.context_policy import ContextPolicyError, resolve_context_policy
 from ncp.drift import EmbeddingAdapter, compute_drift
-from ncp.ontology.facade import OntologyFacade, make_tool_handlers as make_ontology_tool_handlers
+from ncp.ontology.enrichment import build_enricher
+from ncp.ontology.facade import OntologyFacade, cached_facade, make_tool_handlers as make_ontology_tool_handlers
 from ncp.principals import (
     AuthorizationError,
     Principal,
@@ -1306,7 +1307,39 @@ def tools_for_config(config: NCPConfig | None) -> list[dict[str, object]]:
     # default) leaves the list exactly as above.
     if config.tool_profile != "core" and config.ontology.enabled:
         tools += ONTOLOGY_MCP_TOOLS
+    if config.ontology.enabled:
+        # Advertise the optional per-request ontology extension (design §6.1)
+        # on ncp_get_context; a disabled ontology keeps the legacy schema.
+        tools = [_with_ontology_context_arg(tool) if tool["name"] == "ncp_get_context" else tool
+                 for tool in tools]
     return tools
+
+
+_ONTOLOGY_CONTEXT_ARG: dict[str, object] = {
+    "description": (
+        "Optional ontology enrichment control. false (or {\"enabled\": false} / "
+        "{\"mode\": \"off\"}) opts this request out; {\"mode\": \"auto\"|\"always\"} "
+        "overrides the configured mode and needs the admin capability (otherwise ignored "
+        "with a warning). Omit to use [ontology].retrieval_mode."
+    ),
+    "anyOf": [
+        {"type": "boolean"},
+        {
+            "type": "object",
+            "properties": {
+                "enabled": {"type": "boolean"},
+                "mode": {"type": "string", "enum": ["off", "auto", "always"]},
+            },
+            "additionalProperties": False,
+        },
+    ],
+}
+
+
+def _with_ontology_context_arg(tool: dict[str, object]) -> dict[str, object]:
+    schema = dict(tool["inputSchema"])  # type: ignore[arg-type]
+    schema["properties"] = {**schema.get("properties", {}), "ontology": _ONTOLOGY_CONTEXT_ARG}  # type: ignore[dict-item]
+    return {**tool, "inputSchema": schema}
 
 
 def handlers_for_tools(
@@ -1498,6 +1531,10 @@ def make_handlers(
     tasks_enabled = config.tasks_enabled if config is not None else False
     task_stale_open = config.tasks_stale_open_seconds if config is not None else 1800.0
     task_service = TaskService(store, notifier, TaskSettings.from_config(config), log=_err)
+
+    def ontology_facade() -> OntologyFacade:
+        return cached_facade(config, store)
+
     sessions: dict[str, FetchSession] = {}
     sessions_lock = threading.Lock()
     coordination = getattr(store, "coordination", None)
@@ -1837,7 +1874,16 @@ def make_handlers(
             raise ContextPolicyError("context_policy requires a loaded NCP config")
         policy = resolve_context_policy(config, policy_name) if config is not None else None
         request_config = policy.config if policy is not None and policy.identity is not None else None
-        assembler = Assembler(store=store, config=request_config or config)
+        # Opt-in ontology enrichment (design §6.4). None whenever the ontology
+        # is disabled or the request resolves to mode off: the assembler then
+        # runs the unchanged legacy path and the response gains no keys.
+        enricher = None
+        if config is not None and config.ontology.enabled:
+            enricher = build_enricher(
+                config, store, principal=current_principal(), request=args.get("ontology"),
+                facade_provider=ontology_facade,
+            )
+        assembler = Assembler(store=store, config=request_config or config, ontology=enricher)
         stream = bool(args.get("stream", False))
         search_text = conscious.task + " " + conscious.slot
         try:
@@ -1901,6 +1947,8 @@ def make_handlers(
                 handler_result["drift"] = drift_block
             if as_of is not None:
                 handler_result["as_of"] = as_of
+            if enricher is not None:
+                handler_result["ontology"] = stream_result.ontology
             if compact:
                 _compact_response(handler_result)
             return StreamResponse(
@@ -1935,16 +1983,21 @@ def make_handlers(
             response["drift"] = drift_block
         if as_of is not None:
             response["as_of"] = as_of
+        if enricher is not None:
+            response["ontology"] = result.ontology
         if compact:
             _compact_response(response)
         if response_max_tokens is not None:
             def _refit(ceiling: int) -> dict[str, object]:
                 refitted = assembler.refit(result, budget=budget, max_tokens=ceiling, query_text=search_text)
-                return {
+                refit_fields: dict[str, object] = {
                     "context": refitted.context,
                     "pending_whisper_ids": refitted.pending_whisper_ids,
                     "retrieved_chunk_ids": _retrieved_chunk_ids(refitted),
                 }
+                if enricher is not None:
+                    refit_fields["ontology"] = refitted.ontology
+                return refit_fields
 
             response = fit_response(response, response_max_tokens, reassemble=_refit)
         return response
@@ -3149,9 +3202,14 @@ def make_handlers(
     if config is not None and config.ontology.enabled:
         # Opt-in: only an enabled [ontology] builds the facade (and so creates
         # the ontology tables). Disabled leaves the handler table unchanged.
-        handlers.update(make_ontology_tool_handlers(
-            OntologyFacade.from_config(config, store), current_principal,
-        ))
+        # The facade is cached per store (no migration per make_handlers call).
+        # Under the full profile it is built now, so a bad [ontology] section
+        # still fails at startup; under the core profile the ontology tools
+        # are unlisted and it is built lazily, so no ontology tables are
+        # created unless an ontology tool actually runs.
+        if config.tool_profile != "core":
+            ontology_facade()
+        handlers.update(make_ontology_tool_handlers(ontology_facade, current_principal))
     return handlers
 
 

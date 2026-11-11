@@ -10,6 +10,12 @@ Scope rules: an ``AuthContext`` reads its own namespace plus ``global`` in its
 tenant, and writes only its own scope. Writes into ``global`` additionally need
 ``admin``; asserting or keeping a relation ``verified`` needs ``verify``.
 Out-of-scope rows behave exactly like missing rows.
+
+Validity: a relation is *active* only inside ``[valid_from, valid_until)``.
+Relations whose ``valid_from`` lies in the future are excluded from traversal,
+cardinality counting and (through traversal) automatic enrichment until that
+instant; ``explain`` still shows them with ``in_validity_window = false``.
+Chunk evidence whose ``valid_from`` lies in the future is likewise not live.
 """
 
 from __future__ import annotations
@@ -18,6 +24,7 @@ import hashlib
 import json
 import sqlite3
 import threading
+import time
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
@@ -39,6 +46,10 @@ class OntologyConflictError(ValueError):
     """An optimistic-concurrency or idempotency precondition did not hold."""
 
 
+class OntologyTimeoutError(TimeoutError):
+    """A read exceeded its caller-supplied deadline and was interrupted."""
+
+
 class OntologyNotFoundError(ValueError):
     """A referenced object is missing or outside the caller's readable scope.
 
@@ -48,7 +59,10 @@ class OntologyNotFoundError(ValueError):
 
 _TS_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"  # fixed width, so text order is time order
 _IN_BATCH = 500
-_ACTIVE = "r.status != 'revoked' AND (r.valid_until IS NULL OR r.valid_until > :now)"
+_ACTIVE = (
+    "r.status != 'revoked' AND r.valid_from <= :now"
+    " AND (r.valid_until IS NULL OR r.valid_until > :now)"
+)
 # NCP chunk liveness: deleted/forgotten/consolidated-away rows are gone,
 # superseded rows carry superseded_by, bitemporal and TTL expiry by timestamp.
 _LIVE_CHUNK = (
@@ -56,6 +70,10 @@ _LIVE_CHUNK = (
     " AND (c.expiry IS NULL OR c.expiry > :now_epoch)"
     " AND (IFNULL(c.scope, 'pipeline') = 'global' OR c.pipeline_id = {namespace})"
 )
+# Added when the chunks table carries CAP-C5 ``valid_from``: future facts are not live yet.
+_LIVE_CHUNK_STARTED = " AND (c.valid_from IS NULL OR c.valid_from <= :now_epoch)"
+# Progress-handler granularity (SQLite VM instructions) for deadline checks.
+_PROGRESS_STEPS = 1000
 
 _SCHEMA_V1 = (
     """CREATE TABLE ontology_entities (
@@ -162,6 +180,11 @@ def _dt(value: str | None) -> datetime | None:
     return datetime.strptime(value, _TS_FORMAT).replace(tzinfo=timezone.utc)
 
 
+def _check_deadline(deadline: float | None) -> None:
+    if deadline is not None and time.monotonic() > deadline:
+        raise OntologyTimeoutError("ontology read exceeded its deadline")
+
+
 def _require(auth: AuthContext, capability: Capability) -> None:
     if capability not in auth.capabilities:
         raise PermissionError(f"ontology operation requires the {capability!r} capability")
@@ -224,28 +247,54 @@ class SQLiteOntologyStore:
             connection.close()
 
     @contextmanager
-    def _transaction(self, *, write: bool) -> Iterator[sqlite3.Connection]:
+    def _transaction(
+        self, *, write: bool, deadline: float | None = None,
+    ) -> Iterator[sqlite3.Connection]:
+        """One explicit transaction. ``deadline`` (``time.monotonic()``, reads
+        only) interrupts running statements once passed and raises
+        :class:`OntologyTimeoutError`."""
         guard = self._lock if self._shared is not None else nullcontext()
         with guard:
             opened = nullcontext(self._shared) if self._shared is not None else self._open()
             with opened as connection:
                 if connection.in_transaction:
                     raise RuntimeError("ontology store connection has an open transaction")
-                connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+                if deadline is not None:
+                    if write:
+                        raise ValueError("deadlines apply to read transactions only")
+                    _check_deadline(deadline)
+                    connection.set_progress_handler(
+                        lambda: 1 if time.monotonic() > deadline else 0, _PROGRESS_STEPS,
+                    )
                 try:
-                    yield connection
-                except BaseException:
-                    if connection.in_transaction:
-                        connection.execute("ROLLBACK")
+                    with self._begin(connection, write=write):
+                        yield connection
+                except sqlite3.OperationalError as exc:
+                    if deadline is not None and "interrupted" in str(exc):
+                        raise OntologyTimeoutError("ontology read exceeded its deadline") from None
                     raise
-                try:
-                    connection.execute("COMMIT")
-                except BaseException:
-                    # A failed COMMIT (e.g. SQLITE_BUSY) leaves the transaction
-                    # open; a shared connection would otherwise stay wedged.
-                    if connection.in_transaction:
-                        connection.execute("ROLLBACK")
-                    raise
+                finally:
+                    if deadline is not None:
+                        connection.set_progress_handler(None, 0)
+
+    @staticmethod
+    @contextmanager
+    def _begin(connection: sqlite3.Connection, *, write: bool) -> Iterator[None]:
+        connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+        try:
+            yield
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        try:
+            connection.execute("COMMIT")
+        except BaseException:
+            # A failed COMMIT (e.g. SQLITE_BUSY) leaves the transaction
+            # open; a shared connection would otherwise stay wedged.
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
 
     @staticmethod
     def _plain(connection: sqlite3.Connection) -> sqlite3.Cursor:
@@ -304,10 +353,17 @@ class SQLiteOntologyStore:
     # -- evidence liveness ---------------------------------------------------
 
     @staticmethod
-    def _has_chunks_table(connection: sqlite3.Connection) -> bool:
-        return connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'chunks'"
-        ).fetchone() is not None
+    def _live_chunk_sql(connection: sqlite3.Connection, namespace: str) -> str | None:
+        """Liveness predicate over alias ``c``; ``None`` without a ``chunks`` table."""
+        columns = {row[1] for row in SQLiteOntologyStore._plain(connection).execute(
+            "PRAGMA table_info(chunks)"
+        )}
+        if not columns:
+            return None
+        live = _LIVE_CHUNK.format(namespace=namespace)
+        if "valid_from" in columns:
+            live += _LIVE_CHUNK_STARTED
+        return live
 
     def _valid_evidence_sql(self, connection: sqlite3.Connection) -> str:
         """``EXISTS`` clause over alias ``r``: one valid row whose chunk is still live.
@@ -316,8 +372,8 @@ class SQLiteOntologyStore:
         never counts (fail closed), matching the assert-time rule.
         """
         chunk_ok = "e.evidence_type != 'chunk'"
-        if self._has_chunks_table(connection):
-            live = _LIVE_CHUNK.format(namespace="r.namespace")
+        live = self._live_chunk_sql(connection, "r.namespace")
+        if live is not None:
             chunk_ok = (
                 "e.evidence_type != 'chunk' OR EXISTS (SELECT 1 FROM chunks c"
                 f" WHERE c.chunk_id = e.evidence_id AND {live})"
@@ -330,9 +386,9 @@ class SQLiteOntologyStore:
     def _chunk_live(
         self, connection: sqlite3.Connection, chunk_id: str, namespace: str, now: datetime,
     ) -> bool:
-        if not self._has_chunks_table(connection):
+        live = self._live_chunk_sql(connection, ":namespace")
+        if live is None:
             return False  # nothing to reconcile against: fail closed
-        live = _LIVE_CHUNK.format(namespace=":namespace")
         return self._row(
             connection, f"SELECT 1 FROM chunks c WHERE c.chunk_id = :chunk_id AND {live}",
             {"chunk_id": chunk_id, "namespace": namespace, "now_epoch": now.timestamp()},
@@ -621,6 +677,21 @@ class SQLiteOntologyStore:
             raise ValueError("relation endpoints, type and schema pack are immutable")
         if existing["status"] == "revoked":
             raise ValueError("revoked relations cannot be re-asserted")
+        # The validity window belongs to the original asserter (the trusted
+        # ``asserted_by`` principal, which the facade also records as
+        # ``created_by``); anyone else needs admin to move it. Out-of-scope
+        # ids were already rejected above as not_found, so this leaks nothing.
+        window = (
+            _ts(relation.valid_from),
+            None if relation.valid_until is None else _ts(relation.valid_until),
+        )
+        if window != (existing["valid_from"], existing["valid_until"]) and (
+            existing["asserted_by"] != auth.principal_id
+        ):
+            if "admin" not in auth.capabilities:
+                raise PermissionError(
+                    "only the original asserter or an admin may change a relation's validity window"
+                )
         if existing["status"] == "verified":
             _require(auth, "verify")  # changing a verified fact is a verification act
 
@@ -668,19 +739,24 @@ class SQLiteOntologyStore:
         if row is not None:
             raise ValueError("relation type does not allow cycles")
 
-    def traverse(self, request: GraphQuery, *, auth: AuthContext) -> GraphResult:
+    def traverse(
+        self, request: GraphQuery, *, auth: AuthContext, deadline: float | None = None,
+    ) -> GraphResult:
         """Breadth-first expansion over visible, active relations in both directions.
 
         Each reached relation yields one ``GraphPath``: the BFS-tree chain from
         a seed to the relation's far endpoint. ``nodes[i]`` and ``nodes[i+1]``
         are joined by ``relations[i]``, which may point either way. Edges at
         each node are ordered by (relation_type, relation_id).
+        ``deadline`` (``time.monotonic()``) bounds wall-clock time; passing it
+        raises :class:`OntologyTimeoutError` rather than returning a partial
+        graph.
         """
         _require(auth, "read")
         now = datetime.now(timezone.utc)
         warnings: list[str] = []
         paths: list[GraphPath] = []
-        with self._transaction(write=False) as connection:
+        with self._transaction(write=False, deadline=deadline) as connection:
             seeds = self._visible_seeds(connection, request.seeds, auth)
             if len(seeds) > request.max_nodes:
                 seeds = seeds[:request.max_nodes]
@@ -695,6 +771,7 @@ class SQLiteOntologyStore:
             for _ in range(request.max_hops):
                 next_frontier: list[str] = []
                 for node in frontier:
+                    _check_deadline(deadline)
                     for row in self._rows(connection, edge_sql, {**params, "node": node}):
                         if row["relation_id"] in seen_edges:
                             continue
@@ -789,11 +866,12 @@ class SQLiteOntologyStore:
 
     def get_entities(
         self, entity_ids: Sequence[UUID | str], *, auth: AuthContext,
+        deadline: float | None = None,
     ) -> dict[str, Entity]:
         """Visible entities by id, in one read transaction; invisible ids are absent."""
         _require(auth, "read")
         found: dict[str, Entity] = {}
-        with self._transaction(write=False) as connection:
+        with self._transaction(write=False, deadline=deadline) as connection:
             for entity_id in dict.fromkeys(str(item) for item in entity_ids):
                 entity = self._load_entity(connection, entity_id, auth)
                 if entity is not None:
@@ -858,6 +936,114 @@ class SQLiteOntologyStore:
                 if ids:
                     return EntityMatch(entity_ids=tuple(ids), matched_key=normalized), column
         return EntityMatch(entity_ids=(), matched_key=normalized), "none"
+
+    def resolve_terms(
+        self, terms: Sequence[str], *, auth: AuthContext, schema_packs: Sequence[str] = (),
+        limit: int = 20, deadline: float | None = None,
+    ) -> dict[str, tuple[tuple[UUID, ...], str]]:
+        """Batch exact lookup for automatic resolution, in one read transaction.
+
+        Maps each normalized term that matched something to ``(entity_ids,
+        matched_on)`` exactly like :meth:`resolve_entities`: canonical keys
+        win and aliases are consulted only for terms with no canonical match;
+        ``entity_ids`` is sorted and holds at most ``limit + 1`` ids. Only
+        visible, live entities of ``schema_packs`` (all packs when empty)
+        count. Never picks a winner among several matches.
+        """
+        _require(auth, "read")
+        keys = sorted({key for key in (normalize_key(term) for term in terms) if 1 <= len(key) <= 256})
+        found: dict[str, tuple[tuple[UUID, ...], str]] = {}
+        if not keys:
+            return found
+        params: list[Any] = [auth.scope.tenant_id, auth.scope.namespace, GLOBAL_NAMESPACE]
+        visible = "e.tenant_id = ? AND e.namespace IN (?, ?) AND e.deleted_at IS NULL"
+        if schema_packs:
+            visible += f" AND e.schema_pack IN ({','.join('?' * len(schema_packs))})"
+            params.extend(schema_packs)
+        with self._transaction(write=False, deadline=deadline) as connection:
+            for column, source in (
+                ("canonical_key", "ontology_entities e"),
+                ("alias", "ontology_aliases a JOIN ontology_entities e ON e.entity_id = a.entity_id"),
+            ):
+                pending = [key for key in keys if key not in found]
+                matched: dict[str, list[str]] = {}
+                field = "e.canonical_key" if column == "canonical_key" else "a.alias"
+                for start in range(0, len(pending), _IN_BATCH):
+                    batch = pending[start:start + _IN_BATCH]
+                    rows = self._plain(connection).execute(
+                        f"SELECT DISTINCT {field}, e.entity_id FROM {source} WHERE {visible}"
+                        f" AND {field} IN ({','.join('?' * len(batch))})"
+                        f" ORDER BY {field}, e.entity_id",
+                        (*params, *batch),
+                    )
+                    for key, entity_id in rows:
+                        ids = matched.setdefault(key, [])
+                        if len(ids) <= limit:
+                            ids.append(entity_id)
+                for key, ids in matched.items():
+                    found[key] = (tuple(UUID(item) for item in ids), column)
+        return found
+
+    def live_chunk_evidence(
+        self, chunk_ids: Sequence[str], *, auth: AuthContext, relation_namespace: str,
+        deadline: float | None = None,
+    ) -> set[str]:
+        """The subset of ``chunk_ids`` that is live evidence for a relation in
+        ``relation_namespace`` *and* readable by the caller.
+
+        Live means not superseded, expired, past ``valid_to`` or before
+        ``valid_from``; readable means a ``global``-scope chunk or one in the
+        caller's own pipeline. Without a ``chunks`` table nothing is live.
+        """
+        _require(auth, "read")
+        ids = sorted({str(chunk_id) for chunk_id in chunk_ids})
+        live: set[str] = set()
+        if not ids:
+            return live
+        now = datetime.now(timezone.utc)
+        with self._transaction(write=False, deadline=deadline) as connection:
+            predicate = self._live_chunk_sql(connection, ":relation_namespace")
+            if predicate is None:
+                return live
+            for start in range(0, len(ids), _IN_BATCH):
+                batch = ids[start:start + _IN_BATCH]
+                names = {f"id{index}": value for index, value in enumerate(batch)}
+                rows = self._plain(connection).execute(
+                    "SELECT c.chunk_id FROM chunks c WHERE c.chunk_id IN"
+                    f" ({','.join(':' + name for name in names)}) AND {predicate}"
+                    " AND (IFNULL(c.scope, 'pipeline') = 'global' OR c.pipeline_id = :caller)",
+                    {**names, "relation_namespace": relation_namespace,
+                     "caller": auth.scope.namespace, "now_epoch": now.timestamp()},
+                )
+                live.update(chunk_id for (chunk_id,) in rows)
+        return live
+
+    @staticmethod
+    def initialized(path: str | Path) -> bool:
+        """Read-only probe: whether ``path`` already holds the ontology schema.
+
+        Never creates the file or any table, so automatic enrichment can skip
+        an uninitialized store without the side effect of migrating it.
+        """
+        target = Path(path)
+        if not target.exists():
+            return False
+        try:
+            # A plain connect on an existing file creates nothing; a query-only
+            # pragma keeps the probe read-only.
+            connection = sqlite3.connect(target, timeout=1.0)
+            connection.execute("PRAGMA query_only = ON")
+        except sqlite3.Error:
+            return False
+        try:
+            return connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table'"
+                " AND name = 'ontology_schema_versions'"
+            ).fetchone() is not None
+        except sqlite3.Error:
+            return False
+        finally:
+            connection.close()
 
     def explain_relation(
         self, relation_id: UUID, *, auth: AuthContext,
@@ -963,7 +1149,12 @@ class SQLiteOntologyStore:
         return len(affected)
 
     def revoke_relation(self, relation_id: UUID, *, auth: AuthContext, reason: str) -> Relation:
-        """Mark a relation revoked (idempotent). Revoking another principal's needs admin."""
+        """Mark a relation revoked (idempotent). Revoking another principal's needs admin.
+
+        The original asserter may revoke its own relation, *including a
+        verified one*, without the ``verify`` capability: withdrawing a claim
+        only removes it from traversal and never makes anything verified.
+        """
         _require_write(auth, auth.scope)  # before the lookup: no existence oracle
         if not reason.strip():
             raise ValueError("reason is required")

@@ -725,11 +725,64 @@ more than 100 `relation_types` or 32 evidence refs). An object outside the
 caller's readable scope is reported exactly like a missing one (`not_found`);
 an authorization failure never falls back to an unscoped query.
 
+**Policy details.** A relation is active only inside
+`[valid_from, valid_until)`: future-dated relations are skipped by traversal,
+cardinality checks and automatic context, but `ncp_ontology_explain` still
+returns them (`in_validity_window: false`). Chunk evidence whose `valid_from`
+is in the future is not live. Only the original asserter or an `admin` may
+change an existing relation's `valid_from`/`valid_until` by re-asserting it.
+The asserter may revoke its own relation, even a verified one, without
+`verify`. `verified_only: false` is honored only when the server's
+`[ontology] verified_only` is false or the caller has `verify`/`admin`;
+otherwise it is forced to `true` with a `forced:` warning. Query/explain
+redact relation attribute values whose key looks like a credential
+(`password`, `secret`, `token`, `api_key`, `private_key`, `credential`) as
+`[REDACTED]` unless the caller has `admin`.
+
+### Ontology-aware context (opt-in)
+
+With `[ontology] enabled = true`, `ncp_get_context` may append a
+`[NCP:ONTOLOGY]` block of verified domain-graph paths (after memory, before
+whispers) and returns an `ontology` metadata object. Disabled, or when the
+request resolves to mode `off`, the response is byte-for-byte the legacy one
+and has no `ontology` key.
+
+- **Mode** (`[ontology] retrieval_mode`, default `auto`): `off`, `auto` (expand
+  only on a positive trigger) or `always`. A request may pass `"ontology":
+  false` (or `{"mode": "off"}`) to opt out; `{"mode": "auto"|"always"}` needs
+  `admin` and is otherwise ignored with a warning.
+- **Trigger (`auto`)**: entity keys/aliases/ids in `task`/`slot`/`intent` are
+  resolved exactly in the caller's scope. Expansion needs a uniquely resolved
+  entity plus relationship intent (depends, upstream, consumer, owner, impact,
+  pack relation names) or diagnostic intent (why, lag, outage, root cause), or
+  two supporting signals (matching type name, memory chunk mentioning the
+  entity). Ambiguous aliases are never guessed. Budgeted by `trigger_max_ms`.
+- **Expansion**: bounded traversal (`max_hops`/`max_nodes`/`max_edges`,
+  `graph_timeout_ms`), always verified-only; each relation needs a live chunk
+  readable by the caller or an external attestation. Paths are ranked
+  `0.40*query_relevance + 0.25*evidence_quality + 0.15*freshness +
+  0.10*distance + 0.10*diversity` and serialized as compact statements with
+  evidence chunk citations (`ev:`), never entity/relation attributes. The block
+  is limited to `max_graph_tokens` inside the caller's `max_tokens`; the
+  conscious block and budget header are never evicted for it. Cited chunks are
+  not added to `retrieved_chunk_ids`.
+- **Failures**: timeouts and backend errors return ordinary context with
+  `fallback_reason` (or fail the call when `fail_mode = "closed"` /
+  `fallback_to_memory = false`); an authorization failure fails closed.
+- **Metadata**: `ontology_triggered`, `reason_code`, `candidate_count`,
+  `verified_path_count`, `latency_ms`, `graph_tokens`, `fallback_reason`,
+  `signals`, `entities`, `paths` (ids, labels, relation types, evidence ids),
+  `omitted`, `warnings`. Raw query text is never included.
+- Enrichment reads an existing ontology but never creates its tables: under
+  the `core` tool profile the ontology store stays uninitialized
+  (`reason_code: "ontology_uninitialized"`) until an ontology tool runs.
+
 ## Streaming
 
 Pass `"stream": true` to `ncp_get_context`. Over HTTP the response is NDJSON:
 one `{"type": "ncp_chunk", "section": ..., "index": ..., "text": ...}` line
-per section (`conscious`, `subconscious`, `whispers`, `budget_header`),
+per section (`conscious`, `subconscious`, `ontology` when enriched, `whispers`,
+`budget_header`),
 terminated by the standard JSON-RPC result line. All sections derive from a
 single assembly pass, so the concatenated stream matches the non-streaming
 `context` exactly.
