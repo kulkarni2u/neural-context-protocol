@@ -919,6 +919,21 @@ NCP is the memory bus. In our workflows, Sarathi is one orchestrator that runs o
 
 -----
 
+## Working on NCP with agents
+
+NCP's own development uses a brain/worker split ([`AGENTS.md`](./AGENTS.md)). The brain is Opus, set as the session model in `.claude/settings.json`; it plans, decides, integrates and commits. It delegates bounded work to the workers in `.claude/agents/`:
+
+| Worker | Model | Use |
+|---|---|---|
+| `vichara` | haiku | read-only research |
+| `pravaha` | sonnet | implementation |
+| `nirnaya` | sonnet | read-only review |
+| `parikshaka` | haiku | test/lint summaries |
+
+When Sarathi orchestrates, it dispatches the same roles. Every worker starts with `ncp_get_context` and ends with `ncp_write_memory`.
+
+-----
+
 ## Documentation
 
 - [Setup guide](./docs/NCP_SETUP.md)

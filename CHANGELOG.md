@@ -15,7 +15,8 @@ empty and had to be filled with hand-written `ncp_ontology_assert` calls.
 build files, CODEOWNERS, deploy manifests and Kafka usage into a reviewable
 manifest, and `ncp ontology seed`, which loads one or more manifests and
 keeps the graph in sync with them on every run. An opt-in `infrastructure`
-v2 schema pack adds repos, modules and tables. Nothing changes for
+v2 schema pack adds repos, modules and tables, and contributors get a
+brain/worker model-tiering workflow for agents. Nothing changes for
 deployments that leave `[ontology]` disabled, there are no store schema
 migrations, and no existing tool, request or response changes shape.
 
@@ -46,8 +47,9 @@ Upgrade notes:
   (unchanged re-runs write nothing); reports relations dropped from the
   manifest as stale and, with `--prune`, closes their validity window
   without touching other principals' relations. `--dry-run`,
-  `--status candidate` and `--json` are supported. Previously the only way to
-  populate the graph was hand-written `ncp_ontology_assert` calls.
+  `--status candidate`, `--pipeline-id` and `--json` are supported.
+  Previously the only way to populate the graph was hand-written
+  `ncp_ontology_assert` calls.
   - **Several manifests in one run** (e.g. one per monorepo module): merged
     under one `source` (`--source`), so cross-file references resolve and
     `--prune` covers them together; conflicting redeclarations are errors
@@ -58,13 +60,15 @@ Upgrade notes:
     dependencies. Referenced entities are never rewritten.
 - **`ncp ontology scan [ROOT]`** (`ncp/ontology/scan.py`): a reference
   exporter that writes a seed manifest from a repository (via `git ls-files`)
-  without touching the store. Modules from `package.json`, `pyproject.toml`,
-  `go.mod`, `Cargo.toml`, `pom.xml` and `build.gradle(.kts)` with in-repo
-  `DEPENDS_ON` edges; services from `Chart.yaml`, k8s workloads and
+  without touching the store (`-o/--output`, `--pipeline-id`, `--source`,
+  `--repo-name`, `--environment`, `--kafka-cluster`). Modules from
+  `package.json`, `pyproject.toml`, `go.mod`, `Cargo.toml`, `pom.xml` and
+  `build.gradle(.kts)` with in-repo `DEPENDS_ON` edges; services from
+  `Chart.yaml`, k8s `Deployment`/`StatefulSet`/`DaemonSet` workloads and
   `Dockerfile`s; `Team OWNS` from `CODEOWNERS`; `PRODUCES`/`CONSUMES` from
   Kafka client usage in Java/Kotlin, Python, JS/TS and Go and Spring Cloud
-  Stream bindings (`candidate` by default); hand-written `ncp-ontology.*`
-  files merged in. Every relation cites `path#Lnn`. `--schema-version 1`
+  Stream bindings (`candidate` by default; `--heuristics verified|off`
+  changes or skips them); hand-written `ncp-ontology.*` files merged in. Every relation cites `path#Lnn`. `--schema-version 1`
   emits v1-only facts.
 - **`infrastructure` v2 schema pack** (`ncp/ontology/packs/infrastructure.v2.json`,
   opt-in): a superset of v1 adding `Repo`, `Module` and `Table` with
@@ -78,6 +82,23 @@ Upgrade notes:
   seeder to diff and prune.
 - `examples/13_ontology/manifest.toml`: a sample seed manifest, and a
   "Seeding the graph" section in `docs/NCP_ONTOLOGY.md`.
+
+### Changed
+
+- **Contributor workflow: brain/worker model tiering** (no runtime change).
+  `AGENTS.md` gains a "Model tiering: brain and workers" section. The new
+  tracked `.claude/settings.json` sets the session model to `opus` (the
+  brain), and `.claude/agents/` defines four workers: `vichara` (haiku,
+  read-only research), `pravaha` (sonnet, implementation), `nirnaya`
+  (sonnet, read-only review) and `parikshaka` (haiku, test/lint summaries).
+  Each worker starts with `ncp_get_context` and ends with
+  `ncp_write_memory`. `.gitignore` now ignores `.claude/*` except
+  `.claude/agents/` and `.claude/settings.json`; it ignored all of `.claude/`
+  before.
+- Upgrade note for contributors: a pre-existing local `.claude/settings.json`
+  now shows as tracked and modified. Merge it, or move personal settings to
+  `.claude/settings.local.json`. Claude Code versions that only read
+  `CLAUDE.md` can add `@AGENTS.md` to their local `CLAUDE.md`.
 
 ## [1.9.0] - 2026-11-11
 
