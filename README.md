@@ -556,7 +556,7 @@ A common multi-agent shape is one long-lived **router** that receives events and
 | Request/reply threads | `ncp_emit_whisper` with `progress`/`result` and `in_reply_to` | Results matched to the request that caused them |
 | Push delivery | `ncp_wait_whispers`, `GET /events` | Wake on new work instead of polling `ncp_get_context` |
 | Task ledger | `ncp_task` (opt-in) | Durable record of in-flight work, with leases that expire if a worker dies |
-| Overview | `ncp_overview` | One bounded line per pipeline, most urgent first |
+| Overview | `ncp_overview` (needs `profile = "full"`) | One bounded line per pipeline, most urgent first |
 
 ```text
 router loop:
@@ -669,7 +669,7 @@ ncp_overview         — ranked, token-bounded summary across active pipelines (
 ncp_ontology_*       — opt-in domain graph: capabilities / query / explain / assert / revoke / evidence
 ```
 
-`ncp_wait_whispers` and `ncp_overview` are in the full tool profile; `ncp_task` appears only when `[tasks].enabled = true`, and the six `ncp_ontology_*` tools only when `[ontology].enabled = true`. None of them are in the `core` profile. See [the ontology guide](./docs/NCP_ONTOLOGY.md).
+The `[tools] profile` setting picks the advertised surface: `core` (5 per-turn lifecycle tools), `standard` (the default: core plus `ncp_record_outcome`, the decision tools and `ncp_wait_whispers`) or `full` (everything). `ncp_overview`, `ncp_remember`, `ncp_recall`, `ncp_improve`, `ncp_task` and the memo tools require `profile = "full"` (`ncp_task` also needs `[tasks].enabled = true`); the six `ncp_ontology_*` tools need `[ontology].enabled = true` and a non-`core` profile. See [the ontology guide](./docs/NCP_ONTOLOGY.md).
 
 The core agent-to-agent protocol is still: read context, publish memory, signal peers, and record outcomes. The memory facade (`ncp_remember` / `ncp_recall` / `ncp_improve`) is an ergonomic layer over the same trust-aware chunks and graph edges.
 
@@ -888,7 +888,7 @@ ncp memory recall "fast feedback" --pipeline-id pipe_demo
 ncp memory improve --pipeline-id pipe_demo
 ```
 
-**MCP tools:** `ncp_remember`, `ncp_recall`, `ncp_improve` registered automatically when the server starts.
+**MCP tools:** `ncp_remember`, `ncp_recall`, `ncp_improve` are advertised when the server runs with `[tools] profile = "full"` (not in the default `standard` profile).
 
 -----
 

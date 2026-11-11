@@ -173,7 +173,7 @@ class TestDisabledCompatibility:
     @pytest.mark.parametrize("toml", [
         None,
         "[ontology]\nenabled = false\n",
-        '[tools]\nprofile = "full"\n\n[ontology]\nenabled = false\nprovider = "builtin"\n',
+        '[tools]\nprofile = "standard"\n\n[ontology]\nenabled = false\nprovider = "builtin"\n',
     ])
     def test_tools_list_and_unknown_tool_bytes_unchanged(self, tmp_path: Path, toml: str | None) -> None:
         baseline_root = _project(tmp_path / "baseline", None)
