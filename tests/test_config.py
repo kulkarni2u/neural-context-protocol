@@ -35,14 +35,14 @@ def test_load_config_reads_file_and_env_overrides(tmp_path: Path) -> None:
     assert config.values["observability"]["log_level"] == "warning"
 
 
-def test_tool_profile_defaults_to_full(tmp_path: Path) -> None:
+def test_tool_profile_defaults_to_standard(tmp_path: Path) -> None:
     project = tmp_path / "repo"
     (project / ".git").mkdir(parents=True)
 
-    assert load_config(cwd=project).tool_profile == "full"
+    assert load_config(cwd=project).tool_profile == "standard"
 
 
-@pytest.mark.parametrize("profile", ["core", "full"])
+@pytest.mark.parametrize("profile", ["core", "standard", "full"])
 def test_tool_profile_accepts_supported_toml_values(tmp_path: Path, profile: str) -> None:
     project = tmp_path / "repo"
     (project / ".git").mkdir(parents=True)
@@ -52,13 +52,13 @@ def test_tool_profile_accepts_supported_toml_values(tmp_path: Path, profile: str
     assert load_config(cwd=project).tool_profile == profile
 
 
-def test_tool_profile_invalid_value_falls_back_to_full(tmp_path: Path) -> None:
+def test_tool_profile_invalid_value_falls_back_to_standard(tmp_path: Path) -> None:
     project = tmp_path / "repo"
     (project / ".git").mkdir(parents=True)
     (project / ".ncp").mkdir()
     (project / ".ncp" / "config.toml").write_text('[tools]\nprofile = "minimal"\n')
 
-    assert load_config(cwd=project).tool_profile == "full"
+    assert load_config(cwd=project).tool_profile == "standard"
 
 
 def test_dedup_scan_limit_defaults_and_file_and_env_overrides(tmp_path: Path) -> None:
@@ -326,6 +326,7 @@ def test_adaptive_budget_config_defaults(tmp_path: Path) -> None:
     assert config.adaptive_budget_enabled is True
     assert config.adaptive_budget_floor_tokens == 300
     assert config.adaptive_budget_ceiling_tokens == 2000
+    assert config.adaptive_allow_expand is False
 
 
 def test_adaptive_budget_config_file_and_env_overrides(tmp_path: Path) -> None:
@@ -426,3 +427,18 @@ def test_drift_window_turns_is_clamped_to_at_least_one(tmp_path: Path) -> None:
 
     config = load_config(cwd=project)
     assert config.drift_window_turns == 1
+
+
+@pytest.mark.parametrize("profile", ["core", "standard", "full"])
+def test_tool_profile_env_accepts_each_profile(tmp_path: Path, profile: str) -> None:
+    project = tmp_path / "repo"
+    (project / ".git").mkdir(parents=True)
+
+    assert load_config(cwd=project, env={"NCP_TOOL_PROFILE": profile}).tool_profile == profile
+
+
+def test_tool_profile_env_unknown_value_falls_back_to_standard(tmp_path: Path) -> None:
+    project = tmp_path / "repo"
+    (project / ".git").mkdir(parents=True)
+
+    assert load_config(cwd=project, env={"NCP_TOOL_PROFILE": "bogus"}).tool_profile == "standard"

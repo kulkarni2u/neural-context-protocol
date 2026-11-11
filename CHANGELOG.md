@@ -4,6 +4,35 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [Unreleased]
 
+Cuts NCP's fixed per-turn token overhead. The MCP tool catalog is sent to
+the model every turn and had become the largest fixed cost (~7.1k tokens by
+chars/4 under the old default), larger than the 840-token context budget.
+
+### Changed
+
+- **Breaking default:** `[tools] profile` now defaults to a new `standard`
+  profile (10 tools): the 5 core tools plus `ncp_record_outcome`,
+  `ncp_record_decision`, `ncp_get_decision`, `ncp_compile_decision_query`
+  and `ncp_wait_whispers`. Set `profile = "full"` (or `NCP_TOOL_PROFILE=full`)
+  to restore `ncp_overview`, `ncp_remember`, `ncp_recall`, `ncp_improve`,
+  `ncp_task` and the memo tools. Unknown profile values fall back to
+  `standard`. Default `tools/list` drops from ~28.4k to ~15.6k chars (-45%).
+- Trimmed MCP tool definitions (descriptions, and `ncp_emit_whisper`'s nested
+  per-type payload `allOf` schemas, which were documentation only; payloads
+  are still validated server-side). Full-profile `tools/list` drops from
+  ~28.3k to ~17.8k chars (-37%). Removed detail lives in the "Tool schema
+  notes" section of `docs/NCP_HTTP_API.md`; a test guards the size.
+- Adaptive context budget now only shrinks by default and never exceeds
+  `[budget].context_token_budget` (previously up to 1.5x). Set
+  `adaptive_allow_expand = true` (or `NCP_ADAPTIVE_ALLOW_EXPAND=1`) to restore
+  upward scaling to `adaptive_budget_ceiling_tokens`.
+
+### Removed
+
+- The unused `ncp.skill_cache` module (no runtime callers) and the
+  `[skill_cache]` config keys. The `skill_ref` chunk source value is kept for
+  stored-data compatibility; the design doc moved to `docs/archive/`.
+
 ## [1.9.1] - 2026-11-11
 
 ### Release scope
