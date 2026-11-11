@@ -1307,9 +1307,10 @@ def tools_for_config(config: NCPConfig | None) -> list[dict[str, object]]:
     # default) leaves the list exactly as above.
     if config.tool_profile != "core" and config.ontology.enabled:
         tools += ONTOLOGY_MCP_TOOLS
-    if config.ontology.enabled:
+    if config.ontology.enabled and config.ontology.provider != "disabled":
         # Advertise the optional per-request ontology extension (design §6.1)
-        # on ncp_get_context; a disabled ontology keeps the legacy schema.
+        # on ncp_get_context; a disabled ontology (feature or provider, where
+        # the argument is ignored) keeps the legacy schema.
         tools = [_with_ontology_context_arg(tool) if tool["name"] == "ncp_get_context" else tool
                  for tool in tools]
     return tools

@@ -253,6 +253,10 @@ class TestDisabledIsLegacy:
         off_ctx = next(tool for tool in off if tool["name"] == "ncp_get_context")
         on_ctx = next(tool for tool in on if tool["name"] == "ncp_get_context")
         assert "ontology" not in off_ctx["inputSchema"]["properties"]
+        provider_off = tools_for_config(load_config(cwd=_project(
+            tmp_path / "c", '[ontology]\nenabled = true\nprovider = "disabled"\n')))
+        provider_ctx = next(tool for tool in provider_off if tool["name"] == "ncp_get_context")
+        assert provider_ctx == off_ctx
         assert "ontology" in on_ctx["inputSchema"]["properties"]
         on_props = dict(on_ctx["inputSchema"]["properties"])
         on_props.pop("ontology")
@@ -448,6 +452,44 @@ class TestExpansion:
         context = response["context"]
         assert context.startswith("[NCP:CONSCIOUS]") and "[NCP:BUDGET]" in context
         assert response["ontology"]["graph_tokens"] == 0 or estimate_tokens(context) <= 60
+
+    @staticmethod
+    def _wide_graph(world: World) -> None:
+        facts = world.payroll()
+        for index in range(6):
+            topic = world.entity("KafkaTopic", f"payroll-out-{index}")
+            world.relate(facts["payroll"], topic, "PRODUCES", evidence=[facts["events_chunk"]])
+
+    def test_refit_sheds_graph_before_memory(self, world: World) -> None:
+        self._wide_graph(world)
+        agent = ConsciousBlock(owns=[], must_not=[], agent_id="a1", role="b", task="payroll_consumer_lag",
+                               slot="x", intent="advance", pipeline_id="p1")
+        query = "payroll_consumer_lag x"
+        enriched = Assembler(store=world.store, config=world.config,
+                             ontology=build_enricher(world.config, world.store))
+        legacy = Assembler(store=world.store, config=world.config)
+        result = enriched.assemble(conscious=agent, budget=BudgetContext(), query_text=query, max_tokens=800)
+        plain = legacy.assemble(conscious=agent, budget=BudgetContext(), query_text=query, max_tokens=800)
+        assert result.graph is not None and result.graph.tokens > 100 and result.chunks
+        for ceiling in (80, 120, 200):
+            refitted = enriched.refit(result, budget=BudgetContext(), max_tokens=ceiling, query_text=query)
+            baseline = legacy.refit(plain, budget=BudgetContext(), max_tokens=ceiling, query_text=query)
+            # Memory is never evicted to keep graph statements.
+            assert [c.chunk_id for c in refitted.chunks] == [c.chunk_id for c in baseline.chunks]
+            assert estimate_tokens(refitted.context) <= ceiling
+
+    def test_response_max_tokens_trims_ontology_detail(self, world: World) -> None:
+        self._wide_graph(world)
+        for ceiling in (150, 200, 400):
+            enabled = world.get_context(task="payroll_consumer_lag", slot="x", max_tokens=1500,
+                                        response_max_tokens=ceiling)
+            legacy = world.get_context(task="payroll_consumer_lag", slot="x", max_tokens=1500,
+                                       response_max_tokens=ceiling, ontology=False)
+            assert legacy.get("truncated", {"fits": True})["fits"]
+            assert enabled["truncated"]["fits"], enabled["truncated"]
+            assert "ontology_detail" in enabled["truncated"]["dropped"]
+            assert "paths" not in enabled["ontology"]
+            assert enabled["ontology"]["verified_path_count"] == enabled["context"].count("\npath:")
 
     def test_stream_and_response_refit_keep_graph_bounded(self, world: World) -> None:
         world.payroll()
@@ -768,6 +810,12 @@ class TestPolicyFixes:
             "Password": REDACTED, "items": [{"token": REDACTED}], "ok": 3,
         }
         assert redact_attributes({"zone": "a"}, extra=("zone",)) == {"zone": REDACTED}
+        assert redact_attributes({"Zone": "a", "x": [[{"API_KEY": 1}]]}, extra=("zone",)) == {
+            "Zone": REDACTED, "x": [[{"API_KEY": REDACTED}]],
+        }
+        assert redact_attributes({"Authorization": "Bearer x", "AWS_ACCESS_KEY": "a", "passphrase": "p"}) == {
+            "Authorization": REDACTED, "AWS_ACCESS_KEY": REDACTED, "passphrase": REDACTED,
+        }
 
 
 # ── HTTP principal path ──────────────────────────────────────────────────────

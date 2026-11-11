@@ -772,7 +772,10 @@ and has no `ontology` key.
 - **Metadata**: `ontology_triggered`, `reason_code`, `candidate_count`,
   `verified_path_count`, `latency_ms`, `graph_tokens`, `fallback_reason`,
   `signals`, `entities`, `paths` (ids, labels, relation types, evidence ids),
-  `omitted`, `warnings`. Raw query text is never included.
+  `omitted`, `warnings`. Raw query text is never included. Under
+  `response_max_tokens` the graph block is shed before memory, and once the
+  other diagnostics are gone the metadata is cut to its core telemetry
+  (`truncated.dropped` lists `ontology_detail`).
 - Enrichment reads an existing ontology but never creates its tables: under
   the `core` tool profile the ontology store stays uninitialized
   (`reason_code: "ontology_uninitialized"`) until an ontology tool runs.

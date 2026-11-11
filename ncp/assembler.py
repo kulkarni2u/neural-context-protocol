@@ -579,15 +579,15 @@ class Assembler:
         chunks and whispers already chosen, then re-encodes.
         """
         graph = result.graph
-        memory_max_tokens = max_tokens
-        if graph is not None and graph.text is not None:
-            memory_max_tokens = max_tokens - graph.tokens - 2
+        # Graph data is shed first: memory and whispers are fitted to the whole
+        # ceiling (no graph reservation here) and ``_encode_with_graph`` then
+        # drops graph statements until the result fits.
         chunks, whispers = self._fit_token_budget(
             conscious=result.conscious,
             budget=budget,
             chunks=result.chunks,
             whispers=result.whispers,
-            max_tokens=max(1, memory_max_tokens),
+            max_tokens=max(1, max_tokens),
             query_text=query_text,
         )
         kept_ids = {chunk.chunk_id for chunk in chunks}

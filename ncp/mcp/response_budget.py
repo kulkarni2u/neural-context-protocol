@@ -31,6 +31,14 @@ _TRIM_STEPS: tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...] = (
     ("tier_hint", ("tier_hint", "complexity_signal"), ()),
 )
 _MAX_REASSEMBLIES = 4
+# Applied after every diagnostic step: the opt-in ontology bundle is cut to
+# its core telemetry (per-path detail, entities, signals and warnings go). The
+# ``[NCP:ONTOLOGY]`` block in ``context`` still carries the paths themselves.
+_ONTOLOGY_STEP = "ontology_detail"
+_ONTOLOGY_CORE = (
+    "schema_version", "mode", "ontology_triggered", "reason_code", "verified_path_count",
+    "graph_tokens", "fallback_reason",
+)
 
 # A callback that re-assembles the context under a token ceiling and returns
 # the fields that depend on it: context, pending_whisper_ids, retrieved_chunk_ids.
@@ -56,6 +64,14 @@ def compact_telemetry(telemetry: dict[str, Any]) -> dict[str, Any]:
         # Contradicting evidence ids stay visible: the reader must reason about them.
         compact["fanin_contradictions"] = contradictions
     return compact
+
+
+def _trim_ontology(response: dict[str, Any]) -> bool:
+    bundle = response.get("ontology")
+    if not isinstance(bundle, dict) or set(bundle) <= set(_ONTOLOGY_CORE):
+        return False
+    response["ontology"] = {key: bundle[key] for key in _ONTOLOGY_CORE if key in bundle}
+    return True
 
 
 def context_sha256(context: str) -> str:
@@ -103,6 +119,9 @@ def fit_response(
         if changed:
             truncated["dropped"].append(label)
 
+    if response_tokens(fitted) > max_tokens and _trim_ontology(fitted):
+        truncated["dropped"].append(_ONTOLOGY_STEP)
+
     if response_tokens(fitted) > max_tokens and reassemble is not None:
         for _ in range(_MAX_REASSEMBLIES):
             overflow = response_tokens(fitted) - max_tokens
@@ -112,6 +131,8 @@ def fit_response(
             if ceiling < 1:
                 break
             fitted.update(reassemble(ceiling))
+            if _ONTOLOGY_STEP in truncated["dropped"]:
+                _trim_ontology(fitted)  # a re-assembly returns the full bundle again
             truncated["context_max_tokens"] = ceiling
             if "context_sha256" in fitted:
                 fitted["context_sha256"] = context_sha256(str(fitted["context"]))

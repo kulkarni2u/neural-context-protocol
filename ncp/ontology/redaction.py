@@ -19,7 +19,8 @@ REDACTED = "[REDACTED]"
 
 # Matched anywhere in the key, case-insensitively, after folding '-'/' ' to '_'.
 SENSITIVE_KEY_PATTERN = re.compile(
-    r"password|passwd|secret|token|api_?key|private_?key|credential",
+    r"password|passwd|passphrase|secret|token|api_?key|access_?key|private_?key|credential"
+    r"|authorization",
     re.IGNORECASE,
 )
 
@@ -28,7 +29,7 @@ def is_sensitive_key(key: str, extra: Iterable[str] = ()) -> bool:
     folded = re.sub(r"[\s-]+", "_", key)
     if SENSITIVE_KEY_PATTERN.search(folded):
         return True
-    return key in set(extra)
+    return key.casefold() in {name.casefold() for name in extra}
 
 
 def redact_attributes(value: JsonValue, *, extra: Iterable[str] = ()) -> JsonValue:
