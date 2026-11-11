@@ -1251,6 +1251,7 @@ def test_pg_async_wrapper_matches_sync(postgres_backend: PostgresBackend) -> Non
 
 
 def test_async_pgvector_store_keeps_facade_disabled() -> None:
+    pytest.importorskip("psycopg_pool")  # AsyncPgvectorStore needs the [pgvector] extra
     from ncp.stores.pgvector_async import AsyncPgvectorStore
 
     store = AsyncPgvectorStore("postgresql://unused.invalid/ncp")  # never connects
