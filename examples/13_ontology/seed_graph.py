@@ -98,7 +98,7 @@ def seed(client: MCPClient, pipeline: str = PIPELINE) -> dict[str, object]:
         chunk_id = _chunk_id(src, relation, dst)
         client.call("ncp_write_memory", {
             "chunk_id": chunk_id, "content": text, "layer": "semantic", "src": "tool_result",
-            "written_by": "ontology_seed", "pipeline_id": pipeline,
+            "written_by": "ontology_seeder", "pipeline_id": pipeline,
         })
         result = client.call("ncp_ontology_assert", {
             "kind": "relation", "pipeline_id": pipeline,

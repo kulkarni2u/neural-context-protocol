@@ -1,6 +1,7 @@
 # ~/.codex/config.toml (or a project-scoped Codex config): register NCP's
-# streamable HTTP MCP endpoint. Same entry as examples/07_codex_cli; the
-# ontology needs nothing Codex-specific.
+# streamable HTTP MCP endpoint. Same endpoint as examples/07_codex_cli
+# (which ships it as JSON in mcp_servers.json); the ontology needs nothing
+# Codex-specific.
 
 [mcp_servers.ncp]
 url = "http://127.0.0.1:4242/mcp"

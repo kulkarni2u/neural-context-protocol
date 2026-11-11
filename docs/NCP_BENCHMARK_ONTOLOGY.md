@@ -65,7 +65,7 @@ about 3 s.
 | evidence precision / recall | Over surfaced chunk ids, which are `retrieved_chunk_ids` plus the graph block's `ev:` citations |
 | tokens to full recall | Prompt tokens at the smallest budget on the ladder 200…2400 that reaches fact recall 1.0. Unset when no budget on the ladder reaches it. |
 | oracle evidence tokens | Tokens needed to show exactly the ground-truth evidence chunks as `[NCP:SUBCONSCIOUS]` lines, i.e. a perfect memory retriever. Computed, not run. |
-| unsupported assertion rate | Relations in the graph block that are not verified with live evidence, divided by all relations in the block |
+| unsupported assertion rate | Relations in the graph block that are not verified with live evidence, divided by all relations in the block. Separately, every path's `ev:` citations are checked: each relation on the path must cite its own live evidence chunk, and no superseded or unrelated chunk may be cited (`unsupported_citations`). |
 | SQL statements | Statements per call, counted with `sqlite3.Connection.set_trace_callback` on every connection. SQLite only. |
 | graph cost | Enricher telemetry: `latency_ms` (trigger plus traversal plus ranking) and `graph_tokens` |
 
@@ -73,8 +73,10 @@ about 3 s.
 
 Measured on November 11, 2026: Linux x86_64 container with 4 vCPUs, Python
 3.13.18, SQLite 3.53.1, PostgreSQL 16.15 and Redis 7.0.15 on loopback, token
-unit `chars_div4`. All quality numbers are deterministic. Latency varies by
-roughly ±2 ms between runs on this machine.
+unit `chars_div4`. All quality numbers are deterministic and reproduce
+exactly on a re-run. Latency does not: across re-runs on this machine the
+SQLite dependency p95 overhead ranged from about +7 to +14 ms and the
+Postgres one from about +30 to +35 ms, so read the latency rows as ±5 ms.
 
 ### Dependency tasks (8 tasks, default config)
 
@@ -130,7 +132,7 @@ no effect on that.
 | Graph overhead < 50 ms p95 on a controlled local corpus | p95 delta of **+11.3 ms** on SQLite and **+34.8 ms** on Postgres. The p50 delta was +8.7 ms and +25.2 ms. | **Met** on both backends. Postgres has little headroom: the mean graph `latency_ms` is 23 ms against the default `graph_timeout_ms = 50`. No fallbacks occurred here, but a slower host would see timeouts and therefore degraded (graph-free) context. |
 | 15–25% token reduction on dependency-rich tasks | Prompt tokens went **up** by 293% (SQLite) and 323% (Postgres) at a fixed budget. On the 2 tasks where the baseline reaches full recall at all, the ontology arm needed **26.8% more** tokens to reach it. At defaults, the graph block is 2.2× the oracle evidence text. With `max_graph_tokens = 150` it is 22.5% *smaller* than the oracle, but fact recall drops to 0.67. | **Not met.** On this corpus the ontology spends tokens to raise recall; it does not save them. See the analysis below. |
 | No meaningful regression on non-graph tasks | Prompt tokens and evidence recall are identical. Latency rose by +2.1 ms p95 (SQLite) and +5.7 ms p95 (Postgres), and SQLite runs +8 SQL statements per call. | **Met** for context quality and tokens. There is a small, measured latency cost from evaluating the trigger. |
-| Zero verified-without-evidence assertions | 0 of 111 surfaced relations were unsupported on each backend, and 0 of 45 at the 150-token slice. Neither planted hazard ever surfaced. | **Met** |
+| Zero verified-without-evidence assertions | 0 of 111 surfaced relations were unsupported on each backend, and 0 of 45 at the 150-token slice, with 0 unsupported `ev:` citations. Neither planted hazard ever surfaced. | **Met** |
 
 ### Why tokens went up, not down
 
@@ -146,15 +148,21 @@ no effect on that.
 - **Traversal answers a broader question than the task asks.** Automatic
   expansion walks both directions and every relation type, so incoming
   edges and `OWNS` edges come back along with the outgoing dependencies.
-  That fills the slice: 400 of the 400 available tokens, since
-  `min(max_graph_tokens, remaining budget)` here is about 400. It also
-  lowers evidence precision (0.285 on SQLite) and makes the block 2.2× the
-  oracle text. Restricting automatic expansion to the relation types and
-  direction the intent implies, for example outgoing `DEPENDS_ON` for
+  The slice is the full `max_graph_tokens = 500` (about 740 tokens of the
+  800 budget remain after the header). Blocks range from 269 to 494 tokens
+  (mean 400), and the three seeds with the largest neighborhoods come
+  within 15 tokens of the cap. The broad walk also lowers evidence
+  precision (0.285 on SQLite) and makes the block 2.2× the oracle text.
+  Restricting automatic expansion to the relation types and direction the
+  intent implies, for example outgoing `DEPENDS_ON` for
   "depends on", is the obvious lever. It is not implemented.
-- **Compact statements are cheaper per fact.** At a 150-token slice the
-  block costs 22.5% less than the oracle evidence text for the facts it
-  covers. Ranking then drops the paths beyond the slice, so recall is 0.67.
+- **A smaller slice is not cheaper per fact.** At a 150-token slice the
+  block is 22.5% smaller than the oracle evidence text for *all*
+  ground-truth facts, but it covers only 67% of them (ranking drops the
+  paths beyond the slice, including off-question incoming and `OWNS`
+  paths). Per covered fact that is roughly 16% *more* tokens than the
+  oracle, so the compact `Type:key -REL-> Type:key` format alone does not
+  deliver the hypothesized saving.
 
 ### Cost accounting
 

@@ -102,8 +102,11 @@ pipelines = ["demo"]
 capabilities = ["verify"]
 ```
 
-then run `NCP_AUTH_TOKEN=$NCP_TOKEN_SEEDER python examples/13_ontology/seed_graph.py`.
-With `[principals]` configured every HTTP client needs its own token.
+then run `NCP_AUTH_TOKEN=$NCP_TOKEN_SEEDER python examples/13_ontology/seed_graph.py`
+(the seed writes its evidence chunks as `written_by = "ontology_seeder"`, so
+keep that `agent_id`). With `[principals]` configured every HTTP client needs
+its own token, and `mcp_client.py` must pass that principal's `agent_id`:
+`NCP_AUTH_TOKEN=<token> python examples/13_ontology/mcp_client.py --agent-id <agent_id>`.
 
 ## What a harness has to do
 

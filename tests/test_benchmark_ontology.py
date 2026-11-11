@@ -51,3 +51,24 @@ def test_ontology_benchmark_quality_is_deterministic(tmp_path: Path) -> None:
         ]
 
     assert quality(_run(tmp_path / "a")) == quality(_run(tmp_path / "b"))
+
+
+def test_unsupported_citation_check_flags_dead_or_missing_evidence() -> None:
+    from ncp.bench.ontology import Fact, _unsupported_citations
+
+    facts = {
+        "r1": Fact("DEPENDS_ON", "a", "b", "ev-1"),
+        "r2": Fact("DEPENDS_ON", "b", "c", "ev-2"),
+        "stale": Fact("DEPENDS_ON", "a", "c", "ev-old", supported=False),
+    }
+
+    def check(relation_ids: list[str], evidence_ids: list[str]) -> int:
+        response = {"ontology": {"paths": [
+            {"relation_ids": relation_ids, "evidence_ids": evidence_ids},
+        ]}}
+        return _unsupported_citations(response, facts, {"ev-old"})
+
+    assert check(["r1", "r2"], ["ev-1", "ev-2"]) == 0
+    assert check(["r1", "r2"], ["ev-1"]) == 1             # r2 shown without its evidence
+    assert check(["r1"], ["ev-1", "ev-old"]) == 1         # cites superseded evidence
+    assert check(["r1"], ["ev-1", "unrelated-chunk"]) == 1  # cites evidence of no relation shown

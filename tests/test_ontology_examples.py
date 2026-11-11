@@ -4,6 +4,7 @@ ephemeral loopback ``ncp serve`` HTTP server (no external network)."""
 from __future__ import annotations
 
 import importlib
+from contextlib import contextmanager
 import socket
 import threading
 from collections.abc import Iterator
@@ -22,8 +23,16 @@ def _free_port() -> int:
         return int(sock.getsockname()[1])
 
 
-@pytest.fixture
-def server_url(tmp_path: Path) -> Iterator[str]:
+SEEDER_PRINCIPAL = """
+[principals.ontology_seeder]
+token_env = "NCP_TOKEN_SEEDER"
+agent_id = "ontology_seeder"
+pipelines = ["demo"]
+capabilities = ["verify"]
+"""
+
+
+def _serve(tmp_path: Path, *, principals: bool = False) -> Iterator[str]:
     root = tmp_path / "project"
     (root / ".git").mkdir(parents=True)
     (root / ".ncp").mkdir()
@@ -31,6 +40,9 @@ def server_url(tmp_path: Path) -> Iterator[str]:
     # Generous time budgets keep the smoke test independent of machine load.
     config = config.replace("trigger_max_ms = 10", "trigger_max_ms = 1000").replace(
         "graph_timeout_ms = 50", "graph_timeout_ms = 5000")
+    if principals:  # the shared-deployment setup the README documents
+        config = config.replace('unauthenticated_capabilities = ["read", "write", "verify"]', "")
+        config += SEEDER_PRINCIPAL
     (root / ".ncp" / "config.toml").write_text(config, encoding="utf-8")
     port = _free_port()
     server = create_http_server(host="127.0.0.1", port=port, cwd=root)
@@ -46,7 +58,15 @@ def server_url(tmp_path: Path) -> Iterator[str]:
 
 
 @pytest.fixture
+def server_url(tmp_path: Path) -> Iterator[str]:
+    yield from _serve(tmp_path)
+
+
+@pytest.fixture
 def example(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr("sys.dont_write_bytecode", True)  # no __pycache__ in examples/
+    monkeypatch.delenv("NCP_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("NCP_MCP_URL", raising=False)
     monkeypatch.syspath_prepend(str(EXAMPLE))
     for name in ("mcp_http", "seed_graph", "mcp_client"):
         monkeypatch.delitem(__import__("sys").modules, name, raising=False)
@@ -72,6 +92,23 @@ def test_seed_and_generic_client(server_url: str, example, capsys) -> None:
     # Explicit mode.
     assert report["query"]["resolved"] is True and report["query"]["paths"] > 0
     assert report["explain"]["verified_and_supported"] is True
+
+
+def test_seed_and_client_with_documented_principal(
+    tmp_path: Path, example, monkeypatch: pytest.MonkeyPatch, capsys,
+) -> None:
+    """README's shared-deployment path: a verify principal seeds, and the
+    client passes that principal's agent_id."""
+    seed_graph, mcp_client = example
+    token = "seeder-test-token"
+    monkeypatch.setenv("NCP_TOKEN_SEEDER", token)
+    with contextmanager(_serve)(tmp_path, principals=True) as url:
+        monkeypatch.setenv("NCP_AUTH_TOKEN", token)
+        assert seed_graph.main(["--url", url]) == 0
+        assert mcp_client.main(["--url", url, "--agent-id", "ontology_seeder"]) == 0
+        out = capsys.readouterr().out
+        assert "Service:checkout -DEPENDS_ON-> Service:payments" in out
+        assert '"verified_and_supported": true' in out
 
 
 def test_seed_reports_disabled_server(tmp_path: Path, example, capsys) -> None:

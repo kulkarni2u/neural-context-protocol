@@ -29,8 +29,9 @@ the ``[NCP:ONTOLOGY]`` block), *evidence* precision/recall over surfaced
 chunk ids (retrieved chunks plus graph ``ev:`` citations), the smallest
 prompt that reaches full fact recall on a budget ladder, the unsupported
 assertion rate (surfaced relations that are not verified with live
-evidence; the corpus plants a candidate relation and a verified relation
-whose only evidence was superseded), SQL statements per call (SQLite only,
+evidence, plus ``ev:`` citations that are not the live evidence of a
+path's relations; the corpus plants a candidate relation and a verified
+relation whose only evidence was superseded), SQL statements per call (SQLite only,
 counted with ``sqlite3.Connection.set_trace_callback``) and the graph cost
 the enricher reports (``latency_ms``, ``candidate_count``, ``graph_tokens``).
 """
@@ -165,6 +166,7 @@ class Corpus:
     facts: list[Fact] = field(default_factory=list)
     control_chunks: dict[str, tuple[str, ...]] = field(default_factory=dict)
     chunk_count: int = 0
+    superseded: set[str] = field(default_factory=set)  # evidence chunks that are not live
 
     def by_relation_id(self) -> dict[str, Fact]:
         return {fact.relation_id: fact for fact in self.facts}
@@ -270,6 +272,7 @@ def seed_corpus(store: Any, facade: OntologyFacade) -> Corpus:
     relate(stale)
     replacement = chunk("ev-stale-01", f"{src} no longer calls {dst}; refunds come via events.")
     store.supersede(stale.chunk_id, replacement)
+    corpus.superseded.add(stale.chunk_id)
 
     for service_index, service in enumerate(SERVICES):
         for index, template in enumerate(_DISTRACTOR_TEMPLATES):
@@ -376,6 +379,27 @@ def _surfaced(response: dict[str, Any]) -> tuple[set[str], set[str]]:
     return chunks, relations
 
 
+def _unsupported_citations(
+    response: dict[str, Any], facts: dict[str, Fact], superseded: set[str],
+) -> int:
+    """Graph-block citations that do not back a live, verified fact: per path,
+    every relation must be a supported corpus fact whose evidence chunk is
+    cited, and every cited chunk must be one of those (live) chunks."""
+    bad = 0
+    for path in (response.get("ontology") or {}).get("paths") or ():
+        cited = {str(item) for item in path.get("evidence_ids") or ()}
+        backing: set[str] = set()
+        for rid in (str(item) for item in path.get("relation_ids") or ()):
+            fact = facts.get(rid)
+            if fact is None or not fact.supported or fact.chunk_id in superseded:
+                continue  # counted as an unsupported relation
+            backing.add(fact.chunk_id)
+            if fact.chunk_id not in cited:
+                bad += 1  # relation shown without citing its live evidence
+        bad += len(cited - backing)  # never a superseded chunk: those are not backing
+    return bad
+
+
 def _fact_recall(task: Task, corpus_facts: dict[str, Fact], chunks: set[str],
                  relations: set[str]) -> float | None:
     if not task.truth_facts:
@@ -407,6 +431,7 @@ def _run_arm(
     per_task: list[dict[str, Any]] = []
     surfaced_relations = 0
     unsupported_surfaced = 0
+    unsupported_citations = 0
 
     # Pass 1 (first, on a fresh store): quality, tokens, graph cost, SQL count.
     for index, task in enumerate(tasks):
@@ -424,6 +449,7 @@ def _run_arm(
         unsupported_surfaced += len(relations & unsupported_ids)
         # A relation in the block must be one the corpus verified with live evidence.
         unsupported_surfaced += len([rid for rid in relations if rid not in facts])
+        unsupported_citations += _unsupported_citations(response, facts, corpus.superseded)
         per_task.append({
             "task": task.name, "family": task.family,
             "prompt_tokens": estimate_tokens(str(response["context"])),
@@ -501,6 +527,7 @@ def _run_arm(
         "families": families,
         "surfaced_relations": surfaced_relations,
         "unsupported_surfaced": unsupported_surfaced,
+        "unsupported_citations": unsupported_citations,
         "unsupported_assertion_rate": (
             _round(unsupported_surfaced / surfaced_relations, 4) if surfaced_relations else 0.0
         ),
@@ -627,7 +654,9 @@ def _compare(baseline: dict[str, Any], ontology: dict[str, Any]) -> dict[str, An
                 delta("control", "evidence_recall_mean") in (0, 0.0, None)
                 and (delta("control", "prompt_tokens_mean") or 0) <= 0
             ),
-            "zero_unsupported_assertions": ontology["unsupported_surfaced"] == 0,
+            "zero_unsupported_assertions": (
+                ontology["unsupported_surfaced"] == 0 and ontology["unsupported_citations"] == 0
+            ),
         },
     }
 

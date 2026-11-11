@@ -44,7 +44,10 @@ def _label(entity: dict) -> str:
     return f"{entity['entity_type']}:{entity['canonical_key']}"
 
 
-def run(client: MCPClient, pipeline: str = PIPELINE, *, key: str = "checkout") -> dict:
+def run(
+    client: MCPClient, pipeline: str = PIPELINE, *, key: str = "checkout",
+    agent_id: str = "generic_client",
+) -> dict:
     report: dict[str, object] = {}
 
     # 1. discovery
@@ -58,7 +61,7 @@ def run(client: MCPClient, pipeline: str = PIPELINE, *, key: str = "checkout") -
 
     # 2. automatic mode: the same ncp_get_context call any NCP harness already makes
     context = client.call("ncp_get_context", {
-        "agent_id": "generic_client", "role": "build", "pipeline_id": pipeline,
+        "agent_id": agent_id, "role": "build", "pipeline_id": pipeline,
         "task": f"fix_{key.replace('-', '_')}_latency", "slot": key.replace("-", "_"),
         "intent": "find_upstream_dependencies", "max_tokens": 800,
     })
@@ -108,9 +111,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--url", default=DEFAULT_URL, help="ncp serve MCP endpoint")
     parser.add_argument("--pipeline", default=PIPELINE, help="pipeline_id (ontology namespace)")
     parser.add_argument("--key", default="checkout", help="entity key to investigate")
+    parser.add_argument(
+        "--agent-id", default="generic_client",
+        help="agent_id for ncp_get_context; with [principals] it must match the token's principal",
+    )
     args = parser.parse_args(argv)
     try:
-        run(MCPClient(args.url), args.pipeline, key=args.key)
+        run(MCPClient(args.url), args.pipeline, key=args.key, agent_id=args.agent_id)
     except MCPError as exc:
         print("MCP error:", exc)
         return 1

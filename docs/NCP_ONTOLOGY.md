@@ -111,16 +111,18 @@ like a missing one. In-process hosts can use the same operations through
     in the future, are inactive. They are skipped by traversal, by
     cardinality checks and by automatic context, but
     `ncp_ontology_explain` still shows them (`in_validity_window: false`).
-  - **B3.** `verified_only: false` on a query is honored only when the
+  - **B3.** The asserter may revoke its own relation, even a verified
+    one, without `verify`. Revoking someone else's relation needs `admin`.
+  - **B4.** `verified_only: false` on a query is honored only when the
     server's `verified_only` is false or the caller has `verify` or
     `admin`. Otherwise the query is forced back to `true`, with a `forced:`
     warning.
-  - **B4.** Query and explain redact credential-like attribute keys
-    (`password`, `secret`, `token`, `api_key`, `private_key`,
-    `credential`) as `[REDACTED]` unless the caller has `admin`.
-  - **B5 (asserter revoke rule).** The asserter may revoke its own
-    relation, even a verified one, without `verify`. Revoking someone
-    else's relation needs `admin`.
+  - **B5.** Query and explain redact relation attributes whose key looks
+    like a credential (the key contains, case-insensitively, `password`,
+    `passwd`, `passphrase`, `secret`, `token`, `api_key`, `access_key`,
+    `private_key`, `credential` or `authorization`) as `[REDACTED]` unless
+    the caller has `admin`. Entity attributes are never returned by query
+    or explain.
 - **Other invariants.**
   - `created_by` is always the authenticated principal.
   - An explicit `relation_id` must already exist in the caller's scope, so
@@ -203,9 +205,10 @@ the included paths (by ids).
 Measured on the benchmark corpus with default limits (see
 [`NCP_BENCHMARK_ONTOLOGY.md`](./NCP_BENCHMARK_ONTOLOGY.md)):
 
-- Enrichment added about +11 ms p95 per `ncp_get_context` on SQLite and
-  about +35 ms on Postgres.
-- Non-graph requests pay about 1.5–2 ms for the trigger.
+- Enrichment added about +7 to +14 ms p95 per `ncp_get_context` on SQLite
+  (+11 ms in the published run) and about +30 to +35 ms on Postgres, across
+  re-runs.
+- Non-graph requests pay about 1.3–2 ms for the trigger.
 - Automatic context raised fact recall on dependency tasks from 0.38 to 1.00,
   but it **increased** prompt tokens. The design's 15–25% token-reduction
   hypothesis was not met.
@@ -227,7 +230,7 @@ Measured on the benchmark corpus with default limits (see
   `verify`. NCP does not check the source deterministically, so keep
   `verify` for trusted ingestion principals.
 - **`verified_only` override rules.** A client cannot loosen
-  `verified_only` without `verify` or `admin` (B3). Automatic context
+  `verified_only` without `verify` or `admin` (B4). Automatic context
   ignores `verified_only` entirely and is always verified-only.
 - **Future-dated relations.** These are not counted toward cardinality
   limits until they become active. A planned edge can therefore coexist
