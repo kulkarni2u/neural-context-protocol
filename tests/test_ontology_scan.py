@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -13,7 +14,7 @@ from click.testing import CliRunner
 from ncp.cli import main
 from ncp.config import load_config
 from ncp.ontology.facade import OntologyError, OntologyFacade
-from ncp.ontology.scan import scan_repository
+from ncp.ontology.scan import _kafka_usages, _service_name, scan_repository
 from ncp.ontology.seed import memory_chunk_writer, seed_ontology
 from ncp.stores.sqlite import SQLiteStore
 
@@ -244,3 +245,40 @@ class TestScanThenSeed:
     def test_not_a_directory(self, tmp_path: Path) -> None:
         with pytest.raises(OntologyError, match="not a directory"):
             scan_repository(tmp_path / "missing")
+
+
+def test_k8s_name_parsing():
+    head = "kind: Deployment\n"
+    assert _service_name("d.yaml", head + "metadata:\n  name: web\n") == ("web", 1)
+    assert _service_name("d.yaml", head + "metadata:\n  labels:\n    a: b\n  name: \"web-2\"\n")[0] == "web-2"
+    assert _service_name("d.yaml", head + "metadata:\n  name: {{ .Release.Name }}\n")[0] is None
+    # A templated sibling key (namespace) must not hide the literal name.
+    helm = head + "metadata:\n  namespace: {{ .Release.Namespace }}\n  name: api\n"
+    assert _service_name("d.yaml", helm)[0] == "api"
+    nested = head + "metadata:\n  labels:\n    name: wrong\nspec:\n  name: also-wrong\n"
+    assert _service_name("d.yaml", nested)[0] is None
+
+
+def test_yaml_binding_parsing():
+    text = (
+        "bindings:\n"
+        "  orders-in-0:\n"
+        "    group: g\n"
+        "    destination: order.events\n"
+        "  pay-out-0:\n"
+        "    destination: \"pay.events\"\n"
+        "  empty-in-1:\n"
+        "    group: g\n"
+        "  other:\n"
+        "    destination: not.this\n"
+    )
+    assert list(_kafka_usages("application.yml", text)) == [
+        ("CONSUMES", "order.events", 4), ("PRODUCES", "pay.events", 6)]
+
+
+def test_scan_yaml_regexes_are_linear():
+    payload = "\t\t\n" * 50_000
+    started = time.perf_counter()
+    assert _service_name("k8s/deploy.yaml", "kind: Deployment\nmetadata:\n" + payload + "x") is not None
+    assert list(_kafka_usages("application.yml", "orders-in-0:\n" + payload + "x")) == []
+    assert time.perf_counter() - started < 1.0

@@ -300,8 +300,44 @@ def _owning_module(rel: str, modules: dict[str, _Module]) -> _Module | None:
 
 
 _K8S_KIND = re.compile(r"^kind:\s*(Deployment|StatefulSet|DaemonSet)\s*$", re.MULTILINE)
-_K8S_NAME = re.compile(r"^metadata:\s*\n(?:[ \t]+.*\n)*?[ \t]+name:\s*[\"']?([A-Za-z0-9.\-_]+)",
-                       re.MULTILINE)
+_K8S_META = re.compile(r"^metadata:[ \t]*(?:#.*)?$")
+_K8S_NAME_VALUE = re.compile(r"name[ \t]*:[ \t]*[\"']?([A-Za-z0-9.\-_]+)")
+_K8S_NAME_KEY = re.compile(r"name[ \t]*:")
+
+
+def _indent(line: str) -> int:
+    return len(line) - len(line.lstrip(" \t"))
+
+
+def _k8s_metadata_name(text: str, start: int = 0) -> str | None:
+    """Return ``metadata.name`` (line-based, linear time); None if absent or templated."""
+    lines = text.split("\n")
+    first = text.count("\n", 0, start)
+    for begin in (first, 0):
+        for index in range(begin, len(lines)):
+            if not _K8S_META.match(lines[index].rstrip("\r")):
+                continue
+            block_indent = 0
+            for line in lines[index + 1:]:
+                line = line.rstrip("\r")
+                if not line.strip():
+                    continue
+                indent = _indent(line)
+                if indent == 0:
+                    break
+                if block_indent == 0:
+                    block_indent = indent
+                if indent == block_indent:
+                    stripped = line.strip()
+                    if _K8S_NAME_KEY.match(stripped) and "{{" in stripped:
+                        return None
+                    match = _K8S_NAME_VALUE.match(stripped)
+                    if match:
+                        return match.group(1)
+            return None
+        if begin == 0:
+            break
+    return None
 
 
 def _service_name(rel: str, text: str) -> tuple[str | None, int] | None:
@@ -315,10 +351,7 @@ def _service_name(rel: str, text: str) -> tuple[str | None, int] | None:
         kind = _K8S_KIND.search(text)
         if kind is None:
             return None
-        match = _K8S_NAME.search(text, kind.end()) or _K8S_NAME.search(text)
-        if match and "{{" not in match.group(0):
-            return match.group(1), _line(text, kind.start())
-        return (None, _line(text, kind.start()))
+        return _k8s_metadata_name(text, kind.end()), _line(text, kind.start())
     return None
 
 
@@ -384,10 +417,8 @@ _KAFKA_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
         ("PRODUCES", r"spring\.cloud\.stream\.bindings\.[A-Za-z0-9_.-]*-out-\d+\.destination\s*[=:]\s*([A-Za-z0-9._-]+)"),
     )
 )
-_YAML_BINDING = re.compile(
-    r"^([ \t]*)([A-Za-z0-9_.-]+-(in|out)-\d+)\s*:\s*\n(?:\1[ \t]+.*\n)*?\1[ \t]+destination\s*:\s*"
-    r"[\"']?([A-Za-z0-9._-]+)", re.MULTILINE,
-)
+_YAML_BINDING_KEY = re.compile(r"([ \t]*)([A-Za-z0-9_.-]+)-(in|out)-\d+[ \t]*:[ \t]*(?:#.*)?")
+_YAML_DESTINATION = re.compile(r"destination[ \t]*:[ \t]*[\"']?([A-Za-z0-9._-]+)")
 _TOPIC_NAME = re.compile(r"^[A-Za-z0-9._-]{1,249}$")
 
 
@@ -399,9 +430,23 @@ def _topics(literal: str) -> list[str]:
 def _kafka_usages(rel: str, text: str) -> Iterator[tuple[str, str, int]]:
     suffix = PurePosixPath(rel).suffix
     if suffix in (".yml", ".yaml"):
-        for match in _YAML_BINDING.finditer(text):
-            direction = "CONSUMES" if match.group(3) == "in" else "PRODUCES"
-            yield direction, match.group(4), _line(text, match.start(4))
+        lines = text.split("\n")
+        for number, raw in enumerate(lines):
+            key = _YAML_BINDING_KEY.fullmatch(raw.rstrip("\r"))
+            if key is None:
+                continue
+            key_indent = len(key.group(1))
+            for offset in range(number + 1, len(lines)):
+                line = lines[offset].rstrip("\r")
+                if not line.strip():
+                    continue
+                if _indent(line) <= key_indent:
+                    break
+                dest = _YAML_DESTINATION.match(line.lstrip(" \t"))
+                if dest and _TOPIC_NAME.match(dest.group(1)):
+                    direction = "CONSUMES" if key.group(3) == "in" else "PRODUCES"
+                    yield direction, dest.group(1), offset + 1
+                    break
         return
     for direction, pattern in _KAFKA_PATTERNS:
         if suffix == ".properties" and "spring.cloud" not in pattern.pattern:
