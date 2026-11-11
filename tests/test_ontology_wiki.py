@@ -100,7 +100,9 @@ def test_scan_manifest_pages(tmp_path: Path) -> None:
     service = pages["services/svc.md"]
     assert "## Produces" in service and "## Consumes" in service
     assert "svc/src/main/java/com/acme/K.java#L" in service
-    assert "kafka_like_sites" in pages["coverage.md"]
+    coverage = pages["coverage.md"]
+    assert "## Per-broker coverage" in coverage and "| kafka |" in coverage
+    assert "producer_sites" in coverage
     assert "(destinations/kafkatopic-orders.v1.md)" in pages["index.md"]
     # messaging matrix lists problems first
     matrix = pages["messaging.md"]
