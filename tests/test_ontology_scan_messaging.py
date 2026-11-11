@@ -91,9 +91,9 @@ RULE_CASES = [
         "ch.publish('ex.pub', 'key', Buffer.from('x'))\n"
         "ch.consume('q.recv', (m) => m)\n"
         "await channel.bindQueue('q.bound', 'ex.bound', 'rk')\n"
-    ), {("PRODUCES", "Queue:amqp:q.send"), ("PRODUCES", "Exchange:amqp:ex.pub"),
-        ("CONSUMES", "Queue:amqp:q.recv"),
-        ("ROUTES_TO", "Exchange:amqp:ex.bound->Queue:amqp:q.bound")}, id="amqplib"),
+    ), {("PRODUCES", "Queue:rabbitmq:q.send"), ("PRODUCES", "Exchange:rabbitmq:ex.pub"),
+        ("CONSUMES", "Queue:rabbitmq:q.recv"),
+        ("ROUTES_TO", "Exchange:rabbitmq:ex.bound->Queue:rabbitmq:q.bound")}, id="amqplib"),
     pytest.param(".ts", (
         "import { SQSClient, SendMessageCommand, ReceiveMessageCommand } from '@aws-sdk/client-sqs'\n"
         "import { Consumer } from 'sqs-consumer'\n"
@@ -130,8 +130,8 @@ RULE_CASES = [
         "ch.basic_publish(exchange='', routing_key='py.default', body=b'x')\n"
         "ch.basic_publish('', 'py.positional', b'x')\n"
         "ch.basic_consume(queue='py.consume', on_message_callback=cb)\n"
-    ), {("PRODUCES", "Exchange:amqp:py.ex"), ("PRODUCES", "Queue:amqp:py.default"),
-        ("PRODUCES", "Queue:amqp:py.positional"), ("CONSUMES", "Queue:amqp:py.consume")},
+    ), {("PRODUCES", "Exchange:rabbitmq:py.ex"), ("PRODUCES", "Queue:rabbitmq:py.default"),
+        ("PRODUCES", "Queue:rabbitmq:py.positional"), ("CONSUMES", "Queue:rabbitmq:py.consume")},
         id="pika"),
     pytest.param(".go", (
         "package main\nimport kafka \"github.com/segmentio/kafka-go\"\n"
@@ -150,8 +150,8 @@ RULE_CASES = [
         "ch.Publish(\"\", \"go.default\", false, false, amqp.Publishing{})\n"
         "msgs, _ := ch.Consume(\"go.queue\", \"\", true, false, false, false, nil)\n"
     ), {("PRODUCES", "Queue:sqs:go-sqs-out"), ("CONSUMES", "Queue:sqs:go-sqs-in"),
-        ("PRODUCES", "Exchange:amqp:go.ex"), ("PRODUCES", "Exchange:amqp:go.ex2"),
-        ("PRODUCES", "Queue:amqp:go.default"), ("CONSUMES", "Queue:amqp:go.queue")},
+        ("PRODUCES", "Exchange:rabbitmq:go.ex"), ("PRODUCES", "Exchange:rabbitmq:go.ex2"),
+        ("PRODUCES", "Queue:rabbitmq:go.default"), ("CONSUMES", "Queue:rabbitmq:go.queue")},
         id="go-sqs-amqp"),
     pytest.param(".java", (
         "class A {\n"
@@ -231,10 +231,10 @@ def test_unresolved_destinations_are_candidates_for_every_broker(tmp_path: Path)
         "ch.sendToQueue(queueName, Buffer.from('x'))\n"
         "new ReceiveMessageCommand({ QueueUrl: config.url })\n"
         "ch.publish(process.env.EXCHANGE, 'k', b)\n"))
-    queue = _entity(manifest, "Queue", "amqp:unresolved:queueName")
+    queue = _entity(manifest, "Queue", "rabbitmq:unresolved:queueName")
     assert queue.attributes["unresolved"] is True and queue.attributes["expression"] == "queueName"
     assert _entity(manifest, "Queue", "sqs:unresolved:config.url")
-    assert _entity(manifest, "Exchange", "amqp:unresolved:env:EXCHANGE")
+    assert _entity(manifest, "Exchange", "rabbitmq:unresolved:env:EXCHANGE")
     assert {r.status for r in _edges(manifest).values()} == {"candidate"}
 
 
@@ -243,7 +243,7 @@ def test_unresolved_stays_candidate_in_verified_mode(tmp_path: Path) -> None:
         **SCAFFOLD[".ts"], "svc/a.ts": "import 'amqplib'\nch.sendToQueue(q, b)\nch.consume('lit', f)\n"})
     manifest = scan_repository(root, heuristics="verified").manifest
     statuses = {r.dst: r.status for r in _edges(manifest).values()}
-    assert statuses == {"Queue:amqp:unresolved:q": "candidate", "Queue:amqp:lit": "verified"}
+    assert statuses == {"Queue:rabbitmq:unresolved:q": "candidate", "Queue:rabbitmq:lit": "verified"}
 
 
 # -- generic constant index ------------------------------------------------------------
@@ -720,7 +720,7 @@ def test_node_repo_without_package_name_or_dockerfile(tmp_path: Path) -> None:
     assert set(_edges(manifest)) == {
         ("Service:web-shop", "CONSUMES", "KafkaTopic:orders"),
         ("Service:web-shop", "PRODUCES", "KafkaTopic:payments"),
-        ("Service:web-shop", "PRODUCES", "Queue:amqp:emails"),
+        ("Service:web-shop", "PRODUCES", "Queue:rabbitmq:emails"),
         ("Service:web-shop", "PRODUCES", "Queue:sqs:jobs"),
     }
     assert _entity(manifest, "Queue", "sqs:jobs").attributes["env"] == "JOBS_QUEUE_URL"
@@ -736,7 +736,7 @@ def test_node_package_without_name_in_a_subdirectory(tmp_path: Path) -> None:
     manifest = scan_repository(root).manifest
     assert _keys(manifest, "Module") == {"packages/api"}  # the nameless workspace root is not a module
     assert _entity(manifest, "Module", "packages/api").attributes["name"] == "api"
-    assert ("Module:packages/api", "CONSUMES", "Queue:amqp:api.q") in _edges(manifest)
+    assert ("Module:packages/api", "CONSUMES", "Queue:rabbitmq:api.q") in _edges(manifest)
 
 
 def test_node_source_only_repo_gets_a_synthetic_root_module(tmp_path: Path) -> None:
@@ -769,7 +769,7 @@ def test_python_mini_repo(tmp_path: Path) -> None:
         ("Service:orders-worker", "PRODUCES", "KafkaTopic:orders"),
         ("Service:orders-worker", "CONSUMES", "KafkaTopic:orders"),
         ("Service:orders-worker", "CONSUMES", "Queue:sqs:jobs-q"),
-        ("Service:orders-worker", "PRODUCES", "Exchange:amqp:audit")}
+        ("Service:orders-worker", "PRODUCES", "Exchange:rabbitmq:audit")}
 
 
 def test_go_mini_repo(tmp_path: Path) -> None:
@@ -802,14 +802,14 @@ def test_schema_below_3_skips_queue_and_exchange_sites(tmp_path: Path) -> None:
     for version in (1, 2):
         result = scan_repository(root, schema_version=version)
         assert _flows(result.manifest) == {("PRODUCES", "KafkaTopic:k.t")}
-        amqp = result.summary["messaging"]["amqp"]
+        amqp = result.summary["messaging"]["rabbitmq"]
         assert amqp["skipped_schema"] == 2 and amqp["sites"] == 2 and amqp["matched_sites"] == 0
         (warning,) = [w for w in result.summary["warnings"] if "--schema-version 3" in w]
         assert "pack_versions = { infrastructure = 3 }" in warning
         assert not any("extracted 0" in w for w in result.summary["warnings"])
     result = scan_repository(root)
     assert result.manifest.schema_version == 3 and result.summary["schema_version"] == 3
-    assert result.summary["messaging"]["amqp"]["skipped_schema"] == 0
+    assert result.summary["messaging"]["rabbitmq"]["skipped_schema"] == 0
     assert not any("--schema-version 3" in w for w in result.summary["warnings"])
 
 
@@ -861,8 +861,8 @@ def test_summary_shape(tmp_path: Path) -> None:
                      "consumer.subscribe({ topic: 'k.in' })\n"
                      "ch.sendToQueue('q1', b)\nch.consume(build(), f)\nch.sendToQueue(dynamic, b)\n")})
     summary = scan_repository(root).summary
-    assert set(summary["messaging"]) == {"kafka", "amqp"}
-    amqp = summary["messaging"]["amqp"]
+    assert set(summary["messaging"]) == {"kafka", "rabbitmq"}
+    amqp = summary["messaging"]["rabbitmq"]
     assert set(amqp) == {
         "sites", "producer_sites", "consumer_sites", "matched_sites", "unmatched_sites",
         "unresolved", "skipped_no_owner", "skipped_schema", "unmatched_examples"}
@@ -882,7 +882,7 @@ def test_warnings_cover_every_broker(tmp_path: Path) -> None:
         **SCAFFOLD[".ts"],
         "svc/a.ts": "import 'amqplib'\nch.consume(build(), f)\nch.consume(other(), f)\n"})
     warnings = scan_repository(root).summary["warnings"]
-    assert any("found 2 amqp-like site(s) but extracted 0 destinations" in w for w in warnings)
+    assert any("found 2 rabbitmq-like site(s) but extracted 0 destinations" in w for w in warnings)
     root = _write(tmp_path / "r2", {
         "lib/a.ts": "import 'amqplib'\nch.consume('q', f)\n"})
     warnings = scan_repository(root, schema_version=2).summary["warnings"]
@@ -964,3 +964,136 @@ def test_env_and_call_parsers_are_linear() -> None:
     msg.call_args("a," * 50_000)
     msg.unquote("'" + "\\'" * 25_000)
     assert time.perf_counter() - started < 1.0
+
+
+# -- F: per-module gating, broker name, synthetic modules, shared predicates ----------------
+
+NODE_MODULE = {
+    "package.json": json.dumps({"name": "orders-svc", "dependencies": {
+        "kafkajs": "^2", "amqplib": "^0.10"}}),
+    "src/client.ts": (
+        "import { Kafka } from 'kafkajs'\nimport amqp from 'amqplib'\n"
+        "export const kafka = new Kafka({ brokers: [] })\n"),
+    "src/orders.ts": (  # never imports kafkajs / amqplib: the clients live in client.ts
+        "const ORDERS_TOPIC = 'orders.v1'\n"
+        "export class Orders {\n"
+        "  async emit(messages) { await this.producer.send({ topic: ORDERS_TOPIC, messages }) }\n"
+        "  async listen() { await consumer.subscribe({ topics: [\"payments.v1\"] }) }\n"
+        "  bill(buf) { channel.sendToQueue(Queues.BILLING, buf) }\n}\n"
+        "const Queues = { BILLING: 'billing' }\n"),
+}
+
+
+@pytest.mark.parametrize("manifest_only", [True, False], ids=["package-json", "source-mention"])
+def test_node_calls_without_import_use_module_context(tmp_path: Path, manifest_only: bool) -> None:
+    files = dict(NODE_MODULE)
+    if not manifest_only:  # no manifest dependency: another source file of the module names it
+        files["package.json"] = '{"name": "orders-svc"}'
+    else:  # the other file does not mention the brokers either
+        files["src/client.ts"] = "export const answer = 42\n"
+    manifest = scan_repository(_write(tmp_path / "repo", files)).manifest
+    assert _flows(manifest) == {
+        ("PRODUCES", "KafkaTopic:orders.v1"), ("CONSUMES", "KafkaTopic:payments.v1"),
+        ("PRODUCES", "Queue:rabbitmq:billing")}
+
+
+def test_python_calls_without_import_use_requirements_txt(tmp_path: Path) -> None:
+    manifest = scan_repository(_write(tmp_path / "py-svc", {
+        "requirements.txt": "# deps\nconfluent-kafka==2.3\npika>=1.3\n",
+        "app/jobs.py": (
+            "def run(self):\n"
+            "    self.producer.produce('py.orders', value=b'x')\n"
+            "    self.channel.basic_publish(exchange='py.ex', routing_key='k', body=b'x')\n"),
+    })).manifest
+    assert _flows(manifest) == {("PRODUCES", "KafkaTopic:py.orders"),
+                                   ("PRODUCES", "Exchange:rabbitmq:py.ex")}
+    assert _keys(manifest, "Module") == {"(root)"}
+
+
+def test_go_calls_without_import_use_go_mod(tmp_path: Path) -> None:
+    manifest = scan_repository(_write(tmp_path / "go-svc", {
+        "go.mod": ("module example.com/go-svc\n\nrequire (\n"
+                   "\tgithub.com/segmentio/kafka-go v0.4.47\n)\n"),
+        "internal/w.go": ('package internal\n\nvar w = Writer{Topic: "go.orders"}\n'
+                          'func f() { _ = ProducerMessage{Topic: "go.sarama"} }\n'
+                          'var r = kafka.ReaderConfig{Topic: "go.read"}\n'),
+    })).manifest
+    assert {("PRODUCES", "KafkaTopic:go.sarama"), ("CONSUMES", "KafkaTopic:go.read")} <= _flows(manifest)
+
+
+def test_module_without_the_dependency_ignores_generic_calls(tmp_path: Path) -> None:
+    manifest = scan_repository(_write(tmp_path / "repo", {
+        "kafka-mod/package.json": '{"name": "k", "dependencies": {"kafkajs": "1"}}',
+        "kafka-mod/src/a.ts": "producer.send({ topic: 'real.topic', messages })\n",
+        "other/package.json": '{"name": "other"}',
+        "other/src/b.ts": ("bus.producer.send({ topic: 'fake.topic', messages })\n"
+                           "channel.sendToQueue('fake.q', b)\nconsumer.subscribe({ topic: 'x' })\n"),
+    })).manifest
+    assert _flows(manifest) == {("PRODUCES", "KafkaTopic:real.topic")}
+
+
+def test_all_amqp_clients_share_the_rabbitmq_broker(tmp_path: Path) -> None:
+    manifest = scan_repository(_write(tmp_path / "repo", {
+        "node/package.json": '{"name": "n", "dependencies": {"amqplib": "1"}}',
+        "node/a.ts": "ch.sendToQueue('shared', b)\n",
+        "jvm/build.gradle": "plugins { id 'java' }\n",
+        "jvm/src/A.java": ('class A { void f() { rabbitTemplate.convertAndSend("shared", msg); } }\n'),
+    })).manifest
+    queues = {e.key for e in manifest.entities if e.type == "Queue"}
+    assert queues == {"rabbitmq:shared"}
+
+
+def test_python_only_repo_gets_a_synthetic_root_module(tmp_path: Path) -> None:
+    result = scan_repository(_write(tmp_path / "scripts-repo", {
+        "worker.py": "import kafka\nproducer.send('py.t', b'x')\n"}))
+    assert _keys(result.manifest, "Module") == {"(root)"}
+    assert _entity(result.manifest, "Module", "(root)").attributes["name"] == "scripts-repo"
+    assert ("PRODUCES", "KafkaTopic:py.t") in _flows(result.manifest)
+    assert result.summary["messaging"]["kafka"]["skipped_no_owner"] == 0
+
+
+def test_go_only_repo_without_go_mod_gets_a_synthetic_root_module(tmp_path: Path) -> None:
+    result = scan_repository(_write(tmp_path / "go-bare", {
+        "main.go": 'package main\n\nvar w = kafka.Writer{Topic: "go.t"}\n'}))
+    assert _keys(result.manifest, "Module") == {"(root)"}
+    assert ("PRODUCES", "KafkaTopic:go.t") in _flows(result.manifest)
+
+
+def test_requirements_txt_alone_forms_a_module(tmp_path: Path) -> None:
+    manifest = scan_repository(_write(tmp_path / "repo", {
+        "svc/requirements.txt": "boto3\n-r other.txt\n",
+        "svc/app.py": "sqs.send_message(QueueUrl='https://sqs.x.amazonaws.com/1/jobs', Body='x')\n",
+        "root.txt": "x",
+    })).manifest
+    assert _keys(manifest, "Module") == {"svc"}
+    assert ("PRODUCES", "Queue:sqs:jobs") in _flows(manifest)
+
+
+def test_unresolved_and_pattern_predicates() -> None:
+    assert msg.is_unresolved_key("unresolved:x") and msg.is_unresolved_key("rabbitmq:unresolved:q")
+    assert msg.is_pattern_key("pattern:orders.*") and msg.is_pattern_key("kafka:pattern:a")
+    assert not msg.is_unresolved_key("rabbitmq:my.unresolved:x") and not msg.is_pattern_key("sqs:jobs")
+
+
+def test_scan_defaults_to_one_shared_schema_version(tmp_path: Path, monkeypatch) -> None:
+    from ncp.ontology import scan as scan_module
+
+    assert scan_module.DEFAULT_SCAN_SCHEMA_VERSION == 3
+    seen: list[int] = []
+    real = scan_module.scan_repository
+
+    def spy(root, **kwargs):
+        seen.append(kwargs.get("schema_version"))
+        return real(root, **kwargs)
+
+    monkeypatch.setattr(scan_module, "scan_repository", spy)
+    root = _write(tmp_path / "repo", {"package.json": '{"name": "a"}', "a.ts": "x\n"})
+    expected = tmp_path / "expected.json"
+    expected.write_text(json.dumps({"entities": [], "relations": []}))
+    runner = CliRunner()
+    assert runner.invoke(main, ["ontology", "eval", str(expected), "--scan", str(root)]).exit_code == 0
+    assert runner.invoke(main, ["ontology", "scan", str(root)]).exit_code == 0
+    assert seen == [3, 3]
+    assert runner.invoke(main, ["ontology", "eval", str(expected), "--scan", str(root),
+                                "--schema-version", "2"]).exit_code == 0
+    assert seen[-1] == 2

@@ -234,6 +234,33 @@ class TestDemote:
         assert world.status(API_ORDERS) == "verified"
 
 
+class TestLimitAndGlobal:
+    def test_limit_warns_when_the_namespace_may_hold_more(self, world: World) -> None:
+        result = world.runner.invoke(main, [
+            "ontology", "promote", "--list", "--limit", "2",
+            "--pipeline-id", "shop", "--cwd", str(world.root)])
+        assert result.exit_code == 0, result.output
+        assert "warning: loaded 2 relation(s)" in result.output  # stderr is mixed in by default
+        quiet = world.cli("promote", "--list")
+        assert "warning: loaded" not in quiet.output
+
+    def test_demote_accepts_limit(self, world: World) -> None:
+        world.cli("promote", "--all")
+        result = world.cli("demote", "--match", "*", "--reason", "x", "--limit", "1")
+        assert "warning: loaded 1 relation(s)" in result.output and "demoted 1" in result.output
+
+    @pytest.mark.parametrize("command", ["promote", "demote"])
+    def test_global_namespace_needs_allow_global(self, world: World, command: str) -> None:
+        args = ["ontology", command, "--all" if command == "promote" else "--match", "*",
+                "--pipeline-id", "global", "--cwd", str(world.root)]
+        if command == "demote":
+            args += ["--reason", "x"]
+        refused = world.runner.invoke(main, args)
+        assert refused.exit_code == 2 and "--allow-global" in refused.output
+        allowed = world.runner.invoke(main, [*args, "--allow-global", "--allow-empty"])
+        assert allowed.exit_code == 0, allowed.output
+
+
 class TestSelectPromotions:
     @staticmethod
     def item(key: str, type_: str, dst: str, conf: float = 0.6,

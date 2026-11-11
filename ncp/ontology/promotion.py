@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import sys
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -28,6 +29,7 @@ from typing import TYPE_CHECKING
 from ncp.ontology.facade import OntologyError, _translate_errors
 from ncp.ontology.models import AuthContext, EvidenceRef, Relation, normalize_key
 from ncp.ontology.policy import PromotionConfig
+from ncp.ontology.scan_messaging import is_pattern_key, is_unresolved_key
 
 if TYPE_CHECKING:
     from ncp.ontology.facade import OntologyFacade
@@ -39,7 +41,6 @@ CLI_PRINCIPAL = "cli:promote"
 CHECKLIST_RE = re.compile(
     r"^\s*[-*]\s*\[[xX]\]\s*`([^`]+?) -([A-Z][A-Z0-9_]*)-> ([^`]+?)`", re.MULTILINE,
 )
-_PLACEHOLDER_RE = re.compile(r"(^|:)(unresolved|pattern):")
 
 
 @dataclass(frozen=True)
@@ -78,7 +79,7 @@ class PromotionPlan:
 
 def is_unresolved(dst: str) -> bool:
     """Whether ``dst`` (``Type:key`` or a bare key) is a scanner placeholder."""
-    return _PLACEHOLDER_RE.search(dst) is not None
+    return is_unresolved_key(dst) or is_pattern_key(dst)
 
 
 def split_ref(ref: str) -> tuple[str | None, str]:
@@ -259,6 +260,9 @@ def load_relations(facade: OntologyFacade, auth: AuthContext, *, limit: int = 10
     store = facade._require_enabled()
     with _translate_errors():
         relations = store.list_relations(auth=auth, limit=limit)  # type: ignore[attr-defined]
+        if len(relations) >= limit:
+            print(f"warning: loaded {limit} relation(s), the --limit; the namespace may hold "
+                  "more (raise --limit to see them all).", file=sys.stderr)
         names = store.get_entities(  # type: ignore[attr-defined]
             [r.src_entity_id for r in relations] + [r.dst_entity_id for r in relations],
             auth=auth,

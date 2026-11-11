@@ -155,6 +155,10 @@ class SchemaRegistry:
                 )
             for field_name in ("from", "to"):
                 extra = spec.get(field_name) or []
+                if not isinstance(extra, list) or not all(isinstance(v, str) for v in extra):
+                    raise PackError(
+                        f"relation type {name!r}: {field_name!r} must be a list of entity type names"
+                    )
                 current[field_name] = [*current[field_name],
                                        *(v for v in extra if v not in current[field_name])]
         merged["version"] = raw.get("version")

@@ -174,3 +174,14 @@ class TestEvalCli:
         golden.write_text(json.dumps(EXPECTED))
         result = CliRunner().invoke(main, ["ontology", "eval", str(golden)])
         assert result.exit_code != 0
+
+
+def test_unresolved_queue_keys_are_skipped_at_entity_level() -> None:
+    expected = _manifest([("Service", "svc")], [])
+    actual = _manifest(
+        [("Service", "svc"), ("Queue", "rabbitmq:unresolved:queueName"),
+         ("Exchange", "sqs:unresolved:env:TOPIC"), ("Queue", "rabbitmq:jobs")],
+        [],
+    )
+    report = evaluate(expected, actual)
+    assert report.unexpected_entities == ["Queue:rabbitmq:jobs"]

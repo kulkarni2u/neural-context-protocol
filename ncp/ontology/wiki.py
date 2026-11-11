@@ -19,6 +19,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ncp.ontology.scan_messaging import is_pattern_key, is_unresolved_key
+
 PRODUCES = "PRODUCES"
 CONSUMES = "CONSUMES"
 MESSAGING = (PRODUCES, CONSUMES)
@@ -156,14 +158,14 @@ def _attrs(model: Model, ref: Ref) -> Mapping[str, Any]:
 def _is_unresolved(model: Model, ref: Ref) -> bool:
     attrs = _attrs(model, ref)
     return (
-        ref[1].startswith("unresolved:") or _truthy(attrs.get("unresolved"))
+        is_unresolved_key(ref[1]) or _truthy(attrs.get("unresolved"))
         or any(_truthy(r.attributes.get("unresolved")) for r in model.by_dst.get(ref, ()))
     )
 
 
 def _is_pattern(model: Model, ref: Ref) -> bool:
     attrs = _attrs(model, ref)
-    return ref[1].startswith("pattern:") or _truthy(attrs.get("pattern"))
+    return is_pattern_key(ref[1]) or _truthy(attrs.get("pattern"))
 
 
 def _pattern_text(model: Model, ref: Ref) -> str:
@@ -172,8 +174,9 @@ def _pattern_text(model: Model, ref: Ref) -> str:
     if raw:
         return str(raw)
     name = str(attrs.get("name") or ref[1])
-    if name.startswith("pattern:"):
-        name = name[len("pattern:"):]
+    marked = _PATTERN_MARK.search(name)
+    if marked:
+        return name[marked.end():]  # ``pattern:x`` / ``<broker>:pattern:x``
     if ":" in name and ref[1].count(":") >= 2:
         name = name.split(":", 1)[1]
     return name
@@ -193,13 +196,79 @@ def _display_name(model: Model, ref: Ref) -> str:
     return str(attrs.get("name") or ref[1])
 
 
+_PATTERN_MARK = re.compile(r"(?:^|:)pattern:")
+MAX_PATTERN_LENGTH = 200
+_MAX_NAME_LENGTH = 500
+_SAFE_REGEX_LITERAL = re.compile(r"[A-Za-z0-9_\-/]")
+
+
+def _regex_tokens(pattern: str) -> list[str] | None:
+    """Tokens of a repo-supplied topic regex limited to literals, ``\\.``, ``.``, ``.*`` and
+    ``.+`` (optionally anchored with ``^`` / ``$``): ``"."`` any char, ``"*"`` any run, any other
+    token a literal. None for anything richer. The regex is never compiled."""
+    text = pattern[1:] if pattern.startswith("^") else pattern
+    text = text[:-1] if text.endswith("$") and not text.endswith("\\$") else text
+    tokens: list[str] = []
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char == "\\" and text[index + 1:index + 2] == ".":
+            tokens.append("\\.")
+            index += 2
+        elif char == ".":
+            follow = text[index + 1:index + 2]
+            if follow == "*":
+                tokens.append("*")
+                index += 2
+            elif follow == "+":
+                tokens += [".", "*"]
+                index += 2
+            else:
+                tokens.append(".")
+                index += 1
+        elif _SAFE_REGEX_LITERAL.fullmatch(char):
+            tokens.append(char)
+            index += 1
+        else:
+            return None
+    return tokens
+
+
+def _glob_tokens_match(tokens: list[str], name: str) -> bool:
+    """Wildcard match in O(len(tokens) * len(name)): no backtracking."""
+    reachable = [True] + [False] * len(name)
+    for token in tokens:
+        following = [False] * (len(name) + 1)
+        if token == "*":
+            seen = False
+            for i in range(len(name) + 1):
+                seen = seen or reachable[i]
+                following[i] = seen
+        else:
+            literal = "." if token == "\\." else token
+            for i, char in enumerate(name):
+                if reachable[i] and (token == "." or char == literal):
+                    following[i + 1] = True
+        reachable = following
+    return reachable[-1]
+
+
+def _pattern_supported(pattern: str) -> bool:
+    """Whether :func:`_pattern_matches` can evaluate ``pattern`` (glob, or a simple regex)."""
+    return len(pattern) <= MAX_PATTERN_LENGTH and (
+        _regex_tokens(pattern) is not None or not any(c in pattern for c in "()|+{}\\"))
+
+
 def _pattern_matches(pattern: str, name: str) -> bool:
+    """Best-effort: ``fnmatch`` globs and simple regexes (literals, ``\\.``, ``.``, ``.*``,
+    ``.+``). Repo-supplied regexes are never compiled (ReDoS); anything richer, or longer than
+    :data:`MAX_PATTERN_LENGTH`, does not match."""
+    if len(pattern) > MAX_PATTERN_LENGTH or len(name) > _MAX_NAME_LENGTH:
+        return False
     if fnmatch.fnmatchcase(name, pattern):
         return True
-    try:
-        return re.fullmatch(pattern, name) is not None
-    except re.error:
-        return False
+    tokens = _regex_tokens(pattern)
+    return tokens is not None and _glob_tokens_match(tokens, name)
 
 
 @dataclass
@@ -406,7 +475,9 @@ def _destination_page(ctx: _Ctx, info: DestInfo, page: str) -> str:
         out += ["", "Consumers listed with `via pattern` subscribe through a `pattern:` destination "
                     "that matches this name (best-effort fnmatch/regex)."]
     if _is_pattern(model, ref):
-        out += ["", f"Pattern: `{_inline(_pattern_text(model, ref))}`"]
+        text = _pattern_text(model, ref)
+        out += ["", f"Pattern: `{_inline(text)}`"
+                + ("" if _pattern_supported(text) else " (pattern not evaluated)")]
         matches = sorted(d for d in model.destinations
                          if d != ref and not _is_pattern(model, d) and d[0] == ref[0]
                          and _pattern_matches(_pattern_text(model, ref), _display_name(model, d)))

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -55,6 +56,29 @@ def test_extends_merges_base_and_new_types(tmp_path: Path) -> None:
     assert produces.intents == base.relation_types["PRODUCES"].intents
     # the base is untouched
     assert "Queue" not in base.entity_types
+
+
+def test_extension_of_infrastructure_v3_keeps_queue_and_exchange(tmp_path: Path) -> None:
+    example = REPO / "examples" / "13_ontology" / "packs" / "infrastructure.cache.v9.json"
+    docs = (REPO / "docs" / "NCP_ONTOLOGY.md").read_text(encoding="utf-8")
+    snippet = re.search(r'```json\n(\{"id": "infrastructure", "version": 9,.*?\})\n```', docs, re.S)
+    assert snippet is not None
+    docs_path = _write(tmp_path / "docs_ext.json", json.loads(snippet.group(1)))
+    for path in (example, docs_path):
+        registry = SchemaRegistry.builtin([path])
+        merged = next(p for p in registry.packs() if (p.id, p.version) == ("infrastructure", 9))
+        base = next(p for p in registry.packs() if (p.id, p.version) == ("infrastructure", 3))
+        assert {"Queue", "Exchange", "Cache"} <= set(merged.entity_types)
+        assert "ROUTES_TO" in merged.relation_types and "READS" in merged.relation_types
+        assert "Cache" not in base.entity_types
+
+
+def test_extension_endpoints_must_be_lists_of_strings(tmp_path: Path) -> None:
+    for bad in ("Queue", ["Queue", 3], {"a": 1}):
+        ext = {**EXTENSION, "relation_types": {"PRODUCES": {"from": bad}}}
+        path = _write(tmp_path / "bad.json", ext)
+        with pytest.raises(PackError, match="list of entity type names"):
+            SchemaRegistry.builtin([path])
 
 
 def test_endpoint_validation_error_names_file(tmp_path: Path) -> None:
@@ -136,6 +160,13 @@ def test_config_pack_paths_from_env(tmp_path: Path) -> None:
     root = _project(tmp_path, "[ontology]\nenabled = true\n")
     config = load_config(cwd=root, env={"NCP_ONTOLOGY_PACK_PATHS": "a.json:/abs/b.json"})
     assert config.ontology.pack_paths == (str(root / "a.json"), "/abs/b.json")
+
+
+def test_config_pack_paths_from_env_resolve_against_project_root(tmp_path: Path) -> None:
+    root = _project(tmp_path, "[ontology]\nenabled = true\n")
+    (root / "sub").mkdir()
+    config = load_config(cwd=root / "sub", env={"NCP_ONTOLOGY_PACK_PATHS": "packs/x.json"})
+    assert config.ontology.pack_paths == (str(root / "packs" / "x.json"),)
 
 
 def test_custom_pack_must_be_listed_in_packs(tmp_path: Path) -> None:

@@ -3291,11 +3291,29 @@ def ontology_seed_command(
         )
 
 
-def _ontology_session(cwd: Path | None, pipeline_id: str):  # type: ignore[no-untyped-def]
-    """Config, enabled facade and local-operator auth (read/write/verify) for promote/demote."""
+def _scan_schema_default() -> str:
+    """The scanner's default schema version (imported lazily: ``ncp.ontology.scan`` is heavy)."""
+    from ncp.ontology.scan import DEFAULT_SCAN_SCHEMA_VERSION
+
+    return str(DEFAULT_SCAN_SCHEMA_VERSION)
+
+
+def _ontology_session(  # type: ignore[no-untyped-def]
+    cwd: Path | None, pipeline_id: str, allow_global: bool = False,
+):
+    """Config, enabled facade and local-operator auth (read/write/verify) for promote/demote.
+
+    The ``global`` namespace carries admin rights, so it needs an explicit ``--allow-global``."""
     from ncp.config import load_config
     from ncp.ontology.facade import OntologyError, OntologyFacade
+    from ncp.ontology.models import GLOBAL_NAMESPACE
     from ncp.ontology.promotion import cli_auth
+
+    if pipeline_id.strip().lower() == GLOBAL_NAMESPACE and not allow_global:
+        raise click.UsageError(
+            "the 'global' namespace is shared and acts with admin rights; "
+            "pass --allow-global to confirm."
+        )
 
     config = load_config(cwd=cwd or Path.cwd())
     store = _resolve_runtime_store(config)
@@ -3354,6 +3372,9 @@ def _select_by_ref(stored, ids, match, types):  # type: ignore[no-untyped-def]
 @ontology_group.command("promote")
 @click.argument("relation_ids", nargs=-1)
 @click.option("--pipeline-id", required=True, help="Namespace whose relations to promote.")
+@click.option("--allow-global", is_flag=True, help="Required to act on the shared 'global' namespace.")
+@click.option("--limit", type=click.IntRange(1), default=10_000, show_default=True,
+              help="Maximum relations loaded from the namespace (a warning is printed when hit).")
 @click.option("--cwd", default=None, type=click.Path(exists=True, file_okay=False, path_type=Path))
 @click.option("--list", "list_only", is_flag=True, help="List candidate relations (after any selectors) and exit.")
 @click.option("--match", default=None, help="Glob (fnmatch) on '<src> -<TYPE>-> <dst>', e.g. 'Service:order-* -PRODUCES-> *'.")
@@ -3370,7 +3391,8 @@ def _select_by_ref(stored, ids, match, types):  # type: ignore[no-untyped-def]
 @click.option("--allow-empty", is_flag=True, help="Exit 0 even when nothing matched.")
 @click.option("--json", "--json-output", "json_output", is_flag=True, help="Emit JSON.")
 def ontology_promote_command(
-    relation_ids: tuple[str, ...], pipeline_id: str, cwd: Path | None, list_only: bool,
+    relation_ids: tuple[str, ...], pipeline_id: str, allow_global: bool, limit: int,
+    cwd: Path | None, list_only: bool,
     match: str | None, types: tuple[str, ...], min_confidence: float | None, select_all: bool,
     from_checklist: Path | None, auto_rules: bool, include_unresolved: bool, dry_run: bool,
     allow_empty: bool, json_output: bool,
@@ -3403,10 +3425,10 @@ def ontology_promote_command(
             "nothing selected: pass relation ids, --match, --type, --min-confidence, "
             "--from-checklist, --auto or --all (or --list to review)."
         )
-    config, facade, auth = _ontology_session(cwd, pipeline_id)
+    config, facade, auth = _ontology_session(cwd, pipeline_id, allow_global)
     rules = config.ontology.promotion
     try:
-        everything = load_relations(facade, auth)
+        everything = load_relations(facade, auth, limit=limit)
     except OntologyError as exc:
         raise click.ClickException(f"[{exc.code}] {exc.message}") from exc
     candidates = [s for s in everything if s.item.status == "candidate"]
@@ -3491,6 +3513,9 @@ def ontology_promote_command(
 @ontology_group.command("demote")
 @click.argument("relation_ids", nargs=-1)
 @click.option("--pipeline-id", required=True, help="Namespace whose relations to demote.")
+@click.option("--allow-global", is_flag=True, help="Required to act on the shared 'global' namespace.")
+@click.option("--limit", type=click.IntRange(1), default=10_000, show_default=True,
+              help="Maximum relations loaded from the namespace (a warning is printed when hit).")
 @click.option("--cwd", default=None, type=click.Path(exists=True, file_okay=False, path_type=Path))
 @click.option("--match", default=None, help="Glob (fnmatch) on '<src> -<TYPE>-> <dst>'.")
 @click.option("--type", "types", multiple=True, help="Relation type to include (repeatable).")
@@ -3499,7 +3524,8 @@ def ontology_promote_command(
 @click.option("--allow-empty", is_flag=True, help="Exit 0 even when nothing matched.")
 @click.option("--json", "--json-output", "json_output", is_flag=True, help="Emit JSON.")
 def ontology_demote_command(
-    relation_ids: tuple[str, ...], pipeline_id: str, cwd: Path | None, match: str | None,
+    relation_ids: tuple[str, ...], pipeline_id: str, allow_global: bool, limit: int,
+    cwd: Path | None, match: str | None,
     types: tuple[str, ...], reason: str, dry_run: bool, allow_empty: bool, json_output: bool,
 ) -> None:
     """Turn verified relations back into candidates (they leave context).
@@ -3516,9 +3542,9 @@ def ontology_demote_command(
         raise click.UsageError("nothing selected: pass relation ids, --match or --type.")
     if not reason.strip():
         raise click.UsageError("--reason must not be empty.")
-    _config, facade, auth = _ontology_session(cwd, pipeline_id)
+    _config, facade, auth = _ontology_session(cwd, pipeline_id, allow_global)
     try:
-        verified = [s for s in load_relations(facade, auth) if s.item.status == "verified"]
+        verified = [s for s in load_relations(facade, auth, limit=limit) if s.item.status == "verified"]
     except OntologyError as exc:
         raise click.ClickException(f"[{exc.code}] {exc.message}") from exc
     selected, missing = _select_by_ref(verified, relation_ids, match, types)
@@ -3559,7 +3585,7 @@ def ontology_demote_command(
 @click.option("--environment", default="prod", show_default=True, help="'environment' attribute for detected services.")
 @click.option("--kafka-cluster", default="main", show_default=True, help="'cluster' attribute for detected Kafka topics.")
 @click.option(
-    "--schema-version", type=click.Choice(["1", "2", "3"]), default="3", show_default=True,
+    "--schema-version", type=click.Choice(["1", "2", "3"]), default=_scan_schema_default,
     help="3 adds Queue / Exchange nodes (SQS, SNS, RabbitMQ, JMS; infrastructure v3); 2 emits "
          "Repo/Module nodes (infrastructure v2) and Kafka topics only; 1 emits services, "
          "topics and teams only.",
@@ -3689,7 +3715,7 @@ def ontology_scan_command(
             f"{attribution['edges_from_module']} module(s)", markup=False, highlight=False)  # type: ignore[index]
     if summary["schema_version"] >= 2:  # type: ignore[operator]
         click.echo(
-            f"note: schema v{summary['schema_version']} (Repo/Module) — the manifest pins "
+            f"note: schema v{summary['schema_version']} (Repo/Module/Queue/Exchange) — the manifest pins "
             f"schema_version = {summary['schema_version']}; seed it into a namespace that is "
             "not already on an older version (pin [ontology] pack_versions = "
             f"{{ infrastructure = {summary['schema_version']} }}).", err=True,
@@ -3845,7 +3871,8 @@ def ontology_pack_show_command(pack_id: str, version: int | None, cwd: Path | No
 @click.option("--scan", "scan_root", default=None,
               type=click.Path(exists=True, file_okay=False, path_type=Path),
               help="Scan this directory and score the result.")
-@click.option("--schema-version", type=int, default=2, show_default=True, help="With --scan.")
+@click.option("--schema-version", type=click.Choice(["1", "2", "3"]), default=_scan_schema_default,
+              help="With --scan (default: the same as `ncp ontology scan`, 3).")
 @click.option("--include-tests", is_flag=True, help="With --scan: also read test files.")
 @click.option("--repo-name", default=None, help="With --scan: Repo entity name.")
 @click.option("--json", "--json-output", "json_output", is_flag=True, help="Emit the report as JSON.")
@@ -3858,7 +3885,7 @@ def ontology_eval_command(
     expected: Path,
     actual: Path | None,
     scan_root: Path | None,
-    schema_version: int,
+    schema_version: str,
     include_tests: bool,
     repo_name: str | None,
     json_output: bool,
@@ -3883,7 +3910,7 @@ def ontology_eval_command(
     try:
         if scan_root is not None:
             actual_manifest = scan_repository(
-                scan_root, repo_name=repo_name, schema_version=schema_version,
+                scan_root, repo_name=repo_name, schema_version=int(schema_version),
                 include_tests=include_tests,
             ).manifest
             actual_raw: object = actual_manifest

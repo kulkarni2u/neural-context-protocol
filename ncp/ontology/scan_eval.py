@@ -25,6 +25,7 @@ from pathlib import Path
 
 from ncp.ontology.facade import OntologyError
 from ncp.ontology.models import Entity
+from ncp.ontology.scan_messaging import is_unresolved_key
 from ncp.ontology.seed import SeedManifest, SeedRelation, _split_ref, parse_manifest
 
 UNRESOLVED_PREFIX = "unresolved:"
@@ -209,7 +210,7 @@ def evaluate(
     act_to_exp: dict[int, int] = {}
     exp_matched: set[int] = set()
     for a, (atype, akey, anames) in enumerate(act_idx.entities):
-        if akey.startswith(UNRESOLVED_PREFIX):
+        if is_unresolved_key(akey):
             continue
         for e, (etype, ekey, enames) in enumerate(exp_idx.entities):
             if etype == atype and e not in exp_matched and anames & enames:
@@ -231,7 +232,7 @@ def evaluate(
             bump(report.entities_by_type, report.entities, etype, "fn")
             report.missing_entities.append(f"{etype}:{ekey}")
     for a, (atype, akey, _names) in enumerate(act_idx.entities):
-        if not entity_ok(atype) or a in act_to_exp or akey.startswith(UNRESOLVED_PREFIX):
+        if not entity_ok(atype) or a in act_to_exp or is_unresolved_key(akey):
             continue
         bump(report.entities_by_type, report.entities, atype, "fp")
         report.unexpected_entities.append(f"{atype}:{akey}")
@@ -247,7 +248,7 @@ def evaluate(
         return ("raw", etype, key), f"{etype}:{key}" if etype else key, etype
 
     def is_unresolved(label: str) -> bool:
-        return UNRESOLVED_PREFIX in label
+        return is_unresolved_key(label) or UNRESOLVED_PREFIX in label
 
     expected_rels: dict[tuple[object, str, object], tuple[SeedRelation, str]] = {}
     for rel in expected.relations:

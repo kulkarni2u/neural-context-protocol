@@ -241,3 +241,47 @@ def test_scan_summary_out(tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
     assert "kafka" in json.loads(summary.read_text())
     assert "kafka" not in json.loads(out.read_text())
+
+
+def test_pattern_matching_is_safe_and_simple_regexes_match() -> None:
+    import time
+
+    from ncp.ontology.wiki import _pattern_matches
+
+    start = time.perf_counter()
+    assert _pattern_matches("(a+)+$", "a" * 40 + "!") is False  # never compiled: no ReDoS
+    assert _pattern_matches("^(a|aa)+$", "a" * 60 + "b") is False
+    assert _pattern_matches("a" * 201, "a" * 201) is False  # over the length cap
+    assert time.perf_counter() - start < 0.5
+    assert _pattern_matches(r"orders\..*", "orders.v1")
+    assert not _pattern_matches(r"orders\..*", "orders")
+    assert _pattern_matches(r"^orders\.v.$", "orders.v1") and not _pattern_matches(r"orders\.v.", "orders.v12")
+    assert _pattern_matches(r"pay.+", "payments") and not _pattern_matches(r"pay.+", "pay")
+    assert _pattern_matches("orders.*", "orders.v1")  # glob form
+
+
+def _pattern_world(pattern: str) -> dict:
+    return {
+        "entities": [
+            {"type": "Service", "key": "svc"},
+            {"type": "KafkaTopic", "key": f"pattern:{pattern}",
+             "attributes": {"name": f"pattern:{pattern}", "pattern": True}},
+            {"type": "KafkaTopic", "key": "orders.v1", "attributes": {"name": "orders.v1"}},
+        ],
+        "relations": [
+            {"src": "Service:svc", "type": "CONSUMES", "dst": f"KafkaTopic:pattern:{pattern}"},
+            {"src": "Service:svc", "type": "PRODUCES", "dst": "KafkaTopic:orders.v1"},
+        ],
+    }
+
+
+def test_unsupported_pattern_is_rendered_as_not_evaluated() -> None:
+    pages = build_wiki(_pattern_world("(a+)+$"))
+    page = next(t for p, t in pages.items() if p.startswith("destinations/") and "Pattern:" in t)
+    assert "pattern not evaluated" in page and "orders.v1" not in page.split("Pattern:")[1]
+
+
+def test_simple_regex_pattern_page_lists_matching_destinations() -> None:
+    pages = build_wiki(_pattern_world("orders\\..*"))
+    page = next(t for p, t in pages.items() if p.startswith("destinations/") and "Pattern:" in t)
+    assert "pattern not evaluated" not in page and "orders.v1" in page.split("Matching destinations")[1]

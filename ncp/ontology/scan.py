@@ -52,7 +52,7 @@ import subprocess
 import tomllib
 import xml.etree.ElementTree as ET
 from bisect import bisect_right
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Collection, Iterable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Literal
@@ -84,6 +84,7 @@ CODEOWNERS_PATHS = ("CODEOWNERS", ".github/CODEOWNERS", "docs/CODEOWNERS", ".git
 SOURCE_SUFFIXES = frozenset({".java", ".kt", ".scala", ".py", ".js", ".mjs", ".cjs", ".ts",
                              ".tsx", ".jsx", ".mts", ".cts", ".go", ".properties", ".yml",
                              ".yaml"})
+DEFAULT_SCAN_SCHEMA_VERSION = 3  # scan, ``ncp ontology scan`` and ``ncp ontology eval --scan``
 HEURISTIC_CONFIDENCE = 0.6
 UNRESOLVED_CONFIDENCE = 0.4
 STRUCTURAL_CONFIDENCE = 0.95
@@ -105,6 +106,7 @@ class _Module:
     aggregator: bool = False  # ... and only lists workspaces: not a module
     fallback: str = ""  # display name when no package identity exists
     evidence: str | None = None  # file cited for a module without a build file
+    manifest_words: set[str] = field(default_factory=set)  # messaging words in build manifests
 
     @property
     def key(self) -> str:
@@ -247,6 +249,24 @@ def _parse_pyproject(text: str, rel: str, module: _Module) -> None:
         module.deps.append(("python", _pep503(dep), rel, _line_of(text, dep)))
     if project.get("scripts") or poetry.get("scripts"):
         module.markers.append(("python_scripts", rel, _line_of(text, "scripts")))
+
+
+_REQUIREMENTS_FILE = re.compile(r"requirements(?:[-_.][\w.-]{1,60})?\.txt")
+_REQUIREMENT_NAME = re.compile(r"\s*([A-Za-z0-9][A-Za-z0-9._-]*)")
+
+
+def _parse_requirements(text: str, rel: str, module: _Module) -> None:
+    """``requirements*.txt``: one dependency per line (options, includes and comments skipped).
+    A requirements file alone makes a module (named after its directory)."""
+    for number, raw in enumerate(text.split("\n"), 1):
+        line = raw.split("#", 1)[0].strip()
+        if not line or line.startswith(("-", "git+", "http")):
+            continue
+        found = _REQUIREMENT_NAME.match(line)
+        if found:
+            module.deps.append(("python", _pep503(found.group(1)), rel, number))
+    if "python" not in module.names:
+        module.anonymous = True
 
 
 def _parse_go_mod(text: str, rel: str, module: _Module) -> None:
@@ -1530,6 +1550,7 @@ def _site_result(rule_broker: str, rule_entity: str, line: int, direction: str,
 
 def _file_results(
     rel: str, text: str, lowered: str, module: str, resolver: _Resolver,
+    context: Collection[str] = (),
 ) -> tuple[list[_Hit], list[_Res]]:
     """Every messaging hit of one file and one :class:`_Res` per call site."""
     suffix = PurePosixPath(rel).suffix
@@ -1547,7 +1568,7 @@ def _file_results(
         for number, jvm_site_hits, direction in jvm_sites:
             results.append(_site_result("kafka", "KafkaTopic", number, direction, jvm_site_hits))
             accounted.add(number)
-    for site in _msg.find_sites(suffix, text, lowered):
+    for site in _msg.find_sites(suffix, text, lowered, context):
         accounted.add(site.line)
         rule = site.rule
         site_hits: list[_Hit] = []
@@ -1683,7 +1704,7 @@ def scan_repository(
     repo_name: str | None = None,
     environment: str = "prod",
     kafka_cluster: str = "main",
-    schema_version: int = 3,
+    schema_version: int = DEFAULT_SCAN_SCHEMA_VERSION,
     heuristics: HeuristicMode = "candidate",
     include_tests: bool = False,
 ) -> ScanResult:
@@ -1710,7 +1731,8 @@ def scan_repository(
         name = PurePosixPath(rel).name
         directory = _dir(rel)
         is_gradle = name in ("build.gradle", "build.gradle.kts")
-        if name not in parsers and not is_gradle:
+        is_requirements = _REQUIREMENTS_FILE.fullmatch(name) is not None
+        if name not in parsers and not is_gradle and not is_requirements:
             continue
         text = _read(base, rel)
         if text is None:
@@ -1727,6 +1749,9 @@ def scan_repository(
                 ):
                     continue
                 _parse_gradle(text, rel, module, _gradle_path(directory, gradle_roots))
+                module.manifest_words |= _msg.context_words(text.lower())
+            elif is_requirements:
+                _parse_requirements(text, rel, module)
             else:
                 parsers[name](text, rel, module)
         except (ValueError, ET.ParseError, tomllib.TOMLDecodeError) as exc:
@@ -1735,9 +1760,11 @@ def scan_repository(
         if module.names or (module.anonymous and not module.aggregator):
             module.build_files.append(rel)
             modules[directory] = module
-    # A JS/TS tree with no build file above some source: one synthetic module named after the repo.
+    # A JS/TS, Python or Go tree with no build file above some source: one synthetic module
+    # named after the repo.
     if "." not in modules:
-        orphan = next((rel for rel in files if PurePosixPath(rel).suffix in _msg.JS
+        orphan = next((rel for rel in files
+                       if PurePosixPath(rel).suffix in _msg.JS + _msg.PY + _msg.GO
                        and not _is_test_path(rel) and _owning_module(rel, modules) is None), None)
         if orphan is not None:
             modules["."] = _Module(path=".", fallback=repo, evidence=orphan)
@@ -1943,6 +1970,13 @@ def scan_repository(
         beans: dict[str, tuple[str, dict[str, str]]] = {}
         default_topics: dict[str, tuple[str, str, dict[str, str]]] = {}
         cache: dict[str, str] = {}
+        # Per module: the broker words its manifests and source files mention. A call such as
+        # ``producer.send({ topic })`` often sits in a file that never imports the client.
+        module_words: dict[str, set[str]] = {}
+        for module in modules.values():
+            words = module_words.setdefault(module.path, set(module.manifest_words))
+            for _eco, dep_name, _file, _line_no in module.deps:
+                words |= _msg.context_words(dep_name.lower())
         for rel in files:
             suffix = PurePosixPath(rel).suffix
             if suffix not in SOURCE_SUFFIXES or (not include_tests and _is_test_path(rel)):
@@ -1976,7 +2010,11 @@ def scan_repository(
             else:
                 for const_owner, name, value, env in _msg.extract_constants(text, suffix):
                     consts.add(const_owner, name, value, rel, module_path, env)
-            if _msg.mentions_messaging(text) is not None:
+            lowered_text = text.lower()
+            if home is not None:
+                module_words.setdefault(home.path, set()).update(
+                    _msg.context_words(lowered_text))
+            if _msg.mentions_messaging(lowered_text) is not None:
                 cache[rel] = text
         resolver = _Resolver(props, consts)
         resolver.beans = beans
@@ -1985,7 +2023,8 @@ def scan_repository(
             home = _owning_module(rel, modules)
             sources = sources_for(home) if home is not None else []
             hits, results = _file_results(rel, text, text.lower(), home.path if home else "",
-                                          resolver)
+                                          resolver, module_words.get(home.path, set()) if home
+                                          else set())
             lines = text.split("\n")
             kafka_skipped = False
             for res in sorted(results, key=lambda item: item.line):

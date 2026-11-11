@@ -4,6 +4,96 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [Unreleased]
 
+## [1.10.0] - 2026-11-11
+
+### Release scope
+
+Turns `ncp ontology scan` from a Spring/Kafka reader into a language-agnostic
+messaging scanner (Kafka, SQS, SNS, RabbitMQ, JMS in JS/TS, Python, Go and
+JVM), attributes edges to the deployable service, and adds the review loop
+around it: a wiki of the scan, promotion of reviewed candidates, custom schema
+packs and an accuracy eval.
+
+### Upgrade notes
+
+- **`ncp ontology scan` now defaults to `--schema-version 3`** (Queue,
+  Exchange, `ROUTES_TO`). Pin `[ontology] pack_versions = { infrastructure = 3 }`
+  for the namespace you seed into, or pass `--schema-version 2` to keep the
+  old output (Queue / Exchange sites are then counted as `skipped_schema`).
+  `ncp ontology eval --scan` uses the same default (it was 2).
+- **Dockerfile-only services now take `spring.application.name`** instead of
+  the directory name. Re-seeding can leave the old directory-named `Service`
+  behind, so seed with `ncp ontology seed --prune`.
+- RabbitMQ destinations of every AMQP 0-9-1 client (amqplib, pika, amqp091,
+  Spring AMQP) are keyed `Queue:rabbitmq:<name>` / `Exchange:rabbitmq:<name>`;
+  the `amqp` broker key and `summary["messaging"]["amqp"]` are gone.
+- `ncp ontology promote` / `demote` refuse `--pipeline-id global` unless
+  `--allow-global` is passed.
+
+### Added
+
+- **Kafka producer coverage** on the JVM: `<kafka|producer|template|sender>.send` /
+  `sendDefault` / `produce`, `ProducerRecord`, reactor `SenderRecord`,
+  `@SendTo`, `streamBridge.send`, with the destination resolved like consumers.
+- **SpEL resolution** (bounded evaluator, no `eval`): `#{'${a.b}'}`,
+  `.split(',')`, `+` concatenation, `T(pkg.Class).CONST`,
+  `environment['x']` / `getProperty(..)`, `systemProperties[..]`,
+  `@bean.field` / `@bean.getX()` / `__listener.topic`.
+- **Service attribution**: deployable detection (Spring Boot / `application`
+  plugin, `@SpringBootApplication`, `main`, `package.json` `start` / `bin`,
+  Go `package main`, Python scripts, `Procfile`); edges start at the service,
+  else at every depending service with relation attribute `via_module`, else
+  at the `Module`.
+- **SQS, SNS, RabbitMQ and JMS** scanning and **schema pack `infrastructure`
+  v3** (`Queue`, `Exchange`, `ROUTES_TO`; SNS topics are `Exchange` nodes).
+- **Language-agnostic rule table** (`ncp/ontology/scan_messaging.py`) for
+  JS/TS, Python, Go and JVM; a generic constant index (JS/TS objects and enums,
+  Python module / class constants, Go `const` blocks); environment defaults
+  (`process.env.X ?? "d"`, `os.getenv("X", "d")`); and **per-module
+  gating**: a client rule applies when the owning module's files or build
+  manifest dependencies (`package.json`, `pyproject.toml`, `requirements*.txt`,
+  `go.mod`, Gradle / Maven) mention the client, so `producer.send({ topic })`
+  in a file that never imports `kafkajs` is still found.
+- **Node, Python and Go repos with no build file** get a synthetic root module
+  named after the repo; a `package.json` without `name` and a lone
+  `requirements.txt` form modules.
+- **`ncp ontology promote` / `demote`** (selectors, `--from-checklist`,
+  `--auto`, `--dry-run`, `--limit`) and **`[ontology.promotion]`**
+  auto-promotion at `seed` (`--auto-promote` / `--no-auto-promote`).
+- **`ncp ontology wiki`**: per-service, per-module and per-destination pages
+  with a producers-vs-consumers table, a messaging matrix, coverage, a
+  `candidates.md` checklist and `--compare` against an earlier scan; scan
+  `--summary-out` writes the summary JSON the wiki reads.
+- **Custom schema packs**: `[ontology] pack_paths`, `extends`, env
+  `NCP_ONTOLOGY_PACK_PATHS`, and `ncp ontology pack list|validate|show`.
+- **`ncp ontology eval`**: precision / recall / F1 of a scan against a golden
+  manifest, with CI thresholds.
+- Store `list_relations` (used by promote / demote).
+- Scan summary keys `messaging` (per broker), `attribution` and
+  `destinations`.
+
+### Changed
+
+- Scan defaults to schema 3 (one shared `DEFAULT_SCAN_SCHEMA_VERSION` used by
+  scan and eval).
+- One shared `is_unresolved_key` / `is_pattern_key` predicate (matching
+  `<broker>:unresolved:` / `<broker>:pattern:` keys) in the eval, wiki and
+  promotion code.
+
+### Fixed
+
+- Node, Python and Go services whose producer / channel calls live in files
+  that never import the client no longer produce nothing.
+- The wiki no longer compiles repo-supplied topic regexes (a pattern such as
+  `(a+)+$` could hang it); only globs and simple regexes (`.`, `.*`, `.+`,
+  `\.`, at most 200 characters) are evaluated, others render as
+  "pattern (not evaluated)".
+- `eval` skips unresolved `Queue` / `Exchange` entities
+  (`<broker>:unresolved:...`), not only keys starting with `unresolved:`.
+- `promote` / `demote` warn on stderr when the 10,000-relation load limit is
+  reached (`--limit` raises it).
+- Pack extensions reject a bare string for a relation's `from` / `to`.
+
 ## [1.9.2] - 2026-11-11
 
 ### Release scope

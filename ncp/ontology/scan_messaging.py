@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import re
 from bisect import bisect_right
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
 
 MAX_LINE = 2000  # longer lines are minified / generated; never worth parsing
@@ -35,7 +35,25 @@ JVM = (".java", ".kt", ".scala")
 KEYWORDS = (
     "kafka", "sqs", "sns", "amqp", "rabbit", "jms", "queue", "exchange", "publish",
     "sendtoqueue", "queueurl", "topicarn", "destination", "streambridge", "sendto",
+    # Generic call words: the client is often created in another file of the module, so the
+    # file itself never names the broker (the module context decides in :func:`find_sites`).
+    "producer", "consume", "subscribe", "basic_publish",
 )
+
+
+def is_unresolved_key(key: str) -> bool:
+    """True for a Queue / Exchange / KafkaTopic key that holds a placeholder
+    (``<broker>:unresolved:<x>`` or ``unresolved:<x>``)."""
+    return _UNRESOLVED_KEY.search(key) is not None
+
+
+def is_pattern_key(key: str) -> bool:
+    """True for a pattern key (``<broker>:pattern:<x>`` or ``pattern:<x>``)."""
+    return _PATTERN_KEY.search(key) is not None
+
+
+_UNRESOLVED_KEY = re.compile(r"(?:^|:)unresolved:")
+_PATTERN_KEY = re.compile(r"(?:^|:)pattern:")
 
 
 def mentions_messaging(text: str) -> str | None:
@@ -231,14 +249,14 @@ def dest_name(value: str) -> tuple[str, dict[str, object]]:
 @dataclass(frozen=True)
 class Rule:
     id: str
-    broker: str  # kafka | sqs | sns | rabbitmq | amqp | jms
+    broker: str  # kafka | sqs | sns | rabbitmq (every AMQP 0-9-1 client) | jms
     entity: str  # KafkaTopic | Queue | Exchange
     direction: str  # PRODUCES | CONSUMES | ROUTES_TO
     suffixes: tuple[str, ...]
     pattern: re.Pattern[str]  # ends at the destination expression
     mode: str = "first"  # how the group is cut into destination expressions
     group: str = "args"  # regex group holding the destination expression(s)
-    requires: tuple[str, ...] = ()  # file must mention one of these (lower-case)
+    requires: tuple[str, ...] = ()  # the owning module must mention one of these (lower-case)
     skip: int = 0  # leading positional arguments to ignore (e.g. a Go ``ctx``)
     keys: tuple[str, ...] = ()  # keyword / annotation attribute names
 
@@ -296,13 +314,13 @@ _RULES: list[Rule] = [
     _rule("rdkafka.producer.produce", "kafka", "KafkaTopic", "PRODUCES", JS,
           _PRODUCER + r"produce\s*\(\s*" + _ARGS, requires=("kafka",)),
     # -- JS / TS: amqplib --------------------------------------------------------------
-    _rule("amqplib.sendToQueue", "amqp", "Queue", "PRODUCES", JS,
+    _rule("amqplib.sendToQueue", "rabbitmq", "Queue", "PRODUCES", JS,
           r"\.\s*sendToQueue\s*\(\s*" + _ARGS, requires=("amqp", "rabbit")),
-    _rule("amqplib.publish", "amqp", "Exchange", "PRODUCES", JS,
+    _rule("amqplib.publish", "rabbitmq", "Exchange", "PRODUCES", JS,
           _CHANNEL + r"publish\s*\(\s*" + _ARGS, "publish", requires=("amqp", "rabbit")),
-    _rule("amqplib.consume", "amqp", "Queue", "CONSUMES", JS,
+    _rule("amqplib.consume", "rabbitmq", "Queue", "CONSUMES", JS,
           _CHANNEL + r"consume\s*\(\s*" + _ARGS, requires=("amqp", "rabbit")),
-    _rule("amqplib.bindQueue", "amqp", "Exchange", "ROUTES_TO", JS,
+    _rule("amqplib.bindQueue", "rabbitmq", "Exchange", "ROUTES_TO", JS,
           r"\.\s*bindQueue\s*\(\s*" + _ARGS, "bind", requires=("amqp", "rabbit")),
     # -- JS / TS: AWS SDK v3, sqs-consumer ---------------------------------------------
     _rule("aws3.SendMessageCommand", "sqs", "Queue", "PRODUCES", JS,
@@ -331,11 +349,11 @@ _RULES: list[Rule] = [
           r"\breceive_message\s*\(\s*" + _NEST_P + r"\bQueueUrl\s*=\s*" + _ARGS),
     _rule("boto3.publish", "sns", "Exchange", "PRODUCES", PY,
           r"\.\s*publish(?:_batch)?\s*\(\s*" + _NEST_P + r"\bTopicArn\s*=\s*" + _ARGS),
-    _rule("pika.basic_publish", "amqp", "Exchange", "PRODUCES", PY,
+    _rule("pika.basic_publish", "rabbitmq", "Exchange", "PRODUCES", PY,
           r"\.\s*basic_publish\s*\(\s*" + _ARGS, "publish", keys=("exchange", "routing_key")),
-    _rule("pika.basic_consume", "amqp", "Queue", "CONSUMES", PY,
+    _rule("pika.basic_consume", "rabbitmq", "Queue", "CONSUMES", PY,
           r"\.\s*basic_consume\s*\(\s*" + _ARGS, keys=("queue",)),
-    _rule("pika.queue_bind", "amqp", "Exchange", "ROUTES_TO", PY,
+    _rule("pika.queue_bind", "rabbitmq", "Exchange", "ROUTES_TO", PY,
           r"\.\s*queue_bind\s*\(\s*" + _ARGS, "bind", keys=("queue", "exchange")),
     # -- Go: kafka-go, sarama, aws-sdk-go, amqp091 -------------------------------------
     _rule("kafka-go.Writer", "kafka", "KafkaTopic", "PRODUCES", GO,
@@ -355,12 +373,12 @@ _RULES: list[Rule] = [
           r"ReceiveMessageInput\s*\{" + _NEST_B + r"\bQueueUrl\s*:\s*" + _ARGS),
     _rule("awsgo.PublishInput", "sns", "Exchange", "PRODUCES", GO,
           r"PublishInput\s*\{" + _NEST_B + r"\bTopicArn\s*:\s*" + _ARGS),
-    _rule("amqp091.Publish", "amqp", "Exchange", "PRODUCES", GO,
+    _rule("amqp091.Publish", "rabbitmq", "Exchange", "PRODUCES", GO,
           _CHANNEL + r"Publish\s*\(\s*" + _ARGS, "publish", requires=("amqp",)),
-    _rule("amqp091.PublishWithContext", "amqp", "Exchange", "PRODUCES", GO,
+    _rule("amqp091.PublishWithContext", "rabbitmq", "Exchange", "PRODUCES", GO,
           _CHANNEL + r"PublishWithContext\s*\(\s*" + _ARGS, "publish", requires=("amqp",),
           skip=1),
-    _rule("amqp091.Consume", "amqp", "Queue", "CONSUMES", GO,
+    _rule("amqp091.Consume", "rabbitmq", "Queue", "CONSUMES", GO,
           _CHANNEL + r"Consume\s*\(\s*" + _ARGS, requires=("amqp",)),
     # -- JVM: Spring AMQP, JMS, Spring Cloud AWS, AWS SDK v2 ---------------------------
     _rule("spring-amqp.send", "rabbitmq", "Exchange", "PRODUCES", JVM,
@@ -390,6 +408,13 @@ _RULES: list[Rule] = [
           r"PublishRequest\s*\.\s*builder\s*\(\s*\)[^;]{0,400}?\.\s*topicArn\s*\(\s*" + _ARGS),
 ]
 RULES: tuple[Rule, ...] = tuple(_RULES)
+REQUIRE_WORDS: tuple[str, ...] = tuple(sorted({word for rule in RULES for word in rule.requires}))
+
+
+def context_words(lowered: str) -> set[str]:
+    """The ``requires`` words (:data:`REQUIRE_WORDS`) that occur in lower-cased ``lowered``;
+    the unit a module's messaging context is built from (files, build manifests)."""
+    return {word for word in REQUIRE_WORDS if word in lowered}
 
 
 # -- turning a matched argument tail into destination expressions -------------------------
@@ -566,11 +591,19 @@ def blank_long_lines(text: str) -> str:
 _COMMENT = ("//", "/*", "*", "#")
 
 
-def find_sites(suffix: str, text: str, lowered: str | None = None) -> list[Site]:
-    """Every rule match in ``text`` (a file with extension ``suffix``), sorted by line."""
+def find_sites(
+    suffix: str, text: str, lowered: str | None = None, context: Collection[str] | str = (),
+) -> list[Site]:
+    """Every rule match in ``text`` (a file with extension ``suffix``), sorted by line.
+
+    A rule with ``requires`` applies when the file *or* its module context mentions one of the
+    words. ``context`` is the owning module's lower-case words (see :func:`context_words`:
+    other source files of the module and its build manifest dependencies), because the client
+    is usually created in a different file than the one that calls ``producer.send``."""
     lowered = lowered if lowered is not None else text.lower()
     rules = [rule for rule in RULES if suffix in rule.suffixes
-             and (not rule.requires or any(word in lowered for word in rule.requires))]
+             and (not rule.requires
+                  or any(word in lowered or word in context for word in rule.requires))]
     if not rules:
         return []
     text = blank_long_lines(text)
