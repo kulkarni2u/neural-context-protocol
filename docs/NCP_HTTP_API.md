@@ -679,8 +679,10 @@ Compilation suppresses automatic embedding calls on every store backend.
 
 ### Ontology tools (opt-in)
 
-Listed only with `[ontology] enabled = true` and the `full` tool profile
-(SQLite store). With the ontology disabled (the default) `tools/list` and every
+Listed only with `[ontology] enabled = true` and the `full` tool profile.
+Storage is the NCP store itself (`[ontology] store = "inherit"`): SQLite or
+PostgreSQL/pgvector (see [Ontology storage backends](#ontology-storage-backends));
+on any other backend the tools answer `{"ok": false, "error": {"code": "disabled"}}`. With the ontology disabled (the default) `tools/list` and every
 other tool response are byte-for-byte unchanged, and calling an ontology tool
 returns the ordinary `-32601 Tool not found` error.
 
@@ -779,6 +781,37 @@ and has no `ontology` key.
 - Enrichment reads an existing ontology but never creates its tables: under
   the `core` tool profile the ontology store stays uninitialized
   (`reason_code: "ontology_uninitialized"`) until an ontology tool runs.
+
+### Ontology storage backends
+
+Both backends implement the same store API with the same semantics: equal
+ordered graph results, status transitions, revisions, idempotency/conflict
+outcomes, cardinality and cycle rules, evidence liveness, scope isolation and
+error codes (`tests/test_ontology_parity.py` runs one scenario suite against
+both and requires identical transcripts).
+
+- **SQLite** (`SQLiteStore`): `ontology_*` tables in the NCP database file;
+  writers serialize on `BEGIN IMMEDIATE`.
+- **PostgreSQL** (`PgvectorStore`): `{schema}.{table_prefix}ontology_*` tables
+  in the pgvector store's own schema and prefix, created by an additive,
+  versioned migration the first time the ontology is used (a plain
+  `PgvectorStore` and a disabled ontology create nothing). Key columns use
+  `COLLATE "C"` so ordering matches SQLite byte order. Writes run in `READ
+  COMMITTED` behind transaction-scoped advisory locks -- one per
+  `(tenant, pipeline)` write scope for relation writes (so cardinality, cycle
+  and idempotency checks are race-free while pipelines write in parallel),
+  one per relation id and per entity id -- with a bounded `lock_timeout`.
+  Reads use one `REPEATABLE READ, READ ONLY` snapshot; `graph_timeout_ms` /
+  `trigger_max_ms` become `SET LOCAL statement_timeout` inside that
+  transaction. `ontology_events` is append-only (a trigger rejects `UPDATE`,
+  `DELETE` and `TRUNCATE`). Chunk evidence is checked against
+  `{schema}.{table_prefix}chunks` and fails closed if that table is absent.
+- **Async hosts**: NCP's async runtime (`AsyncPgvectorStore`) covers only the
+  post-turn write path and never assembles context, so the facade stays
+  disabled for it. In-process async code can use
+  `ncp.ontology.stores.AsyncPostgresOntologyStore`, a thin wrapper that runs
+  the PostgreSQL store in worker threads (`asyncio.to_thread`) with identical
+  results.
 
 ## Streaming
 

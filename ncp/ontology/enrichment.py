@@ -10,8 +10,8 @@ Otherwise :class:`OntologyEnricher.enrich` runs inside the assembler, after
 the existing retrieval has chosen its memory chunks and before the final
 budget trim:
 
-1. Eligibility: SQLite store whose ontology schema already exists (the probe
-   never creates tables), at least one enabled pack, a non-zero graph token
+1. Eligibility: SQLite or pgvector store whose ontology schema already
+   exists (the probe never creates tables), at least one enabled pack, a non-zero graph token
    slice that fits beside the conscious block and budget header.
 2. Signals + decision within ``trigger_max_ms`` (:mod:`ncp.ontology.trigger`).
 3. Bounded traversal, **always** ``verified_only``, within ``graph_timeout_ms``.
@@ -45,6 +45,7 @@ from ncp.ontology.policy import OntologyConfig
 from ncp.ontology.ranking import PathCandidate, rank_paths
 from ncp.ontology.resolution import content_tokens, resolve
 from ncp.ontology.serializer import SerializedGraph, entity_label, serialize
+from ncp.ontology.stores.postgres import PostgresOntologyStore
 from ncp.ontology.stores.sqlite import OntologyTimeoutError, SQLiteOntologyStore
 from ncp.ontology.trigger import TriggerThresholds, evaluate
 from ncp.principals import AuthorizationError
@@ -56,6 +57,19 @@ if TYPE_CHECKING:
     from ncp.types import ConsciousBlock, SubconsciousChunk
 
 CONTEXT_SCHEMA_VERSION = 1
+
+
+def _backend_errors() -> tuple[type[BaseException], ...]:
+    """Store errors that degrade to fallback: SQLite, psycopg (when installed), invalid input."""
+    errors: tuple[type[BaseException], ...] = (sqlite3.Error, ValueError)
+    try:
+        import psycopg
+    except ImportError:  # pragma: no cover - psycopg is an optional extra
+        return errors
+    return (*errors, psycopg.Error)
+
+
+_BACKEND_ERRORS = _backend_errors()
 _MODES = ("off", "auto", "always")
 
 
@@ -293,18 +307,22 @@ class OntologyEnricher:
             raise OntologyUnavailableError(f"ontology enrichment failed: {fallback}")
         return self._result(started, reason, fallback_reason=fallback, **values)
 
-    def _ontology_store(self) -> SQLiteOntologyStore | None:
+    def _ontology_store(self) -> SQLiteOntologyStore | PostgresOntologyStore | None:
         """The ontology store, or ``None`` when its schema does not exist yet.
 
         Probed read-only first so enrichment never creates ontology tables
         (e.g. under the core tool profile, where no ontology tool runs).
         """
+        from ncp.stores.pgvector import PgvectorStore
         from ncp.stores.sqlite import SQLiteStore
 
         if isinstance(self.store, SQLiteStore):
             if not SQLiteOntologyStore.initialized(self.store.path):
                 return None
-        elif not isinstance(self.store, SQLiteOntologyStore):
+        elif isinstance(self.store, PgvectorStore):
+            if not PostgresOntologyStore.initialized(self.store):
+                return None
+        elif not isinstance(self.store, (SQLiteOntologyStore, PostgresOntologyStore)):
             raise LookupError("provider_unavailable")
         facade = self._facade_provider()
         if facade.store is None:
@@ -366,7 +384,7 @@ class OntologyEnricher:
             return self._fallback(started, "trigger_timeout", "trigger_timeout")
         except PermissionError as exc:
             raise OntologyAuthError(str(exc)) from None
-        except (sqlite3.Error, ValueError) as exc:
+        except _BACKEND_ERRORS as exc:
             return self._fallback(started, "trigger_error", f"trigger_error:{type(exc).__name__}")
 
         decision = evaluate(
@@ -396,7 +414,7 @@ class OntologyEnricher:
             )
         except PermissionError as exc:
             raise OntologyAuthError(str(exc)) from None
-        except (sqlite3.Error, ValueError) as exc:
+        except _BACKEND_ERRORS as exc:
             return self._fallback(
                 started, decision.reason_code, f"graph_error:{type(exc).__name__}",
                 triggered=True, **common,
@@ -420,7 +438,7 @@ class OntologyEnricher:
 
     def _expand(
         self,
-        store: SQLiteOntologyStore,
+        store: SQLiteOntologyStore | PostgresOntologyStore,
         auth: AuthContext,
         seeds: Sequence[Any],
         deadline: float,

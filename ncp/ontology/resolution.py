@@ -122,7 +122,7 @@ def resolve(
     schema_packs: Sequence[str] = (),
     deadline: float | None = None,
 ) -> Resolution:
-    """Resolve ``texts`` against ``store`` (a ``SQLiteOntologyStore``).
+    """Resolve ``texts`` against ``store`` (a SQLite or Postgres ontology store).
 
     A term that is a sub-phrase of a longer resolved term (``payroll`` inside
     ``payroll events``) is not used on its own, so the most specific match

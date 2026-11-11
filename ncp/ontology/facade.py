@@ -2,9 +2,9 @@
 
 ``OntologyFacade.from_config`` builds an enabled facade only when
 ``[ontology] enabled = true``, the provider is ``builtin`` and the NCP store
-is SQLite; otherwise it is a *disabled* facade whose ``capabilities()`` is
-``{"enabled": False, "version": "1"}`` and whose other operations raise
-``OntologyError(code="disabled")``.
+is SQLite or PostgreSQL (``PgvectorStore``); otherwise it is a *disabled*
+facade whose ``capabilities()`` is ``{"enabled": False, "version": "1"}`` and
+whose other operations raise ``OntologyError(code="disabled")``.
 
 Every operation takes a trusted :class:`AuthContext`. Hosts build it with
 :func:`auth_context_for` from the authenticated principal (never from tool
@@ -40,6 +40,7 @@ from ncp.ontology.models import (
 from ncp.ontology.policy import OntologyConfig
 from ncp.ontology.redaction import redact_attributes
 from ncp.ontology.registry import SchemaRegistry
+from ncp.ontology.stores.postgres import PostgresOntologyStore
 from ncp.ontology.stores.sqlite import (
     OntologyConflictError, OntologyNotFoundError, SQLiteOntologyStore,
 )
@@ -222,7 +223,7 @@ class OntologyFacade:
     def __init__(
         self,
         config: OntologyConfig,
-        store: SQLiteOntologyStore | None,
+        store: SQLiteOntologyStore | PostgresOntologyStore | None,
         *,
         disabled_reason: str | None = None,
     ) -> None:
@@ -247,11 +248,16 @@ class OntologyFacade:
         *,
         registry: SchemaRegistry | None = None,
     ) -> OntologyFacade:
-        """Provider lifecycle: enabled only for ``builtin`` over an NCP SQLite store.
+        """Provider lifecycle: enabled only for ``builtin`` over an NCP SQLite
+        or (sync) pgvector store.
 
         An unknown provider name is a configuration error (raised), never a
-        dynamic import. A non-SQLite store yields a disabled facade.
+        dynamic import. Any other store -- including the async-only
+        ``AsyncPgvectorStore``, whose runtime never assembles context (use
+        ``AsyncPostgresOntologyStore`` from async hosts) -- yields a disabled
+        facade.
         """
+        from ncp.stores.pgvector import PgvectorStore
         from ncp.stores.sqlite import SQLiteStore
 
         if config is None:
@@ -264,8 +270,11 @@ class OntologyFacade:
                 f"[ontology].provider {ontology.provider!r} is not available; "
                 "expected 'builtin' or 'disabled'"
             )
-        if isinstance(store, SQLiteOntologyStore):
+        if isinstance(store, (SQLiteOntologyStore, PostgresOntologyStore)):
             return cls(ontology, store)
+        if isinstance(store, PgvectorStore):
+            registry = registry or SchemaRegistry.builtin()
+            return cls(ontology, PostgresOntologyStore.inherit(store, registry))
         if not isinstance(store, SQLiteStore):
             backend = type(store).__name__
             return cls.disabled(f"ontology storage is not available for the {backend} backend")
@@ -278,7 +287,7 @@ class OntologyFacade:
     def enabled(self) -> bool:
         return self.store is not None
 
-    def _require_enabled(self) -> SQLiteOntologyStore:
+    def _require_enabled(self) -> SQLiteOntologyStore | PostgresOntologyStore:
         if self.store is None:
             raise OntologyError("disabled", self.disabled_reason or "ontology is disabled")
         return self.store
