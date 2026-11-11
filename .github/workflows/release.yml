@@ -44,7 +44,7 @@ jobs:
         run: bash scripts/release_preflight.sh
 
       - name: Upload distribution artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: python-dist
           path: dist/
