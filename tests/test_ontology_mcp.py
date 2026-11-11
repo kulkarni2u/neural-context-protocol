@@ -805,6 +805,19 @@ class TestEvidenceTool:
         })
         assert sixteen["ok"] and sixteen["chunks"] == [] and len(sixteen["missing"]) == 16
 
+    def test_oversized_array_is_rejected_without_a_full_scan(self, tmp_path: Path) -> None:
+        client = InProcess(_project(tmp_path, ENABLED_TOML))
+        started = time.perf_counter()
+        _error(client("ncp_ontology_evidence", {
+            "pipeline_id": "p1", "chunk_ids": [f"sub_{index}" for index in range(200_000)],
+        }), "limit")
+        assert time.perf_counter() - started < 5.0  # was quadratic: minutes
+        # Duplicates do not count toward the limit (dedupe keeps first order).
+        repeated = client("ncp_ontology_evidence", {
+            "pipeline_id": "p1", "chunk_ids": ["sub_b", " sub_a "] * 5_000,
+        })
+        assert repeated["ok"] and repeated["missing"] == ["sub_b", "sub_a"]
+
     def test_python_facade_method(self, tmp_path: Path) -> None:
         root = _project(tmp_path, ENABLED_TOML)
         store = SQLiteStore(root / ".ncp" / "store.db")

@@ -218,6 +218,12 @@ def _require_write(auth: AuthContext, scope: Scope) -> None:
         _require(auth, "admin")
 
 
+def _evidence_reader(auth: AuthContext) -> str | None:
+    """Pipeline whose pipeline-scoped chunks ``evidence_chunks`` may return
+    (``None``: global-scope chunks only, as ``pipeline_id = NULL`` never matches)."""
+    return None if auth.scope.namespace == GLOBAL_NAMESPACE else auth.scope.namespace
+
+
 class SQLiteOntologyStore:
     """``OntologyStore`` over SQLite; see the module docstring for scope rules.
 
@@ -1076,7 +1082,10 @@ class SQLiteOntologyStore:
         Same liveness and readability as :meth:`live_chunk_evidence` with the
         caller's own namespace (a ``global``-scope chunk or one in the
         caller's pipeline). Missing, expired, superseded and out-of-scope ids
-        are all simply absent (indistinguishable).
+        are all simply absent (indistinguishable). A ``global``-namespace
+        caller reads ``global``-scope chunks only: every principal may read
+        that namespace, so it must not expose pipeline-scoped memory of a
+        pipeline that happens to be named ``global``.
         """
         _require(auth, "read")
         ids = sorted({str(chunk_id) for chunk_id in chunk_ids})
@@ -1095,7 +1104,7 @@ class SQLiteOntologyStore:
                     connection,
                     "SELECT c.chunk_id, c.content, c.layer, c.src FROM chunks c WHERE c.chunk_id IN"
                     f" ({','.join(':' + name for name in names)}) AND {predicate}",
-                    {**names, "caller": auth.scope.namespace, "now_epoch": now.timestamp()},
+                    {**names, "caller": _evidence_reader(auth), "now_epoch": now.timestamp()},
                 ):
                     found[row["chunk_id"]] = {
                         "chunk_id": row["chunk_id"], "layer": row["layer"], "src": row["src"],

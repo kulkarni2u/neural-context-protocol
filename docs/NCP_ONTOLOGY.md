@@ -79,7 +79,7 @@ profile. The full arguments and result shapes are in
 | `ncp_ontology_explain` | `read` | One relation with all its evidence (liveness) and validity |
 | `ncp_ontology_assert` | `write` (`verify` for verified relations) | Upsert an entity, or assert a relation idempotently |
 | `ncp_ontology_revoke` | `write` (own relation) or `admin` | Revoke a relation (audited, idempotent) |
-| `ncp_ontology_evidence` | `read` | Exact-id text of cited evidence chunks (at most 16) that are still live and readable in `pipeline_id`; any other id is listed in `missing` |
+| `ncp_ontology_evidence` | `read` | Exact-id text of cited evidence chunks (at most 16) that are still live and readable in `pipeline_id` (`global`: global-scope chunks only); any other id is listed in `missing` |
 
 The read tools (`query`, `explain`, `evidence`) return current state only and
 reject an `as_of` argument with `invalid`.
@@ -88,7 +88,15 @@ reject an `as_of` argument with `invalid`.
 so upserting an entity with a new version keeps its id. Such an upgrade is
 rejected with `conflict` while any non-revoked relation still touches the
 entity (the message carries no count or ids). Revoke those relations, upgrade
-both endpoints, then re-assert them under the new version. As a defensive
+both endpoints, then re-assert them under the new version. The check counts
+relations in every namespace: a `global` entity cannot be upgraded while any
+pipeline still has a non-revoked relation to it. A `global` admin cannot see
+or revoke those from `global`; an `admin` principal allowed in each such
+pipeline finds them with `ncp_ontology_query` (`pipeline_id` set to that
+pipeline) and revokes them there with `ncp_ontology_revoke`. A relation whose
+versions disagree still counts toward `max_outgoing`/`max_incoming` and cycle
+checks until it is revoked, because it becomes live again if its endpoint
+returns to the relation's version. As a defensive
 check, traversal, query and automatic context never return a relation whose
 pack version differs from either endpoint's current version. `explain` still
 shows such a relation, with `active: false`, `schema_consistent: false` and

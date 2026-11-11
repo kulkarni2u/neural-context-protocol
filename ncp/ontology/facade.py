@@ -558,16 +558,17 @@ class OntologyFacade:
         store = self._require_enabled()
         if not isinstance(chunk_ids, (list, tuple)) or not chunk_ids:
             raise OntologyError("invalid", "chunk_ids must be a non-empty array of strings")
-        requested: list[str] = []
+        # Dict for O(1) dedupe; the limit is checked as ids arrive so a huge
+        # array is rejected without first being scanned in full.
+        requested: dict[str, None] = {}
         for item in chunk_ids:
             if not isinstance(item, str) or not item.strip():
                 raise OntologyError("invalid", "chunk_ids must be non-empty strings")
-            if item.strip() not in requested:
-                requested.append(item.strip())
-        if len(requested) > MAX_EVIDENCE_CHUNKS:
-            raise OntologyError("limit", f"chunk_ids exceeds {MAX_EVIDENCE_CHUNKS} entries")
+            requested[item.strip()] = None
+            if len(requested) > MAX_EVIDENCE_CHUNKS:
+                raise OntologyError("limit", f"chunk_ids exceeds {MAX_EVIDENCE_CHUNKS} entries")
         with _translate_errors():
-            found = store.evidence_chunks(requested, auth=auth)
+            found = store.evidence_chunks(list(requested), auth=auth)
         return {
             "ok": True,
             "chunks": [found[chunk_id] for chunk_id in requested if chunk_id in found],

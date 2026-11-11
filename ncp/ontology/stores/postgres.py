@@ -67,7 +67,7 @@ from ncp.ontology.registry import RelationType, SchemaRegistry
 from ncp.ontology.stores._traversal import breadth_first
 from ncp.ontology.stores.sqlite import (
     _SAME_SCHEMA, _SCHEMA_UPGRADE_CONFLICT, OntologyConflictError, OntologyNotFoundError,
-    OntologyTimeoutError, _check_deadline, _require, _require_write, _ts,
+    OntologyTimeoutError, _check_deadline, _evidence_reader, _require, _require_write, _ts,
 )
 
 if TYPE_CHECKING:
@@ -1142,7 +1142,7 @@ class PostgresOntologyStore:
             for row in tx.rows(
                 f"SELECT c.chunk_id, c.content, c.layer, c.src FROM {self.chunks_table} c"
                 f" WHERE c.chunk_id = ANY(%(ids)s) AND {predicate}",
-                {"ids": ids, "caller": auth.scope.namespace, "now_epoch": now.timestamp()},
+                {"ids": ids, "caller": _evidence_reader(auth), "now_epoch": now.timestamp()},
             ):
                 found[row["chunk_id"]] = {
                     "chunk_id": row["chunk_id"], "layer": row["layer"], "src": row["src"],

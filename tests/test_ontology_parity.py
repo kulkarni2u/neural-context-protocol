@@ -900,6 +900,19 @@ def sc_evidence_chunks_exact_id(b: Backend) -> list:
     return [norm(found), norm(staging), denied]
 
 
+
+def sc_evidence_global_namespace_reads_global_scope_only(b: Backend) -> list:
+    # Every principal may read the ``global`` ontology namespace, so evidence
+    # read there must not return pipeline-scoped memory of a pipeline that
+    # happens to be named "global".
+    s = b.store
+    shared = b.chunk("shared", "global runbook", pipeline=None, scope="global")
+    named = b.chunk("named", "pipeline literally named global", pipeline="global")
+    found = s.evidence_chunks([shared, named], auth=auth(GLOBAL))
+    assert sorted(found) == [shared]
+    assert sorted(s.evidence_chunks([shared, named], auth=auth())) == [shared]
+    return [norm(found)]
+
 SCENARIOS: dict[str, Callable[[Backend], list]] = {
     name.removeprefix("sc_"): value for name, value in dict(globals()).items()
     if name.startswith("sc_")
