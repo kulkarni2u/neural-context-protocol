@@ -43,6 +43,9 @@ recent_slot_budget = 2
 adaptive_budget_enabled = true
 # adaptive_budget_floor_tokens = 300
 # adaptive_budget_ceiling_tokens = 2000
+# By default adaptation may only shrink: the adjusted budget never exceeds
+# context_token_budget. Set true to allow scaling up (to the ceiling above).
+# adaptive_allow_expand = false
 
 [chunking]
 max_chunk_tokens = 200
@@ -104,9 +107,11 @@ confidence_k = 20
 # similarity_threshold = 0.95
 
 # [tools]
-# MCP tool surface: "full" (default) advertises all generally available
-# tools, while "core" exposes only the bounded per-turn context lifecycle.
-# profile = "full"
+# MCP tool surface: "standard" (default) = per-turn lifecycle plus outcome,
+# decision and wait_whispers tools; "core" = only the bounded per-turn
+# lifecycle; "full" adds ncp_overview/remember/recall/improve/task and memo
+# tools (subject to their own flags).
+# profile = "standard"
 
 [embedding]
 # CAP-C4: local semantic embeddings for SQLite/pgvector hybrid lexical+vector

@@ -643,6 +643,15 @@ class TestToolGating:
     def test_visible_when_enabled_full_profile(self, tmp_path: Path) -> None:
         config = load_config(cwd=tmp_path)
         config.values["tasks"]["enabled"] = True
+        config.values["tools"]["profile"] = "full"
+        assert "ncp_task" in {t["name"] for t in tools_for_config(config)}
+
+    def test_never_in_standard_profile_even_when_enabled(self, tmp_path: Path) -> None:
+        config = load_config(cwd=tmp_path)
+        config.values["tasks"]["enabled"] = True
+        assert config.tool_profile == "standard"
+        assert "ncp_task" not in {t["name"] for t in tools_for_config(config)}
+        config.values["tools"]["profile"] = "full"
         assert "ncp_task" in {t["name"] for t in tools_for_config(config)}
 
     def test_never_in_core_profile_even_when_enabled(self, tmp_path: Path) -> None:
@@ -1118,7 +1127,7 @@ class _HttpServer:
     def __init__(self, tmp_path: Path) -> None:
         (tmp_path / ".git").mkdir(exist_ok=True)
         (tmp_path / ".ncp").mkdir(exist_ok=True)
-        (tmp_path / ".ncp" / "config.toml").write_text("[tasks]\nenabled = true\n")
+        (tmp_path / ".ncp" / "config.toml").write_text('[tools]\nprofile = "full"\n\n[tasks]\nenabled = true\n')
         self.server = create_http_server(host="127.0.0.1", port=0, cwd=tmp_path)
         self.port = self.server.server_address[1]
         self.conns: list[http.client.HTTPConnection] = []

@@ -659,7 +659,14 @@ def _enable_tasks(tmp_path: Path) -> None:
 class TestMcpTool:
     def test_not_core_but_in_full_profile(self, tmp_path: Path) -> None:
         assert "ncp_overview" not in CORE_TOOL_NAMES
-        names = {t["name"] for t in tools_for_config(load_config(cwd=tmp_path))}
+        # Default profile is standard: overview needs profile = "full".
+        default_names = {t["name"] for t in tools_for_config(load_config(cwd=tmp_path))}
+        assert "ncp_overview" not in default_names
+        full = tmp_path / "full"
+        (full / ".ncp").mkdir(parents=True)
+        (full / ".git").mkdir()
+        (full / ".ncp" / "config.toml").write_text('[tools]\nprofile = "full"\n')
+        names = {t["name"] for t in tools_for_config(load_config(cwd=full))}
         assert "ncp_overview" in names
         core = tmp_path / "core"
         (core / ".ncp").mkdir(parents=True)

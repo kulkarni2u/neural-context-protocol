@@ -1,0 +1,32 @@
+# .ncp/config.toml snippet for the ontology example.
+#
+# The ontology is opt-in: without this section (or with enabled = false) every
+# NCP tool response is byte-for-byte unchanged and the ncp_ontology_* tools
+# are not listed. Storage is the NCP store itself (SQLite or PostgreSQL).
+
+[ontology]
+enabled = true
+retrieval_mode = "auto"     # off | auto | always -- auto expands only on a positive trigger
+packs = ["infrastructure"]  # the built-in infrastructure.v1 pack
+max_hops = 2
+max_nodes = 30
+max_edges = 60
+max_graph_tokens = 500      # cap on the [NCP:ONTOLOGY] block inside max_tokens
+verified_only = true
+fail_mode = "fallback"      # optional enrichment degrades to ordinary context
+fallback_to_memory = true
+trigger_max_ms = 10
+graph_timeout_ms = 50
+
+# LOCAL DEMO ONLY. Callers without a principal (stdio, or HTTP without
+# [principals]) get these capabilities. The default is ["read", "write"],
+# which cannot assert *verified* relations. Granting "verify" here lets the
+# seed script verify relations on a loopback-only server; in any shared
+# deployment drop this line and give "verify" to one principal instead:
+#
+#   [principals.ontology_seeder]
+#   token_env = "NCP_TOKEN_SEEDER"
+#   agent_id = "ontology_seeder"
+#   pipelines = ["demo"]
+#   capabilities = ["verify"]
+unauthenticated_capabilities = ["read", "write", "verify"]

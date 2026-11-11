@@ -13,6 +13,7 @@ import json
 import os
 import secrets
 import shutil
+import sqlite3
 import subprocess
 import time
 
@@ -3143,6 +3144,242 @@ def doctor_command(cwd: Path, host: str, port: int, json_output: bool) -> None:
                 click.echo(f"     fix: {c['fix']}")
     if failed:
         raise SystemExit(1)
+
+
+@main.group("ontology")
+def ontology_group() -> None:
+    """Manage the opt-in ontology (typed entity/relation graph)."""
+
+
+@ontology_group.command("seed")
+@click.argument(
+    "manifests", nargs=-1, required=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
+@click.option("--cwd", default=None, type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("--pipeline-id", default=None, help="Target namespace (overrides the manifests' 'pipeline').")
+@click.option(
+    "--source", default=None,
+    help="Source name (principal seed:<source>; the prune scope). Overrides the manifests' 'source'.",
+)
+@click.option("--prune", is_flag=True, help="Close relations this source seeded earlier that the manifest no longer lists.")
+@click.option("--dry-run", is_flag=True, help="Validate and report the changes without writing anything.")
+@click.option(
+    "--status", "status_override", type=click.Choice(["verified", "candidate"]), default=None,
+    help="Force every relation to this status (e.g. 'candidate' to stage a manifest unverified).",
+)
+@click.option("--json", "--json-output", "json_output", is_flag=True, help="Emit the report as JSON.")
+def ontology_seed_command(
+    manifests: tuple[Path, ...],
+    cwd: Path | None,
+    pipeline_id: str | None,
+    source: str | None,
+    prune: bool,
+    dry_run: bool,
+    status_override: str | None,
+    json_output: bool,
+) -> None:
+    """Seed entities and relations from one or more JSON/TOML/YAML MANIFESTS.
+
+    Several manifests (e.g. one per monorepo module) are merged into one run
+    with one source, so cross-manifest references resolve and --prune covers
+    them together. Relations may also reference entities already in the
+    store. Idempotent: re-running unchanged manifests writes nothing. See
+    docs/NCP_ONTOLOGY.md#seeding-the-graph.
+    """
+    from ncp.config import load_config
+    from ncp.ontology.facade import OntologyError, OntologyFacade
+    from ncp.ontology.seed import (
+        load_manifest, memory_chunk_writer, merge_manifests, seed_ontology,
+    )
+
+    config = load_config(cwd=cwd or Path.cwd())
+    # A dry run with the ontology disabled only validates: check the manifest against
+    # the built-in schema in a throw-away in-memory database. It never opens the
+    # project store or builds an embedding adapter.
+    offline = dry_run and not config.ontology.enabled
+    memory_db = sqlite3.connect(":memory:") if offline else None
+    try:
+        if memory_db is not None:
+            from ncp.ontology.registry import SchemaRegistry
+            from ncp.ontology.stores.sqlite import SQLiteOntologyStore
+
+            facade = OntologyFacade(
+                config.ontology, SQLiteOntologyStore(memory_db, SchemaRegistry.builtin()),
+            )
+            store = None
+        else:
+            store = _resolve_runtime_store(config)
+            facade = OntologyFacade.from_config(config, store)
+        if not facade.enabled:
+            raise click.ClickException(
+                f"{facade.disabled_reason or 'ontology is disabled'}: add an [ontology] section "
+                "with enabled = true to .ncp/config.toml (see examples/13_ontology/config.toml)."
+            )
+        merged = merge_manifests(
+            [(str(path), load_manifest(path)) for path in manifests],
+            source=source, pipeline=pipeline_id,
+        )
+        report = seed_ontology(
+            facade, merged.manifest, namespace=pipeline_id,
+            write_chunk=memory_chunk_writer(store) if store is not None else None,
+            prune=prune, dry_run=dry_run,
+            status_override=status_override,  # type: ignore[arg-type]
+            where=merged.where,
+        )
+    except OntologyError as exc:
+        hint = (" (offline dry run: only entities declared in the manifests are known)"
+                if offline and "existing entity" in exc.message else "")
+        raise click.ClickException(f"[{exc.code}] {exc.message}{hint}") from exc
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    finally:
+        if memory_db is not None:
+            memory_db.close()
+
+    if json_output:
+        click.echo(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+        return
+    summary = report.to_dict()
+    entities, relations = summary["entities"], summary["relations"]
+    prefix = "[yellow]dry run[/yellow] — would seed" if dry_run else "[green]Seeded[/green]"
+    if offline:
+        prefix = "[yellow]dry run (offline, no store)[/yellow] — would seed"
+    console.print(
+        f"{prefix} [bold]{report.namespace}[/bold] as {report.principal_id}: "
+        f"entities {entities['created']} new / {entities['updated']} updated / "  # type: ignore[index]
+        f"{entities['unchanged']} unchanged / {entities['referenced']} referenced; "  # type: ignore[index]
+        f"relations {relations['created']} new / "  # type: ignore[index]
+        f"{relations['updated']} updated / {relations['reopened']} reopened / "  # type: ignore[index]
+        f"{relations['unchanged']} unchanged / {relations['pruned']} pruned"  # type: ignore[index]
+    )
+    for line in report.pruned:
+        console.print(f"  pruned: {line}")
+    if report.stale:
+        console.print(
+            f"[yellow]{len(report.stale)} relation(s) seeded earlier are no longer in the manifest "
+            "(re-run with --prune to close them):[/yellow]"
+        )
+        for line in report.stale:
+            console.print(f"  stale: {line}")
+    for warning in report.warnings:
+        console.print(f"[yellow]warning:[/yellow] {warning}")
+    if offline:
+        console.print(
+            "[dim]ontology is disabled: validated against the built-in schema only; "
+            "counts assume an empty store and references to existing entities are not checked.[/dim]"
+        )
+
+
+@ontology_group.command("scan")
+@click.argument("root", default=".", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("-o", "--output", default=None, type=click.Path(dir_okay=False, path_type=Path),
+              help="Write the manifest here (.json). Default: stdout.")
+@click.option("--pipeline-id", default=None, help="Target namespace written into the manifest.")
+@click.option("--source", default=None, help="Source name for the manifest (default: the repo directory name).")
+@click.option("--repo-name", default=None, help="Repo entity name (default: the directory name).")
+@click.option("--environment", default="prod", show_default=True, help="'environment' attribute for detected services.")
+@click.option("--kafka-cluster", default="main", show_default=True, help="'cluster' attribute for detected Kafka topics.")
+@click.option(
+    "--schema-version", type=click.Choice(["1", "2"]), default="2", show_default=True,
+    help="2 emits Repo/Module nodes (infrastructure v2); 1 emits services, topics and teams only.",
+)
+@click.option(
+    "--heuristics", type=click.Choice(["candidate", "verified", "off"]), default="candidate",
+    show_default=True, help="Status for Kafka edges inferred from code, or 'off' to skip them.",
+)
+@click.option("--include-tests", is_flag=True, help="Also read test files for Kafka usage.")
+@click.option(
+    "--json", "--json-output", "json_output", is_flag=True,
+    help="Print the scan summary (with the Kafka coverage report) as JSON instead of the "
+         "text summary; the manifest goes to -o, or is embedded under 'manifest' without it.",
+)
+def ontology_scan_command(
+    root: Path,
+    output: Path | None,
+    pipeline_id: str | None,
+    source: str | None,
+    repo_name: str | None,
+    environment: str,
+    kafka_cluster: str,
+    schema_version: str,
+    heuristics: str,
+    include_tests: bool,
+    json_output: bool,
+) -> None:
+    """Scan a (mono)repo at ROOT and write a seed manifest for `ncp ontology seed`.
+
+    Reads build files (package.json, pyproject.toml, go.mod, Cargo.toml,
+    pom.xml, build.gradle), Dockerfile / Chart.yaml / k8s workloads,
+    CODEOWNERS, Kafka client usage and hand-written ncp-ontology.* files.
+    Spring topic placeholders (${...}) and string constants are resolved; a
+    coverage report shows what was matched and warns when nothing was.
+    Reads files only: no store, database or embedding model is opened.
+    Review the manifest, then seed it.
+    """
+    from ncp.ontology.facade import OntologyError
+    from ncp.ontology.scan import scan_repository
+
+    try:
+        result = scan_repository(
+            root, pipeline=pipeline_id, source=source, repo_name=repo_name,
+            environment=environment, kafka_cluster=kafka_cluster,
+            schema_version=int(schema_version), heuristics=heuristics,  # type: ignore[arg-type]
+            include_tests=include_tests,
+        )
+    except OntologyError as exc:
+        raise click.ClickException(f"[{exc.code}] {exc.message}") from exc
+    text = result.to_json()
+    summary = result.summary
+    if json_output:
+        if output is not None:
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(text, encoding="utf-8")
+        payload: dict[str, object] = {"summary": summary,
+                                      "output": str(output) if output else None}
+        if output is None:
+            payload["manifest"] = json.loads(text)
+        click.echo(json.dumps(payload, indent=2))
+        return
+    relations = summary["relations"]
+    statuses = summary["statuses"]
+    line = (
+        f"Scanned {summary['files']} files: {summary['modules']} modules, "
+        f"{summary['services']} services, {summary['teams']} teams, {summary['topics']} topics; "
+        f"{sum(relations.values())} relations "  # type: ignore[union-attr]
+        f"({', '.join(f'{k} {v}' for k, v in sorted(relations.items()))}); "  # type: ignore[union-attr]
+        f"{statuses.get('candidate', 0)} candidate"  # type: ignore[union-attr]
+    )
+    report_console = console if output is not None else Console(stderr=True)
+    if output is None:
+        click.echo(text, nl=False)
+        click.echo(line, err=True)
+    else:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(text, encoding="utf-8")
+        console.print(line)
+        console.print(f"Wrote {output}. Review it, then: ncp ontology seed {output} --prune")
+    kafka = summary["kafka"]
+    if kafka["kafka_like_sites"] or kafka["files_examined"]:  # type: ignore[index]
+        table = Table(title="Kafka coverage", box=box.SIMPLE_HEAVY, show_header=False)
+        for label, key in (
+            ("files examined", "files_examined"), ("kafka-like sites", "kafka_like_sites"),
+            ("matched", "matched_sites"), ("  via property", "resolved_via_property"),
+            ("  via constant", "resolved_via_constant"),
+            ("unresolved placeholders", "unresolved_placeholders"),
+            ("unmatched", "unmatched_sites"), ("skipped (no owner)", "skipped_no_owner"),
+        ):
+            table.add_row(label, str(kafka[key]))  # type: ignore[index]
+        report_console.print(table)
+        for example in kafka["unmatched_examples"]:  # type: ignore[index]
+            report_console.print(f"  unmatched: {example}", markup=False, highlight=False)
+    if summary["schema_version"] == 2:
+        click.echo(
+            "note: schema v2 (Repo/Module) — the manifest pins schema_version = 2; seed it into "
+            "a namespace that is not already on v1.", err=True,
+        )
+    for warning in summary["warnings"]:  # type: ignore[union-attr]
+        click.echo(f"warning: {warning}", err=True)
 
 
 @main.group("infra")

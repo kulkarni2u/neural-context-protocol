@@ -96,13 +96,26 @@ def get_context(
     diversity_limit: int | None = None,
     max_tokens: int | None = None,
     context_policy: str | None = None,
+    ontology: object = None,
 ) -> str:
-    """Assemble raw pidgin context for one agent turn."""
+    """Assemble raw pidgin context for one agent turn.
+
+    ``ontology`` is the optional per-request extension of ``ncp_get_context``
+    (``False`` opts out; ``{"mode": ...}`` needs admin). It is ignored while
+    ``[ontology]`` is disabled, so the default output is the legacy context.
+    """
 
     resolved_config = config or _CONFIG or configure(cwd=Path.cwd())
     resolved_store = store or create_store(resolved_config)
     policy = resolve_context_policy(resolved_config, context_policy)
-    assembler = Assembler(store=resolved_store, config=policy.config)
+    enricher = None
+    if resolved_config.ontology.enabled:
+        from ncp.ontology.enrichment import build_enricher
+
+        # In-process hosts have no transport principal: the facade's
+        # unauthenticated capabilities apply (principal "local").
+        enricher = build_enricher(resolved_config, resolved_store, request=ontology)
+    assembler = Assembler(store=resolved_store, config=policy.config, ontology=enricher)
     return assembler.assemble(
         conscious=agent,
         budget=budget or BudgetContext(),

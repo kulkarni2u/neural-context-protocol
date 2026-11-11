@@ -27,6 +27,9 @@ from ncp.stores.sqlite import SQLiteStore
 TOKENS = {"alice": "tok-alice", "bob": "tok-bob", "router": "tok-router", "validator": "tok-validator"}
 
 PRINCIPALS_TOML = f"""
+[tools]
+profile = "full"
+
 [tasks]
 enabled = true
 

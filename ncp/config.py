@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 from typing import Any, get_args
 
+from ncp.ontology.policy import OntologyConfig
+
 try:
     import tomllib
 except ModuleNotFoundError:  # pragma: no cover
@@ -57,6 +59,10 @@ DEFAULT_CONFIG = {
         "adaptive_budget_enabled": True,
         "adaptive_budget_floor_tokens": 300,
         "adaptive_budget_ceiling_tokens": 2000,
+        # When false (default) adaptation may only shrink the budget: the
+        # adjusted value never exceeds context_token_budget. true restores
+        # the 0.5x-1.5x scaling up to adaptive_budget_ceiling_tokens.
+        "adaptive_allow_expand": False,
     },
     "chunking": {
         "max_chunk_tokens": 200,
@@ -194,25 +200,8 @@ DEFAULT_CONFIG = {
         "allow_unverified": False,
         "similarity_threshold": 0.95,
     },
-    "skill_cache": {
-        # CAP-C9 v1 (docs/NCP_SKILL_CACHING_DESIGN.md): content-addressed
-        # caching of third-party skill/reference content, for library-API
-        # consumers with no host-level progressive disclosure of their own
-        # (e.g. a custom subagent harness). base_trust seeded for
-        # src="skill_ref" writes that don't pass an explicit base_trust --
-        # same posture as agent_inferred (cross-boundary, unverified
-        # content) but a separate, independently tunable key.
-        "default_trust": 0.60,
-        # Safety-net expiry (days) for the zone="proven" chunks cache_skill()
-        # writes, independent of the caller's own content-hash staleness
-        # check.
-        "default_expiry_days": 30,
-        # Character budget per window before ncp.skill_cache splits skill
-        # content -- headroom under SubconsciousChunk's 2000-char cap.
-        "window_chars": 1800,
-    },
     "tools": {
-        "profile": "full",
+        "profile": "standard",
     },
     "decisions": {
         # Typed decision contract (spec 4h). `enabled` gates the typed path:
@@ -352,6 +341,10 @@ class NCPConfig:
 
     values: dict[str, Any]
     project_root: Path
+
+    @property
+    def ontology(self) -> OntologyConfig:
+        return OntologyConfig.model_validate(self.values.get("ontology", {}))
 
     @property
     def store_type(self) -> str:
@@ -598,6 +591,11 @@ class NCPConfig:
         return int(self.values.get("budget", {}).get("adaptive_budget_ceiling_tokens", 2000))
 
     @property
+    def adaptive_allow_expand(self) -> bool:
+        """Whether adaptive budget may exceed ``context_token_budget``."""
+        return bool(self.values.get("budget", {}).get("adaptive_allow_expand", False))
+
+    @property
     def tier_hints_enabled(self) -> bool:
         """CAP-E3: whether ncp_get_context emits the advisory tier_hint/complexity_signal fields."""
         return bool(self.values.get("tiering", {}).get("tier_hints_enabled", True))
@@ -785,21 +783,9 @@ class NCPConfig:
         return dict(raw) if isinstance(raw, dict) else {}
 
     @property
-    def skill_cache_default_trust(self) -> float:
-        return float(self.values.get("skill_cache", {}).get("default_trust", 0.60))
-
-    @property
-    def skill_cache_default_expiry_days(self) -> int:
-        return int(self.values.get("skill_cache", {}).get("default_expiry_days", 30))
-
-    @property
-    def skill_cache_window_chars(self) -> int:
-        return int(self.values.get("skill_cache", {}).get("window_chars", 1800))
-
-    @property
     def tool_profile(self) -> str:
-        profile = str(self.values.get("tools", {}).get("profile", "full")).lower()
-        return profile if profile in {"core", "full"} else "full"
+        profile = str(self.values.get("tools", {}).get("profile", "standard")).lower()
+        return profile if profile in {"core", "standard", "full"} else "standard"
 
     @property
     def require_signatures(self) -> bool:
@@ -875,7 +861,10 @@ def load_config(
     if not Path(str(values["store"]["path"])).is_absolute():
         values["store"]["path"] = str(project_root / str(values["store"]["path"]))
 
-    return NCPConfig(values=values, project_root=project_root)
+    config = NCPConfig(values=values, project_root=project_root)
+    if "ontology" in values:
+        config.ontology  # Validate an explicitly configured ontology section at startup.
+    return config
 
 
 def find_project_root(start: str | Path) -> Path:
@@ -986,6 +975,9 @@ def _apply_env_overrides(values: dict[str, Any], env: dict[str, str]) -> None:
         values["budget"]["adaptive_budget_floor_tokens"] = int(env["NCP_ADAPTIVE_BUDGET_FLOOR_TOKENS"])
     if "NCP_ADAPTIVE_BUDGET_CEILING_TOKENS" in env:
         values["budget"]["adaptive_budget_ceiling_tokens"] = int(env["NCP_ADAPTIVE_BUDGET_CEILING_TOKENS"])
+    if "NCP_ADAPTIVE_ALLOW_EXPAND" in env:
+        val = env["NCP_ADAPTIVE_ALLOW_EXPAND"].lower()
+        values["budget"]["adaptive_allow_expand"] = val in {"true", "1", "yes"}
     if "NCP_DRIFT_COMPUTED_ENABLED" in env:
         val = env["NCP_DRIFT_COMPUTED_ENABLED"].lower()
         values["drift"]["drift_computed_enabled"] = val in {"true", "1", "yes"}

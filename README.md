@@ -73,6 +73,7 @@ Bounded retrieval is the entry point, not the whole story. The mechanisms below 
 - **Trust-weighted retrieval** — blends lexical relevance (BM25), recency, and trust into one score, with penalties for drift and heavily re-derived generations. See [Retrieval and self-improving memory](#retrieval-and-self-improving-memory).
 - **Layered memory** — every chunk is tagged `episodic`, `procedural`, `semantic`, `social`, or `reasoning_trace`, so retrieval can target the kind of memory a turn actually needs. See [Memory layers](#memory-layers).
 - **Graph-aware retrieval and trust propagation** — typed edges (`caused_by`, `supersedes`, `supports`, `contradicts`, `refines`, `derived_from`) let retrieval expand along relationships and let trust credit or debit a cause for what it produced. See [Graph engineering](#graph-engineering).
+- **Domain ontology** (opt-in) — an evidence-backed graph of services, databases, APIs, topics and teams; `ncp_get_context` can append verified, evidence-cited dependency paths, and `ncp_ontology_*` tools answer explicit graph questions. See [the ontology guide](./docs/NCP_ONTOLOGY.md).
 
 ### Memory decay and the landfill problem
 
@@ -422,6 +423,8 @@ Node fillcolor indicates trust (green ≥0.8, amber 0.5–0.8, red <0.5); edge s
 
 Two further graph capabilities are opt-in: `[graph].infer_edges` (default off) infers `refines` edges between similar chunks at write time with a deterministic similarity ratio — no model calls — marking them `created_by="ncp:inferred"`; and outcome credit recorded via `ncp_record_outcome` propagates along the `caused_by` chain during `ncp calibrate --feedback`, reported as a "via outcome propagation" count. See [the graph engineering plan](./docs/NCP_GRAPH_ENGINEERING_PLAN.md) for the full model, multi-hop semantics, and compatibility details.
 
+Separately from this memory-evidence graph, an opt-in **domain ontology** (`[ontology] enabled = true`, off by default) holds an evidence-backed graph of services, databases, APIs, topics and teams: `ncp_get_context` can append verified dependency paths automatically, and `ncp_ontology_*` tools answer explicit graph questions. Populate it with `ncp ontology scan` (a static exporter that turns a monorepo's build files, CODEOWNERS, deploy manifests and Kafka usage into a reviewable manifest) and `ncp ontology seed` (loads one or more manifests idempotently, every relation evidence-cited, `--prune` to stay in sync); see [Seeding the graph](./docs/NCP_ONTOLOGY.md#seeding-the-graph). An opt-in `infrastructure` v2 schema pack adds repos, modules and tables. See [the ontology guide](./docs/NCP_ONTOLOGY.md), [`examples/13_ontology/`](./examples/13_ontology/README.md) and [its benchmark](./docs/NCP_BENCHMARK_ONTOLOGY.md) (measured on SQLite: fact recall 1.00 against 0.38 at an 800-token budget for about +7 ms p95, and about 20% fewer tokens at matched recall on low budgets; at a fixed 800-token budget it still uses more prompt tokens).
+
 -----
 
 ## Signal filtering at write time
@@ -553,7 +556,7 @@ A common multi-agent shape is one long-lived **router** that receives events and
 | Request/reply threads | `ncp_emit_whisper` with `progress`/`result` and `in_reply_to` | Results matched to the request that caused them |
 | Push delivery | `ncp_wait_whispers`, `GET /events` | Wake on new work instead of polling `ncp_get_context` |
 | Task ledger | `ncp_task` (opt-in) | Durable record of in-flight work, with leases that expire if a worker dies |
-| Overview | `ncp_overview` | One bounded line per pipeline, most urgent first |
+| Overview | `ncp_overview` (needs `profile = "full"`) | One bounded line per pipeline, most urgent first |
 
 ```text
 router loop:
@@ -663,9 +666,10 @@ ncp_record_memo      — store reusable completed work by signature
 ncp_wait_whispers    — block until a whisper is queued for this agent (peeks, never drains)
 ncp_task             — opt-in task ledger: create / claim / heartbeat / release / complete / cancel / get / list
 ncp_overview         — ranked, token-bounded summary across active pipelines (read-only)
+ncp_ontology_*       — opt-in domain graph: capabilities / query / explain / assert / revoke / evidence
 ```
 
-`ncp_wait_whispers` and `ncp_overview` are in the full tool profile; `ncp_task` appears only when `[tasks].enabled = true`. None of them are in the `core` profile.
+The `[tools] profile` setting picks the advertised surface: `core` (5 per-turn lifecycle tools), `standard` (the default: core plus `ncp_record_outcome`, the decision tools and `ncp_wait_whispers`) or `full` (everything). `ncp_overview`, `ncp_remember`, `ncp_recall`, `ncp_improve`, `ncp_task` and the memo tools require `profile = "full"` (`ncp_task` also needs `[tasks].enabled = true`); the six `ncp_ontology_*` tools need `[ontology].enabled = true` and a non-`core` profile. See [the ontology guide](./docs/NCP_ONTOLOGY.md).
 
 The core agent-to-agent protocol is still: read context, publish memory, signal peers, and record outcomes. The memory facade (`ncp_remember` / `ncp_recall` / `ncp_improve`) is an ergonomic layer over the same trust-aware chunks and graph edges.
 
@@ -737,6 +741,7 @@ ncp serve --host 127.0.0.1 --port 4242 --cwd /path/to/project
 
 ```bash
 ncp status      # store and activity metrics
+ncp doctor      # check config, store, migrations, server, agent auth headers and extras (--json)
 ncp cost        # token and USD rollups
 ncp explain     # human-readable runtime summary
 ncp viz         # pipeline visualization
@@ -747,6 +752,8 @@ ncp overview    # ranked cross-pipeline summary: failed tasks, waiting results, 
 ncp consolidate # merge and compact memory
 ncp vacuum      # delete aged rows from append-only tables (--older-than 30d; previews unless --yes)
 ncp forget      # permanently delete specific chunks (--chunk / --agent / --pipeline; previews unless --yes)
+ncp ontology scan # write a seed manifest from a (mono)repo: modules, services, owners, Kafka edges
+ncp ontology seed # load/sync the opt-in ontology from one or more manifests (--dry-run, --prune)
 ncp calibrate   # recalibrate trust (add --feedback for the self-improvement pass)
 ncp refine      # evidence-backed procedural self-refinement: ingest/show/propose/apply/rollback
 ncp handoff     # cross-agent handoff coordination
@@ -840,6 +847,8 @@ ncp explain --cwd /path/to/project
 | `[server]`       | `auth_token` for non-loopback binds                                                        |
 | `[notify]`       | Push delivery: `enabled`, `backend` (auto/memory/redis), `max_subscribers`, `max_wait_seconds`, `poll_interval_seconds` |
 | `[tasks]`        | Task ledger (off by default): `enabled`, lease defaults and limits, `default_max_attempts`, `stale_open_seconds` |
+| `[principals.<name>]` | Opt-in authenticated principals: a bearer token (`token_sha256` or `token_env`) bound to an `agent_id`, a `pipelines` allowlist and `admin`/`verify`/`record_outcome` capabilities. See "Principals" in [the HTTP API](./docs/NCP_HTTP_API.md) |
+| `[ontology]`     | Domain ontology (off by default): `enabled`, `packs`, `pack_versions`, `retrieval_mode`, traversal and token ceilings, timeouts, `fail_mode`. See [the ontology guide](./docs/NCP_ONTOLOGY.md#configuration-reference-ontology) |
 
 Pgvector schema changes are managed with versioned, checksummed migrations that support rollback:
 
@@ -879,7 +888,7 @@ ncp memory recall "fast feedback" --pipeline-id pipe_demo
 ncp memory improve --pipeline-id pipe_demo
 ```
 
-**MCP tools:** `ncp_remember`, `ncp_recall`, `ncp_improve` registered automatically when the server starts.
+**MCP tools:** `ncp_remember`, `ncp_recall`, `ncp_improve` are advertised when the server runs with `[tools] profile = "full"` (not in the default `standard` profile).
 
 -----
 
@@ -910,6 +919,21 @@ NCP is the memory bus. In our workflows, Sarathi is one orchestrator that runs o
 
 -----
 
+## Working on NCP with agents
+
+NCP's own development uses a brain/worker split ([`AGENTS.md`](./AGENTS.md)). The brain is Opus, set as the session model in `.claude/settings.json`; it plans, decides, integrates and commits. It delegates bounded work to the workers in `.claude/agents/`:
+
+| Worker | Model | Use |
+|---|---|---|
+| `vichara` | haiku | read-only research |
+| `pravaha` | sonnet | implementation |
+| `nirnaya` | sonnet | read-only review |
+| `parikshaka` | haiku | test/lint summaries |
+
+When Sarathi orchestrates, it dispatches the same roles. Every worker starts with `ncp_get_context` and ends with `ncp_write_memory`.
+
+-----
+
 ## Documentation
 
 - [Setup guide](./docs/NCP_SETUP.md)
@@ -919,6 +943,7 @@ NCP is the memory bus. In our workflows, Sarathi is one orchestrator that runs o
 - [Context policies (foundation)](./docs/NCP_CONTEXT_POLICY.md)
 - [Router coordination primitives (design)](./docs/specs/2026-11-02-ncp-coordination-primitives-design.md)
 - [Graph engineering plan](./docs/NCP_GRAPH_ENGINEERING_PLAN.md)
+- [Ontology (opt-in domain graph)](./docs/NCP_ONTOLOGY.md)
 - [Benchmark: task success at matched budget](./docs/NCP_BENCHMARK_TASK_SUCCESS.md)
 - [Benchmark: provider-real efficacy](./docs/NCP_BENCHMARK_EFFICACY_LIVE.md)
 - [Benchmark: coding pipeline](./docs/NCP_BENCHMARK_CODING_PIPELINE.md)
@@ -927,6 +952,7 @@ NCP is the memory bus. In our workflows, Sarathi is one orchestrator that runs o
 - [Benchmark: research pipeline](./docs/NCP_BENCHMARK_RESEARCH_PIPELINE.md)
 - [Benchmark: ingestion-time compression](./docs/NCP_BENCHMARK_COMPRESSION.md)
 - [Benchmark: fan-in reduction](./docs/NCP_BENCHMARK_FANIN_REDUCE.md)
+- [Benchmark: ontology](./docs/NCP_BENCHMARK_ONTOLOGY.md)
 - [MACE multi-agent eval](./benchmarks/mace/README.md)
 - [North-star capability roadmap](./docs/NCP_NORTH_STAR_CAPABILITY_ROADMAP.md)
 - [Active handoff packet](./docs/NCP_ACTIVE_HANDOFF_PACKET.md)
