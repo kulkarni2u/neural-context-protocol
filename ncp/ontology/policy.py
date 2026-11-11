@@ -13,6 +13,12 @@ class OntologyConfig(Contract):
     store: Literal["inherit"] = "inherit"
     fail_mode: Literal["closed", "fallback"] = "fallback"
     packs: tuple[Identifier, ...] = ("infrastructure",)
+    # Schema version used for writes that name none, per pack (e.g.
+    # ``{ infrastructure = 2 }``). Unpinned packs use the registry default
+    # (``infrastructure`` -> 1), so new built-in versions never apply silently.
+    pack_versions: dict[Identifier, Annotated[int, Field(strict=True, ge=1)]] = Field(
+        default_factory=dict,
+    )
     retrieval_mode: RetrievalMode = "auto"
     max_hops: Annotated[int, Field(strict=True, ge=0, le=5)] = 2
     max_nodes: Annotated[int, Field(strict=True, ge=1, le=100)] = 30

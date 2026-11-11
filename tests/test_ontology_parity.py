@@ -913,6 +913,21 @@ def sc_evidence_global_namespace_reads_global_scope_only(b: Backend) -> list:
     assert sorted(s.evidence_chunks([shared, named], auth=auth())) == [shared]
     return [norm(found)]
 
+def sc_relations_asserted_by(b: Backend) -> list:
+    s = b.store
+    api, db, cache = service("api"), database("db"), database("cache")
+    put(s, api, db, cache)
+    s.assert_relation(rel("mine", api, db, status="verified", evidence=(attestation(),)),
+                      auth=auth(principal="seed:a"), idempotency_key="m")
+    s.assert_relation(rel("theirs", api, cache), auth=auth(principal="seed:b"),
+                      idempotency_key="t")
+    s.revoke_relation(rid("mine"), auth=auth(principal="seed:a"), reason="gone")
+    mine = s.relations_asserted_by("seed:a", auth=auth(principal="seed:a"))
+    assert [r.relation_id for r in mine] == [rid("mine")] and mine[0].status == "revoked"
+    assert s.relations_asserted_by("seed:a", auth=auth(STAGING)) == []
+    return [norm(mine), norm(s.relations_asserted_by("seed:b", auth=auth()))]
+
+
 SCENARIOS: dict[str, Callable[[Backend], list]] = {
     name.removeprefix("sc_"): value for name, value in dict(globals()).items()
     if name.startswith("sc_")

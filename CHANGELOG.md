@@ -4,6 +4,102 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [Unreleased]
 
+## [1.9.1] - 2026-11-11
+
+### Release scope
+
+Makes the 1.9.0 ontology usable without custom code. NCP never extracts
+graph facts from memory writes, so an ontology enabled in 1.9.0 started
+empty and had to be filled with hand-written `ncp_ontology_assert` calls.
+1.9.1 adds `ncp ontology scan`, a static exporter that turns a (mono)repo's
+build files, CODEOWNERS, deploy manifests and Kafka usage into a reviewable
+manifest, and `ncp ontology seed`, which loads one or more manifests and
+keeps the graph in sync with them on every run. An opt-in `infrastructure`
+v2 schema pack adds repos, modules and tables, and contributors get a
+brain/worker model-tiering workflow for agents. Nothing changes for
+deployments that leave `[ontology]` disabled, there are no store schema
+migrations, and no existing tool, request or response changes shape.
+
+Upgrade notes:
+
+- Seeding runs in-process as a trusted local operator and can mark relations
+  `verified`. Seed only from sources you would trust unreviewed; use
+  `--status candidate` to stage anything else. `scan` marks its Kafka edges
+  (inferred from code) `candidate` by default.
+- `--prune` only closes relations asserted by the same `source` (principal
+  `seed:<source>`); relations written by agents over MCP or by other sources
+  are never touched. Entities are not pruned. Seed a monorepo's per-module
+  manifests in one run, or give each module its own `source`.
+- `infrastructure` v2 is registered but **not** the default: writes that
+  name no `schema_version` stay on v1 unless `[ontology].pack_versions = {
+  infrastructure = 2 }`. `ncp_ontology_capabilities` now lists both versions,
+  each with a `default` flag. A namespace already on v1 cannot be re-seeded
+  as v2 in place.
+
+### Added
+
+- **`ncp ontology seed <manifests...>`** (`ncp/ontology/seed.py`): declarative
+  seeding of the ontology from a JSON/TOML/YAML manifest of entities and
+  relations exported from an authoritative source (entity registry, service
+  catalog, CODEOWNERS). Validates the whole manifest against the enabled
+  schema pack before writing; writes each relation's `evidence` text as a
+  memory chunk and cites it (or an `attestation`); idempotent and diff-based
+  (unchanged re-runs write nothing); reports relations dropped from the
+  manifest as stale and, with `--prune`, closes their validity window
+  without touching other principals' relations. `--dry-run`,
+  `--status candidate`, `--pipeline-id` and `--json` are supported.
+  Previously the only way to populate the graph was hand-written
+  `ncp_ontology_assert` calls.
+  - **Several manifests in one run** (e.g. one per monorepo module): merged
+    under one `source` (`--source`), so cross-file references resolve and
+    `--prune` covers them together; conflicting redeclarations are errors
+    that name both files.
+  - **References to existing entities**: a relation endpoint not declared in
+    the manifests resolves against entities already in the store (namespace,
+    then `global`), so a module's manifest need not redeclare its
+    dependencies. Referenced entities are never rewritten.
+- **`ncp ontology scan [ROOT]`** (`ncp/ontology/scan.py`): a reference
+  exporter that writes a seed manifest from a repository (via `git ls-files`)
+  without touching the store (`-o/--output`, `--pipeline-id`, `--source`,
+  `--repo-name`, `--environment`, `--kafka-cluster`). Modules from
+  `package.json`, `pyproject.toml`, `go.mod`, `Cargo.toml`, `pom.xml` and
+  `build.gradle(.kts)` with in-repo `DEPENDS_ON` edges; services from
+  `Chart.yaml`, k8s `Deployment`/`StatefulSet`/`DaemonSet` workloads and
+  `Dockerfile`s; `Team OWNS` from `CODEOWNERS`; `PRODUCES`/`CONSUMES` from
+  Kafka client usage in Java/Kotlin, Python, JS/TS and Go and Spring Cloud
+  Stream bindings (`candidate` by default; `--heuristics verified|off`
+  changes or skips them); hand-written `ncp-ontology.*` files merged in. Every relation cites `path#Lnn`. `--schema-version 1`
+  emits v1-only facts.
+- **`infrastructure` v2 schema pack** (`ncp/ontology/packs/infrastructure.v2.json`,
+  opt-in): a superset of v1 adding `Repo`, `Module` and `Table` with
+  `CONTAINS`, `BUILDS`, `READS` and `WRITES`, and `Module` endpoints on
+  `DEPENDS_ON`/`PRODUCES`/`CONSUMES`/`OWNS`.
+- **`[ontology].pack_versions`**: pins the schema version used by writes
+  that name none. `SchemaRegistry.default_version` keeps unpinned packs on
+  their stable version, so new built-in versions never apply silently.
+- `relations_asserted_by` on the SQLite and PostgreSQL ontology stores: the
+  relations one principal asserted in a namespace (any status), used by the
+  seeder to diff and prune.
+- `examples/13_ontology/manifest.toml`: a sample seed manifest, and a
+  "Seeding the graph" section in `docs/NCP_ONTOLOGY.md`.
+
+### Changed
+
+- **Contributor workflow: brain/worker model tiering** (no runtime change).
+  `AGENTS.md` gains a "Model tiering: brain and workers" section. The new
+  tracked `.claude/settings.json` sets the session model to `opus` (the
+  brain), and `.claude/agents/` defines four workers: `vichara` (haiku,
+  read-only research), `pravaha` (sonnet, implementation), `nirnaya`
+  (sonnet, read-only review) and `parikshaka` (haiku, test/lint summaries).
+  Each worker starts with `ncp_get_context` and ends with
+  `ncp_write_memory`. `.gitignore` now ignores `.claude/*` except
+  `.claude/agents/` and `.claude/settings.json`; it ignored all of `.claude/`
+  before.
+- Upgrade note for contributors: a pre-existing local `.claude/settings.json`
+  now shows as tracked and modified. Merge it, or move personal settings to
+  `.claude/settings.local.json`. Claude Code versions that only read
+  `CLAUDE.md` can add `@AGENTS.md` to their local `CLAUDE.md`.
+
 ## [1.9.0] - 2026-11-11
 
 ### Release scope

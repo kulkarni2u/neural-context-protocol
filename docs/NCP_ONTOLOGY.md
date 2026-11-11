@@ -25,7 +25,7 @@ harnesses must not treat a path as permission to change anything.
 
 | Term | Meaning |
 |---|---|
-| Schema pack | A versioned, immutable set of entity types (with required attributes) and relation types (allowed endpoint types, cardinality, cycles). v1 ships `infrastructure` v1: `Service`, `Database`, `API`, `KafkaTopic`, `Incident`, `Team`; `DEPENDS_ON`, `PRODUCES`, `CONSUMES`, `EXPOSES`, `OWNS`. |
+| Schema pack | A versioned, immutable set of entity types (with required attributes) and relation types (allowed endpoint types, cardinality, cycles). `infrastructure` v1 (the default): `Service`, `Database`, `API`, `KafkaTopic`, `Incident`, `Team`; `DEPENDS_ON`, `PRODUCES`, `CONSUMES`, `EXPOSES`, `OWNS`. `infrastructure` v2 (opt-in, a superset; see [Schema pack v2](#schema-pack-v2-repos-modules-tables)) adds `Repo`, `Module`, `Table` and `CONTAINS`, `BUILDS`, `READS`, `WRITES`. |
 | Entity | `(tenant, namespace, entity_type, canonical_key)` plus aliases and attributes. Ids are deterministic. Attributes are never serialized into automatic context. |
 | Relation | A typed edge with `status` (`candidate`, `verified`, `disputed` or `revoked`), `confidence`, a validity window `[valid_from, valid_until)`, `observed_at` and evidence refs. |
 | Evidence | Either an NCP memory chunk id (`evidence_type: "chunk"`) or an `external_attestation`. A chunk is live only while it is not superseded or expired, its `valid_from` has passed, and the caller can read it. |
@@ -51,6 +51,7 @@ refresh.
 | `store` | `"inherit"` | `inherit` | Use the NCP store's own backend (SQLite file, or the pgvector store's schema and prefix). |
 | `fail_mode` | `"fallback"` | `fallback`, `closed` | For optional enrichment: `fallback` degrades to ordinary context; `closed` fails the `ncp_get_context` call. |
 | `packs` | `["infrastructure"]` | registered pack ids | Packs enabled for writes, queries and automatic context. An unregistered id is a startup error. |
+| `pack_versions` | `{}` | pack id → registered version | Version used by writes that name no `schema_version`, e.g. `{ infrastructure = 2 }`. Unpinned packs stay on their stable default (`infrastructure` → 1), so new built-in versions never apply silently. An unregistered pin is a startup error. |
 | `retrieval_mode` | `"auto"` | `off`, `auto`, `always` | Automatic enrichment policy (see [Automatic trigger](#automatic-trigger-policy)). |
 | `max_hops` | `2` | 0–5 | Traversal depth ceiling. Larger requests are clamped with a `clamped:` warning. |
 | `max_nodes` | `30` | 1–100 | Node ceiling per traversal (clamped). |
@@ -65,6 +66,167 @@ refresh.
 | `graph_timeout_ms` | `50` | 1–5000 | Time budget for traversal and evidence mapping during enrichment. On Postgres it becomes `SET LOCAL statement_timeout`. |
 | `fallback_to_memory` | `true` | bool | With `fail_mode = "fallback"`, return ordinary context on timeout or backend error. When false, those failures fail the call. |
 | `unauthenticated_capabilities` | `["read", "write"]` | subset of `read`, `write`, `verify`, `admin` | Capabilities for callers without a principal (stdio, or HTTP without `[principals]`). Granting `verify` or `admin` here gives them to every local caller; do this only on a loopback demo. |
+
+## Seeding the graph
+
+NCP does not extract graph facts from memory writes, so a new ontology is
+empty. Populate it from authoritative sources (entity registry, service
+catalog, build files, CODEOWNERS, deploy manifests) with two commands:
+
+- `ncp ontology scan` reads a repository and **writes a manifest**. It never
+  touches the store.
+- `ncp ontology seed` **loads one or more manifests** into the store,
+  idempotently, and keeps the graph in sync with them.
+
+```bash
+ncp ontology scan . -o .ncp/ontology.json --pipeline-id shop   # review the file
+ncp ontology seed .ncp/ontology.json --dry-run                 # show what would change
+ncp ontology seed .ncp/ontology.json --prune                   # apply and sync
+```
+
+Run both from the job that changes the sources (CI on merge, or a cron), so
+the graph follows the repo.
+
+### Manifest format
+
+A manifest is `.json`, `.toml`, or `.yaml`/`.yml` (YAML needs PyYAML):
+
+```toml
+pipeline = "shop"                  # target namespace (or --pipeline-id)
+source = "entity_registry"         # asserting principal seed:<source>; the prune scope
+observed_at = "2026-11-01T00:00:00Z"   # optional; defaults to first-seen time
+# schema_version = 2               # optional; otherwise [ontology].pack_versions, else v1
+
+[[entities]]
+type = "Service"                   # must exist in the schema pack version used
+key = "order-api"
+aliases = ["orders-api"]
+attributes = { environment = "prod" }   # `name` defaults to the key
+
+[[entities]]
+type = "KafkaTopic"
+key = "order.events"
+attributes = { cluster = "main" }
+
+[[relations]]
+src = "order-api"                  # a key, or "Type:key" when a key is ambiguous
+type = "PRODUCES"
+dst = "KafkaTopic:order.events"
+evidence = "order-api publishes OrderPlaced to order.events (registry row 12)."
+# attestation = "registry.yaml#L12"     # and/or an external reference
+# revision = "a1b2c3"              # attestation source revision (default "1")
+# status = "candidate"             # default "verified"
+# confidence = 0.95
+```
+
+### How `seed` works
+
+- **Validated up front, all-or-nothing.** Entity types, required attributes,
+  relation triples (`Service -PRODUCES-> KafkaTopic`), endpoints and evidence
+  are checked against the schema pack before anything is written. Errors name
+  the file and item (`checkout.toml relations[2].dst: ...`).
+- **Endpoints.** A relation endpoint is matched against the manifests'
+  entities first, then against **entities already in the store** (the target
+  namespace, then `global`). A manifest can therefore point at
+  `Service:payments` without redeclaring it. Referenced entities are never
+  written. A relation's source must be in the target namespace; its target
+  may be `global`. A bare key that matches several existing types must be
+  written as `Type:key`.
+- **Every relation cites evidence.** `evidence` text is written as an
+  ordinary memory chunk (`semantic`, `tool_result`, in the target pipeline)
+  and cited as `chunk` evidence; `attestation` is cited as
+  `external_attestation`. A `verified` relation needs at least one.
+- **Idempotent, diff-based.** Ids derive from the namespace, the `source`
+  and the triple. Re-running unchanged manifests writes nothing; a changed
+  relation is updated in place (revision + 1). Two sources asserting the same
+  edge own separate relations.
+- **Staying in sync.** Relations this `source` seeded earlier that the
+  manifests no longer list are reported as *stale*. With `--prune` they are
+  closed (`valid_until` = now): they leave traversal and context at once, keep
+  their history, and reopen if they come back. Relations of other sources, and
+  those agents asserted over MCP, are never touched. Entities are not pruned.
+- **Trust.** `seed` runs in-process with direct store access, so it asserts
+  as a trusted operator with `verify` (and `admin` for `global`). `verified`
+  means "this manifest said so": seed only from sources you would trust
+  unreviewed and use `--status candidate` for anything else. To seed a remote
+  `ncp serve` instead, call `ncp_ontology_assert` with a `verify` principal,
+  as in `examples/13_ontology/seed_graph.py`.
+
+### Several manifests in one run (monorepos)
+
+```bash
+ncp ontology seed modules/*/ontology.toml --source monorepo --prune
+```
+
+Several manifests are **merged into one run under one `source`**, so:
+
+- cross-manifest references resolve (`checkout` can depend on `payments`
+  declared in another module's file);
+- `--prune` sees all of them together, so an edge that moves between modules
+  is not pruned;
+- each manifest's `observed_at` applies to its own relations;
+- `pipeline`, `source`, `schema_pack` and `schema_version` must agree where
+  set (`--pipeline-id` / `--source` override);
+- an entity declared in several files must be declared identically, and an
+  identical relation is kept once. Anything else that collides is an error
+  naming both files.
+
+Seeding modules **separately** under one shared `source` with `--prune`
+would make each run close the others' edges. Either seed them together
+(above) or give each module its own `source`.
+
+### Scanning a repository
+
+`ncp ontology scan [ROOT] -o FILE` is a reference exporter for common
+layouts. It lists files with `git ls-files` (so `.gitignore` applies), or a
+filtered directory walk outside git, and always skips `node_modules`,
+`vendor`, `build`, `dist`, `target` and virtualenvs.
+
+| Reads | Produces | Status |
+|---|---|---|
+| `package.json`, `pyproject.toml`, `go.mod`, `Cargo.toml`, `pom.xml`, `build.gradle(.kts)` | one `Module` per directory (key = repo path, aliases = package names), `Repo CONTAINS Module`, and in-repo dependencies as `Module DEPENDS_ON Module`. Workspace roots, Maven aggregators and Gradle root projects are not modules. | verified |
+| `Chart.yaml`, k8s `Deployment`/`StatefulSet`/`DaemonSet`, `Dockerfile` | a `Service` per module (named by the chart, then the workload, then the directory) and `Module BUILDS Service` | verified |
+| `CODEOWNERS` (root, `.github/`, `docs/`, `.gitlab/`; last match wins) | `Team OWNS Module` and `Team OWNS Service` | verified |
+| Kafka clients: Spring `@KafkaListener` / `KafkaTemplate.send` / `ProducerRecord`, kafka-python / confluent / aiokafka, kafkajs, kafka-go / sarama, Spring Cloud Stream bindings | `PRODUCES` / `CONSUMES` `KafkaTopic` (literal topic names only; test files skipped unless `--include-tests`) | candidate (`--heuristics verified\|off`) |
+| `ncp-ontology.{toml,json,yaml,yml}` anywhere | hand-written facts (databases, tables, external APIs) merged in; they win over a scanned entity with the same type and key | as written |
+
+Every scanned relation cites `attestation = "path#Lnn"`. Options:
+`--pipeline-id`, `--source` (default: the directory name), `--repo-name`,
+`--environment` (service attribute, default `prod`), `--kafka-cluster`
+(default `main`), `--schema-version 1|2` (default 2) and `--heuristics`.
+
+With `--schema-version 1` the scan emits only v1 types: modules and repos
+are dropped, module dependencies are lifted to `Service DEPENDS_ON Service`
+where both modules build a service, and Kafka edges and ownership attach to
+services.
+
+The scan is static: it sees literal names only and follows no code paths,
+and CODEOWNERS matching approximates GitHub's gitignore-style rules. Review
+the manifest before seeding it as verified. A repo with its own conventions
+can skip `scan` and emit a manifest from its own script instead.
+
+### Schema pack v2 (repos, modules, tables)
+
+`infrastructure` v2 is a strict superset of v1:
+
+| Added | Relation types |
+|---|---|
+| `Repo`, `Module`, `Table` (each requires `name`) | `CONTAINS` (`Repo`→`Module`, `Database`→`Table`, acyclic), `BUILDS` (`Module`→`Service`, deployment intent), `READS` / `WRITES` (`Service`/`Module`→`Table`, dependency intent); `DEPENDS_ON`, `PRODUCES`, `CONSUMES` also accept `Module` sources (and `DEPENDS_ON` `Module` targets); `OWNS` reaches `Repo`, `Module`, `Database`, `Table` |
+
+v2 is **opt-in**: writes that name no `schema_version` stay on v1 unless
+`[ontology].pack_versions = { infrastructure = 2 }`. A manifest can also set
+`schema_version = 2` itself, as `scan` does. An entity's version cannot
+change while live relations reference it, so a namespace already seeded on
+v1 cannot be re-seeded as v2 in place: `seed` refuses up front and says so.
+Use a new namespace for v2, or revoke the v1 relations first.
+
+### From Python
+
+`ncp.ontology.seed` exposes `load_manifest`, `parse_manifest`,
+`merge_manifests` and `seed_ontology(facade, manifest,
+write_chunk=memory_chunk_writer(store))`, which returns a `SeedReport`.
+`ncp.ontology.scan.scan_repository(root, ...)` returns the manifest and a
+summary.
 
 ## Tools
 
@@ -332,7 +494,9 @@ Measured on the benchmark corpus with default limits (see
   code change.
 - **No automatic extraction.** NCP does not stage candidate relations from
   memory writes asynchronously. Ingestion happens only through explicit
-  `ncp_ontology_assert`.
+  `ncp_ontology_assert`, or a declarative manifest loaded with
+  `ncp ontology seed` (optionally produced by the static `ncp ontology scan`
+  of a repository; see [Seeding the graph](#seeding-the-graph)).
 - **Verification.** `verified` status relies on the caller holding
   `verify`. NCP does not check the source deterministically, so keep
   `verify` for trusted ingestion principals.
@@ -365,7 +529,7 @@ Measured on the benchmark corpus with default limits (see
   content, not ids. Dereference a cited id with `ncp_ontology_evidence`,
   which may report it `missing` once the chunk is no longer live or
   readable.
-- **No Deployment type.** The `infrastructure` v1 pack has no Deployment
+- **No Deployment type.** Neither `infrastructure` v1 nor v2 has a Deployment
   entity. Store environment and version as Service attributes or in
   evidence chunks.
 
@@ -375,8 +539,9 @@ Measured on the benchmark corpus with default limits (see
    is a byte-for-byte no-op and creates no tables.
 2. **Read-only pilot.** Set `enabled = true`, `retrieval_mode = "off"`, and
    keep the default `unauthenticated_capabilities`. Explicit tools only.
-   Ingest the graph with one `verify` principal, as in
-   `examples/13_ontology/seed_graph.py`.
+   Ingest the graph with `ncp ontology seed` (see
+   [Seeding the graph](#seeding-the-graph)), or over MCP with one `verify`
+   principal, as in `examples/13_ontology/seed_graph.py`.
 3. **Automatic enrichment.** Switch to `retrieval_mode = "auto"`. Watch the
    `ontology` metadata (`reason_code`, `fallback_reason`, `latency_ms`,
    `graph_tokens`), and tune `max_graph_tokens`, `graph_timeout_ms` and

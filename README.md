@@ -423,7 +423,7 @@ Node fillcolor indicates trust (green ≥0.8, amber 0.5–0.8, red <0.5); edge s
 
 Two further graph capabilities are opt-in: `[graph].infer_edges` (default off) infers `refines` edges between similar chunks at write time with a deterministic similarity ratio — no model calls — marking them `created_by="ncp:inferred"`; and outcome credit recorded via `ncp_record_outcome` propagates along the `caused_by` chain during `ncp calibrate --feedback`, reported as a "via outcome propagation" count. See [the graph engineering plan](./docs/NCP_GRAPH_ENGINEERING_PLAN.md) for the full model, multi-hop semantics, and compatibility details.
 
-Separately from this memory-evidence graph, an opt-in **domain ontology** (`[ontology] enabled = true`, off by default) holds an evidence-backed graph of services, databases, APIs, topics and teams: `ncp_get_context` can append verified dependency paths automatically, and `ncp_ontology_*` tools answer explicit graph questions. See [the ontology guide](./docs/NCP_ONTOLOGY.md), [`examples/13_ontology/`](./examples/13_ontology/README.md) and [its benchmark](./docs/NCP_BENCHMARK_ONTOLOGY.md) (measured on SQLite: fact recall 1.00 against 0.38 at an 800-token budget for about +7 ms p95, and about 20% fewer tokens at matched recall on low budgets; at a fixed 800-token budget it still uses more prompt tokens).
+Separately from this memory-evidence graph, an opt-in **domain ontology** (`[ontology] enabled = true`, off by default) holds an evidence-backed graph of services, databases, APIs, topics and teams: `ncp_get_context` can append verified dependency paths automatically, and `ncp_ontology_*` tools answer explicit graph questions. Populate it with `ncp ontology scan` (a static exporter that turns a monorepo's build files, CODEOWNERS, deploy manifests and Kafka usage into a reviewable manifest) and `ncp ontology seed` (loads one or more manifests idempotently, every relation evidence-cited, `--prune` to stay in sync); see [Seeding the graph](./docs/NCP_ONTOLOGY.md#seeding-the-graph). An opt-in `infrastructure` v2 schema pack adds repos, modules and tables. See [the ontology guide](./docs/NCP_ONTOLOGY.md), [`examples/13_ontology/`](./examples/13_ontology/README.md) and [its benchmark](./docs/NCP_BENCHMARK_ONTOLOGY.md) (measured on SQLite: fact recall 1.00 against 0.38 at an 800-token budget for about +7 ms p95, and about 20% fewer tokens at matched recall on low budgets; at a fixed 800-token budget it still uses more prompt tokens).
 
 -----
 
@@ -752,6 +752,8 @@ ncp overview    # ranked cross-pipeline summary: failed tasks, waiting results, 
 ncp consolidate # merge and compact memory
 ncp vacuum      # delete aged rows from append-only tables (--older-than 30d; previews unless --yes)
 ncp forget      # permanently delete specific chunks (--chunk / --agent / --pipeline; previews unless --yes)
+ncp ontology scan # write a seed manifest from a (mono)repo: modules, services, owners, Kafka edges
+ncp ontology seed # load/sync the opt-in ontology from one or more manifests (--dry-run, --prune)
 ncp calibrate   # recalibrate trust (add --feedback for the self-improvement pass)
 ncp refine      # evidence-backed procedural self-refinement: ingest/show/propose/apply/rollback
 ncp handoff     # cross-agent handoff coordination
@@ -846,7 +848,7 @@ ncp explain --cwd /path/to/project
 | `[notify]`       | Push delivery: `enabled`, `backend` (auto/memory/redis), `max_subscribers`, `max_wait_seconds`, `poll_interval_seconds` |
 | `[tasks]`        | Task ledger (off by default): `enabled`, lease defaults and limits, `default_max_attempts`, `stale_open_seconds` |
 | `[principals.<name>]` | Opt-in authenticated principals: a bearer token (`token_sha256` or `token_env`) bound to an `agent_id`, a `pipelines` allowlist and `admin`/`verify`/`record_outcome` capabilities. See "Principals" in [the HTTP API](./docs/NCP_HTTP_API.md) |
-| `[ontology]`     | Domain ontology (off by default): `enabled`, `packs`, `retrieval_mode`, traversal and token ceilings, timeouts, `fail_mode`. See [the ontology guide](./docs/NCP_ONTOLOGY.md#configuration-reference-ontology) |
+| `[ontology]`     | Domain ontology (off by default): `enabled`, `packs`, `pack_versions`, `retrieval_mode`, traversal and token ceilings, timeouts, `fail_mode`. See [the ontology guide](./docs/NCP_ONTOLOGY.md#configuration-reference-ontology) |
 
 Pgvector schema changes are managed with versioned, checksummed migrations that support rollback:
 
@@ -914,6 +916,21 @@ Tool-specific setup lives in:
 ## In our own pipelines
 
 NCP is the memory bus. In our workflows, Sarathi is one orchestrator that runs on top of it. Sarathi is an integration example, not a requirement — NCP works under any MCP-compatible host.
+
+-----
+
+## Working on NCP with agents
+
+NCP's own development uses a brain/worker split ([`AGENTS.md`](./AGENTS.md)). The brain is Opus, set as the session model in `.claude/settings.json`; it plans, decides, integrates and commits. It delegates bounded work to the workers in `.claude/agents/`:
+
+| Worker | Model | Use |
+|---|---|---|
+| `vichara` | haiku | read-only research |
+| `pravaha` | sonnet | implementation |
+| `nirnaya` | sonnet | read-only review |
+| `parikshaka` | haiku | test/lint summaries |
+
+When Sarathi orchestrates, it dispatches the same roles. Every worker starts with `ncp_get_context` and ends with `ncp_write_memory`.
 
 -----
 
