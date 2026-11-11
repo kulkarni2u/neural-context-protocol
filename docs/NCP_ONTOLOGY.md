@@ -62,6 +62,12 @@ refresh.
 | `intent_directed` | `true` | bool | Map the request's relationship intent to relation types, direction and hops (see [Intent-directed expansion](#intent-directed-expansion)). `false` walks every type in both directions to `max_hops` (the v1 behaviour). |
 | `substitute_evidence` | `true` | bool | Graph-first substitution: a memory chunk cited by a shown fact is not repeated as text (see [Graph-first context](#graph-first-context-block-v2)). |
 | `verified_only` | `true` | bool | Default for explicit queries. Automatic context is **always** verified-only. |
+| `promotion.auto` | `false` | bool | `ncp ontology seed` writes candidates that meet the rules below as verified (see [Promoting candidates](#promoting-candidates)). |
+| `promotion.min_confidence` | `0.6` | 0.0–1.0 | Candidates below this are held back. |
+| `promotion.require_resolved` | `true` | bool | Hold back `unresolved:*` / `pattern:*` destinations. |
+| `promotion.require_counterpart` | `false` | bool | PRODUCES needs a CONSUMES on the same destination (and vice versa), in the same manifest or store. |
+| `promotion.types` | `["PRODUCES", "CONSUMES", "ROUTES_TO"]` | relation types | Only these types are auto-promoted. |
+| `promotion.verified_confidence` | `0.9` | 0.0–1.0 | Promoted relations get at least this confidence. |
 | `trigger_max_ms` | `10` | 1–1000 | Time budget for the automatic trigger (entity resolution and decision). |
 | `graph_timeout_ms` | `50` | 1–5000 | Time budget for traversal and evidence mapping during enrichment. On Postgres it becomes `SET LOCAL statement_timeout`. |
 | `fallback_to_memory` | `true` | bool | With `fail_mode = "fallback"`, return ordinary context on timeout or backend error. When false, those failures fail the call. |
@@ -266,6 +272,61 @@ the manifest against the built-in schema in a throw-away in-memory database
 relation as new; references to entities that already exist in a store are not
 checked. A real seed, or a dry run with the ontology enabled (which diffs
 against the store), is unchanged.
+
+### Promoting candidates
+
+`ncp ontology scan` emits heuristic messaging edges as `candidate` relations
+(Kafka edges 0.6, `unresolved:*` / `pattern:*` destinations 0.4). **Context
+assembly only follows verified relations** (automatic enrichment is always
+verified-only, and `[ontology] verified_only = false` does not change that), so
+a candidate never reaches a prompt until it is promoted. Workflow:
+
+1. `ncp ontology scan . -o manifest.json`, then `ncp ontology seed manifest.json`
+   (candidates are stored, not used).
+2. Review: `ncp ontology promote --pipeline-id shop --list` (id, confidence,
+   evidence), or tick lines in the generated wiki checklist.
+3. Promote what you checked, or let rules do it.
+
+```bash
+ncp ontology promote --pipeline-id shop --list [--json]
+ncp ontology promote --pipeline-id shop <relation-id>...             # by id (or 8+ char prefix)
+ncp ontology promote --pipeline-id shop --match 'Service:order-* -PRODUCES-> *' --min-confidence 0.6
+ncp ontology promote --pipeline-id shop --type PRODUCES --type CONSUMES
+ncp ontology promote --pipeline-id shop --from-checklist review.md   # ticked '- [x] `src -TYPE-> dst`' lines
+ncp ontology promote --pipeline-id shop --auto --dry-run             # apply [ontology.promotion] rules
+ncp ontology promote --pipeline-id shop --all --include-unresolved
+ncp ontology demote  --pipeline-id shop <relation-id>... --reason "topic renamed"
+```
+
+Selectors combine with AND; `--all` takes every candidate. Refs are
+`Type:key` as in manifests (`--match` is an `fnmatch` glob against
+`"<src> -<TYPE>-> <dst>"`). Destinations whose key starts with `unresolved:` or
+`pattern:` are held back (and counted in the output) unless
+`--include-unresolved` is passed. `--dry-run` writes nothing. The exit code is 1
+when nothing was selected, unless `--allow-empty`.
+
+Promotion re-asserts the same relation as `verified`, keeping its evidence
+and attestation (a candidate with none gets `promoted:cli`), raising
+confidence to `max(confidence, verified_confidence)` and recording
+`promoted_by` (`cli` or `auto:<rule>`) and `promoted_at` attributes. The CLI
+acts as the local operator `cli:promote` with `read`/`write`/`verify` in the
+`--pipeline-id` namespace (plus `admin` for `global`), the same trust model as
+`seed`; nothing is checked against `[principals]`. Over MCP use
+`ncp_ontology_assert` with a principal holding `verify`. `demote` re-asserts
+verified relations as `candidate` (evidence kept, `demote_reason` recorded), so
+they leave context immediately; use the revoke tool to withdraw one entirely.
+
+A later `ncp ontology seed` of a manifest that still lists the relation as
+`candidate` writes it back to candidate (the seeder owns what it asserted).
+Use `--auto-promote`, or edit the manifest's `status`, to keep it verified.
+
+**Auto-promote.** With `[ontology.promotion] auto = true` (or
+`ncp ontology seed --auto-promote`; `--no-auto-promote` overrides the config)
+`seed` writes candidates that meet the rules as `verified` with attestation
+`auto-promote:<rule>` and reports how many were promoted and held back (and
+why). `--status` overrides win. `ncp ontology promote --auto` applies the same
+rules to candidates already in the store. Rules are evaluated by the pure
+function `ncp.ontology.promotion.select_promotions`.
 
 ### Schema pack v2 (repos, modules, tables)
 
