@@ -4,9 +4,29 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [Unreleased]
 
-Cuts NCP's fixed per-turn token overhead. The MCP tool catalog is sent to
-the model every turn and had become the largest fixed cost (~7.1k tokens by
-chars/4 under the old default), larger than the 840-token context budget.
+## [1.9.2] - 2026-11-11
+
+### Release scope
+
+Cuts NCP's fixed per-turn token overhead and makes `ncp ontology scan`
+work on Spring/Kafka repositories. The MCP tool catalog is sent to the
+model every turn and had become the largest fixed cost (~7.1k tokens by
+chars/4 under the old default), larger than the 840-token context budget;
+the new default catalog is ~3.9k.
+
+### Upgrade notes
+
+- **The default tool profile is now `standard`.** Agents that call
+  `ncp_overview`, `ncp_remember`, `ncp_recall`, `ncp_improve`, `ncp_task`
+  or the memo tools get an unknown-tool error (-32601) until you set
+  `[tools] profile = "full"` (or `NCP_TOOL_PROFILE=full`).
+- **Adaptive budget no longer grows past `context_token_budget`.** Set
+  `[budget] adaptive_allow_expand = true` to keep the 1.9.1 behaviour.
+- `ncp_emit_whisper`'s input schema no longer carries per-type payload
+  `allOf` branches; payload validation is unchanged (server-side).
+- Remove any `[skill_cache]` block from config; it is ignored.
+- Re-run `ncp ontology scan` on Spring repos: topics previously dropped now
+  appear, and unresolved ones appear as candidate `unresolved:*` topics.
 
 ### Changed
 
