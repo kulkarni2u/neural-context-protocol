@@ -117,7 +117,7 @@ class SeedRelation(Contract):
 
 class SeedManifest(Contract):
     pipeline: Identifier | None = None
-    source: Identifier = DEFAULT_SOURCE
+    source: Identifier | None = None
     schema_pack: Identifier | None = None
     schema_version: Annotated[int, Field(strict=True, ge=1)] | None = None
     observed_at: AwareDatetime | None = None
@@ -135,6 +135,7 @@ class SeedReport:
     entities_created: int = 0
     entities_updated: int = 0
     entities_unchanged: int = 0
+    entities_referenced: int = 0
     relations_created: int = 0
     relations_updated: int = 0
     relations_unchanged: int = 0
@@ -151,7 +152,8 @@ class SeedReport:
             "principal_id": self.principal_id,
             "dry_run": self.dry_run,
             "entities": {"created": self.entities_created, "updated": self.entities_updated,
-                         "unchanged": self.entities_unchanged},
+                         "unchanged": self.entities_unchanged,
+                         "referenced": self.entities_referenced},
             "relations": {"created": self.relations_created, "updated": self.relations_updated,
                           "unchanged": self.relations_unchanged,
                           "reopened": self.relations_reopened, "pruned": self.relations_pruned},
@@ -209,6 +211,103 @@ def parse_manifest(raw: object) -> SeedManifest:
         raise OntologyError("invalid", _validation_message(exc)) from None
 
 
+@dataclass(frozen=True)
+class MergedManifest:
+    """Several manifests combined into one seed run (one source, one prune scope)."""
+
+    manifest: SeedManifest
+    origins: dict[tuple[str, int], str]
+
+    def where(self, kind: str, index: int) -> str:
+        return self.origins.get((kind, index), f"{kind}[{index}]")
+
+
+def _agree(values: Mapping[str, object], field_name: str, hint: str) -> object:
+    distinct = {json.dumps(value, default=str, sort_keys=True): value
+                for value in values.values() if value is not None}
+    if len(distinct) > 1:
+        detail = ", ".join(f"{label}={value!r}" for label, value in values.items() if value is not None)
+        raise OntologyError("invalid", f"manifests disagree on '{field_name}' ({detail}); {hint}")
+    return next(iter(distinct.values()), None)
+
+
+def merge_manifests(
+    manifests: Sequence[tuple[str, SeedManifest]],
+    *,
+    source: str | None = None,
+    pipeline: str | None = None,
+) -> MergedManifest:
+    """Combine labelled manifests (e.g. one per monorepo module) into one.
+
+    * ``pipeline``, ``source``, ``schema_pack`` and ``schema_version`` must
+      agree where set (``source``/``pipeline`` arguments override).
+    * Each manifest's ``observed_at`` is applied to its own relations.
+    * An entity declared in several manifests must be declared identically;
+      an identical relation declared twice is kept once. Anything else that
+      collides is an error naming both files.
+
+    Because the result is seeded as one ``source``, ``prune`` covers every
+    manifest together: an edge that moves between modules is not pruned.
+    """
+    if not manifests:
+        raise OntologyError("invalid", "no manifests given")
+    by_label = {label: manifest for label, manifest in manifests}
+    if len(by_label) != len(manifests):
+        raise OntologyError("invalid", "the same manifest was given twice")
+    merged_pipeline = pipeline or _agree(
+        {label: m.pipeline for label, m in manifests}, "pipeline", "pass --pipeline-id",
+    )
+    merged_source = source or _agree(
+        {label: m.source for label, m in manifests}, "source", "pass --source",
+    )
+    pack = _agree({label: m.schema_pack for label, m in manifests}, "schema_pack",
+                  "use one schema pack")
+    version = _agree({label: m.schema_version for label, m in manifests}, "schema_version",
+                     "use one schema version")
+
+    entities: list[SeedEntity] = []
+    entity_index: dict[tuple[str, str], int] = {}
+    relations: list[SeedRelation] = []
+    relation_index: dict[str, int] = {}
+    origins: dict[tuple[str, int], str] = {}
+    for label, manifest in manifests:
+        for position, entity in enumerate(manifest.entities):
+            try:
+                identity = (entity.type, Entity.canonicalize(entity.key))
+            except ValueError as exc:
+                raise OntologyError("invalid", f"{label} entities[{position}]: {exc}") from None
+            here = f"{label} entities[{position}]"
+            if identity in entity_index:
+                first = entity_index[identity]
+                if entities[first] != entity:
+                    raise OntologyError(
+                        "invalid", f"{here}: {entity.type}:{entity.key} is declared differently "
+                        f"in {origins[('entities', first)]}; declare it once, or identically, "
+                        "or reference it from the other manifest without declaring it",
+                    )
+                continue
+            entity_index[identity] = len(entities)
+            origins[("entities", len(entities))] = here
+            entities.append(entity)
+        for position, relation in enumerate(manifest.relations):
+            if relation.observed_at is None and manifest.observed_at is not None:
+                relation = relation.model_copy(update={"observed_at": manifest.observed_at})
+            fingerprint = relation.model_dump_json()
+            if fingerprint in relation_index:
+                continue  # the identical relation from another manifest
+            relation_index[fingerprint] = len(relations)
+            origins[("relations", len(relations))] = f"{label} relations[{position}]"
+            relations.append(relation)
+    try:
+        manifest = SeedManifest.model_validate({
+            "pipeline": merged_pipeline, "source": merged_source, "schema_pack": pack,
+            "schema_version": version, "entities": entities, "relations": relations,
+        })
+    except ValidationError as exc:
+        raise OntologyError("invalid", _validation_message(exc)) from None
+    return MergedManifest(manifest=manifest, origins=origins)
+
+
 # -- planning ----------------------------------------------------------------------
 
 
@@ -250,40 +349,49 @@ def _pack(facade: OntologyFacade, pack_id: str, version: int) -> SchemaPack:
     raise OntologyError("invalid", f"schema pack {pack_id} v{version} is not registered")
 
 
-def _resolve_endpoint(
-    ref: str, entities: Mapping[tuple[str, str], Entity], by_key: Mapping[str, list[Entity]],
-    where: str,
-) -> Entity:
-    if ":" in ref:
-        entity_type, _, key = ref.partition(":")
-        entity = entities.get((entity_type.strip(), Entity.canonicalize(key)))
-        if entity is not None:
-            return entity
-    matches = by_key.get(Entity.canonicalize(ref), [])
-    if len(matches) == 1:
-        return matches[0]
-    if len(matches) > 1:
-        types = sorted(entity.entity_type for entity in matches)
-        raise OntologyError(
-            "invalid", f"{where}: {ref!r} is ambiguous ({', '.join(types)}); use 'Type:key'",
-        )
-    raise OntologyError("invalid", f"{where}: {ref!r} is not an entity declared in the manifest")
+def _split_ref(ref: str) -> tuple[str | None, str]:
+    """``"Type:key"`` -> ``("Type", "key")``; a bare key -> ``(None, key)``.
+
+    Only a prefix that is a plausible type name counts, so keys that contain
+    a colon themselves (``host:port``) still work as bare keys."""
+    head, sep, tail = ref.partition(":")
+    if sep and head.strip() and head.strip()[0].isupper() and head.strip().isidentifier():
+        return head.strip(), tail
+    return None, ref
+
+
+def _entity_ref(scope: Scope, pack_id: str, version: int, entity_type: str, key: str) -> Entity:
+    """An identity-only entity, used to compute the deterministic id to look up."""
+    return Entity(scope=scope, entity_type=entity_type, canonical_key=key, display_name=key,
+                  schema_pack=pack_id, schema_version=version)
+
+
+def _default_where(kind: str, index: int) -> str:
+    return f"{kind}[{index}]"
 
 
 def _plan(
     facade: OntologyFacade, manifest: SeedManifest, scope: Scope, principal_id: str,
-) -> tuple[list[Entity], list[_PlannedRelation]]:
+    *, where: Callable[[str, int], str] = _default_where,
+) -> tuple[list[Entity], list[_PlannedRelation], dict[str, Entity]]:
+    """Validate the manifest and resolve every endpoint; writes nothing.
+
+    Returns the manifest's entities, the planned relations, and the
+    pre-existing store entities that relations reference without declaring.
+    """
+    store = facade._require_enabled()
     pack_id, version = facade._pack_version(manifest.schema_pack, manifest.schema_version)
     pack = _pack(facade, pack_id, version)
+    global_scope = Scope(tenant_id=scope.tenant_id, namespace=GLOBAL_NAMESPACE)
 
     entities: dict[tuple[str, str], Entity] = {}
     by_key: dict[str, list[Entity]] = {}
     for index, spec in enumerate(manifest.entities):
-        where = f"entities[{index}]"
+        label = where("entities", index)
         if spec.type not in pack.entity_types:
             allowed = ", ".join(sorted(pack.entity_types))
             raise OntologyError(
-                "invalid", f"{where}: unknown entity type {spec.type!r} (pack {pack_id} "
+                "invalid", f"{label}: unknown entity type {spec.type!r} (pack {pack_id} "
                 f"v{version} has: {allowed})",
             )
         attributes = dict(spec.attributes)
@@ -296,42 +404,129 @@ def _plan(
                 "display_name": spec.display_name or spec.key, "aliases": spec.aliases,
                 "attributes": attributes, "schema_pack": pack_id, "schema_version": version,
             })
-            facade._require_enabled().registry.validate_entity(entity)
+            store.registry.validate_entity(entity)
         except ValidationError as exc:
-            raise OntologyError("invalid", f"{where}: {_validation_message(exc)}") from None
+            raise OntologyError("invalid", f"{label}: {_validation_message(exc)}") from None
         except ValueError as exc:
-            raise OntologyError("invalid", f"{where}: {exc}") from None
+            raise OntologyError("invalid", f"{label}: {exc}") from None
         identity = (entity.entity_type, entity.canonical_key)
         if identity in entities:
             raise OntologyError(
-                "invalid", f"{where}: duplicate entity {spec.type}:{entity.canonical_key}",
+                "invalid", f"{label}: duplicate entity {spec.type}:{entity.canonical_key}",
             )
         entities[identity] = entity
         by_key.setdefault(entity.canonical_key, []).append(entity)
 
-    planned: list[_PlannedRelation] = []
-    seen: set[UUID] = set()
+    def declared(ref: str, label: str) -> Entity | None:
+        entity_type, key = _split_ref(ref)
+        canonical = Entity.canonicalize(key)
+        if entity_type is not None:
+            return entities.get((entity_type, canonical))
+        matches = by_key.get(canonical, [])
+        if len(matches) > 1:
+            types = sorted(entity.entity_type for entity in matches)
+            raise OntologyError(
+                "invalid", f"{label}: {ref!r} is ambiguous ({', '.join(types)}); use 'Type:key'",
+            )
+        return matches[0] if matches else None
+
+    # Pass 1: manifest-declared endpoints; collect the rest for one store read.
     for index, item in enumerate(manifest.relations):
-        where = f"relations[{index}]"
-        definition = pack.relation_types.get(item.type)
-        if definition is None:
+        label = where("relations", index)
+        if item.type not in pack.relation_types:
             allowed = ", ".join(sorted(pack.relation_types))
             raise OntologyError(
-                "invalid", f"{where}: unknown relation type {item.type!r} (pack {pack_id} "
+                "invalid", f"{label}: unknown relation type {item.type!r} (pack {pack_id} "
                 f"v{version} has: {allowed})",
             )
-        src = _resolve_endpoint(item.src, entities, by_key, f"{where}.src")
-        dst = _resolve_endpoint(item.dst, entities, by_key, f"{where}.dst")
+    unresolved: dict[str, list[Entity]] = {}
+    for index, item in enumerate(manifest.relations):
+        for ref in (item.src, item.dst):
+            if ref in unresolved or declared(ref, where("relations", index)) is not None:
+                continue
+            entity_type, key = _split_ref(ref)
+            if entity_type is not None and entity_type not in pack.entity_types:
+                raise OntologyError(
+                    "invalid", f"{where('relations', index)}: unknown entity type "
+                    f"{entity_type!r} in {ref!r}",
+                )
+            try:
+                canonical = Entity.canonicalize(key)
+            except ValueError as exc:
+                raise OntologyError("invalid", f"{where('relations', index)}: {exc}") from None
+            types = [entity_type] if entity_type is not None else sorted(pack.entity_types)
+            unresolved[ref] = [
+                _entity_ref(candidate_scope, pack_id, version, candidate_type, canonical)
+                for candidate_scope in (scope, global_scope) for candidate_type in types
+            ]
+
+    existing: dict[str, Entity] = {}
+    ambiguous: set[str] = set()
+    if unresolved:
+        auth = AuthContext(principal_id=principal_id, scope=scope,
+                           capabilities=frozenset({"read"}))
+        candidates = [entity.entity_id for refs in unresolved.values() for entity in refs]
+        with _translate_errors():
+            found = store.get_entities(candidates, auth=auth)  # type: ignore[attr-defined]
+        for ref, refs in unresolved.items():
+            live = [found[str(entity.entity_id)] for entity in refs
+                    if str(entity.entity_id) in found
+                    and found[str(entity.entity_id)].deleted_at is None]
+            # A namespace-local entity shadows a global one of the same type.
+            local = [entity for entity in live if entity.scope == scope]
+            chosen = local or live
+            if len({entity.entity_type for entity in chosen}) == 1:
+                existing[ref] = chosen[0]
+            elif chosen:
+                ambiguous.add(ref)
+
+    def resolve(ref: str, label: str) -> Entity:
+        entity = declared(ref, label)
+        if entity is not None:
+            return entity
+        if ref in ambiguous:
+            raise OntologyError(
+                "invalid", f"{label}: {ref!r} matches several existing entity types; use 'Type:key'",
+            )
+        entity = existing.get(ref)
+        if entity is None:
+            raise OntologyError(
+                "invalid", f"{label}: {ref!r} is neither declared in the manifest nor an "
+                f"existing entity in {scope.namespace!r} or 'global'",
+            )
+        if (entity.schema_pack, entity.schema_version) != (pack_id, version):
+            raise OntologyError(
+                "invalid", f"{label}: existing entity {entity.entity_type}:{entity.canonical_key} "
+                f"is on {entity.schema_pack} v{entity.schema_version}, not v{version}",
+            )
+        return entity
+
+    planned: list[_PlannedRelation] = []
+    seen: set[UUID] = set()
+    referenced: dict[str, Entity] = {}
+    for index, item in enumerate(manifest.relations):
+        label = where("relations", index)
+        definition = pack.relation_types[item.type]
+        src = resolve(item.src, f"{label}.src")
+        dst = resolve(item.dst, f"{label}.dst")
+        if src.scope != scope:
+            raise OntologyError(
+                "invalid", f"{label}.src: {item.src!r} is in {src.scope.namespace!r}; a relation's "
+                f"source must be in the target namespace {scope.namespace!r}",
+            )
+        for entity in (src, dst):
+            if (entity.entity_type, entity.canonical_key) not in entities or entity.scope != scope:
+                referenced[str(entity.entity_id)] = entity
         if src.entity_type not in definition.sources or dst.entity_type not in definition.targets:
             raise OntologyError(
-                "invalid", f"{where}: {src.entity_type} -{item.type}-> {dst.entity_type} is not "
+                "invalid", f"{label}: {src.entity_type} -{item.type}-> {dst.entity_type} is not "
                 f"allowed (from: {', '.join(definition.sources)}; to: "
                 f"{', '.join(definition.targets)})",
             )
         relation_id = seed_relation_id(scope, principal_id, src, item.type, dst)
         if relation_id in seen:
             raise OntologyError(
-                "invalid", f"{where}: duplicate relation {item.src} -{item.type}-> {item.dst}",
+                "invalid", f"{label}: duplicate relation {item.src} -{item.type}-> {item.dst}",
             )
         seen.add(relation_id)
         text = item.evidence.strip() if item.evidence else None
@@ -340,7 +535,7 @@ def _plan(
             if text else None
         )
         planned.append(_PlannedRelation(item, src, dst, relation_id, chunk_id, text))
-    return list(entities.values()), planned
+    return list(entities.values()), planned, referenced
 
 
 # -- execution -----------------------------------------------------------------
@@ -404,6 +599,7 @@ def seed_ontology(
     dry_run: bool = False,
     status_override: SeedStatus | None = None,
     now: datetime | None = None,
+    where: Callable[[str, int], str] | None = None,
 ) -> SeedReport:
     """Apply ``manifest`` to the ontology behind ``facade``.
 
@@ -412,6 +608,12 @@ def seed_ontology(
     chunk; it is required when any relation carries ``evidence`` text (and not
     called on a dry run). ``status_override`` forces every relation to one
     status, e.g. ``candidate`` to stage a manifest without verifying it.
+    ``where(kind, index)`` labels manifest items in errors (see
+    :func:`merge_manifests`, which names the source file).
+
+    Relation endpoints are matched against the manifest's entities first,
+    then against entities already in the store (the namespace, then
+    ``global``); referenced entities are never written.
     """
     store = facade._require_enabled()
     target = namespace or manifest.pipeline
@@ -419,7 +621,7 @@ def seed_ontology(
         raise OntologyError("invalid", "no namespace: set 'pipeline' in the manifest or pass one")
     with _translate_errors():
         scope = Scope(tenant_id=DEFAULT_TENANT, namespace=target)
-    principal = seed_principal(manifest.source)
+    principal = seed_principal(manifest.source or DEFAULT_SOURCE)
     capabilities = {"read", "write", "verify"}
     if scope.namespace == GLOBAL_NAMESPACE:
         capabilities.add("admin")
@@ -431,16 +633,28 @@ def seed_ontology(
             relation.model_copy(update={"status": status_override})
             for relation in manifest.relations
         )})
-    entities, planned = _plan(facade, manifest, scope, principal)
+    entities, planned, referenced = _plan(
+        facade, manifest, scope, principal, where=where or _default_where,
+    )
     if any(item.evidence_text for item in planned) and write_chunk is None and not dry_run:
         raise OntologyError("invalid", "evidence text needs a memory store to write chunks to")
 
     clock = now or datetime.now(timezone.utc)
-    report = SeedReport(namespace=scope.namespace, principal_id=principal, dry_run=dry_run)
+    report = SeedReport(namespace=scope.namespace, principal_id=principal, dry_run=dry_run,
+                        entities_referenced=len(referenced))
 
     # Entities: upsert through the facade so its validation/redaction applies.
     with _translate_errors():
         current = store.get_entities([entity.entity_id for entity in entities], auth=auth)  # type: ignore[attr-defined]
+    for entity in entities:  # before any write: a pack upgrade would fail half-way
+        before = current.get(str(entity.entity_id))
+        if before is not None and before.schema_version != entity.schema_version:
+            raise OntologyError(
+                "invalid", f"{entity.entity_type}:{entity.canonical_key} exists on "
+                f"{before.schema_pack} v{before.schema_version}; the manifest uses "
+                f"v{entity.schema_version}. Seed this namespace with schema_version = "
+                f"{before.schema_version}, or revoke the entity's relations before upgrading",
+            )
     for entity in entities:
         before = current.get(str(entity.entity_id))
         if before is not None and before.deleted_at is None and (
@@ -560,7 +774,8 @@ def memory_chunk_writer(memory_store: object) -> Callable[[str, str, str, str], 
 
 
 __all__ = [
-    "DEFAULT_SOURCE", "SeedEntity", "SeedManifest", "SeedRelation", "SeedReport",
-    "load_manifest", "memory_chunk_writer", "parse_manifest", "seed_ontology",
+    "DEFAULT_SOURCE", "MergedManifest", "SeedEntity", "SeedManifest", "SeedRelation",
+    "SeedReport", "load_manifest", "memory_chunk_writer", "merge_manifests", "parse_manifest",
+    "seed_ontology",
     "seed_principal", "seed_relation_id",
 ]

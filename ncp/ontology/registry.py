@@ -48,6 +48,14 @@ class SchemaPack(Contract):
         return self
 
 
+BUILTIN_PACK_FILES = ("infrastructure.v1.json", "infrastructure.v2.json")
+# The version a write gets when it names no ``schema_version`` and
+# ``[ontology].pack_versions`` pins none. Newer built-in versions are opt-in:
+# an entity's version cannot change while live relations reference it, so
+# silently defaulting existing graphs to a new version would break them.
+DEFAULT_PACK_VERSIONS: dict[str, int] = {"infrastructure": 1}
+
+
 class SchemaRegistry:
     def __init__(self) -> None:
         self._packs: dict[tuple[str, int], SchemaPack] = {}
@@ -55,8 +63,9 @@ class SchemaRegistry:
     @classmethod
     def builtin(cls) -> "SchemaRegistry":
         registry = cls()
-        resource = files("ncp.ontology").joinpath("packs", "infrastructure.v1.json")
-        registry.register(SchemaPack.model_validate_json(resource.read_bytes()))
+        for name in BUILTIN_PACK_FILES:
+            resource = files("ncp.ontology").joinpath("packs", name)
+            registry.register(SchemaPack.model_validate_json(resource.read_bytes()))
         return registry
 
     def register(self, pack: SchemaPack) -> None:
@@ -68,6 +77,17 @@ class SchemaRegistry:
     def packs(self) -> tuple[SchemaPack, ...]:
         """Registered packs ordered by (id, version)."""
         return tuple(self._packs[key] for key in sorted(self._packs))
+
+    def has_version(self, pack_id: str, version: int) -> bool:
+        return (pack_id, version) in self._packs
+
+    def default_version(self, pack_id: str) -> int | None:
+        """The stable default for writes that name no version (see
+        :data:`DEFAULT_PACK_VERSIONS`); the latest for packs without one."""
+        pinned = DEFAULT_PACK_VERSIONS.get(pack_id)
+        if pinned is not None and (pack_id, pinned) in self._packs:
+            return pinned
+        return self.latest_version(pack_id)
 
     def latest_version(self, pack_id: str) -> int | None:
         versions = [version for (name, version) in self._packs if name == pack_id]

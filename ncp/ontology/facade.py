@@ -237,6 +237,12 @@ class OntologyFacade:
             unknown = sorted(set(config.packs) - available)
             if unknown:
                 raise ValueError(f"[ontology].packs names unregistered schema packs: {unknown}")
+            for pack_id, version in sorted(config.pack_versions.items()):
+                if pack_id not in config.packs or not store.registry.has_version(pack_id, version):
+                    raise ValueError(
+                        f"[ontology].pack_versions pins {pack_id} v{version}, which is not "
+                        "an enabled, registered schema pack version"
+                    )
 
     @classmethod
     def disabled(cls, reason: str = "ontology is disabled") -> OntologyFacade:
@@ -305,6 +311,10 @@ class OntologyFacade:
             packs.append({
                 "id": pack.id,
                 "version": pack.version,
+                "default": pack.version == (
+                    config.pack_versions.get(pack.id)
+                    or self.store.registry.default_version(pack.id)
+                ),
                 "entity_types": {
                     name: {"required": list(definition.required)}
                     for name, definition in sorted(pack.entity_types.items())
@@ -346,10 +356,12 @@ class OntologyFacade:
         if not isinstance(pack_id, str) or pack_id not in self.config.packs:
             raise OntologyError("invalid", "schema_pack is not enabled for this server")
         if version is None:
-            latest = store.registry.latest_version(pack_id)
-            if latest is None:
+            default = self.config.pack_versions.get(pack_id) or store.registry.default_version(
+                pack_id,
+            )
+            if default is None:
                 raise OntologyError("invalid", "schema_pack is not enabled for this server")
-            return pack_id, latest
+            return pack_id, default
         if isinstance(version, bool) or not isinstance(version, int):
             raise OntologyError("invalid", "schema_version must be an integer")
         return pack_id, version

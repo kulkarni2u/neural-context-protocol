@@ -56,7 +56,7 @@ def test_schema_pack_validation(endpoints):
     with pytest.raises(ValueError, match="missing required attribute"):
         registry.validate_entity(source.model_copy(update={"attributes": {"name": "Payroll"}}))
     with pytest.raises(ValueError, match="unknown schema pack version"):
-        registry.validate_entity(source.model_copy(update={"schema_version": 2}))
+        registry.validate_entity(source.model_copy(update={"schema_version": 99}))
     with pytest.raises(ValueError, match="endpoint IDs"):
         registry.validate_relation(
             relation(source, target, dst_entity_id=uuid4()), source=source, target=target,
@@ -179,3 +179,18 @@ def test_disabled_config_preserves_context_and_tool_catalog(tmp_path):
     ) == get_context(
         agent=conscious, store=SQLiteStore(tmp_path / "disabled.db"), config=disabled,
     )
+
+
+def test_builtin_infrastructure_v2_is_registered_but_not_default() -> None:
+    registry = SchemaRegistry.builtin()
+    assert registry.latest_version("infrastructure") == 2
+    # New built-in versions are opt-in: writes without a version stay on v1.
+    assert registry.default_version("infrastructure") == 1
+    v1, v2 = (pack for pack in registry.packs() if pack.id == "infrastructure")
+    # v2 is a strict superset of v1: every v1 type and triple stays valid.
+    assert set(v1.entity_types) <= set(v2.entity_types)
+    for name, definition in v1.relation_types.items():
+        assert set(definition.sources) <= set(v2.relation_types[name].sources)
+        assert set(definition.targets) <= set(v2.relation_types[name].targets)
+    assert {"Repo", "Module", "Table"} <= set(v2.entity_types)
+    assert {"CONTAINS", "BUILDS", "READS", "WRITES"} <= set(v2.relation_types)
