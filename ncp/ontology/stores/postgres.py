@@ -1030,6 +1030,27 @@ class PostgresOntologyStore:
             )
             return [self._relation_from_row(tx, row) for row in rows]
 
+    def list_relations(
+        self, *, auth: AuthContext, status: str | None = None, limit: int = 1000,
+    ) -> list[Relation]:
+        """Active relations in exactly the caller's scope, optionally only those with
+        ``status``; see ``SQLiteOntologyStore.list_relations``."""
+        _require(auth, "read")
+        extra, params = "", {
+            "tenant": auth.scope.tenant_id, "namespace": auth.scope.namespace,
+            "now": datetime.now(timezone.utc), "limit": max(1, int(limit)),
+        }
+        if status is not None:
+            extra, params["status"] = " AND r.status = %(status)s", status
+        with self._transaction(write=False) as tx:
+            rows = tx.rows(
+                f"SELECT r.* FROM {self._t('relations')} r WHERE r.tenant_id = %(tenant)s"
+                f" AND r.namespace = %(namespace)s AND {_ACTIVE}{extra}"
+                " ORDER BY r.created_at, r.relation_id LIMIT %(limit)s",
+                params,
+            )
+            return [self._relation_from_row(tx, row) for row in rows]
+
     def resolve_entities(
         self, key: str, *, auth: AuthContext, entity_type: str | None = None,
         schema_pack: str | None = None, limit: int = 20,

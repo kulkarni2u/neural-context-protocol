@@ -1,0 +1,7 @@
+{
+  "id": "infrastructure",
+  "version": 9,
+  "extends": {"id": "infrastructure", "version": 3},
+  "entity_types": {"Cache": {"required": ["name"], "tag": "cache"}},
+  "relation_types": {"READS": {"from": ["Service"], "to": ["Cache"]}}
+}

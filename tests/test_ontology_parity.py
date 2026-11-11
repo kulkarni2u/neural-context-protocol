@@ -927,6 +927,23 @@ def sc_relations_asserted_by(b: Backend) -> list:
     assert s.relations_asserted_by("seed:a", auth=auth(STAGING)) == []
     return [norm(mine), norm(s.relations_asserted_by("seed:b", auth=auth()))]
 
+def sc_list_relations(b: Backend) -> list:
+    s = b.store
+    api, db, cache = service("api"), database("db"), database("cache")
+    put(s, api, db, cache)
+    s.assert_relation(rel("cand", api, db), auth=auth(principal="seed:a"), idempotency_key="c")
+    s.assert_relation(rel("ver", api, cache, status="verified", evidence=(attestation(),)),
+                      auth=auth(principal="seed:b"), idempotency_key="v")
+    s.assert_relation(rel("gone", api, cache), auth=auth(principal="seed:a"), idempotency_key="g")
+    s.revoke_relation(rid("gone"), auth=auth(principal="seed:a"), reason="gone")
+    candidates = s.list_relations(auth=auth(), status="candidate")
+    assert [r.relation_id for r in candidates] == [rid("cand")]
+    everything = s.list_relations(auth=auth())  # any principal, never the revoked one
+    assert {r.relation_id for r in everything} == {rid("cand"), rid("ver")}
+    assert s.list_relations(auth=auth(STAGING)) == []
+    assert len(s.list_relations(auth=auth(), limit=1)) == 1
+    return [norm(candidates), norm(everything)]
+
 
 SCENARIOS: dict[str, Callable[[Backend], list]] = {
     name.removeprefix("sc_"): value for name, value in dict(globals()).items()

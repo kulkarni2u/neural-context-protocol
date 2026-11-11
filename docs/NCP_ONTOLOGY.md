@@ -25,7 +25,7 @@ harnesses must not treat a path as permission to change anything.
 
 | Term | Meaning |
 |---|---|
-| Schema pack | A versioned, immutable set of entity types (with required attributes) and relation types (allowed endpoint types, cardinality, cycles). `infrastructure` v1 (the default): `Service`, `Database`, `API`, `KafkaTopic`, `Incident`, `Team`; `DEPENDS_ON`, `PRODUCES`, `CONSUMES`, `EXPOSES`, `OWNS`. `infrastructure` v2 (opt-in, a superset; see [Schema pack v2](#schema-pack-v2-repos-modules-tables)) adds `Repo`, `Module`, `Table` and `CONTAINS`, `BUILDS`, `READS`, `WRITES`. |
+| Schema pack | A versioned, immutable set of entity types (with required attributes) and relation types (allowed endpoint types, cardinality, cycles). `infrastructure` v1 (the default): `Service`, `Database`, `API`, `KafkaTopic`, `Incident`, `Team`; `DEPENDS_ON`, `PRODUCES`, `CONSUMES`, `EXPOSES`, `OWNS`. `infrastructure` v2 (opt-in, a superset; see [Schema pack v2](#schema-pack-v2-repos-modules-tables)) adds `Repo`, `Module`, `Table` and `CONTAINS`, `BUILDS`, `READS`, `WRITES`. `infrastructure` v3 (opt-in, a superset of v2; see [Schema pack v3](#schema-pack-v3-queues-and-exchanges)) adds `Queue`, `Exchange` and `ROUTES_TO`. |
 | Entity | `(tenant, namespace, entity_type, canonical_key)` plus aliases and attributes. Ids are deterministic. Attributes are never serialized into automatic context. |
 | Relation | A typed edge with `status` (`candidate`, `verified`, `disputed` or `revoked`), `confidence`, a validity window `[valid_from, valid_until)`, `observed_at` and evidence refs. |
 | Evidence | Either an NCP memory chunk id (`evidence_type: "chunk"`) or an `external_attestation`. A chunk is live only while it is not superseded or expired, its `valid_from` has passed, and the caller can read it. |
@@ -52,6 +52,7 @@ refresh.
 | `fail_mode` | `"fallback"` | `fallback`, `closed` | For optional enrichment: `fallback` degrades to ordinary context; `closed` fails the `ncp_get_context` call. |
 | `packs` | `["infrastructure"]` | registered pack ids | Packs enabled for writes, queries and automatic context. An unregistered id is a startup error. |
 | `pack_versions` | `{}` | pack id → registered version | Version used by writes that name no `schema_version`, e.g. `{ infrastructure = 2 }`. Unpinned packs stay on their stable default (`infrastructure` → 1), so new built-in versions never apply silently. An unregistered pin is a startup error. |
+| `pack_paths` | `[]` | JSON file paths | Custom schema pack files, relative to the project root (or absolute); env `NCP_ONTOLOGY_PACK_PATHS` (`os.pathsep`-separated) overrides. See [Custom packs](#custom-packs). A custom pack id must also be listed in `packs`. |
 | `retrieval_mode` | `"auto"` | `off`, `auto`, `always` | Automatic enrichment policy (see [Automatic trigger](#automatic-trigger-policy)). |
 | `max_hops` | `2` | 0–5 | Traversal depth ceiling. Larger requests are clamped with a `clamped:` warning. |
 | `max_nodes` | `30` | 1–100 | Node ceiling per traversal (clamped). |
@@ -62,6 +63,12 @@ refresh.
 | `intent_directed` | `true` | bool | Map the request's relationship intent to relation types, direction and hops (see [Intent-directed expansion](#intent-directed-expansion)). `false` walks every type in both directions to `max_hops` (the v1 behaviour). |
 | `substitute_evidence` | `true` | bool | Graph-first substitution: a memory chunk cited by a shown fact is not repeated as text (see [Graph-first context](#graph-first-context-block-v2)). |
 | `verified_only` | `true` | bool | Default for explicit queries. Automatic context is **always** verified-only. |
+| `promotion.auto` | `false` | bool | `ncp ontology seed` writes candidates that meet the rules below as verified (see [Promoting candidates](#promoting-candidates)). |
+| `promotion.min_confidence` | `0.6` | 0.0–1.0 | Candidates below this are held back. |
+| `promotion.require_resolved` | `true` | bool | Hold back `unresolved:*` / `pattern:*` destinations. |
+| `promotion.require_counterpart` | `false` | bool | PRODUCES needs a CONSUMES on the same destination (and vice versa), in the same manifest or store. |
+| `promotion.types` | `["PRODUCES", "CONSUMES", "ROUTES_TO"]` | relation types | Only these types are auto-promoted. |
+| `promotion.verified_confidence` | `0.9` | 0.0–1.0 | Promoted relations get at least this confidence. |
 | `trigger_max_ms` | `10` | 1–1000 | Time budget for the automatic trigger (entity resolution and decision). |
 | `graph_timeout_ms` | `50` | 1–5000 | Time budget for traversal and evidence mapping during enrichment. On Postgres it becomes `SET LOCAL statement_timeout`. |
 | `fallback_to_memory` | `true` | bool | With `fail_mode = "fallback"`, return ordinary context on timeout or backend error. When false, those failures fail the call. |
@@ -185,20 +192,111 @@ filtered directory walk outside git, and always skips `node_modules`,
 | Reads | Produces | Status |
 |---|---|---|
 | `package.json`, `pyproject.toml`, `go.mod`, `Cargo.toml`, `pom.xml`, `build.gradle(.kts)` | one `Module` per directory (key = repo path, aliases = package names), `Repo CONTAINS Module`, and in-repo dependencies as `Module DEPENDS_ON Module`. Workspace roots, Maven aggregators and Gradle root projects are not modules. | verified |
-| `Chart.yaml`, k8s `Deployment`/`StatefulSet`/`DaemonSet`, `Dockerfile` | a `Service` per module (named by the chart, then the workload, then the directory) and `Module BUILDS Service` | verified |
+| `Chart.yaml`, k8s `Deployment`/`StatefulSet`/`DaemonSet`, `Dockerfile`, and deployable signals (see [service attribution](#service-attribution)) | a `Service` per module (named by the chart, then the workload, then `spring.application.name`, then the package / module name) and `Module BUILDS Service` | verified |
 | `CODEOWNERS` (root, `.github/`, `docs/`, `.gitlab/`; last match wins) | `Team OWNS Module` and `Team OWNS Service` | verified |
-| Kafka clients: Spring `@KafkaListener` / `KafkaTemplate.send` / `ProducerRecord`, kafka-python / confluent / aiokafka, kafkajs, kafka-go / sarama, Spring Cloud Stream bindings | `PRODUCES` / `CONSUMES` `KafkaTopic` (literals, Spring `${...}` placeholders and string constants are resolved, see below; test files skipped unless `--include-tests`) | candidate (`--heuristics verified\|off`) |
+| Messaging clients in JS/TS, Python, Go and JVM code (see [brokers and languages](#brokers-and-languages)) | `PRODUCES` / `CONSUMES` `KafkaTopic` / `Queue` / `Exchange`, and `Exchange ROUTES_TO Queue` (literals, constants, Spring `${...}` placeholders, simple SpEL and environment defaults are resolved, see below; test files skipped unless `--include-tests`) | candidate (`--heuristics verified\|off`) |
 | `ncp-ontology.{toml,json,yaml,yml}` anywhere | hand-written facts (databases, tables, external APIs) merged in; they win over a scanned entity with the same type and key | as written |
 
 Every scanned relation cites `attestation = "path#Lnn"`. Options:
 `--pipeline-id`, `--source` (default: the directory name), `--repo-name`,
 `--environment` (service attribute, default `prod`), `--kafka-cluster`
-(default `main`), `--schema-version 1|2` (default 2) and `--heuristics`.
+(default `main`), `--schema-version 1|2|3` (default 3; the shared constant
+`DEFAULT_SCAN_SCHEMA_VERSION`, also used by `ncp ontology eval --scan`) and
+`--heuristics`.
 
+With `--schema-version 3` (default) the scan also emits `Queue`, `Exchange`
+and `ROUTES_TO` ([schema pack v3](#schema-pack-v3-queues-and-exchanges)).
+With `--schema-version 2`, Queue / Exchange sites are not emitted: they are
+counted as `skipped_schema` in the summary and one warning says to use
+`--schema-version 3` and pin `[ontology] pack_versions = { infrastructure = 3 }`.
 With `--schema-version 1` the scan emits only v1 types: modules and repos
 are dropped, module dependencies are lifted to `Service DEPENDS_ON Service`
 where both modules build a service, and Kafka edges and ownership attach to
 services.
+
+#### Brokers and languages
+
+Each broker is a group of rules in the table in
+`ncp/ontology/scan_messaging.py` (a regex plus how to cut the destination out
+of the call). Rules use bounded, linear-time regexes and skip lines over 2000
+characters.
+
+| Language (suffixes) | Clients and calls |
+|---|---|
+| JS/TS (`.js .mjs .cjs .ts .tsx .jsx .mts .cts`) | kafkajs `producer.send({ topic })`, `sendBatch({ topicMessages })`, `consumer.subscribe({ topic(s) })`; node-rdkafka `producer.produce(topic)`; amqplib `sendToQueue` (Queue), `publish` (Exchange; an empty exchange names a Queue), `consume` (Queue), `bindQueue` (`Exchange ROUTES_TO Queue`); AWS SDK v3 `SendMessageCommand` / `SendMessageBatchCommand` / `ReceiveMessageCommand` (`QueueUrl`), `PublishCommand` (`TopicArn`: an `Exchange` with broker `sns`); sqs-consumer `Consumer.create({ queueUrl })` |
+| Python | confluent-kafka / kafka-python / aiokafka `<...producer>.produce/send/send_and_wait(topic)`, `subscribe([..])`, `KafkaConsumer(topic, ..)`; boto3 `send_message(_batch)` / `receive_message` (`QueueUrl=`), `publish(TopicArn=)`; pika `basic_publish(exchange=, routing_key=)` (empty exchange: a Queue named by the routing key), `basic_consume(queue=)`, `queue_bind` |
+| Go | kafka-go `kafka.Writer{Topic}` / `kafka.ReaderConfig{Topic}`; sarama `ProducerMessage{Topic}` / `ConsumePartition(topic)`; aws-sdk-go `SendMessageInput` / `ReceiveMessageInput` (`QueueUrl: aws.String(..)`), `PublishInput`; amqp091 `Publish` / `PublishWithContext` / `Consume` |
+| JVM (`.java .kt .scala`) | Spring Kafka (`@KafkaListener`, `@SendTo` on a listener, `<kafka\|producer\|template\|sender>.send/sendDefault/produce(..)`, `ProducerRecord`, reactor `SenderRecord.create`), `streamBridge.send(binding-or-destination, ..)`, Spring Cloud Stream bindings; Spring AMQP `rabbitTemplate.convertAndSend/send` (three arguments: an `Exchange`; two: a `Queue` through the default exchange) and `@RabbitListener(queues, queuesToDeclare)`; JMS `jmsTemplate.convertAndSend/send` and `@JmsListener(destination)`; Spring Cloud AWS `@SqsListener` and `sqsTemplate.send(..)` (also `to -> to.queue(..)`); AWS SDK v2 `SendMessageRequest` / `ReceiveMessageRequest` `.builder().queueUrl(..)`, `PublishRequest.builder().topicArn(..)` |
+
+`sendDefault(...)` takes its topic from `spring.kafka.template.default-topic`
+or a `setDefaultTopic(X)` call in the same module, else it is
+`unresolved:sendDefault`. `streamBridge.send(X, ..)` resolves
+`spring.cloud.stream.bindings.<X>.destination` (placeholders and comma lists
+apply), else uses `X` itself as the topic; when the binding's `binder` (or
+`spring.cloud.stream.default-binder`) contains `rabbit` the destination is an
+`Exchange` with broker `rabbitmq` instead. kombu / celery are not scanned.
+
+A queue or topic written as a URL (`https://sqs.<region>.amazonaws.com/<acct>/<name>`)
+or an ARN becomes its last path / `:` segment; the original value stays in
+`attributes.url` / `attributes.arn`. Entity keys: `KafkaTopic` keeps the
+topic name; `Queue` and `Exchange` are keyed `<broker>:<name>` with
+attributes `broker` (`sqs`, `sns`, `rabbitmq`, `jms`) and `name`. Every
+AMQP 0-9-1 client (amqplib, pika, amqp091, Spring AMQP, the Rabbit binder)
+uses broker `rabbitmq`, so one queue reached through different clients has one
+key (`Queue:rabbitmq:<name>`). Unresolved destinations become
+`<broker>:unresolved:...` candidates and patterns `<broker>:pattern:...`.
+
+Rules for a client library only apply to a module that uses it, but the call
+and the client are often in different files (`producer.send({ topic })` in a
+file that never imports `kafkajs`). A rule that names a client word (`kafka`,
+`amqp`, `rabbit`, `sarama`, `sqs`) therefore applies when the *owning module*
+mentions it: in the file itself, in any other source file of the module, or in
+the module's build manifest dependencies (`package.json` dependencies /
+devDependencies / peerDependencies, `pyproject.toml`, `requirements*.txt`,
+`go.mod`, Gradle / Maven). A module with no such mention ignores generic calls
+such as `.send({ topic: ... })`.
+
+#### Service attribution
+
+Edges start at the deployable `Service`, not the build module. Besides
+`Chart.yaml`, k8s workloads and a `Dockerfile` (the strongest signals), a
+module is a service (lower rank) when it:
+
+- applies `org.springframework.boot` (not `apply false`, not
+  `bootJar { enabled = false }`) or the `application` plugin, or declares
+  `bootJar` / `mainClass` (Gradle); has `spring-boot-maven-plugin` outside
+  `pluginManagement` with a packaging other than `pom` (Maven);
+- has a JVM source file with `@SpringBootApplication`, `fun main(` or
+  `static void main(`;
+- has `scripts.start` or `bin` in `package.json`;
+- has a Go file with `package main`;
+- has `[project.scripts]` in `pyproject.toml`, a `__main__.py`, or a `Procfile`.
+
+Service name: `Chart.yaml`, then a named k8s workload, then
+`spring.application.name` (`application*.properties|yml`, base file before
+profiles, `${X:default}` uses the default), then the package / module name
+(the directory name for a Dockerfile-only module, unless
+`spring.application.name` is set). The `Service` attribute
+`detected_by` records the rule (`chart`, `k8s`, `dockerfile`,
+`spring_boot_plugin`, `gradle_application_plugin`, `gradle_main_class`,
+`maven_spring_boot_plugin`, `spring_boot_application`, `main_function`,
+`package_json_start`, `package_json_bin`, `go_package_main`, `python_scripts`,
+`python_main_module`, `procfile`).
+
+A messaging site in module M is attributed to: (1) the service of M; else
+(2) every service whose module transitively `DEPENDS_ON` M in the repo, one
+edge each with relation attribute `via_module = <M>` (deduplicated by
+relation, first evidence kept); else (3) the `Module` (schema 2+; schema 1
+skips the site). The counts are in `summary["attribution"]`
+(`edges_from_service`, `edges_via_dependency`, `edges_from_module`).
+
+Node: a `package.json` without `name` still forms a module (named after its
+directory, the repo name at the root; a nameless workspace root that only
+lists `workspaces` is not a module). A JS/TS, Python or Go tree with source
+above no build file (no `package.json`, `pyproject.toml`/`requirements*.txt`,
+`go.mod`) gets a synthetic root module named after the repo, so its sites are
+never skipped. A `requirements*.txt` alone (no `pyproject.toml`) forms a
+Python module named after its directory.
 
 The scan is static: it follows no code paths, and CODEOWNERS matching
 approximates GitHub's gitignore-style rules. Review the manifest before
@@ -207,9 +305,10 @@ emit a manifest from its own script instead.
 
 #### Spring topics: placeholders and constants
 
-In Java, Kotlin and Scala sources the topic argument of `@KafkaListener`
-(`topics`, `topicPattern`), `<kafkaTemplate>.send(...)` and
-`new ProducerRecord<>(...)` may be a literal, a `"${key}"` /
+In Java, Kotlin and Scala sources the destination argument of Kafka, SQS,
+RabbitMQ and JMS calls (for Kafka: `@KafkaListener` `topics` /
+`topicPattern`, `<producer>.send(...)` and `new ProducerRecord<>(...)`) may
+be a literal, a `"${key}"` /
 `"${key:default}"` placeholder, a constant (`NAME` or `Class.NAME`, from
 `static final String`, Kotlin `const val`, or `val` in an `object` /
 `companion object`), a `@Value("${key}")` field of the same file, or a `+`
@@ -224,9 +323,10 @@ attribute. Values nest (up to 4 levels, cycle-guarded) and comma-separated
 values expand to several topics.
 
 Resolved topics carry `resolved_from` = `literal`, `property:<key>`,
-`default:<key>` (the `${key:default}` default was used) or `constant:<NAME>`.
-A topic that cannot be resolved (unknown property, SpEL `#{...}`, a local
-variable, a constant defined elsewhere) becomes a `KafkaTopic` keyed
+`default:<key>` (the `${key:default}` default was used), `constant:<NAME>`,
+`spel` (see below) or `env_default` (with `env: <NAME>`).
+A topic that cannot be resolved (unknown property, unsupported SpEL
+`#{...}`, a local variable, a constant defined elsewhere) becomes a `KafkaTopic` keyed
 `unresolved:<expression>` (e.g. `unresolved:messaging.orders-topic`)
 with attributes `unresolved = true` and `expression`; its edge is always
 `candidate`, even with `--heuristics verified`. A non-plain `topicPattern`
@@ -234,7 +334,42 @@ becomes `pattern:<regex>` with a `pattern` attribute. Expressions the scan
 does not understand (method calls, ...) produce no topic and show up as
 unmatched in the coverage report.
 
+Non-JVM sources resolve the same way through a generic constant index built
+in the first pass: JS/TS `const|let|var X = "lit"`, `export const Topics = {
+ORDERS: "orders" }` (`Topics.ORDERS`) and `enum T { A = "a" }`; Python
+module-level `X = "lit"`, class attributes and `self.x = "lit"`; Go
+`const X = "lit"` and `const ( ... )` blocks. Environment lookups resolve to
+their default and record `resolved_from = env_default` and `env`:
+`process.env.X ?? "d"`, `process.env.X || "d"`, `os.getenv("X", "d")`,
+`os.environ.get("X", "d")`; a lookup with no default is `unresolved:env:X`.
+JS template literals resolve when every `${name}` is a known constant.
+
+#### SpEL
+
+SpEL is evaluated by a small bounded evaluator (no `eval`); `${...}`
+placeholders inside it are expanded first, as Spring does. Supported:
+`#{'${a.b}'}`, `#{'${a.b}'.split(',')}` (the result is split on commas into
+several topics), `#{'literal'}`, `#{'a' + '${b}'}` and `+` concatenation,
+`#{T(com.x.Topics).ORDERS}` (constant index), `#{environment['a.b']}`,
+`#{environment.getProperty('a.b')}` / `getProperty('a.b', 'dflt')`,
+`#{systemProperties['a.b']}`, and `#{@beanName.field}` /
+`#{@beanName.getX()}` / `#{__listener.topic}` (an `@Value("${...}")` field or
+constant of that name in the class that decapitalises to the bean name, or the
+enclosing class for `__listener`). A resolved topic has `resolved_from =
+spel` and `attributes.spel` (the raw expression). Anything else stays
+`unresolved:#{...}` with the resolvable placeholders expanded in the stored
+text, `attributes.spel`, and `attributes.bean` for bean lookups.
+
 #### Coverage report and warnings
+
+`summary["messaging"]` has one entry per broker that had a site (`kafka`,
+`sqs`, `sns`, `rabbitmq`, `jms`): `sites`, `producer_sites`,
+`consumer_sites`, `matched_sites`, `unmatched_sites`, `unresolved`,
+`skipped_no_owner` (sites), `skipped_schema` and up to 5
+`unmatched_examples`. `summary["attribution"]` and `summary["destinations"]`
+(`KafkaTopic` / `Queue` / `Exchange` counts) complete it, and the warnings
+below apply to every broker. `summary["kafka"]` (described next) is kept for
+compatibility, with `producer_sites` / `consumer_sites` added.
 
 `summary["kafka"]` (and a table printed by `ncp ontology scan`; `--json`
 prints the whole summary as JSON, with the manifest under `manifest` unless
@@ -267,6 +402,106 @@ relation as new; references to entities that already exist in a store are not
 checked. A real seed, or a dry run with the ontology enabled (which diffs
 against the store), is unchanged.
 
+### Reviewing a scan: the ontology wiki
+
+A manifest is hard to verify as JSON. `ncp ontology wiki` renders it as linked
+markdown pages (files only, no store needed, deterministic output):
+
+```bash
+ncp ontology scan . -o scan.json --summary-out scan-summary.json
+ncp ontology wiki scan.json --summary scan-summary.json \
+    --compare previous-scan.json --out .ncp/ontology-wiki
+```
+
+- `index.md`: totals, warnings, what changed, links to every page.
+- `services/`, `modules/`: per service, what it produces and consumes (status,
+  confidence, `resolved_from`, `via_module`, evidence `path#L12`), dependencies.
+- `destinations/`: one page per topic, queue or exchange, with producers and
+  consumers side by side. Flags: `⚠ no consumer in repo`, `⚠ no producer in
+  repo`, `⚠ unresolved name`, `pattern subscription`; `pattern:` subscriptions
+  that match the name are listed as potential consumers. Repo-supplied
+  regexes are never compiled: only globs and regexes made of literals, `\.`,
+  `.`, `.*` and `.+` (at most 200 characters) are evaluated; any other pattern
+  renders as "pattern (not evaluated)" and matches nothing.
+- `messaging.md` (matrix, problems first), `coverage.md` (per-broker scan
+  coverage and every unresolved value), `compare.md` (only with `--compare`:
+  added/removed entities and relations, status/confidence changes, destinations
+  whose producers or consumers changed).
+- `candidates.md`: a checklist of candidate relations grouped by service.
+
+```markdown
+## Producers vs consumers
+
+| Producers | Consumers |
+| --- | --- |
+| [Service:billing](../services/billing.md) (candidate, 0.60, billing/K.java#L12) | [Service:shop](../services/shop.md) (candidate, 0.60, shop/L.java#L40) |
+```
+
+Workflow: scan, build the wiki, read the `compare.md` and the flagged
+destinations, tick (`[x]`) the lines in `candidates.md` you verified, then
+`ncp ontology promote --from-checklist candidates.md`. Checklist lines look like
+``- [ ] `Service:billing -PRODUCES-> KafkaTopic:orders.v1` — conf 0.60 · `billing/K.java#L12` ``;
+do not edit the text inside the first backticks.
+
+### Promoting candidates
+
+`ncp ontology scan` emits heuristic messaging edges as `candidate` relations
+(Kafka edges 0.6, `unresolved:*` / `pattern:*` destinations 0.4). **Context
+assembly only follows verified relations** (automatic enrichment is always
+verified-only, and `[ontology] verified_only = false` does not change that), so
+a candidate never reaches a prompt until it is promoted. Workflow:
+
+1. `ncp ontology scan . -o manifest.json`, then `ncp ontology seed manifest.json`
+   (candidates are stored, not used).
+2. Review: `ncp ontology promote --pipeline-id shop --list` (id, confidence,
+   evidence), or tick lines in the generated wiki checklist.
+3. Promote what you checked, or let rules do it.
+
+```bash
+ncp ontology promote --pipeline-id shop --list [--json]
+ncp ontology promote --pipeline-id shop <relation-id>...             # by id (or 8+ char prefix)
+ncp ontology promote --pipeline-id shop --match 'Service:order-* -PRODUCES-> *' --min-confidence 0.6
+ncp ontology promote --pipeline-id shop --type PRODUCES --type CONSUMES
+ncp ontology promote --pipeline-id shop --from-checklist review.md   # ticked '- [x] `src -TYPE-> dst`' lines
+ncp ontology promote --pipeline-id shop --auto --dry-run             # apply [ontology.promotion] rules
+ncp ontology promote --pipeline-id shop --all --include-unresolved
+ncp ontology demote  --pipeline-id shop <relation-id>... --reason "topic renamed"
+```
+
+Selectors combine with AND; `--all` takes every candidate. Refs are
+`Type:key` as in manifests (`--match` is an `fnmatch` glob against
+`"<src> -<TYPE>-> <dst>"`). Destinations whose key has an `unresolved:` or
+`pattern:` segment (`unresolved:x`, `rabbitmq:unresolved:q`) are held back (and
+counted in the output) unless `--include-unresolved` is passed. `--dry-run`
+writes nothing. The exit code is 1 when nothing was selected, unless
+`--allow-empty`. At most `--limit` relations (default 10000) of the namespace
+are loaded; a warning on stderr says so when the limit is hit, so raise it for
+larger namespaces. `--pipeline-id global` is refused unless `--allow-global` is
+given.
+
+Promotion re-asserts the same relation as `verified`, keeping its evidence
+and attestation (a candidate with none gets `promoted:cli`), raising
+confidence to `max(confidence, verified_confidence)` and recording
+`promoted_by` (`cli` or `auto:<rule>`) and `promoted_at` attributes. The CLI
+acts as the local operator `cli:promote` with `read`/`write`/`verify` in the
+`--pipeline-id` namespace (plus `admin` for `global`, which needs
+`--allow-global`), the same trust model as `seed`; nothing is checked against `[principals]`. Over MCP use
+`ncp_ontology_assert` with a principal holding `verify`. `demote` re-asserts
+verified relations as `candidate` (evidence kept, `demote_reason` recorded), so
+they leave context immediately; use the revoke tool to withdraw one entirely.
+
+A later `ncp ontology seed` of a manifest that still lists the relation as
+`candidate` writes it back to candidate (the seeder owns what it asserted).
+Use `--auto-promote`, or edit the manifest's `status`, to keep it verified.
+
+**Auto-promote.** With `[ontology.promotion] auto = true` (or
+`ncp ontology seed --auto-promote`; `--no-auto-promote` overrides the config)
+`seed` writes candidates that meet the rules as `verified` with attestation
+`auto-promote:<rule>` and reports how many were promoted and held back (and
+why). `--status` overrides win. `ncp ontology promote --auto` applies the same
+rules to candidates already in the store. Rules are evaluated by the pure
+function `ncp.ontology.promotion.select_promotions`.
+
 ### Schema pack v2 (repos, modules, tables)
 
 `infrastructure` v2 is a strict superset of v1:
@@ -281,6 +516,82 @@ v2 is **opt-in**: writes that name no `schema_version` stay on v1 unless
 change while live relations reference it, so a namespace already seeded on
 v1 cannot be re-seeded as v2 in place: `seed` refuses up front and says so.
 Use a new namespace for v2, or revoke the v1 relations first.
+
+### Schema pack v3 (queues and exchanges)
+
+`infrastructure` v3 is a strict superset of v2: it adds `Queue` and
+`Exchange` (each requires `broker` and `name`; `Exchange` also covers SNS
+topics with broker `sns`), lets `PRODUCES` / `CONSUMES` reach `KafkaTopic`,
+`Queue` and `Exchange`, and adds `ROUTES_TO` (`Exchange`→`Queue`, dependency
+intent). It is opt-in like v2: pin `[ontology].pack_versions = {
+infrastructure = 3 }` (the scan's default manifest sets `schema_version = 3`
+itself).
+
+### Custom packs
+
+Define your own entity and relation types in a JSON pack file and list it
+under `[ontology].pack_paths`. Files load wherever the ontology is built
+(`serve`, the Python API, `seed`). Example: `examples/13_ontology/packs/payments.v1.json`.
+
+```toml
+[ontology]
+enabled = true
+packs = ["infrastructure", "payments"]          # a custom id must be listed here to be active
+pack_paths = ["ontology/packs/payments.v1.json"]  # relative to the project root
+pack_versions = { payments = 1 }                # optional pin
+```
+
+A pack file is either a **new pack id** (`id`, `version`, `entity_types`,
+`relation_types`, same format as the built-ins) or an **extension** of a
+registered pack:
+
+```json
+{"id": "infrastructure", "version": 9,
+ "extends": {"id": "infrastructure", "version": 3},
+ "entity_types": {"Cache": {"required": ["name"], "tag": "cache"}},
+ "relation_types": {"READS": {"from": ["Service"], "to": ["Cache"]}}}
+```
+
+An extension must use an unused version. The result is the base plus the new
+types; for relation types the base already defines, only extra `from`/`to`
+endpoints may be added. Types cannot be removed or redefined, and every
+endpoint must name an entity type of the merged pack. Errors name the file.
+Extensions are opt-in like any other version (pin it with `pack_versions`
+or set `schema_version` on writes). Inspect and check packs with:
+
+```bash
+ncp ontology pack list                       # id, version, source, type counts, active/pinned
+ncp ontology pack validate FILE...           # offline, exit 1 on error
+ncp ontology pack show infrastructure --version 9   # merged schema as JSON
+```
+
+### Evaluating scan accuracy
+
+`ncp ontology eval` scores a scan against a hand-curated golden manifest
+(a normal seed manifest, optionally with a top-level `eval` table):
+
+```json
+{"eval": {"ignore_entity_types": ["Team"], "ignore_relation_types": ["OWNS"]},
+ "entities": [...], "relations": [...]}
+```
+
+```bash
+ncp ontology eval expected.json --scan . --by-type --show 20   # --scan uses schema 3 like `scan`
+ncp ontology eval expected.json --actual scan.json --json --min-recall 0.9 --min-precision 0.8
+```
+
+Entities match on `(type, canonical key)` (aliases on either side count);
+relations match on `(src, type, dst)` after refs are resolved through the
+matched entities. Output: precision/recall/F1 overall, per type (`--by-type`),
+missing (FN) and unexpected (FP) examples, and an `unresolved` bucket for
+`unresolved:*` destinations (never FP; the expected relation with the same
+source and type is listed beside it and counts as a miss). `--schema-version` (with `--scan`) defaults to 3, the same as `scan`: pass
+`--schema-version 2` to score a v2 scan against a golden manifest without
+Queue / Exchange entries. `--strict-status`
+also reports status mismatches (expected `verified`, got `candidate`). The
+`--min-*` thresholds apply to relations and exit 1 when missed, for CI.
+A tiny fixture lives in `examples/13_ontology/eval/`. From Python:
+`ncp.ontology.scan_eval.evaluate(expected, actual)`.
 
 ### From Python
 
@@ -552,8 +863,15 @@ Measured on the benchmark corpus with default limits (see
 - **Fixed tenant.** The tenant is always `"default"`. Pipelines are the only
   isolation boundary.
 - **Pack registration deferred.** `ncp_ontology_register_pack` is not
-  implemented. Packs are built-in and immutable, and a new version means a
-  code change.
+  implemented. Built-in packs are immutable; a new version means a code
+  change, or a pack file loaded at startup through `pack_paths` (see
+  [Custom packs](#custom-packs)), never at runtime.
+- **Schema v3 is opt-in and one-way per namespace.** `infrastructure` v3
+  (`Queue`, `Exchange`, `ROUTES_TO`) is not the default pack version, and like
+  v2 a namespace already seeded on an older version cannot be re-seeded on v3 in
+  place while live relations reference its entities (use a new namespace).
+  `ncp ontology scan` emits v3 by default; pin `pack_versions = {
+  infrastructure = 3 }` or scan with `--schema-version 2`.
 - **No automatic extraction.** NCP does not stage candidate relations from
   memory writes asynchronously. Ingestion happens only through explicit
   `ncp_ontology_assert`, or a declarative manifest loaded with
@@ -591,7 +909,7 @@ Measured on the benchmark corpus with default limits (see
   content, not ids. Dereference a cited id with `ncp_ontology_evidence`,
   which may report it `missing` once the chunk is no longer live or
   readable.
-- **No Deployment type.** Neither `infrastructure` v1 nor v2 has a Deployment
+- **No Deployment type.** None of `infrastructure` v1, v2 or v3 has a Deployment
   entity. Store environment and version as Service attributes or in
   evidence chunks.
 
