@@ -679,6 +679,9 @@ Compilation suppresses automatic embedding calls on every store backend.
 
 ### Ontology tools (opt-in)
 
+Operational guide (configuration, auth model, rollout, limitations):
+[`NCP_ONTOLOGY.md`](./NCP_ONTOLOGY.md).
+
 Listed only with `[ontology] enabled = true` and the `full` tool profile.
 Storage is the NCP store itself (`[ontology] store = "inherit"`): SQLite or
 PostgreSQL/pgvector (see [Ontology storage backends](#ontology-storage-backends));

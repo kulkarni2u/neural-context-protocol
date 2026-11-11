@@ -422,6 +422,8 @@ Node fillcolor indicates trust (green ≥0.8, amber 0.5–0.8, red <0.5); edge s
 
 Two further graph capabilities are opt-in: `[graph].infer_edges` (default off) infers `refines` edges between similar chunks at write time with a deterministic similarity ratio — no model calls — marking them `created_by="ncp:inferred"`; and outcome credit recorded via `ncp_record_outcome` propagates along the `caused_by` chain during `ncp calibrate --feedback`, reported as a "via outcome propagation" count. See [the graph engineering plan](./docs/NCP_GRAPH_ENGINEERING_PLAN.md) for the full model, multi-hop semantics, and compatibility details.
 
+Separately from this memory-evidence graph, an opt-in **domain ontology** (`[ontology] enabled = true`, off by default) holds an evidence-backed graph of services, databases, APIs, topics and teams: `ncp_get_context` can append verified dependency paths automatically, and `ncp_ontology_*` tools answer explicit graph questions. See [the ontology guide](./docs/NCP_ONTOLOGY.md), [`examples/13_ontology/`](./examples/13_ontology/README.md) and [its benchmark](./docs/NCP_BENCHMARK_ONTOLOGY.md) (measured: higher dependency recall at a small latency cost, but more prompt tokens, not fewer).
+
 -----
 
 ## Signal filtering at write time
@@ -919,6 +921,7 @@ NCP is the memory bus. In our workflows, Sarathi is one orchestrator that runs o
 - [Context policies (foundation)](./docs/NCP_CONTEXT_POLICY.md)
 - [Router coordination primitives (design)](./docs/specs/2026-11-02-ncp-coordination-primitives-design.md)
 - [Graph engineering plan](./docs/NCP_GRAPH_ENGINEERING_PLAN.md)
+- [Ontology (opt-in domain graph)](./docs/NCP_ONTOLOGY.md)
 - [Benchmark: task success at matched budget](./docs/NCP_BENCHMARK_TASK_SUCCESS.md)
 - [Benchmark: provider-real efficacy](./docs/NCP_BENCHMARK_EFFICACY_LIVE.md)
 - [Benchmark: coding pipeline](./docs/NCP_BENCHMARK_CODING_PIPELINE.md)
@@ -927,6 +930,7 @@ NCP is the memory bus. In our workflows, Sarathi is one orchestrator that runs o
 - [Benchmark: research pipeline](./docs/NCP_BENCHMARK_RESEARCH_PIPELINE.md)
 - [Benchmark: ingestion-time compression](./docs/NCP_BENCHMARK_COMPRESSION.md)
 - [Benchmark: fan-in reduction](./docs/NCP_BENCHMARK_FANIN_REDUCE.md)
+- [Benchmark: ontology](./docs/NCP_BENCHMARK_ONTOLOGY.md)
 - [MACE multi-agent eval](./benchmarks/mace/README.md)
 - [North-star capability roadmap](./docs/NCP_NORTH_STAR_CAPABILITY_ROADMAP.md)
 - [Active handoff packet](./docs/NCP_ACTIVE_HANDOFF_PACKET.md)
