@@ -20,11 +20,19 @@ python3 benchmarks/ontology/run.py            # --repeats 15 --budget 800 (defau
 
 # Sensitivity: a smaller graph slice
 python3 benchmarks/ontology/run.py --max-graph-tokens 150
+
+# Ablations: any extra [ontology] line for the ontology arm
+python3 benchmarks/ontology/run.py --extra-toml 'intent_directed = false'
+python3 benchmarks/ontology/run.py --extra-toml 'substitute_evidence = false'
 ```
+
+For the Postgres arm a throwaway Redis is enough, for example
+`redis-server --port 6391 --save "" --daemonize yes` with
+`NCP_REDIS_URL=redis://127.0.0.1:6391/0`, shut down afterwards.
 
 The output is a JSON artifact (`ncp.bench.ontology.run_ontology_benchmark`).
 Each Postgres arm uses a throwaway schema, dropped afterwards. A full run
-takes about 18 s. `tests/test_benchmark_ontology.py` runs a two-task slice in
+takes about 15 s. `tests/test_benchmark_ontology.py` runs a two-task slice in
 about 3 s.
 
 ## Workload
@@ -63,116 +71,171 @@ about 3 s.
 | prompt tokens | `estimate_tokens(context)` (`chars_div4`), measured at `max_tokens=800` |
 | fact recall | Share of ground-truth relations covered. A relation counts as covered when its evidence chunk is in context, or when the relation appears in the `[NCP:ONTOLOGY]` block. |
 | evidence precision / recall | Over surfaced chunk ids, which are `retrieved_chunk_ids` plus the graph block's `ev:` citations |
-| tokens to full recall | Prompt tokens at the smallest budget on the ladder 200…2400 that reaches fact recall 1.0. Unset when no budget on the ladder reaches it. |
+| tokens to full recall | Prompt tokens at the smallest budget on the ladder that reaches fact recall 1.0. Unset when no budget on the ladder reaches it. The v2 ladder is 100, 150, 200, 300, 400, 600, 800, 1200, 1600, 2400 (v1 started at 200); both arms run the same ladder. |
+| **tokens at matched recall** (primary) | Per dependency task and target recall R, each arm is charged its cheapest ladder rung whose fact recall ≥ R. R is the baseline's best recall anywhere on the ladder ("R = baseline max"; tasks where that is 0 are skipped) or 1.0. Only tasks both arms reach count. Reported as the pooled reduction `1 − Σ ontology / Σ baseline`. The hypothesis is only evaluated with at least max(3, half the tasks) pairs; otherwise it is reported as not measurable. |
+| recall guard | Flags a config that saves tokens by losing recall: a task where the ontology arm has lower fact recall than the baseline at the fixed budget while using fewer tokens, or a lower mean recall with fewer mean tokens. |
 | oracle evidence tokens | Tokens needed to show exactly the ground-truth evidence chunks as `[NCP:SUBCONSCIOUS]` lines, i.e. a perfect memory retriever. Computed, not run. |
 | unsupported assertion rate | Relations in the graph block that are not verified with live evidence, divided by all relations in the block. Separately, every path's `ev:` citations are checked: each relation on the path must cite its own live evidence chunk, and no superseded or unrelated chunk may be cited (`unsupported_citations`). |
 | SQL statements | Statements per call, counted with `sqlite3.Connection.set_trace_callback` on every connection. SQLite only. |
 | graph cost | Enricher telemetry: `latency_ms` (trigger plus traversal plus ranking) and `graph_tokens` |
 
+## Why tokens at matched recall is the primary metric
+
+A fixed-budget token count compares two contexts that answer different
+amounts of the question. On this corpus the baseline returns about 137
+tokens at an 800-token budget because it *under*-retrieves (fact recall
+0.38); any arm that adds the missing facts uses more tokens, and any arm that
+drops facts uses fewer. "Fewer tokens at a fixed budget" therefore rewards
+lost recall. The design hypothesis is about saving tokens for the *same*
+answer quality, so the headline compares the cheapest context each arm needs
+to reach the same fact recall, on tasks both arms reach, and the recall guard
+reports any configuration that gets cheaper by getting worse. The
+fixed-budget table is kept for completeness.
+
+An embedding-backed baseline arm was not run: NCP ships no deterministic
+offline embedder (`LocalEmbeddingAdapter` needs the optional `fastembed`
+extra and a model download, `OpenAIEmbeddingAdapter` needs the network, and a
+hash or bag-of-words stand-in would just be another lexical baseline). The
+artifact records this under `embedding_baseline.skipped`.
+
 ## Measured results
 
 Measured on November 11, 2026: Linux x86_64 container with 4 vCPUs, Python
 3.13.18, SQLite 3.53.1, PostgreSQL 16.15 and Redis 7.0.15 on loopback, token
-unit `chars_div4`. All quality numbers are deterministic and reproduce
-exactly on a re-run. Latency does not: across re-runs on this machine the
-SQLite dependency p95 overhead ranged from about +7 to +14 ms and the
-Postgres one from about +30 to +35 ms, so read the latency rows as ±5 ms.
+unit `chars_div4`, 15 timed rounds. All quality numbers are deterministic and
+reproduce exactly on a re-run; read latency as ±5 ms.
 
-### Dependency tasks (8 tasks, default config)
+**v1** is the shipped PR 6 behaviour (commit 82e4fb6): every relation type in
+both directions, per-path `path:N score:… Type:key -REL-> Type:key` lines,
+the slice filled up to `max_graph_tokens`. **v2** is this change:
+intent-directed traversal, marginal-value stopping, the fact-grouped `v:2`
+block and graph-first substitution, all at default config. The v1 rows under
+the new metrics were measured by running the v2 benchmark harness against
+the v1 code.
 
-| | SQLite baseline | SQLite + ontology | Postgres baseline | Postgres + ontology |
+### Headline: tokens at matched recall (dependency tasks, default ladder)
+
+| | SQLite v1 | SQLite v2 | Postgres v1 | Postgres v2 |
 |---|---:|---:|---:|---:|
-| latency p50 (ms) | 7.84 | 16.57 | 8.37 | 33.59 |
-| latency p95 (ms) | 9.00 | 20.28 | 13.40 | 48.25 |
-| graph `latency_ms` mean | — | 7.74 | — | 23.03 |
-| prompt tokens (mean, budget 800) | 137.0 | 537.9 | 124.3 | 525.1 |
-| `[NCP:ONTOLOGY]` tokens (mean) | — | 400.0 | — | 400.0 |
-| fact recall | 0.377 | **1.000** | 0.011 | **1.000** |
-| evidence precision | 0.375 | 0.285 | 0.062 | 0.278 |
-| tasks reaching full recall on the ladder | 2 / 8 | 8 / 8 | 0 / 8 | 8 / 8 |
-| tokens to full recall (mean, over tasks that reach it) | 142 (2 tasks) | 342 (8 tasks) | — | 330 (8 tasks) |
-| SQL statements per call | 124.3 | 198.5 | n/a | n/a |
-| unsupported relations surfaced | — | **0 / 111** | — | **0 / 111** |
-| triggered / fallbacks | 0 / 0 | 8 / 0 | 0 / 0 | 8 / 0 |
+| R = baseline max: pairs (of 8) | 5 | 5 | 1 | 1 |
+| baseline tokens (mean) | 106.0 | 106.0 | 132.0 | 132.0 |
+| ontology tokens (mean) | 112.2 | **84.4** | 98.0 | 88.0 |
+| **reduction** | −5.9% | **+20.4%** | (+25.8%, 1 pair) | (+33.3%, 1 pair) |
+| R = 1.0: pairs | 2 | 2 | 0 | 0 |
+| R = 1.0: reduction | −35.4% | **+25.3%** | — | — |
+| recall guard (tokens cut by losing recall) | no | no | no | no |
+
+SQLite v2 per task at R = baseline max (baseline → ontology tokens):
+checkout 138 → 97 (R 0.18), shipping 98 → 93 (R 0.33), pricing 96 → 84
+(R 0.5), fraud-check 100 → 74 (R 1.0), inventory 98 → 74 (R 1.0). The other
+three tasks have baseline recall 0 everywhere on the ladder, so there is
+nothing to match.
+
+Ladder sensitivity (SQLite, finer rungs 60, 70, …, 175, 200, … 2400): v2
++29.4% at R = baseline max and +25.8% at R = 1.0; v1 +2.1% and −23.7%. The
+default ladder is the reported number.
+
+### Dependency tasks (8 tasks, default config, fixed budget 800)
+
+| | SQLite baseline | SQLite v1 | SQLite v2 | Postgres baseline | Postgres v1 | Postgres v2 |
+|---|---:|---:|---:|---:|---:|---:|
+| latency p50 (ms) | 6.92 | 16.57 | 13.21 | 7.90 | 33.59 | 21.89 |
+| latency p95 (ms) | 7.69 | 20.28 | 15.04 | 9.47 | 48.25 | 25.33 |
+| p95 overhead vs baseline (ms) | — | +11.3 | **+7.4** | — | +34.8 | **+15.9** |
+| graph `latency_ms` mean | — | 7.74 | 6.11 | — | 23.03 | **11.82** |
+| prompt tokens (mean) | 137.0 | 537.9 | **161.8** | 124.3 | 525.1 | **172.8** |
+| `[NCP:ONTOLOGY]` tokens (mean) | — | 400.0 | **56.0** | — | 400.0 | **56.0** |
+| graph block vs oracle evidence tokens (≈180) | — | +122% | **−68.9%** | — | +122% | **−68.9%** |
+| fact recall | 0.377 | 1.000 | **1.000** | 0.011 | 1.000 | **1.000** |
+| evidence precision | 0.375 | 0.285 | **0.681** | 0.062 | 0.278 | **0.716** |
+| tasks reaching full recall on the ladder | 2 / 8 | 8 / 8 | 8 / 8 | 0 / 8 | 8 / 8 | 8 / 8 |
+| tokens to full recall (mean, all 8 tasks) | — | 342 | **112.5** | — | 330 | **110.6** |
+| SQL statements per call | 124.3 | 198.5 | **160.8** | n/a | n/a | n/a |
+| unsupported relations surfaced | — | 0 / 111 | **0 / 36** | — | 0 / 111 | **0 / 36** |
+| unsupported `ev:` citations | — | 0 | **0** | — | 0 | **0** |
+| triggered / fallbacks | 0 / 0 | 8 / 0 | 8 / 0 | 0 / 0 | 8 / 0 | 8 / 0 |
+
+(v1 latency/token columns are the published PR 6 run; v1 tokens to full
+recall used the old ladder starting at 200.) At a fixed budget v2 still uses
+more tokens than the baseline (+18% SQLite, +39% Postgres), because the
+baseline's 137 tokens carry only 38% (SQLite) or 1% (Postgres) of the facts;
+v2 carries all of them for +25 / +48 tokens.
 
 ### Control tasks (6 tasks, no entity named)
 
-| | SQLite baseline | SQLite + ontology | Postgres baseline | Postgres + ontology |
+| | SQLite baseline | SQLite v2 | Postgres baseline | Postgres v2 |
 |---|---:|---:|---:|---:|
-| latency p50 (ms) | 7.63 | 9.12 | 7.41 | 10.45 |
-| latency p95 (ms) | 9.25 | 11.39 | 9.21 | 14.86 |
+| latency p95 (ms) | 7.87 | 10.33 | 9.12 | 14.62 |
 | prompt tokens (mean) | 123.3 | 123.3 | 94.3 | 94.3 |
 | evidence recall | 0.417 | 0.417 | 0.000 | 0.000 |
 | SQL statements per call | 114.0 | 122.0 | n/a | n/a |
 | triggered | 0 | 0 (`no_entity`) | 0 | 0 (`no_entity`) |
 
-On control tasks the context is the same in both arms. The ontology arm
-evaluates the trigger, which costs a mean of 1.4 ms (SQLite) or 1.9 ms
-(Postgres) and 8 extra SQL statements, then skips. Postgres control recall
-is 0.0 in **both** arms: pgvector lexical retrieval without an embedding
-adapter does not surface these chunks for these task slugs. The ontology has
-no effect on that.
+Context is byte-identical in both arms. The trigger costs about 1.3 ms
+(SQLite) and 1.9 ms (Postgres) mean, as in v1. Postgres control recall is 0.0
+in both arms (pgvector lexical retrieval without an embedding adapter does
+not surface these chunks); the ontology has no effect on that.
 
-### Sensitivity: `max_graph_tokens = 150`
+### Where the savings come from (SQLite ablations, default otherwise)
 
-| Dependency tasks | SQLite + ontology | Postgres + ontology |
-|---|---:|---:|
-| prompt tokens (mean) | 277.4 | 264.1 |
-| `[NCP:ONTOLOGY]` tokens (mean) | 139.5 | 138.9 |
-| fact recall | 0.668 | 0.694 |
-| evidence precision | 0.365 | 0.366 |
-| graph block vs oracle evidence tokens | −22.5% | −22.8% |
-| latency p95 overhead (ms) | +10.2 | +34.7 |
-| unsupported relations surfaced | 0 / 45 | 0 / 45 |
+| Ontology arm config | prompt tokens (fixed 800) | graph tokens | evidence precision | matched-recall reduction (R = baseline max / 1.0) |
+|---|---:|---:|---:|---:|
+| v2 default | 161.8 | 56.0 | 0.681 | +20.4% / +25.3% |
+| `intent_directed = false` | 254.0 | 180.4 | 0.297 | +2.1% / −21.2% |
+| `substitute_evidence = false` | 194.0 | 56.0 | 0.681 | +20.4% / +25.3% |
+| `max_graph_tokens = 150` | 161.8 | 56.0 | 0.681 | +20.4% / +25.3% |
+| v1 (for reference) | 537.9 | 400.0 | 0.285 | −5.9% / −35.4% |
 
-## Hypotheses vs measurements
-
-| Design hypothesis (§11) | Measured | Verdict |
-|---|---|---|
-| Graph overhead < 50 ms p95 on a controlled local corpus | p95 delta of **+11.3 ms** on SQLite and **+34.8 ms** on Postgres. The p50 delta was +8.7 ms and +25.2 ms. | **Met** on both backends. Postgres has little headroom: the mean graph `latency_ms` is 23 ms against the default `graph_timeout_ms = 50`. No fallbacks occurred here, but a slower host would see timeouts and therefore degraded (graph-free) context. |
-| 15–25% token reduction on dependency-rich tasks | Prompt tokens went **up** by 293% (SQLite) and 323% (Postgres) at a fixed budget. On the 2 tasks where the baseline reaches full recall at all, the ontology arm needed **26.8% more** tokens to reach it. At defaults, the graph block is 2.2× the oracle evidence text. With `max_graph_tokens = 150` it is 22.5% *smaller* than the oracle, but fact recall drops to 0.67. | **Not met.** On this corpus the ontology spends tokens to raise recall; it does not save them. See the analysis below. |
-| No meaningful regression on non-graph tasks | Prompt tokens and evidence recall are identical. Latency rose by +2.1 ms p95 (SQLite) and +5.7 ms p95 (Postgres), and SQLite runs +8 SQL statements per call. | **Met** for context quality and tokens. There is a small, measured latency cost from evaluating the trigger. |
-| Zero verified-without-evidence assertions | 0 of 111 surfaced relations were unsupported on each backend, and 0 of 45 at the 150-token slice, with 0 unsupported `ev:` citations. Neither planted hazard ever surfaced. | **Met** |
-
-### Why tokens went up, not down
-
-- **The baseline under-retrieves rather than over-retrieving.** The baseline
-  returns about 135 tokens of memory at an 800-token budget. Its lexical
-  ranking matches the slot name, so it picks distractors such as "checkout
-  deploy …" over 2-hop evidence that never mentions the seed ("payments
-  records every capture in ledger-db"). Raising the budget does not help: 6
-  of 8 tasks never reach full recall on SQLite, even at 2400 tokens. The
-  15–25% hypothesis assumed a baseline that already pays for the right
-  evidence. This one never retrieves it, so the ontology's contribution
-  shows up as recall (0.38 → 1.00), not as savings.
-- **Traversal answers a broader question than the task asks.** Automatic
-  expansion walks both directions and every relation type, so incoming
-  edges and `OWNS` edges come back along with the outgoing dependencies.
-  The slice is the full `max_graph_tokens = 500` (about 740 tokens of the
-  800 budget remain after the header). Blocks range from 269 to 494 tokens
-  (mean 400), and the three seeds with the largest neighborhoods come
-  within 15 tokens of the cap. The broad walk also lowers evidence
-  precision (0.285 on SQLite) and makes the block 2.2× the oracle text.
-  Restricting automatic expansion to the relation types and direction the
-  intent implies, for example outgoing `DEPENDS_ON` for
-  "depends on", is the obvious lever. It is not implemented.
-- **A smaller slice is not cheaper per fact.** At a 150-token slice the
-  block is 22.5% smaller than the oracle evidence text for *all*
-  ground-truth facts, but it covers only 67% of them (ranking drops the
-  paths beyond the slice, including off-question incoming and `OWNS`
-  paths). Per covered fact that is roughly 16% *more* tokens than the
-  oracle, so the compact `Type:key -REL-> Type:key` format alone does not
-  deliver the hypothesized saving.
+- **Intent-directed traversal** is the largest lever: "depends on" now walks
+  outgoing `DEPENDS_ON`/`PRODUCES`/`CONSUMES` only, so incoming and `OWNS`
+  edges no longer fill the block. With it off, the compact format alone
+  takes the block from 400 to 180 tokens, which is not enough to beat the
+  baseline at matched recall.
+- **The v2 format** (grouping, no scores, short tags, one citation per fact)
+  and **marginal-value stopping** make the block 56 tokens for a mean of 4.5
+  facts, 69% below the oracle evidence text for the same facts.
+  `max_graph_tokens = 150` changes nothing, because selection stops on value
+  long before the 500-token ceiling.
+- **Substitution** cuts the fixed-budget context by 17% (194 → 162 tokens):
+  5 cited memory chunks across the 8 tasks are shown only as facts. It does
+  not move the matched-recall numbers, because on the cheapest rungs memory
+  has no room anyway.
+- `min_path_score = 0.25` never binds on this corpus (path scores are
+  0.50–0.72); it is a safety floor, not a tuned value.
 
 ### Cost accounting
 
-- **SQLite statements:** +74 per enriched call (124 → 198.5). This covers the
-  read transaction, entity resolution for candidate terms, the per-hop edge
-  query, evidence liveness lookups and entity hydration. The ontology store
-  opens its own connection per operation.
-- **Postgres:** the graph phase averages 23 ms against SQLite's 7.7 ms.
-  Each phase is a `REPEATABLE READ` transaction with several round-trips on
-  loopback. Statement counts were not instrumented on Postgres.
+- **SQLite statements:** +36.5 per enriched call (124.3 → 160.8), down from
+  +74 in v1. Traversal now issues one edge query and one evidence query per
+  hop for the whole frontier, instead of one edge query per node and one
+  evidence query per relation, and `get_entities` loads all endpoints and
+  their aliases in two queries instead of two per entity. A unit test pins
+  the traversal statement count as independent of frontier width.
+- **Postgres:** fewer round-trips halve the graph phase (23.0 → 11.8 ms mean)
+  and the p95 overhead (+34.8 → +15.9 ms), leaving headroom under
+  `graph_timeout_ms = 50`. Statement counts are not instrumented on Postgres.
+
+## Hypotheses vs measurements
+
+| Design hypothesis (§11) | v1 | v2 | Verdict (v2) |
+|---|---|---|---|
+| Graph overhead < 50 ms p95 on a controlled local corpus | +11.3 ms SQLite, +34.8 ms Postgres | **+7.4 ms** SQLite, **+15.9 ms** Postgres | **Met** on both backends, with more Postgres headroom. |
+| 15–25% token reduction on dependency-rich tasks | Not met (tokens +293% at fixed budget; −5.9% at matched recall) | **+20.4%** at matched recall on SQLite (5 tasks), +25.3% at full recall (2 tasks) | **Met on SQLite**, on the primary metric, with no recall loss. **Not measurable on Postgres**: the lexical pgvector baseline reaches non-zero recall on only 1 of 8 tasks (+33.3% there), below the 3-pair minimum. At a fixed budget tokens still rise (+18% / +39%) because the baseline is missing most facts. |
+| No meaningful regression on non-graph tasks | Met | Context identical, +2.5 ms (SQLite) / +5.5 ms (Postgres) p95, +8 SQL statements | **Met** for context quality and tokens; a small measured trigger cost remains. |
+| Zero verified-without-evidence assertions | 0 / 111 | **0 / 36**, 0 unsupported `ev:` citations, neither planted hazard surfaced | **Met** |
+
+### Caveats on the token result
+
+- The SQLite headline rests on 5 tasks, and 3 of the 8 dependency tasks have
+  no baseline recall to match at all. The result is real for this corpus but
+  small-sample.
+- It depends on the ladder's granularity (20.4% default, 29.4% with finer
+  low rungs), because each arm is charged a whole rung. Both arms always run
+  the same ladder.
+- The cheapest matching ontology contexts are mostly "header + graph block,
+  no memory": a model gets verified facts with chunk ids, not the evidence
+  prose. Whether that is enough for a given task is not measured here (no
+  model in the loop).
 
 ## Limits of this benchmark
 
@@ -181,7 +244,8 @@ no effect on that.
 - There is no model in the loop. Fact recall measures whether the fact is in
   context, not whether a model uses it correctly.
 - Baseline retrieval is lexical: no embedding adapter is configured on
-  either backend. An embedding-backed baseline would likely raise baseline
-  recall and change the token comparison.
+  either backend, and no deterministic offline embedder exists to add one.
+  An embedding-backed baseline would likely raise baseline recall and change
+  the token comparison (and make the Postgres comparison measurable).
 - Latency comes from a single, otherwise idle 4-vCPU container, with
   Postgres and Redis on loopback.

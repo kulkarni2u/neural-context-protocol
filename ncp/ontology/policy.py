@@ -17,7 +17,18 @@ class OntologyConfig(Contract):
     max_hops: Annotated[int, Field(strict=True, ge=0, le=5)] = 2
     max_nodes: Annotated[int, Field(strict=True, ge=1, le=100)] = 30
     max_edges: Annotated[int, Field(strict=True, ge=1, le=200)] = 60
+    # A ceiling, not a target: selection stops on marginal value first.
     max_graph_tokens: Annotated[int, Field(strict=True, ge=0, le=4000)] = 500
+    # Upper bound on paths shown per request; each intent profile has its own
+    # (smaller or equal) cap, see ncp.ontology.trigger.INTENT_PATH_CAPS.
+    max_graph_paths: Annotated[int, Field(strict=True, ge=1, le=100)] = 16
+    # Selection stops at the first ranked path scoring below this.
+    min_path_score: Annotated[float, Field(ge=0.0, le=1.0)] = 0.25
+    # Map relationship intent to relation types / direction / hops (schema
+    # pack ``intents``); false walks every type both ways (v1 behaviour).
+    intent_directed: bool = Field(default=True, strict=True)
+    # Drop a memory chunk's text when a shown graph fact cites it (``ev:``).
+    substitute_evidence: bool = Field(default=True, strict=True)
     verified_only: bool = Field(default=True, strict=True)
     trigger_max_ms: Annotated[int, Field(strict=True, ge=1, le=1000)] = 10
     graph_timeout_ms: Annotated[int, Field(strict=True, ge=1, le=5000)] = 50

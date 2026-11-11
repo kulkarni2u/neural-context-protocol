@@ -435,6 +435,66 @@ def sc_traversal_order_and_limits(b: Backend) -> list:
     return out
 
 
+def sc_traversal_direction_and_type_filters(b: Backend) -> list:
+    """Direction / relation-type filters and the batched (one query per hop)
+    frontier expansion, including shared edges between frontier nodes."""
+    s, out = b.store, []
+    a, c, d, e, f = (node(name) for name in "acdef")
+    put(s, a, c, d, e, f)
+    edges = [("l0", a, c), ("l1", c, d), ("l2", d, a), ("l3", e, c), ("l4", d, d), ("l5", f, d),
+             ("l6", c, f)]
+    for name, src, dst in edges:
+        s.assert_relation(rel(name, src, dst, "LINKS"), auth=auth(), idempotency_key=name)
+    s.assert_relation(rel("p0", a, e, "PARENT"), auth=auth(), idempotency_key="p0")
+    s.assert_relation(rel("p1", f, a, "PARENT"), auth=auth(), idempotency_key="p1")
+    # Two verified edges (external attestation): verified-only + direction.
+    for name in ("l0", "l1"):
+        s.assert_relation(rel(name, *{"l0": (a, c), "l1": (c, d)}[name], "LINKS",
+                              status="verified", evidence=(attestation(),)),
+                          auth=auth(), idempotency_key=f"v-{name}")
+
+    def directed(result: GraphResult, direction: str) -> bool:
+        for path in result.paths:
+            for index, relation in enumerate(path.relations):
+                here = path.nodes[index]
+                if direction == "out" and relation.src_entity_id != here:
+                    return False
+                if direction == "in" and relation.dst_entity_id != here:
+                    return False
+        return True
+
+    for query in (
+        {"direction": "out", "max_hops": 3},
+        {"direction": "in", "max_hops": 3},
+        {"direction": "out", "relation_types": ("LINKS",), "max_hops": 2},
+        {"direction": "in", "relation_types": ("PARENT",), "max_hops": 2},
+        {"direction": "both", "relation_types": ("LINKS", "PARENT"), "max_hops": 2},
+        {"direction": "out", "max_hops": 3, "max_edges": 2},
+        {"direction": "in", "max_hops": 3, "max_nodes": 2},
+        {"direction": "out", "max_hops": 0},
+    ):
+        result = all_paths(s, a, **query)
+        assert directed(result, query["direction"])
+        if "relation_types" in query:
+            assert all(r.relation_type in query["relation_types"]
+                       for path in result.paths for r in path.relations)
+        out.append(norm(result))
+    # Several seeds share edges: each relation is still used once.
+    multi = s.traverse(GraphQuery(seeds=(a.entity_id, c.entity_id, d.entity_id),
+                                  direction="out", max_hops=2, verified_only=False), auth=auth())
+    ids = [str(path.relations[-1].relation_id) for path in multi.paths]
+    assert len(ids) == len(set(ids))
+    out.append(norm(multi))
+    verified_out = s.traverse(GraphQuery(seeds=(a.entity_id,), direction="out", max_hops=3),
+                              auth=auth())
+    verified_in = s.traverse(GraphQuery(seeds=(d.entity_id,), direction="in", max_hops=3),
+                             auth=auth())
+    assert [len(path.relations) for path in verified_out.paths] == [1, 2]  # a->c->d
+    assert [len(path.relations) for path in verified_in.paths] == [1, 2]   # d<-c<-a
+    out += [norm(verified_out), norm(verified_in)]
+    return out
+
+
 def sc_cardinality(b: Backend) -> list:
     s, out = b.store, []
     a, c, d, e, g, h = (node(name) for name in "acdegh")

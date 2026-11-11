@@ -20,7 +20,21 @@ budget trim:
    external attestations support a relation; a path with an unsupported or
    inactive relation, or an endpoint that vanished, is dropped.
 5. Deterministic ranking (:mod:`ncp.ontology.ranking`) and compact
-   serialization (:mod:`ncp.ontology.serializer`) inside the token slice.
+   serialization (:mod:`ncp.ontology.serializer`, block ``v:2``) inside the
+   token slice, with marginal-value stopping (``min_path_score``, per-intent
+   path cap, no-new-fact skip): the slice is a ceiling, not a target.
+
+Traversal is intent-directed (``intent_directed``): the request's
+relationship words pick relation types (via the schema pack's ``intents``
+categories), direction and hops (:func:`ncp.ontology.trigger.classify_intent`).
+
+Graph-first substitution (``substitute_evidence``, applied by the assembler):
+a memory chunk cited by a shown fact's ``ev:`` loses its text in
+``[NCP:SUBCONSCIOUS]``; its id stays in the citation (``ncp_fetch`` can
+retrieve it) and in ``retrieved_chunk_ids``. Outcome-credit rule: a chunk is
+credited when memory retrieval selected it and its content reached the turn,
+verbatim or as a verified fact it evidences. Chunks cited *only* by the graph
+(never selected by memory retrieval) are not credited, exactly as in v1.
 
 Failures: an authorization failure always raises :class:`OntologyAuthError`
 (fail closed, never retried unscoped). Timeouts and backend errors degrade to
@@ -44,10 +58,10 @@ from ncp.ontology.models import (
 from ncp.ontology.policy import OntologyConfig
 from ncp.ontology.ranking import PathCandidate, rank_paths
 from ncp.ontology.resolution import content_tokens, resolve
-from ncp.ontology.serializer import SerializedGraph, entity_label, serialize
+from ncp.ontology.serializer import BLOCK_VERSION, SerializedGraph, entity_label, serialize
 from ncp.ontology.stores.postgres import PostgresOntologyStore
 from ncp.ontology.stores.sqlite import OntologyTimeoutError, SQLiteOntologyStore
-from ncp.ontology.trigger import TriggerThresholds, evaluate
+from ncp.ontology.trigger import IntentProfile, TriggerThresholds, classify_intent, evaluate
 from ncp.principals import AuthorizationError
 
 if TYPE_CHECKING:
@@ -190,6 +204,12 @@ class GraphContext:
     warnings: tuple[str, ...] = ()
     serialized: SerializedGraph | None = None
     omitted: Mapping[str, int] = field(default_factory=dict)
+    intent: IntentProfile | None = None
+    # Memory chunks whose text was replaced by the facts citing them (set by
+    # the assembler; only chunks cited by the final block), plus the memory
+    # order before substitution so a shed statement can restore its chunk.
+    substituted: tuple[SubconsciousChunk, ...] = ()
+    memory_order: tuple[str, ...] = ()
 
     @property
     def text(self) -> str | None:
@@ -199,8 +219,35 @@ class GraphContext:
     def tokens(self) -> int:
         return 0 if self.serialized is None else self.serialized.tokens
 
+    @property
+    def cited_chunk_ids(self) -> frozenset[str]:
+        """Chunk ids shown in the block's ``ev:`` citations."""
+        if self.serialized is None or not self.serialized.statements:
+            return frozenset()
+        return self.serialized.cited_chunk_ids
+
+    @property
+    def substituted_ids(self) -> tuple[str, ...]:
+        return tuple(chunk.chunk_id for chunk in self.substituted)
+
+    def with_substituted(
+        self, chunks: Sequence[SubconsciousChunk], *, memory_order: Sequence[str] | None = None,
+    ) -> GraphContext:
+        order = self.memory_order if memory_order is None else tuple(memory_order)
+        return replace(self, substituted=tuple(chunks), memory_order=order)
+
+    def memory_pool(self, shown: Sequence[SubconsciousChunk]) -> list[SubconsciousChunk]:
+        """``shown`` plus the substituted chunks, in pre-substitution memory order."""
+        if not self.substituted:
+            return list(shown)
+        rank = {chunk_id: index for index, chunk_id in enumerate(self.memory_order)}
+        pool = [*shown, *(c for c in self.substituted if c.chunk_id not in
+                          {s.chunk_id for s in shown})]
+        return sorted(pool, key=lambda chunk: rank.get(chunk.chunk_id, len(rank)))
+
     def shrink(self) -> GraphContext:
-        """Drop the lowest-ranked statement to fit a tighter final budget."""
+        """Drop the lowest-ranked path to fit a tighter final budget (the
+        assembler then restores any substituted chunk no longer cited)."""
         if self.serialized is None:
             return self
         return replace(self, serialized=self.serialized.shrink())
@@ -234,8 +281,17 @@ class GraphContext:
                 "status": "verified",
                 "score": ranked.score,
             })
+        intent = None if self.intent is None else {
+            "name": self.intent.name,
+            "categories": list(self.intent.categories),
+            "relation_types": list(self.intent.relation_types),
+            "direction": self.intent.direction,
+            "hops": self.intent.hops,
+            "path_cap": self.intent.path_cap,
+        }
         return {
             "schema_version": CONTEXT_SCHEMA_VERSION,
+            "block_version": BLOCK_VERSION,
             "mode": self.mode,
             "ontology_triggered": self.triggered,
             "reason_code": self.reason_code,
@@ -243,6 +299,9 @@ class GraphContext:
             "verified_path_count": len(paths),
             "latency_ms": self.latency_ms,
             "graph_tokens": self.tokens,
+            "fact_count": 0 if self.serialized is None else self.serialized.fact_count,
+            "intent": intent,
+            "substituted_chunk_ids": list(self.substituted_ids),
             "fallback_reason": self.fallback_reason,
             "signals": list(self.signals),
             "ambiguous_count": self.ambiguous_count,
@@ -405,9 +464,13 @@ class OntologyEnricher:
         if not decision.should_expand:
             return self._result(started, decision.reason_code, **common)
 
+        profile = self._profile(texts, packs)
+        common["intent"] = profile
         graph_deadline = self._clock() + self.config.graph_timeout_ms / 1000.0
         try:
-            candidates, omitted = self._expand(store, auth, decision.seeds, graph_deadline)
+            candidates, omitted = self._expand(
+                store, auth, decision.seeds, graph_deadline, profile,
+            )
         except OntologyTimeoutError:
             return self._fallback(
                 started, decision.reason_code, "graph_timeout", triggered=True, **common,
@@ -425,15 +488,38 @@ class OntologyEnricher:
             candidates, query_terms=content_tokens(texts), context_chunk_ids=context_ids,
             now=self._now(),
         )
-        serialized = serialize(ranked, max_tokens=slice_tokens)
-        covered = len(ranked) - len(serialized.included) - serialized.omitted_for_tokens
-        if covered:
-            omitted["covered"] = omitted.get("covered", 0) + covered
+        serialized = serialize(
+            ranked, max_tokens=slice_tokens,
+            tags={
+                name: definition.tag for pack in packs
+                for name, definition in pack.entity_types.items() if definition.tag
+            },
+            context_chunk_ids=context_ids, max_paths=profile.path_cap,
+            min_score=self.config.min_path_score,
+        )
+        for key, value in serialized.stopped.items():
+            omitted[key] = omitted.get(key, 0) + value
         return self._result(
             started, decision.reason_code, triggered=True,
             serialized=serialized if serialized.statements else None,
             omitted={key: value for key, value in omitted.items() if value},
             **common,
+        )
+
+    def _profile(self, texts: Sequence[str], packs: Sequence[Any]) -> IntentProfile:
+        """The traversal profile: intent-directed, or the v1 walk (every type,
+        both directions, ``max_hops``) when ``intent_directed`` is off."""
+        if not self.config.intent_directed:
+            return IntentProfile(
+                "undirected", (), "both", self.config.max_hops, self.config.max_graph_paths,
+            )
+        relation_intents: dict[str, set[str]] = {}
+        for pack in packs:
+            for name, definition in pack.relation_types.items():
+                relation_intents.setdefault(name, set()).update(definition.intents)
+        return classify_intent(
+            texts, relation_intents=relation_intents, max_hops=self.config.max_hops,
+            max_paths=self.config.max_graph_paths,
         )
 
     def _expand(
@@ -442,13 +528,17 @@ class OntologyEnricher:
         auth: AuthContext,
         seeds: Sequence[Any],
         deadline: float,
+        profile: IntentProfile,
     ) -> tuple[list[PathCandidate], dict[str, int]]:
-        """Traverse (verified only), map evidence to live readable chunks and
-        load endpoints; returns the supported paths and omission counts."""
+        """Traverse (verified only, filtered by the intent profile), map
+        evidence to live readable chunks and load endpoints; returns the
+        supported paths and omission counts."""
         result = store.traverse(
             GraphQuery(
                 seeds=tuple(seeds),
-                max_hops=self.config.max_hops,
+                relation_types=profile.relation_types,
+                direction=profile.direction,
+                max_hops=profile.hops,
                 max_nodes=self.config.max_nodes,
                 max_edges=self.config.max_edges,
                 verified_only=True,  # automatic enrichment never shows candidates

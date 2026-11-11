@@ -74,12 +74,12 @@ ontology tools: ncp_ontology_assert, ncp_ontology_capabilities, ncp_ontology_exp
 chunk:demo-ev-team-commerce-owns-checkout layer:semantic score:1.0 src:tool_result trust:0.8
   team-commerce owns checkout (CODEOWNERS).
 ...
-[NCP:ONTOLOGY] v:1 status:verified
-path:1 score:0.58 Service:checkout -DEPENDS_ON-> Service:payments ev:demo-ev-checkout-depends_on-payments
-path:2 score:0.58 Service:checkout -DEPENDS_ON-> Service:inventory ev:demo-ev-checkout-depends_on-inventory
+[NCP:ONTOLOGY] v:2 status:verified
+svc:checkout -DEPENDS_ON-> svc:payments,svc:inventory,db:orders-db ev:demo-ev-checkout-depends_on-payments,...
+svc:checkout -PRODUCES-> topic:order-events ev:demo-ev-checkout-produces-order-events
+svc:payments -DEPENDS_ON-> api:card-network-api,db:ledger-db ev:...
 ...
-path:9 score:0.41 Service:checkout -DEPENDS_ON-> Service:payments -DEPENDS_ON-> Database:ledger-db ev:...
-ontology metadata: {"triggered": true, "reason_code": "entity_relationship_intent", "verified_path_count": 13, ...}
+ontology metadata: {"triggered": true, "reason_code": "entity_relationship_intent", "verified_path_count": 8, ...}
 
 == explicit mode ==
 query 'checkout': 13 verified paths

@@ -34,6 +34,16 @@ path's relations; the corpus plants a candidate relation and a verified
 relation whose only evidence was superseded), SQL statements per call (SQLite only,
 counted with ``sqlite3.Connection.set_trace_callback``) and the graph cost
 the enricher reports (``latency_ms``, ``candidate_count``, ``graph_tokens``).
+
+Primary token metric: **tokens at matched recall** (:func:`tokens_at_matched_recall`).
+Each dependency task runs the whole budget ladder in both arms; per task and
+target recall R (the baseline's best recall on the ladder, and 1.0) each arm
+is charged its cheapest rung reaching R, and only tasks both arms reach are
+compared. A fixed-budget token delta rewards whichever arm retrieves *less*,
+so it cannot tell savings from lost recall; :func:`recall_guard` additionally
+flags any configuration that cuts tokens by losing recall. An embedding
+baseline arm is not run: NCP ships no deterministic offline embedder
+(:data:`EMBEDDING_BASELINE_SKIPPED`).
 """
 
 from __future__ import annotations
@@ -62,7 +72,9 @@ from ncp.types import SubconsciousChunk
 
 PIPELINE = "bench_ontology"
 DEFAULT_BUDGET = 800
-LADDER = (200, 300, 400, 600, 800, 1200, 1600, 2400)
+# Rungs below 200 exist because a compact graph block fits there; both arms
+# run the same ladder.
+LADDER = (100, 150, 200, 300, 400, 600, 800, 1200, 1600, 2400)
 _BASE_TIME = 1_760_000_000.0  # fixed chunk timestamps keep ranking reproducible
 _HOPS = 2
 
@@ -465,23 +477,34 @@ def _run_arm(
             "graph_latency_ms": meta.get("latency_ms"),
             "graph_tokens": meta.get("graph_tokens"),
             "graph_candidates": meta.get("candidate_count"),
+            "graph_facts": meta.get("fact_count"),
+            "graph_intent": (meta.get("intent") or {}).get("name"),
+            "substituted_chunks": len(meta.get("substituted_chunk_ids") or ()),
             "oracle_evidence_tokens": task.oracle_tokens,
         })
 
-    # Pass 2: smallest prompt reaching full fact recall on the budget ladder.
+    # Pass 2: the whole budget ladder per dependency task: (budget, prompt
+    # tokens, fact recall) per rung, for tokens-at-matched-recall, plus the
+    # smallest prompt reaching full fact recall.
     for index, task in enumerate(tasks):
         row = per_task[index]
         row["tokens_to_full_recall"] = None
         row["budget_to_full_recall"] = None
+        row["ladder"] = []
+        row["max_ladder_recall"] = None
         if task.family != "dependency":
             continue
         for rung in ladder:
             response = _call(handler, task, rung, f"bench-l{index}-{rung}")
             chunks, relations = _surfaced(response)
-            if _fact_recall(task, facts, chunks, relations) == 1.0:
-                row["tokens_to_full_recall"] = estimate_tokens(str(response["context"]))
+            recall = _fact_recall(task, facts, chunks, relations) or 0.0
+            tokens = estimate_tokens(str(response["context"]))
+            row["ladder"].append({"budget": rung, "prompt_tokens": tokens,
+                                  "fact_recall": _round(recall, 4)})
+            if recall == 1.0 and row["tokens_to_full_recall"] is None:
+                row["tokens_to_full_recall"] = tokens
                 row["budget_to_full_recall"] = rung
-                break
+        row["max_ladder_recall"] = max(item["fact_recall"] for item in row["ladder"])
 
     # Pass 3: latency (untraced). One warm-up call per task, then repeats.
     latencies: dict[str, list[float]] = {"dependency": [], "control": []}
@@ -626,6 +649,8 @@ def _compare(baseline: dict[str, Any], ontology: dict[str, Any]) -> dict[str, An
         _round(1 - sum(g for g, _ in graph_vs_oracle) / sum(t for _, t in graph_vs_oracle), 4)
         if graph_vs_oracle else None
     )
+    matched = tokens_at_matched_recall(baseline["tasks"], ontology["tasks"])
+    guard = recall_guard(baseline, ontology)
     p95_overhead = delta("dependency", "latency_ms_p95")
     control_p95 = delta("control", "latency_ms_p95")
     return {
@@ -645,10 +670,16 @@ def _compare(baseline: dict[str, Any], ontology: dict[str, Any]) -> dict[str, An
         "control_prompt_token_delta": delta("control", "prompt_tokens_mean"),
         "control_evidence_recall_delta": delta("control", "evidence_recall_mean"),
         "unsupported_assertion_rate": ontology["unsupported_assertion_rate"],
+        # Primary token metric: see tokens_at_matched_recall.
+        "tokens_at_matched_recall": matched,
+        "recall_guard": guard,
         "hypotheses": {
             "p95_overhead_under_50ms": None if p95_overhead is None else p95_overhead < 50,
+            # None: not measurable (too few tasks where the baseline has any
+            # recall to match).
             "token_reduction_15_to_25pct_dependency": (
-                None if paired is None else paired >= 0.15
+                None if matched["headline_reduction"] is None or not matched["headline_sufficient"]
+                else matched["headline_reduction"] >= 0.15 and not guard["tokens_cut_by_losing_recall"]
             ),
             "no_control_regression": (
                 delta("control", "evidence_recall_mean") in (0, 0.0, None)
@@ -659,6 +690,103 @@ def _compare(baseline: dict[str, Any], ontology: dict[str, Any]) -> dict[str, An
             ),
         },
     }
+
+
+MIN_MATCHED_PAIRS = 3
+
+
+def _min_tokens_reaching(row: dict[str, Any], recall: float) -> int | None:
+    """Fewest prompt tokens over the ladder rungs whose fact recall >= ``recall``."""
+    reached = [item["prompt_tokens"] for item in row.get("ladder") or ()
+               if item["fact_recall"] >= recall - 1e-9]
+    return min(reached) if reached else None
+
+
+def tokens_at_matched_recall(
+    baseline_tasks: list[dict[str, Any]], ontology_tasks: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Prompt tokens each arm needs to reach the same fact recall, per task.
+
+    Two targets per dependency task: ``R = baseline max`` (the best recall the
+    baseline reaches anywhere on the ladder; tasks where that is 0 have
+    nothing to match and are skipped) and ``R = 1.0``. Only tasks *both* arms
+    reach count, and each arm is charged its cheapest rung that reaches R, so
+    an arm cannot win by spending tokens on recall the other never had, nor by
+    cutting tokens below the recall it is compared at. The headline is the
+    pooled reduction ``1 - sum(ontology) / sum(baseline)`` at
+    ``R = baseline max``.
+    """
+    targets: dict[str, list[dict[str, Any]]] = {"baseline_max": [], "full": []}
+    skipped: dict[str, list[str]] = {"baseline_max": [], "full": []}
+    for base, ont in zip(baseline_tasks, ontology_tasks, strict=True):
+        if base["family"] != "dependency":
+            continue
+        best = base.get("max_ladder_recall") or 0.0
+        for name, recall in (("baseline_max", best), ("full", 1.0)):
+            if recall <= 0:
+                skipped[name].append(base["task"])
+                continue
+            tokens_b, tokens_o = _min_tokens_reaching(base, recall), _min_tokens_reaching(ont, recall)
+            if tokens_b is None or tokens_o is None:
+                skipped[name].append(base["task"])
+                continue
+            targets[name].append({"task": base["task"], "recall": _round(recall, 4),
+                                  "baseline_tokens": tokens_b, "ontology_tokens": tokens_o})
+
+    def pooled(rows: list[dict[str, Any]]) -> float | None:
+        total = sum(row["baseline_tokens"] for row in rows)
+        return _round(1 - sum(row["ontology_tokens"] for row in rows) / total, 4) if total else None
+
+    summary = {
+        name: {
+            "pairs": len(rows), "skipped": skipped[name],
+            "baseline_tokens_mean": _round(statistics.fmean(r["baseline_tokens"] for r in rows))
+            if rows else None,
+            "ontology_tokens_mean": _round(statistics.fmean(r["ontology_tokens"] for r in rows))
+            if rows else None,
+            "reduction": pooled(rows), "per_task": rows,
+        }
+        for name, rows in targets.items()
+    }
+    tasks = sum(1 for row in baseline_tasks if row["family"] == "dependency")
+    pairs = summary["baseline_max"]["pairs"]
+    # Fewer pairs than this and the headline is anecdote, not a measurement.
+    needed = max(MIN_MATCHED_PAIRS, (tasks + 1) // 2)
+    return {
+        "headline_reduction": summary["baseline_max"]["reduction"],
+        "headline_pairs": pairs, "headline_pairs_needed": needed,
+        "headline_sufficient": pairs >= needed,
+        **summary,
+    }
+
+
+def recall_guard(baseline: dict[str, Any], ontology: dict[str, Any]) -> dict[str, Any]:
+    """Flags a config that saves tokens by losing recall: at the fixed budget,
+    per dependency task, the ontology arm uses fewer tokens *and* reaches a
+    lower fact recall than the baseline (or its mean recall drops)."""
+    losses = [
+        {"task": b["task"], "baseline_recall": b["fact_recall"], "ontology_recall": o["fact_recall"],
+         "baseline_tokens": b["prompt_tokens"], "ontology_tokens": o["prompt_tokens"]}
+        for b, o in zip(baseline["tasks"], ontology["tasks"], strict=True)
+        if b["family"] == "dependency" and (o["fact_recall"] or 0) < (b["fact_recall"] or 0)
+    ]
+    base = baseline["families"].get("dependency", {})
+    ont = ontology["families"].get("dependency", {})
+    mean_drop = (ont.get("fact_recall_mean") or 0) < (base.get("fact_recall_mean") or 0)
+    cheaper = (ont.get("prompt_tokens_mean") or 0) < (base.get("prompt_tokens_mean") or 0)
+    return {
+        "tasks_with_recall_loss": losses,
+        "tokens_cut_by_losing_recall": bool(losses and any(
+            item["ontology_tokens"] < item["baseline_tokens"] for item in losses
+        )) or (mean_drop and cheaper),
+    }
+
+
+EMBEDDING_BASELINE_SKIPPED = (
+    "no deterministic offline embedder ships with NCP: LocalEmbeddingAdapter needs the "
+    "optional fastembed extra plus a model download, OpenAIEmbeddingAdapter needs the "
+    "network, and a hash/bag-of-words stand-in would be another lexical baseline"
+)
 
 
 def run_ontology_benchmark(
@@ -718,5 +846,6 @@ def run_ontology_benchmark(
             "python": sys.version.split()[0], "platform": platform.platform(),
             "cpu_count": os.cpu_count(), "sqlite": sqlite3.sqlite_version,
         },
+        "embedding_baseline": {"skipped": EMBEDDING_BASELINE_SKIPPED},
         "backends": results,
     }

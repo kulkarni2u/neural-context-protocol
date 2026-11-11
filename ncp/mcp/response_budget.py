@@ -33,7 +33,7 @@ _TRIM_STEPS: tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...] = (
 _MAX_REASSEMBLIES = 4
 # Applied after every diagnostic step: the opt-in ontology bundle is cut to
 # its core telemetry (per-path detail, entities, signals and warnings go). The
-# ``[NCP:ONTOLOGY]`` block in ``context`` still carries the paths themselves.
+# ``[NCP:ONTOLOGY]`` block in ``context`` still carries the facts themselves.
 _ONTOLOGY_STEP = "ontology_detail"
 _ONTOLOGY_CORE = (
     "schema_version", "mode", "ontology_triggered", "reason_code", "verified_path_count",

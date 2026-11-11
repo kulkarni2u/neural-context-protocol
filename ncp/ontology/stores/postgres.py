@@ -60,10 +60,11 @@ from typing import TYPE_CHECKING, Any, Protocol
 from uuid import UUID
 
 from ncp.ontology.models import (
-    GLOBAL_NAMESPACE, AuthContext, Entity, EntityMatch, EvidenceRef, GraphPath, GraphQuery,
+    GLOBAL_NAMESPACE, AuthContext, Entity, EntityMatch, EvidenceRef, GraphQuery,
     GraphResult, Relation, normalize_key,
 )
 from ncp.ontology.registry import RelationType, SchemaRegistry
+from ncp.ontology.stores._traversal import breadth_first
 from ncp.ontology.stores.sqlite import (
     OntologyConflictError, OntologyNotFoundError, OntologyTimeoutError, _check_deadline, _require,
     _require_write, _ts,
@@ -545,6 +546,10 @@ class PostgresOntologyStore:
             f"SELECT alias FROM {self._t('aliases')} WHERE entity_id = %s ORDER BY alias",
             (row["entity_id"],),
         )]
+        return self._entity_from_row(row, aliases)
+
+    @staticmethod
+    def _entity_from_row(row: dict[str, Any], aliases: Sequence[str]) -> Entity:
         return Entity.model_validate({
             "scope": {"tenant_id": row["tenant_id"], "namespace": row["namespace"]},
             "entity_type": row["entity_type"],
@@ -560,18 +565,22 @@ class PostgresOntologyStore:
             "deleted_at": _utc(row["deleted_at"]),
         })
 
-    def _relation_from_row(self, tx: _Tx, row: dict[str, Any]) -> Relation:
-        evidence = [
+    def _relation_from_row(
+        self, tx: _Tx, row: dict[str, Any], *, evidence: Sequence[dict[str, Any]] | None = None,
+    ) -> Relation:
+        if evidence is None:
+            evidence = tx.rows(
+                f"SELECT * FROM {self._t('relation_evidence')} WHERE relation_id = %s"
+                " AND status = 'valid' ORDER BY evidence_type, evidence_id, source_revision",
+                (row["relation_id"],),
+            )
+        refs = [
             EvidenceRef(
                 evidence_type=item["evidence_type"], evidence_id=item["evidence_id"],
                 source_revision=item["source_revision"],
                 observed_at=_utc(item["observed_at"]),  # type: ignore[arg-type]
             )
-            for item in tx.rows(
-                f"SELECT * FROM {self._t('relation_evidence')} WHERE relation_id = %s"
-                " AND status = 'valid' ORDER BY evidence_type, evidence_id, source_revision",
-                (row["relation_id"],),
-            )
+            for item in evidence
         ]
         return Relation.model_validate({
             "relation_id": row["relation_id"],
@@ -589,7 +598,7 @@ class PostgresOntologyStore:
             "schema_pack": row["schema_pack"],
             "schema_version": row["schema_version"],
             "attributes": _attrs(row["attributes"]),
-            "evidence": evidence,
+            "evidence": refs,
         })
 
     def _load_relation(
@@ -858,66 +867,46 @@ class PostgresOntologyStore:
     def traverse(
         self, request: GraphQuery, *, auth: AuthContext, deadline: float | None = None,
     ) -> GraphResult:
-        """Breadth-first expansion; see ``SQLiteOntologyStore.traverse`` (same order)."""
+        """Breadth-first expansion; see ``SQLiteOntologyStore.traverse`` (same
+        order, same direction / relation-type filters, one edge query and one
+        evidence query per hop)."""
         _require(auth, "read")
         now = datetime.now(timezone.utc)
-        warnings: list[str] = []
-        paths: list[GraphPath] = []
         with self._transaction(write=False, deadline=deadline) as tx:
             seeds = self._visible_seeds(tx, request.seeds, auth)
-            if len(seeds) > request.max_nodes:
-                seeds = seeds[:request.max_nodes]
-                warnings.append(f"truncated: seeds exceed max_nodes={request.max_nodes}")
             edge_sql, params = self._edge_query(tx, request, auth, now)
-            chains: dict[str, tuple[tuple[UUID, ...], tuple[Relation, ...]]] = {
-                seed: ((UUID(seed),), ()) for seed in seeds
-            }
-            seen_edges: set[str] = set()
-            frontier = list(seeds)
-            truncated = False
-            for _ in range(request.max_hops):
-                next_frontier: list[str] = []
-                for node in frontier:
-                    for row in tx.rows(edge_sql, {**params, "node": node}):
-                        if row["relation_id"] in seen_edges:
-                            continue
-                        if len(seen_edges) >= request.max_edges:
-                            warnings.append(f"truncated: max_edges={request.max_edges} reached")
-                            truncated = True
-                            break
-                        other = (
-                            row["dst_entity_id"] if row["src_entity_id"] == node
-                            else row["src_entity_id"]
-                        )
-                        if other not in chains and len(chains) >= request.max_nodes:
-                            if not any("max_nodes" in item for item in warnings):
-                                warnings.append(
-                                    f"truncated: max_nodes={request.max_nodes} reached"
-                                )
-                            continue
-                        seen_edges.add(row["relation_id"])
-                        nodes, relations = chains[node]
-                        chain = (
-                            nodes + (UUID(other),),
-                            relations + (self._relation_from_row(tx, row),),
-                        )
-                        paths.append(GraphPath(nodes=chain[0], relations=chain[1]))
-                        if other not in chains:
-                            chains[other] = chain
-                            next_frontier.append(other)
-                    if truncated:
-                        break
-                frontier = next_frontier
-                if truncated or not frontier:
-                    break
-            else:
-                if frontier and any(
-                    row["relation_id"] not in seen_edges
-                    for node in frontier
-                    for row in tx.rows(edge_sql, {**params, "node": node})
-                ):
-                    warnings.append(f"truncated: max_hops={request.max_hops} reached")
-        return GraphResult(paths=tuple(paths), warnings=tuple(warnings))
+
+            def fetch_edges(frontier: Sequence[str]) -> list[dict[str, Any]]:
+                return tx.rows(edge_sql, {**params, "nodes": list(frontier)})
+
+            def load_relations(rows: Sequence[Any]) -> dict[str, Relation]:
+                evidence = self._evidence_rows(tx, [row["relation_id"] for row in rows])
+                return {
+                    row["relation_id"]: self._relation_from_row(
+                        tx, row, evidence=evidence.get(row["relation_id"], []),
+                    )
+                    for row in rows
+                }
+
+            return breadth_first(
+                request, seeds, fetch_edges=fetch_edges, load_relations=load_relations,
+                check_deadline=lambda: _check_deadline(deadline),
+            )
+
+    def _evidence_rows(self, tx: _Tx, relation_ids: Sequence[str]) -> dict[str, list[dict[str, Any]]]:
+        """Valid evidence rows of ``relation_ids`` in one query (see the SQLite store)."""
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        ids = list(dict.fromkeys(relation_ids))
+        if not ids:
+            return grouped
+        for item in tx.rows(
+            f"SELECT * FROM {self._t('relation_evidence')} WHERE relation_id = ANY(%s)"
+            " AND status = 'valid'"
+            " ORDER BY relation_id, evidence_type, evidence_id, source_revision",
+            (ids,),
+        ):
+            grouped.setdefault(item["relation_id"], []).append(item)
+        return grouped
 
     def _visible_seeds(self, tx: _Tx, seeds: Sequence[UUID], auth: AuthContext) -> list[str]:
         requested = list(dict.fromkeys(str(seed) for seed in seeds))
@@ -954,15 +943,22 @@ class PostgresOntologyStore:
         if request.verified_only:
             clauses.append(f"r.status = 'verified' AND {self._valid_evidence_sql(tx)}")
         relations = self._t("relations")
+        branches = []
+        if request.direction in ("both", "out"):
+            branches.append(
+                f"SELECT x.relation_id FROM {relations} x WHERE {visible('x')}"
+                " AND x.src_entity_id = ANY(%(nodes)s)"
+            )
+        if request.direction in ("both", "in"):
+            branches.append(
+                f"SELECT y.relation_id FROM {relations} y WHERE {visible('y')}"
+                " AND y.dst_entity_id = ANY(%(nodes)s)"
+            )
         sql = (
             f"SELECT r.* FROM {relations} r"
             f" JOIN {self._t('entities')} s ON s.entity_id = r.src_entity_id"
             f" JOIN {self._t('entities')} d ON d.entity_id = r.dst_entity_id"
-            " WHERE r.relation_id IN ("
-            f"SELECT x.relation_id FROM {relations} x WHERE {visible('x')}"
-            " AND x.src_entity_id = %(node)s"
-            f" UNION SELECT y.relation_id FROM {relations} y WHERE {visible('y')}"
-            " AND y.dst_entity_id = %(node)s)"
+            f" WHERE r.relation_id IN ({' UNION '.join(branches)})"
             f" AND {' AND '.join(clauses)}"
             " ORDER BY r.relation_type, r.relation_id"
         )
@@ -976,13 +972,27 @@ class PostgresOntologyStore:
     ) -> dict[str, Entity]:
         """Visible entities by id, in one read transaction; invisible ids are absent."""
         _require(auth, "read")
-        found: dict[str, Entity] = {}
+        requested = list(dict.fromkeys(str(item) for item in entity_ids))
+        if not requested:
+            return {}
         with self._transaction(write=False, deadline=deadline) as tx:
-            for entity_id in dict.fromkeys(str(item) for item in entity_ids):
-                entity = self._load_entity(tx, entity_id, auth)
-                if entity is not None:
-                    found[entity_id] = entity
-        return found
+            rows = {row["entity_id"]: row for row in tx.rows(
+                f"SELECT * FROM {self._t('entities')} WHERE entity_id = ANY(%s)"
+                " AND tenant_id = %s AND namespace IN (%s, %s)",
+                (requested, auth.scope.tenant_id, auth.scope.namespace, GLOBAL_NAMESPACE),
+            )}
+            aliases: dict[str, list[str]] = {}
+            if rows:
+                for entity_id, alias in tx.tuples(
+                    f"SELECT entity_id, alias FROM {self._t('aliases')}"
+                    " WHERE entity_id = ANY(%s) ORDER BY entity_id, alias",
+                    (list(rows),),
+                ):
+                    aliases.setdefault(entity_id, []).append(alias)
+        return {
+            entity_id: self._entity_from_row(rows[entity_id], aliases.get(entity_id, []))
+            for entity_id in requested if entity_id in rows
+        }
 
     def relation_in_scope(self, relation_id: UUID, *, auth: AuthContext) -> bool:
         """Whether ``relation_id`` names a relation in exactly the caller's scope."""

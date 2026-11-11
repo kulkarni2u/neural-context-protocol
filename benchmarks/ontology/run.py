@@ -27,6 +27,9 @@ def main() -> None:
                         help="max_tokens for the fixed-budget pass and latency rounds.")
     parser.add_argument("--max-graph-tokens", type=int, default=None,
                         help="Override [ontology].max_graph_tokens for the ontology arm.")
+    parser.add_argument("--extra-toml", action="append", default=[],
+                        help="Extra [ontology] line for the ontology arm, e.g. "
+                             "'intent_directed = false' (repeatable).")
     args = parser.parse_args()
     if args.backends:
         backends = tuple(item.strip() for item in args.backends.split(",") if item.strip())
@@ -35,6 +38,8 @@ def main() -> None:
     toml = ENABLED_TOML
     if args.max_graph_tokens is not None:
         toml += f"max_graph_tokens = {args.max_graph_tokens}\n"
+    for line in args.extra_toml:
+        toml += line.strip() + "\n"
     with tempfile.TemporaryDirectory(prefix="ncp-bench-ontology-") as tmpdir:
         artifact = run_ontology_benchmark(
             workdir=tmpdir, backends=backends, budget=args.budget, repeats=args.repeats,

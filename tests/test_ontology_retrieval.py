@@ -289,8 +289,10 @@ class TestTrigger:
         assert meta["verified_path_count"] >= 2
         assert meta["graph_tokens"] > 0 and meta["fallback_reason"] is None
         assert HEADER in response["context"]
-        assert "Service:payroll -CONSUMES-> KafkaTopic:payroll-events" in response["context"]
-        assert f"ev:{facts['events_chunk']}" in response["context"]
+        line = next(text for text in response["context"].splitlines()
+                    if text.startswith("svc:payroll -CONSUMES-> "))
+        assert "topic:payroll-events" in line and facts["events_chunk"] in line.split(" ev:")[1]
+        assert meta["block_version"] == 2 and meta["intent"]["direction"] == "out"
         # Ontology block sits after memory, before the budget header.
         context = response["context"]
         assert context.index(HEADER) < context.index("[NCP:BUDGET]")
@@ -432,7 +434,7 @@ class TestExpansion:
         meta = response["ontology"]
         assert meta["verified_path_count"] == 1
         assert meta["paths"][0]["external_evidence_count"] == 1
-        assert "Service:billing <-OWNS- Team:platform att:1" in response["context"]
+        assert "svc:billing <-OWNS- team:platform ev:att" in response["context"]
 
     def test_graph_tokens_respect_slice_and_total_budget(self, tmp_path: Path) -> None:
         world = World(_project(tmp_path, None), ENABLED + VERIFIER + "max_graph_tokens = 60\n")
@@ -470,12 +472,20 @@ class TestExpansion:
         legacy = Assembler(store=world.store, config=world.config)
         result = enriched.assemble(conscious=agent, budget=BudgetContext(), query_text=query, max_tokens=800)
         plain = legacy.assemble(conscious=agent, budget=BudgetContext(), query_text=query, max_tokens=800)
-        assert result.graph is not None and result.graph.tokens > 100 and result.chunks
+        assert result.graph is not None and result.graph.tokens > 50
+        # Graph-first substitution: cited memory is shown as facts, not text.
+        assert result.graph.substituted
+        assert [c.chunk_id for c in result.graph.memory_pool(result.chunks)] == [
+            c.chunk_id for c in plain.chunks]
         for ceiling in (80, 120, 200):
             refitted = enriched.refit(result, budget=BudgetContext(), max_tokens=ceiling, query_text=query)
             baseline = legacy.refit(plain, budget=BudgetContext(), max_tokens=ceiling, query_text=query)
-            # Memory is never evicted to keep graph statements.
-            assert [c.chunk_id for c in refitted.chunks] == [c.chunk_id for c in baseline.chunks]
+            # Memory is never evicted to keep graph statements: every chunk the
+            # legacy refit keeps is shown as text or as a fact citing it.
+            assert refitted.graph is not None
+            assert [c.chunk_id for c in refitted.graph.memory_pool(refitted.chunks)] == [
+                c.chunk_id for c in baseline.chunks]
+            assert set(refitted.graph.substituted_ids) <= refitted.graph.cited_chunk_ids
             assert estimate_tokens(refitted.context) <= ceiling
 
     def test_response_max_tokens_trims_ontology_detail(self, world: World) -> None:
@@ -489,7 +499,10 @@ class TestExpansion:
             assert enabled["truncated"]["fits"], enabled["truncated"]
             assert "ontology_detail" in enabled["truncated"]["dropped"]
             assert "paths" not in enabled["ontology"]
-            assert enabled["ontology"]["verified_path_count"] == enabled["context"].count("\npath:")
+            # The core telemetry still describes the block actually shown.
+            assert (enabled["ontology"]["verified_path_count"] > 0) == (
+                "[NCP:ONTOLOGY]" in enabled["context"])
+            assert enabled["ontology"]["graph_tokens"] <= estimate_tokens(enabled["context"])
 
     def test_stream_and_response_refit_keep_graph_bounded(self, world: World) -> None:
         world.payroll()
@@ -841,3 +854,99 @@ class TestPrincipalPath:
         }, principal=principal, authorizer=ToolAuthorizer(world.store))
         body = json.loads(response["result"]["content"][0]["text"])
         assert body["ontology"]["verified_path_count"] >= 1
+
+
+# ── graph-first substitution and intent-directed expansion (block v:2) ──────
+
+
+class TestGraphFirst:
+    def test_cited_memory_chunk_is_substituted_but_credited(self, world: World) -> None:
+        facts = world.payroll()
+        response = world.get_context(task="payroll_upstream_dependencies", slot="payroll",
+                                     max_tokens=800)
+        meta, context = response["ontology"], response["context"]
+        substituted = meta["substituted_chunk_ids"]
+        assert substituted, meta
+        for chunk_id in substituted:
+            # Text gone from memory, id still cited in the block and credited.
+            assert f"chunk:{chunk_id}" not in context
+            block = context.split("[NCP:ONTOLOGY]")[1]
+            assert chunk_id in block
+            assert chunk_id in response["retrieved_chunk_ids"]
+        assert "payroll reads the ledger database" not in context
+        assert facts["ledger_chunk"] in substituted
+
+    def test_substitution_off_keeps_memory_text(self, tmp_path: Path) -> None:
+        world = World(_project(tmp_path, None), ENABLED + VERIFIER + "substitute_evidence = false\n")
+        world.payroll()
+        response = world.get_context(task="payroll_upstream_dependencies", slot="payroll",
+                                     max_tokens=800)
+        assert response["ontology"]["substituted_chunk_ids"] == []
+        assert "payroll reads the ledger database" in response["context"]
+        on = World(_project(tmp_path / "on", None))
+        on.payroll()
+        enabled = on.get_context(task="payroll_upstream_dependencies", slot="payroll",
+                                 max_tokens=800)
+        assert estimate_tokens(enabled["context"]) < estimate_tokens(response["context"])
+        # Same retrieval; substitution changes what is shown, not what is credited.
+        assert len(enabled["retrieved_chunk_ids"]) == len(response["retrieved_chunk_ids"]) > 0
+
+    def test_dependency_intent_walks_outgoing_dependency_types_only(self, world: World) -> None:
+        facts = world.payroll()
+        team = world.entity("Team", "people-ops")
+        caller = world.entity("Service", "portal")
+        world.relate(team, facts["payroll"], "OWNS", evidence=[world.chunk("people-ops owns payroll")])
+        world.relate(caller, facts["payroll"], "DEPENDS_ON",
+                     evidence=[world.chunk("portal calls payroll")])
+        meta = world.get_context(task="what_does_payroll_depend_on", slot="x")["ontology"]
+        assert meta["intent"]["name"] == "dependency" and meta["intent"]["direction"] == "out"
+        assert "OWNS" not in meta["intent"]["relation_types"]
+        relations = {rel for path in meta["paths"] for rel in path["relations"]}
+        labels = {label for path in meta["paths"] for label in path["labels"]}
+        assert relations <= {"CONSUMES", "DEPENDS_ON", "PRODUCES"}
+        assert "Service:portal" not in labels and "Team:people-ops" not in labels
+
+    def test_impact_and_ownership_intents(self, world: World) -> None:
+        facts = world.payroll()
+        team = world.entity("Team", "people-ops")
+        caller = world.entity("Service", "portal")
+        world.relate(team, facts["payroll"], "OWNS", evidence=[world.chunk("people-ops owns payroll")])
+        world.relate(caller, facts["payroll"], "DEPENDS_ON",
+                     evidence=[world.chunk("portal calls payroll")])
+        impact = world.get_context(task="what_breaks_if_payroll_is_down", slot="x")
+        assert impact["ontology"]["intent"]["direction"] == "in"
+        assert "svc:payroll <-DEPENDS_ON- svc:portal" in impact["context"]
+        assert "topic:payroll-events" not in impact["context"]
+        owner = world.get_context(task="who_owns_payroll", slot="x")
+        assert owner["ontology"]["intent"]["relation_types"] == ["OWNS"]
+        assert "svc:payroll <-OWNS- team:people-ops" in owner["context"]
+        assert "DEPENDS_ON" not in owner["context"].split("[NCP:ONTOLOGY]")[1]
+
+    def test_intent_directed_off_is_the_v1_walk(self, tmp_path: Path) -> None:
+        world = World(_project(tmp_path, None), ENABLED + VERIFIER + "intent_directed = false\n")
+        facts = world.payroll()
+        team = world.entity("Team", "people-ops")
+        world.relate(team, facts["payroll"], "OWNS", evidence=[world.chunk("people-ops owns payroll")])
+        meta = world.get_context(task="what_does_payroll_depend_on", slot="x")["ontology"]
+        assert meta["intent"]["name"] == "undirected" and meta["intent"]["direction"] == "both"
+        assert "OWNS" in {rel for path in meta["paths"] for rel in path["relations"]}
+
+    def test_max_graph_tokens_is_a_ceiling_not_a_target(self, world: World) -> None:
+        world.payroll()
+        meta = world.get_context(task="payroll_upstream_dependencies", slot="x",
+                                 max_tokens=2000)["ontology"]
+        assert 0 < meta["graph_tokens"] < 100  # 500-token slice, two facts
+
+    def test_new_config_fields_are_validated(self) -> None:
+        from pydantic import ValidationError
+
+        from ncp.ontology.policy import OntologyConfig
+
+        config = OntologyConfig()
+        assert (config.max_graph_paths, config.min_path_score) == (16, 0.25)
+        assert config.intent_directed is True and config.substitute_evidence is True
+        for bad in ({"max_graph_paths": 0}, {"max_graph_paths": 101}, {"min_path_score": -0.1},
+                    {"min_path_score": 1.5}, {"intent_directed": "yes"},
+                    {"substitute_evidence": 1}, {"min_path_score": float("nan")}):
+            with pytest.raises(ValidationError):
+                OntologyConfig(**bad)

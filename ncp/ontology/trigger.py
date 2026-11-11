@@ -24,17 +24,18 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from uuid import UUID
 
-from ncp.ontology.models import Entity, RetrievalMode, normalize_key
+from ncp.ontology.models import Entity, RetrievalMode, TraversalDirection, normalize_key
 from ncp.ontology.resolution import Resolution, tokenize
 
 RELATIONSHIP_TERMS = frozenset({
-    "affect", "affected", "affects", "blast", "call", "calls", "connected", "consume",
+    "affect", "affected", "affects", "blast", "break", "breaks", "call", "calls", "connected",
+    "consume",
     "consumer", "consumers", "consumes", "consuming", "depend", "dependency",
     "dependencies", "dependent", "dependents", "depends", "downstream", "expose",
     "exposed", "exposes", "impact", "impacted", "impacts", "owned", "owner", "owners",
     "ownership", "owns", "produce", "produced", "producer", "producers", "produces",
-    "producing", "radius", "related", "relationship", "relationships", "topology",
-    "upstream", "uses",
+    "producing", "radius", "related", "relationship", "relationships", "relies", "rely",
+    "require", "requires", "topology", "upstream", "uses",
 })
 DIAGNOSTIC_TERMS = frozenset({
     "broken", "cause", "debug", "degraded", "diagnose", "error", "errors", "fail",
@@ -168,7 +169,113 @@ def evaluate(
     return TriggerDecision(True, reason, seeds, candidates, tuple(signals), score, ambiguous)
 
 
+# -- intent-directed expansion ------------------------------------------------------
+#
+# Once the trigger has decided to expand, the same cheap request words choose
+# *what* to expand: which relation types (by the schema pack's ``intents``
+# category, never by hardcoded type names), which direction and how many hops.
+# Deterministic, no LLM. One recognised category -> its profile; none or more
+# than one -> ``mixed`` (every type, both directions, one hop fewer).
+
+DEPENDENCY_TERMS = frozenset({
+    "call", "calls", "calling", "depend", "dependencies", "dependency", "depends",
+    "need", "needs", "relies", "rely", "require", "requires", "upstream", "use", "uses",
+    "using",
+})
+IMPACT_TERMS = frozenset({
+    "affect", "affected", "affects", "blast", "break", "breaks", "callers", "consumers",
+    "dependent", "dependents", "downstream", "impact", "impacted", "impacts", "radius",
+})
+OWNERSHIP_TERMS = frozenset({
+    "maintainer", "maintainers", "maintains", "owned", "owner", "owners", "ownership",
+    "owns", "team", "teams",
+})
+DEPLOYMENT_TERMS = frozenset({
+    "cluster", "deployed", "deployment", "hosted", "hosting", "hosts", "region", "runs",
+})
+# "who uses X" / "what services depend on X" ask for dependents (incoming),
+# while "what does X depend on" asks for dependencies (outgoing).
+_DEPENDENT_QUESTION = re.compile(
+    r"\b(?:who|what|which)(?: (?!does\b|do\b|did\b|is\b)[\w-]+)?"
+    r" (call|calls|consume|consumes|depend|depends|need|needs|relies|rely|require|requires"
+    r"|use|uses)\b"
+)
+INTENT_PROFILES = ("dependency", "impact", "ownership", "deployment", "mixed")
+# Per-intent statement caps (further bounded by ``max_graph_paths``).
+INTENT_PATH_CAPS = {"dependency": 16, "impact": 16, "ownership": 8, "deployment": 8, "mixed": 12}
+
+
+@dataclass(frozen=True, slots=True)
+class IntentProfile:
+    """Traversal shape for one request: ``relation_types`` empty means all."""
+
+    name: str
+    relation_types: tuple[str, ...]
+    direction: TraversalDirection
+    hops: int
+    path_cap: int
+    categories: tuple[str, ...] = ()
+
+
+def intent_categories(texts: Sequence[str]) -> tuple[str, ...]:
+    """Relationship-intent categories named by the request words (sorted)."""
+    words: list[str] = []
+    for text in texts:
+        words.extend(tokenize(text))
+    vocabulary = set(words)
+    joined = " ".join(words)
+    found: set[str] = set()
+    dependent_verbs = {match.group(1) for match in _DEPENDENT_QUESTION.finditer(joined)}
+    if dependent_verbs or vocabulary & IMPACT_TERMS:
+        found.add("impact")
+    if (vocabulary - dependent_verbs) & DEPENDENCY_TERMS:
+        found.add("dependency")
+    if vocabulary & OWNERSHIP_TERMS:
+        found.add("ownership")
+    if vocabulary & DEPLOYMENT_TERMS:
+        found.add("deployment")
+    if not found and vocabulary & DIAGNOSTIC_TERMS:
+        found.add("dependency")  # a symptom's causes live upstream
+    return tuple(sorted(found))
+
+
+def classify_intent(
+    texts: Sequence[str],
+    *,
+    relation_intents: Mapping[str, Iterable[str]],
+    max_hops: int,
+    max_paths: int,
+) -> IntentProfile:
+    """The traversal profile for ``texts``. ``relation_intents`` maps each
+    enabled relation type to its schema-pack ``intents`` categories."""
+    categories = intent_categories(texts)
+
+    def types_for(category: str) -> tuple[str, ...]:
+        return tuple(sorted(
+            name for name, intents in relation_intents.items() if category in set(intents)
+        ))
+
+    def cap(name: str) -> int:
+        return max(1, min(INTENT_PATH_CAPS[name], max_paths))
+
+    if len(categories) == 1:
+        category = categories[0]
+        lookup = "dependency" if category == "impact" else category
+        types = types_for(lookup)
+        if types:
+            if category in ("dependency", "impact"):
+                direction: TraversalDirection = "out" if category == "dependency" else "in"
+                return IntentProfile(category, types, direction, max_hops, cap(category),
+                                     categories)
+            return IntentProfile(category, types, "both", min(1, max_hops), cap(category),
+                                 categories)
+    return IntentProfile("mixed", (), "both", max(0, min(max_hops, max(1, max_hops - 1))),
+                         cap("mixed"), categories)
+
+
 __all__ = [
-    "DIAGNOSTIC_TERMS", "EXPAND_REASONS", "RELATIONSHIP_TERMS", "SKIP_REASONS",
-    "TriggerDecision", "TriggerThresholds", "evaluate", "type_names",
+    "DEPENDENCY_TERMS", "DEPLOYMENT_TERMS", "DIAGNOSTIC_TERMS", "EXPAND_REASONS",
+    "IMPACT_TERMS", "INTENT_PATH_CAPS", "INTENT_PROFILES", "OWNERSHIP_TERMS",
+    "RELATIONSHIP_TERMS", "SKIP_REASONS", "IntentProfile", "TriggerDecision",
+    "TriggerThresholds", "classify_intent", "evaluate", "intent_categories", "type_names",
 ]

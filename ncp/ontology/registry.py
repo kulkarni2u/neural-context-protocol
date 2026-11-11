@@ -1,19 +1,26 @@
 """Versioned schema packs and structural validation for domain assertions."""
 
 from importlib.resources import files
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field, StringConstraints, model_validator
 
 from ncp.ontology.models import (
     GLOBAL_NAMESPACE, Contract, Entity, Identifier, PositiveInt, Relation,
 )
+
+# Relationship-intent categories a relation type can serve during automatic
+# enrichment (see ``ncp.ontology.trigger.classify_intent``). A relation type
+# with no category is only reached by mixed/unknown-intent expansion.
+RelationIntent = Literal["dependency", "ownership", "deployment"]
 
 
 class EntityType(Contract):
     required: tuple[Identifier, ...] = ()
     sensitive: tuple[Identifier, ...] = ()
     alias_strategy: Literal["exact"] = "exact"
+    # Short label used by the compact context serializer (``svc:checkout``).
+    tag: Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9]{0,7}$")] | None = None
 
 
 class RelationType(Contract):
@@ -22,6 +29,9 @@ class RelationType(Contract):
     max_outgoing: PositiveInt | None = None
     max_incoming: PositiveInt | None = None
     allow_cycles: bool = Field(default=True, strict=True)
+    # Intent categories this relation type answers, e.g. ``dependency`` for
+    # "what does X depend on" (outgoing) and "what breaks if X fails" (incoming).
+    intents: tuple[RelationIntent, ...] = ()
 
 
 class SchemaPack(Contract):

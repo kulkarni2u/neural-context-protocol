@@ -55,7 +55,11 @@ refresh.
 | `max_hops` | `2` | 0–5 | Traversal depth ceiling. Larger requests are clamped with a `clamped:` warning. |
 | `max_nodes` | `30` | 1–100 | Node ceiling per traversal (clamped). |
 | `max_edges` | `60` | 1–200 | Edge ceiling per traversal (clamped). |
-| `max_graph_tokens` | `500` | 0–4000 | Maximum size of the `[NCP:ONTOLOGY]` block. It always comes out of the caller's `max_tokens`. |
+| `max_graph_tokens` | `500` | 0–4000 | Ceiling (not a target) on the `[NCP:ONTOLOGY]` block. It always comes out of the caller's `max_tokens`; selection usually stops earlier on marginal value. |
+| `max_graph_paths` | `16` | 1–100 | Most ranked paths shown per request. Each intent profile has its own cap (dependency/impact 16, ownership/deployment 8, mixed 12), bounded by this value. |
+| `min_path_score` | `0.25` | 0.0–1.0 | Selection stops at the first ranked path scoring below this (ranking weights in `ncp/ontology/ranking.py`). |
+| `intent_directed` | `true` | bool | Map the request's relationship intent to relation types, direction and hops (see [Intent-directed expansion](#intent-directed-expansion)). `false` walks every type in both directions to `max_hops` (the v1 behaviour). |
+| `substitute_evidence` | `true` | bool | Graph-first substitution: a memory chunk cited by a shown fact is not repeated as text (see [Graph-first context](#graph-first-context-block-v2)). |
 | `verified_only` | `true` | bool | Default for explicit queries. Automatic context is **always** verified-only. |
 | `trigger_max_ms` | `10` | 1–1000 | Time budget for the automatic trigger (entity resolution and decision). |
 | `graph_timeout_ms` | `50` | 1–5000 | Time budget for traversal and evidence mapping during enrichment. On Postgres it becomes `SET LOCAL statement_timeout`. |
@@ -157,13 +161,79 @@ resolves, and returns ordinary context on an empty graph.
 
 Expansion is bounded and verified-only. Every relation needs a live,
 caller-readable chunk or a valid external attestation. Paths are ranked
-deterministically, serialized as compact `Type:key -REL-> Type:key ev:<chunk>`
-statements without attributes, and kept within `max_graph_tokens` inside the
+deterministically, serialized as compact fact lines without attributes
+(block `v:2`, below), and kept within `max_graph_tokens` inside the
 caller's budget. The block is shed before memory when the response is cut
 to fit, and the conscious block and budget header are never evicted. Each
-response's `ontology` metadata reports `ontology_triggered`, `reason_code`,
-`verified_path_count`, `latency_ms`, `graph_tokens`, `fallback_reason` and
-the included paths (by ids).
+response's `ontology` metadata reports `schema_version`, `block_version`,
+`ontology_triggered`, `reason_code`, `verified_path_count`, `fact_count`,
+`intent` (profile name, categories, relation types, direction, hops,
+path cap), `substituted_chunk_ids`, `latency_ms`, `graph_tokens`,
+`fallback_reason`, `omitted` (including the stop reasons `covered`,
+`low_score`, `path_cap`, `token_budget`) and the included paths (by ids,
+with each path's score).
+
+### Intent-directed expansion
+
+Once the trigger decides to expand, the same request words pick *what* to
+expand. The mapping is deterministic (no LLM) and uses the schema pack's
+relation `intents` categories, not hardcoded type names; in
+`infrastructure` v1, `DEPENDS_ON`, `PRODUCES` and `CONSUMES` carry
+`dependency` and `OWNS` carries `ownership`.
+
+| Request words (examples) | Profile | Relation types | Direction | Hops |
+|---|---|---|---|---|
+| depends on, dependencies, uses, calls, requires, needs, upstream | `dependency` | `dependency` types | outgoing | `max_hops` |
+| impact, blast radius, what breaks, dependents, downstream, consumers, "who/what/which … uses/calls/depends" | `impact` | `dependency` types | incoming | `max_hops` |
+| owner, owns, ownership, team, maintainers | `ownership` | `ownership` types | both | 1 |
+| deployed, hosted, runs, cluster, region | `deployment` | `deployment` types | both | 1 |
+| diagnostic words only (why, slow, outage, lag, …) | `dependency` | `dependency` types | outgoing | `max_hops` |
+| none, several categories, or a category with no types in the enabled packs | `mixed` | all | both | `max_hops − 1` (at least 1) |
+
+The `infrastructure` pack has no `deployment` types, so deployment questions
+fall back to `mixed`. Both stores filter by relation type and direction in
+SQL (`GraphQuery.direction`: `both`, `out`, `in`), and traverse one query
+per hop for the whole frontier plus one evidence query per hop.
+
+### Graph-first context (block v:2)
+
+```text
+[NCP:ONTOLOGY] v:2 status:verified
+svc:checkout -DEPENDS_ON-> svc:payments,svc:cart,db:orders-db ev:ev-dep-03,ev-dep-02,ev-dep-05
+svc:checkout -PRODUCES-> topic:order-events ev:ev-prod-00
+svc:payments -DEPENDS_ON-> api:card-network-api ev:ev-dep-10+1
+svc:billing <-OWNS- team:platform ev:att
+```
+
+- Each verified relation of the selected paths is one fact, emitted once.
+  Facts with the same anchor (the endpoint nearer the seed), type and
+  direction share a line, so shared path prefixes are never repeated.
+- `ev:` holds one citation per target, in target order: the chunk shown
+  (a chunk already in memory when there is one), `+N` for N more evidence
+  refs, `att` for attestation-only support. There is no per-line score.
+- Type tags come from the pack's entity types (`Service` → `svc`, `Database`
+  → `db`, `KafkaTopic` → `topic`), falling back to the type's initials.
+  Keys and ids are folded to a safe character set, so nothing in a label can
+  open a line or a `[NCP:…]` header.
+- **Marginal-value stopping.** Paths are added in rank order. A path whose
+  relations are all shown already adds no new fact and is skipped. Selection
+  stops at the first path below `min_path_score` or at the intent's path cap.
+  `max_graph_tokens` is only a ceiling.
+- **Substitution** (`substitute_evidence`). A memory chunk cited by a shown
+  fact loses its `[NCP:SUBCONSCIOUS]` text: the fact stands in for it, and
+  its id stays in `ev:`. The freed budget is not refilled; memory keeps its
+  usual cap and trim rules. If statements are later shed to fit a tighter
+  ceiling (budget refit, `response_max_tokens`), a chunk that loses its last
+  citing statement comes back as text, so memory is never lost to keep graph
+  data. The chunk's text can be pulled with `ncp_fetch` using the fact's
+  entity names (the chunk id is not a search key), and the relation with
+  `ncp_ontology_explain` using `ontology.paths[].relation_ids`.
+- **Outcome credit.** A chunk is credited in `retrieved_chunk_ids` when
+  memory retrieval selected it *and* its content reached the turn, verbatim
+  or as a verified fact it evidences. Substituted chunks are therefore
+  credited, exactly as they would be without substitution. Chunks cited
+  *only* by the graph (never selected by memory retrieval) are not credited,
+  as in v1.
 
 ## Backends
 
@@ -205,16 +275,20 @@ the included paths (by ids).
 Measured on the benchmark corpus with default limits (see
 [`NCP_BENCHMARK_ONTOLOGY.md`](./NCP_BENCHMARK_ONTOLOGY.md)):
 
-- Enrichment added about +7 to +14 ms p95 per `ncp_get_context` on SQLite
-  (+11 ms in the published run) and about +30 to +35 ms on Postgres, across
-  re-runs.
-- Non-graph requests pay about 1.3–2 ms for the trigger.
-- Automatic context raised fact recall on dependency tasks from 0.38 to 1.00,
-  but it **increased** prompt tokens. The design's 15–25% token-reduction
-  hypothesis was not met.
-- On Postgres the graph phase averages about 23 ms, against the default
-  `graph_timeout_ms = 50`. Leave headroom on slower hosts, or expect
-  fallbacks.
+- Enrichment added +7.4 ms p95 per `ncp_get_context` on SQLite and +15.9 ms
+  on Postgres in the v2 run (v1: +11.3 / +34.8 ms). The graph phase now
+  averages about 6 ms (SQLite) and 12 ms (Postgres) against the default
+  `graph_timeout_ms = 50`.
+- Non-graph requests pay about 1.3–2 ms for the trigger; their context is
+  unchanged.
+- On dependency tasks the `[NCP:ONTOLOGY]` block averages 56 tokens (v1:
+  400), fact recall is 1.00 (baseline 0.38) and evidence precision 0.68
+  (v1: 0.29).
+- Primary token metric, tokens at matched recall: **20.4% fewer** prompt
+  tokens than the baseline on SQLite (5 tasks with baseline recall to
+  match; 25.3% at full recall on 2 tasks), with no recall loss. On Postgres
+  this is not measurable (1 task). At a fixed budget the context is still
+  larger than the baseline's, because the baseline omits most facts.
 
 ## Known limitations
 
@@ -244,10 +318,13 @@ Measured on the benchmark corpus with default limits (see
   longer than 63 bytes, and the ontology derives table, index and trigger
   names from `table_prefix`. A very long prefix can be truncated, so keep
   `schema` and `table_prefix` short.
-- **Broad traversal.** Automatic expansion follows every relation type in
-  both directions, so a "depends on" question also brings back dependents
-  and owners. In the benchmark this lowered evidence precision and is the
-  main reason tokens rose.
+- **Keyword intent.** Intent mapping is keyword-based. A question phrased
+  without the listed words falls back to `mixed` (all types, both
+  directions, one hop fewer), and "what does X use" vs "who uses X" relies
+  on the word order heuristic.
+- **Citation ids are not search keys.** A substituted chunk is cited by id,
+  but `ncp_fetch` searches content, not ids; fetch by the fact's entity
+  names instead.
 - **No Deployment type.** The `infrastructure` v1 pack has no Deployment
   entity. Store environment and version as Service attributes or in
   evidence chunks.

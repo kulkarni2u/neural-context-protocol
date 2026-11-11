@@ -33,10 +33,11 @@ from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 from ncp.ontology.models import (
-    GLOBAL_NAMESPACE, AuthContext, Capability, Entity, EntityMatch, EvidenceRef, GraphPath,
+    GLOBAL_NAMESPACE, AuthContext, Capability, Entity, EntityMatch, EvidenceRef,
     GraphQuery, GraphResult, Relation, Scope, normalize_key,
 )
 from ncp.ontology.registry import RelationType, SchemaRegistry
+from ncp.ontology.stores._traversal import breadth_first
 
 if TYPE_CHECKING:
     from ncp.stores.sqlite import SQLiteStore
@@ -411,6 +412,10 @@ class SQLiteOntologyStore:
             "SELECT alias FROM ontology_aliases WHERE entity_id = ? ORDER BY alias",
             (row["entity_id"],),
         )]
+        return self._entity_from_row(row, aliases)
+
+    @staticmethod
+    def _entity_from_row(row: sqlite3.Row, aliases: Sequence[str]) -> Entity:
         return Entity.model_validate({
             "scope": {"tenant_id": row["tenant_id"], "namespace": row["namespace"]},
             "entity_type": row["entity_type"],
@@ -426,19 +431,24 @@ class SQLiteOntologyStore:
             "deleted_at": _dt(row["deleted_at"]),
         })
 
-    def _relation_from_row(self, connection: sqlite3.Connection, row: sqlite3.Row) -> Relation:
-        evidence = [
-            EvidenceRef(
-                evidence_type=item["evidence_type"], evidence_id=item["evidence_id"],
-                source_revision=item["source_revision"],
-                observed_at=_dt(item["observed_at"]),  # type: ignore[arg-type]
-            )
-            for item in self._rows(
+    def _relation_from_row(
+        self, connection: sqlite3.Connection, row: sqlite3.Row,
+        *, evidence: Sequence[sqlite3.Row] | None = None,
+    ) -> Relation:
+        if evidence is None:
+            evidence = self._rows(
                 connection,
                 "SELECT * FROM ontology_relation_evidence WHERE relation_id = ?"
                 " AND status = 'valid' ORDER BY evidence_type, evidence_id, source_revision",
                 (row["relation_id"],),
             )
+        refs = [
+            EvidenceRef(
+                evidence_type=item["evidence_type"], evidence_id=item["evidence_id"],
+                source_revision=item["source_revision"],
+                observed_at=_dt(item["observed_at"]),  # type: ignore[arg-type]
+            )
+            for item in evidence
         ]
         return Relation.model_validate({
             "relation_id": row["relation_id"],
@@ -456,7 +466,7 @@ class SQLiteOntologyStore:
             "schema_pack": row["schema_pack"],
             "schema_version": row["schema_version"],
             "attributes": json.loads(row["attributes"]),
-            "evidence": evidence,
+            "evidence": refs,
         })
 
     def _load_relation(
@@ -742,76 +752,64 @@ class SQLiteOntologyStore:
     def traverse(
         self, request: GraphQuery, *, auth: AuthContext, deadline: float | None = None,
     ) -> GraphResult:
-        """Breadth-first expansion over visible, active relations in both directions.
+        """Breadth-first expansion over visible, active relations.
 
         Each reached relation yields one ``GraphPath``: the BFS-tree chain from
         a seed to the relation's far endpoint. ``nodes[i]`` and ``nodes[i+1]``
         are joined by ``relations[i]``, which may point either way. Edges at
         each node are ordered by (relation_type, relation_id).
+        ``request.direction`` restricts expansion to outgoing (``out``) or
+        incoming (``in``) edges; ``relation_types`` to those type names.
+        Each hop is one edge query over the whole frontier plus one evidence
+        query (see :mod:`ncp.ontology.stores._traversal`).
         ``deadline`` (``time.monotonic()``) bounds wall-clock time; passing it
         raises :class:`OntologyTimeoutError` rather than returning a partial
         graph.
         """
         _require(auth, "read")
         now = datetime.now(timezone.utc)
-        warnings: list[str] = []
-        paths: list[GraphPath] = []
         with self._transaction(write=False, deadline=deadline) as connection:
             seeds = self._visible_seeds(connection, request.seeds, auth)
-            if len(seeds) > request.max_nodes:
-                seeds = seeds[:request.max_nodes]
-                warnings.append(f"truncated: seeds exceed max_nodes={request.max_nodes}")
             edge_sql, params = self._edge_query(connection, request, auth, now)
-            chains: dict[str, tuple[tuple[UUID, ...], tuple[Relation, ...]]] = {
-                seed: ((UUID(seed),), ()) for seed in seeds
-            }
-            seen_edges: set[str] = set()
-            frontier = list(seeds)
-            truncated = False
-            for _ in range(request.max_hops):
-                next_frontier: list[str] = []
-                for node in frontier:
-                    _check_deadline(deadline)
-                    for row in self._rows(connection, edge_sql, {**params, "node": node}):
-                        if row["relation_id"] in seen_edges:
-                            continue
-                        if len(seen_edges) >= request.max_edges:
-                            warnings.append(f"truncated: max_edges={request.max_edges} reached")
-                            truncated = True
-                            break
-                        other = (
-                            row["dst_entity_id"] if row["src_entity_id"] == node
-                            else row["src_entity_id"]
-                        )
-                        if other not in chains and len(chains) >= request.max_nodes:
-                            if not any("max_nodes" in item for item in warnings):
-                                warnings.append(
-                                    f"truncated: max_nodes={request.max_nodes} reached"
-                                )
-                            continue
-                        seen_edges.add(row["relation_id"])
-                        nodes, relations = chains[node]
-                        chain = (
-                            nodes + (UUID(other),),
-                            relations + (self._relation_from_row(connection, row),),
-                        )
-                        paths.append(GraphPath(nodes=chain[0], relations=chain[1]))
-                        if other not in chains:
-                            chains[other] = chain
-                            next_frontier.append(other)
-                    if truncated:
-                        break
-                frontier = next_frontier
-                if truncated or not frontier:
-                    break
-            else:
-                if frontier and any(
-                    row["relation_id"] not in seen_edges
-                    for node in frontier
-                    for row in self._rows(connection, edge_sql, {**params, "node": node})
-                ):
-                    warnings.append(f"truncated: max_hops={request.max_hops} reached")
-        return GraphResult(paths=tuple(paths), warnings=tuple(warnings))
+
+            def fetch_edges(frontier: Sequence[str]) -> list[Any]:
+                marks = {f"node{index}": node for index, node in enumerate(frontier)}
+                sql = edge_sql.replace(":nodes", ", ".join(f":{name}" for name in marks))
+                return self._rows(connection, sql, {**params, **marks})
+
+            def load_relations(rows: Sequence[Any]) -> dict[str, Relation]:
+                evidence = self._evidence_rows(connection, [row["relation_id"] for row in rows])
+                return {
+                    row["relation_id"]: self._relation_from_row(
+                        connection, row, evidence=evidence.get(row["relation_id"], []),
+                    )
+                    for row in rows
+                }
+
+            return breadth_first(
+                request, seeds, fetch_edges=fetch_edges, load_relations=load_relations,
+                check_deadline=lambda: _check_deadline(deadline),
+            )
+
+    def _evidence_rows(
+        self, connection: sqlite3.Connection, relation_ids: Sequence[str],
+    ) -> dict[str, list[sqlite3.Row]]:
+        """Valid evidence rows of ``relation_ids`` in one query, per relation in
+        (evidence_type, evidence_id, source_revision) order."""
+        grouped: dict[str, list[sqlite3.Row]] = {}
+        ids = list(dict.fromkeys(relation_ids))
+        if not ids:
+            return grouped
+        marks = ",".join("?" * len(ids))
+        for item in self._rows(
+            connection,
+            f"SELECT * FROM ontology_relation_evidence WHERE relation_id IN ({marks})"
+            " AND status = 'valid'"
+            " ORDER BY relation_id, evidence_type, evidence_id, source_revision",
+            ids,
+        ):
+            grouped.setdefault(item["relation_id"], []).append(item)
+        return grouped
 
     def _visible_seeds(
         self, connection: sqlite3.Connection, seeds: Sequence[UUID], auth: AuthContext,
@@ -831,6 +829,7 @@ class SQLiteOntologyStore:
         self, connection: sqlite3.Connection, request: GraphQuery, auth: AuthContext,
         now: datetime,
     ) -> tuple[str, dict[str, Any]]:
+        """Edge SQL for one hop; ``:nodes`` is replaced by the frontier's placeholders."""
         params: dict[str, Any] = {
             "tenant": auth.scope.tenant_id, "namespace": auth.scope.namespace,
             "global": GLOBAL_NAMESPACE, "now": _ts(now), "now_epoch": now.timestamp(),
@@ -848,15 +847,22 @@ class SQLiteOntologyStore:
             params.update({name[1:]: value for name, value in zip(names, request.relation_types)})
         if request.verified_only:
             clauses.append(f"r.status = 'verified' AND {self._valid_evidence_sql(connection)}")
+        branches = []
+        if request.direction in ("both", "out"):
+            branches.append(
+                f"SELECT x.relation_id FROM ontology_relations x WHERE {visible('x')}"
+                " AND x.src_entity_id IN (:nodes)"
+            )
+        if request.direction in ("both", "in"):
+            branches.append(
+                f"SELECT y.relation_id FROM ontology_relations y WHERE {visible('y')}"
+                " AND y.dst_entity_id IN (:nodes)"
+            )
         sql = (
             "SELECT r.* FROM ontology_relations r"
             " JOIN ontology_entities s ON s.entity_id = r.src_entity_id"
             " JOIN ontology_entities d ON d.entity_id = r.dst_entity_id"
-            " WHERE r.relation_id IN ("
-            f"SELECT x.relation_id FROM ontology_relations x WHERE {visible('x')}"
-            " AND x.src_entity_id = :node"
-            f" UNION SELECT y.relation_id FROM ontology_relations y WHERE {visible('y')}"
-            " AND y.dst_entity_id = :node)"
+            f" WHERE r.relation_id IN ({' UNION '.join(branches)})"
             f" AND {' AND '.join(clauses)}"
             " ORDER BY r.relation_type, r.relation_id"
         )
@@ -870,13 +876,30 @@ class SQLiteOntologyStore:
     ) -> dict[str, Entity]:
         """Visible entities by id, in one read transaction; invisible ids are absent."""
         _require(auth, "read")
-        found: dict[str, Entity] = {}
+        requested = list(dict.fromkeys(str(item) for item in entity_ids))
+        if not requested:
+            return {}
+        marks = ",".join("?" * len(requested))
         with self._transaction(write=False, deadline=deadline) as connection:
-            for entity_id in dict.fromkeys(str(item) for item in entity_ids):
-                entity = self._load_entity(connection, entity_id, auth)
-                if entity is not None:
-                    found[entity_id] = entity
-        return found
+            rows = {row["entity_id"]: row for row in self._rows(
+                connection,
+                f"SELECT * FROM ontology_entities WHERE entity_id IN ({marks})"
+                " AND tenant_id = ? AND namespace IN (?, ?)",
+                (*requested, auth.scope.tenant_id, auth.scope.namespace, GLOBAL_NAMESPACE),
+            )}
+            aliases: dict[str, list[str]] = {}
+            if rows:
+                found_marks = ",".join("?" * len(rows))
+                for entity_id, alias in self._plain(connection).execute(
+                    f"SELECT entity_id, alias FROM ontology_aliases"
+                    f" WHERE entity_id IN ({found_marks}) ORDER BY entity_id, alias",
+                    tuple(rows),
+                ):
+                    aliases.setdefault(entity_id, []).append(alias)
+        return {
+            entity_id: self._entity_from_row(rows[entity_id], aliases.get(entity_id, []))
+            for entity_id in requested if entity_id in rows
+        }
 
     def relation_in_scope(self, relation_id: UUID, *, auth: AuthContext) -> bool:
         """Whether ``relation_id`` names a relation in exactly the caller's scope."""

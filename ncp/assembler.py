@@ -71,8 +71,20 @@ class AssemblyResult:
         Reflects filtering, fan-in reduction and budget trimming, so it is
         exactly the evidence a model saw -- the set a turn-based outcome
         should credit. Synthetic recent-ref and cold-start chunks are excluded.
+        Chunks whose text the ontology replaced with a verified fact citing
+        them (graph-first substitution) are included: memory retrieval chose
+        them and their content reached the turn as that fact.
         """
-        return stored_evidence_ids(self.chunks, self.evidence_sources)
+        return stored_evidence_ids(credited_chunks(self), self.evidence_sources)
+
+
+def credited_chunks(result: object) -> list[SubconsciousChunk]:
+    """Chunks shown in memory plus those substituted by graph facts."""
+    chunks = list(getattr(result, "chunks", []) or [])
+    graph = getattr(result, "graph", None)
+    if graph is not None:
+        chunks.extend(graph.substituted)
+    return chunks
 
 
 def stored_evidence_ids(
@@ -290,6 +302,19 @@ class Assembler:
                 chunks=combined_chunks,
                 max_tokens=effective_max_tokens,
             )
+            if graph.text is not None and self._ontology.config.substitute_evidence:
+                # Graph-first substitution: a memory chunk whose fact is shown
+                # (cited in a statement's ``ev:``) loses its text here; its id
+                # stays cited and fetchable. Nothing refills the freed budget
+                # beyond the already-capped candidate set (normal trim rules).
+                cited = graph.cited_chunk_ids
+                substituted = [chunk for chunk in combined_chunks if chunk.chunk_id in cited]
+                if substituted:
+                    order = [chunk.chunk_id for chunk in combined_chunks]
+                    combined_chunks = [
+                        chunk for chunk in combined_chunks if chunk.chunk_id not in cited
+                    ]
+                    graph = graph.with_substituted(substituted, memory_order=order)
             if effective_max_tokens is not None and graph.text is not None:
                 # The graph slice comes out of the caller's budget (no hidden
                 # inflation); +2 covers the block separator's rounding.
@@ -327,7 +352,8 @@ class Assembler:
         # Finding 2: unconditional eviction totals, independent of the
         # relevance/confidence gate above -- captures cap- and budget-fit
         # evictions even when nothing cleared the >=0.5/>=0.6 threshold.
-        evicted_chunk_count = len(deduped_chunks) - len(combined_chunks)
+        substituted_count = 0 if graph is None else len(graph.substituted)
+        evicted_chunk_count = len(deduped_chunks) - len(combined_chunks) - substituted_count
         evicted_whisper_count = len(all_whispers) - len(combined_whispers)
         final_combined_ids = {chunk.chunk_id for chunk in combined_chunks}
         surfaced_contradictions = [
@@ -346,7 +372,10 @@ class Assembler:
             fanin_merged_count,
             surfaced_contradictions,
             fanin_dropped_malformed_count,
-            {chunk.chunk_id: origins.get(chunk.chunk_id, "retrieval") for chunk in combined_chunks},
+            {
+                chunk.chunk_id: origins.get(chunk.chunk_id, "retrieval")
+                for chunk in [*combined_chunks, *(() if graph is None else graph.substituted)]
+            },
             graph,
         )
 
@@ -387,26 +416,52 @@ class Assembler:
         contradiction_notes: list[tuple[str, str]] | None,
         graph: GraphContext | None,
         max_tokens: int | None,
-    ) -> tuple[str, GraphContext | None]:
+        unfitted: frozenset[str] = frozenset(),
+    ) -> tuple[str, GraphContext | None, list[SubconsciousChunk]]:
         """Encode, then shed graph statements (lowest rank first) until the
         whole context fits ``max_tokens``. Memory, whispers, the conscious
-        block and the budget header are never evicted for graph data."""
+        block and the budget header are never evicted for graph data.
+
+        ``chunks`` is the full memory selection, substituted chunks included.
+        With ``substitute_evidence`` a chunk cited by the current block is
+        shown only as that fact; when shedding removes its last citing
+        statement its text comes back. Returns the context, the final graph
+        (``substituted`` = chunks it still replaces) and the chunks shown.
+        ``unfitted`` names substituted chunks that never went through the
+        memory budget fit; if the whole block is shed and they still do not
+        fit, they are left out rather than overflow the budget.
+        """
+        substitute = self._ontology is not None and self._ontology.config.substitute_evidence
         while True:
+            cited = graph.cited_chunk_ids if graph is not None and substitute else frozenset()
+            shown = [chunk for chunk in chunks if chunk.chunk_id not in cited]
             context = self.encoder.assemble(
                 conscious=conscious,
-                chunks=chunks,
+                chunks=shown,
                 whispers=whispers,
                 budget=budget,
                 contradiction_notes=contradiction_notes,
                 graph_text=None if graph is None else graph.text,
             )
             if (
+                graph is not None and graph.text is None and unfitted and max_tokens is not None
+                and estimate_tokens(context) > max_tokens
+            ):
+                chunks = [chunk for chunk in chunks if chunk.chunk_id not in unfitted]
+                unfitted = frozenset()
+                continue
+            if (
                 graph is None
                 or graph.text is None
                 or max_tokens is None
                 or estimate_tokens(context) <= max_tokens
             ):
-                return context, graph
+                if graph is not None:
+                    graph = graph.with_substituted(
+                        [chunk for chunk in chunks if chunk.chunk_id in cited],
+                        memory_order=[chunk.chunk_id for chunk in chunks],
+                    )
+                return context, graph, shown
             graph = graph.shrink()
 
     def assemble(
@@ -455,14 +510,15 @@ class Assembler:
                 contradiction_notes=fanin_contradictions or None,
             )
         else:
-            context, graph = self._encode_with_graph(
+            context, graph, combined_chunks = self._encode_with_graph(
                 conscious=hydrated,
-                chunks=combined_chunks,
+                chunks=graph.memory_pool(combined_chunks),
                 whispers=combined_whispers,
                 budget=budget,
                 contradiction_notes=fanin_contradictions or None,
                 graph=graph,
                 max_tokens=max_tokens if max_tokens is not None else self._context_token_budget,
+                unfitted=frozenset(graph.substituted_ids),
             )
         context = self.middleware.post_assemble(context)
         return AssemblyResult(
@@ -579,13 +635,15 @@ class Assembler:
         chunks and whispers already chosen, then re-encodes.
         """
         graph = result.graph
-        # Graph data is shed first: memory and whispers are fitted to the whole
-        # ceiling (no graph reservation here) and ``_encode_with_graph`` then
-        # drops graph statements until the result fits.
+        # Graph data is shed first: memory (substituted chunks included, as
+        # text) and whispers are fitted to the whole ceiling (no graph
+        # reservation here) and ``_encode_with_graph`` then drops graph
+        # statements until the result fits, re-substituting cited chunks.
+        pool = result.chunks if graph is None else graph.memory_pool(result.chunks)
         chunks, whispers = self._fit_token_budget(
             conscious=result.conscious,
             budget=budget,
-            chunks=result.chunks,
+            chunks=pool,
             whispers=result.whispers,
             max_tokens=max(1, max_tokens),
             query_text=query_text,
@@ -601,7 +659,7 @@ class Assembler:
                 contradiction_notes=contradictions or None,
             )
         else:
-            context, graph = self._encode_with_graph(
+            context, graph, chunks = self._encode_with_graph(
                 conscious=result.conscious,
                 chunks=chunks,
                 whispers=whispers,
@@ -619,7 +677,7 @@ class Assembler:
             pending_whisper_ids=[w for w in result.pending_whisper_ids if w in kept_whisper_ids],
             evicted_high_relevance=result.evicted_high_relevance,
             evicted_whispers=result.evicted_whispers,
-            evicted_chunk_count=result.evicted_chunk_count + len(result.chunks) - len(chunks),
+            evicted_chunk_count=result.evicted_chunk_count + len(pool) - len(kept_ids),
             evicted_whisper_count=result.evicted_whisper_count + len(result.whispers) - len(whispers),
             retrieval_used_fallback=result.retrieval_used_fallback,
             fanin_merged_count=result.fanin_merged_count,

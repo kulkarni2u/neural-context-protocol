@@ -25,7 +25,7 @@ from pathlib import Path, PurePosixPath
 from typing import BinaryIO, Sequence, get_args
 
 from ncp.adaptive_budget import AdaptiveBudgetResult, compute_adaptive_budget
-from ncp.assembler import Assembler, stored_evidence_ids
+from ncp.assembler import Assembler, credited_chunks, stored_evidence_ids
 from ncp.mcp.response_budget import compact_telemetry, context_sha256, fit_response
 from ncp.budget import BudgetSnapshot, evaluate_budget
 from ncp.chunker import filter_content
@@ -1823,7 +1823,7 @@ def make_handlers(
         into ncp_post_turn(retrieved_chunk_ids=...). Synthetic recent-ref and
         cold-start chunks are not stored chunks and are excluded."""
         return stored_evidence_ids(
-            list(getattr(result, "chunks", []) or []),
+            credited_chunks(result),
             getattr(result, "evidence_sources", None),
         )
 
