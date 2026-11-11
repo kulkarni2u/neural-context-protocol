@@ -1,0 +1,29 @@
+{
+  "id": "infrastructure",
+  "version": 3,
+  "entity_types": {
+    "Service": {"required": ["name", "environment"], "tag": "svc"},
+    "KafkaTopic": {"required": ["cluster", "name"], "tag": "topic"},
+    "Database": {"required": ["name"], "tag": "db"},
+    "API": {"required": ["name"], "tag": "api"},
+    "Incident": {"required": ["incident_key"], "tag": "inc"},
+    "Team": {"required": ["name"], "tag": "team"},
+    "Repo": {"required": ["name"], "tag": "repo"},
+    "Module": {"required": ["name"], "tag": "mod"},
+    "Table": {"required": ["name"], "tag": "tbl"},
+    "Queue": {"required": ["broker", "name"], "tag": "queue"},
+    "Exchange": {"required": ["broker", "name"], "tag": "exch"}
+  },
+  "relation_types": {
+    "PRODUCES": {"from": ["Service", "Module"], "to": ["KafkaTopic", "Queue", "Exchange"], "intents": ["dependency"]},
+    "CONSUMES": {"from": ["Service", "Module"], "to": ["KafkaTopic", "Queue", "Exchange"], "intents": ["dependency"]},
+    "DEPENDS_ON": {"from": ["Service", "Module"], "to": ["Service", "Database", "API", "Module"], "intents": ["dependency"]},
+    "EXPOSES": {"from": ["Service"], "to": ["API"]},
+    "OWNS": {"from": ["Team"], "to": ["Service", "Repo", "Module", "Database", "Table"], "intents": ["ownership"]},
+    "CONTAINS": {"from": ["Repo", "Database"], "to": ["Module", "Table"], "allow_cycles": false},
+    "BUILDS": {"from": ["Module"], "to": ["Service"], "intents": ["deployment"]},
+    "READS": {"from": ["Service", "Module"], "to": ["Table"], "intents": ["dependency"]},
+    "WRITES": {"from": ["Service", "Module"], "to": ["Table"], "intents": ["dependency"]},
+    "ROUTES_TO": {"from": ["Exchange"], "to": ["Queue"], "intents": ["dependency"]}
+  }
+}

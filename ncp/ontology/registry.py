@@ -48,7 +48,9 @@ class SchemaPack(Contract):
         return self
 
 
-BUILTIN_PACK_FILES = ("infrastructure.v1.json", "infrastructure.v2.json")
+BUILTIN_PACK_FILES = (
+    "infrastructure.v1.json", "infrastructure.v2.json", "infrastructure.v3.json",
+)
 # The version a write gets when it names no ``schema_version`` and
 # ``[ontology].pack_versions`` pins none. Newer built-in versions are opt-in:
 # an entity's version cannot change while live relations reference it, so

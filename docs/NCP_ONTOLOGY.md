@@ -185,20 +185,95 @@ filtered directory walk outside git, and always skips `node_modules`,
 | Reads | Produces | Status |
 |---|---|---|
 | `package.json`, `pyproject.toml`, `go.mod`, `Cargo.toml`, `pom.xml`, `build.gradle(.kts)` | one `Module` per directory (key = repo path, aliases = package names), `Repo CONTAINS Module`, and in-repo dependencies as `Module DEPENDS_ON Module`. Workspace roots, Maven aggregators and Gradle root projects are not modules. | verified |
-| `Chart.yaml`, k8s `Deployment`/`StatefulSet`/`DaemonSet`, `Dockerfile` | a `Service` per module (named by the chart, then the workload, then the directory) and `Module BUILDS Service` | verified |
+| `Chart.yaml`, k8s `Deployment`/`StatefulSet`/`DaemonSet`, `Dockerfile`, and deployable signals (see [service attribution](#service-attribution)) | a `Service` per module (named by the chart, then the workload, then `spring.application.name`, then the package / module name) and `Module BUILDS Service` | verified |
 | `CODEOWNERS` (root, `.github/`, `docs/`, `.gitlab/`; last match wins) | `Team OWNS Module` and `Team OWNS Service` | verified |
-| Kafka clients: Spring `@KafkaListener` / `KafkaTemplate.send` / `ProducerRecord`, kafka-python / confluent / aiokafka, kafkajs, kafka-go / sarama, Spring Cloud Stream bindings | `PRODUCES` / `CONSUMES` `KafkaTopic` (literals, Spring `${...}` placeholders and string constants are resolved, see below; test files skipped unless `--include-tests`) | candidate (`--heuristics verified\|off`) |
+| Messaging clients in JS/TS, Python, Go and JVM code (see [brokers and languages](#brokers-and-languages)) | `PRODUCES` / `CONSUMES` `KafkaTopic` / `Queue` / `Exchange`, and `Exchange ROUTES_TO Queue` (literals, constants, Spring `${...}` placeholders, simple SpEL and environment defaults are resolved, see below; test files skipped unless `--include-tests`) | candidate (`--heuristics verified\|off`) |
 | `ncp-ontology.{toml,json,yaml,yml}` anywhere | hand-written facts (databases, tables, external APIs) merged in; they win over a scanned entity with the same type and key | as written |
 
 Every scanned relation cites `attestation = "path#Lnn"`. Options:
 `--pipeline-id`, `--source` (default: the directory name), `--repo-name`,
 `--environment` (service attribute, default `prod`), `--kafka-cluster`
-(default `main`), `--schema-version 1|2` (default 2) and `--heuristics`.
+(default `main`), `--schema-version 1|2|3` (default 3) and `--heuristics`.
 
+With `--schema-version 3` (default) the scan also emits `Queue`, `Exchange`
+and `ROUTES_TO` ([schema pack v3](#schema-pack-v3-queues-and-exchanges)).
+With `--schema-version 2`, Queue / Exchange sites are not emitted: they are
+counted as `skipped_schema` in the summary and one warning says to use
+`--schema-version 3` and pin `[ontology] pack_versions = { infrastructure = 3 }`.
 With `--schema-version 1` the scan emits only v1 types: modules and repos
 are dropped, module dependencies are lifted to `Service DEPENDS_ON Service`
 where both modules build a service, and Kafka edges and ownership attach to
 services.
+
+#### Brokers and languages
+
+Each broker is a group of rules in the table in
+`ncp/ontology/scan_messaging.py` (a regex plus how to cut the destination out
+of the call). Rules use bounded, linear-time regexes and skip lines over 2000
+characters.
+
+| Language (suffixes) | Clients and calls |
+|---|---|
+| JS/TS (`.js .mjs .cjs .ts .tsx .jsx .mts .cts`) | kafkajs `producer.send({ topic })`, `sendBatch({ topicMessages })`, `consumer.subscribe({ topic(s) })`; node-rdkafka `producer.produce(topic)`; amqplib `sendToQueue` (Queue), `publish` (Exchange; an empty exchange names a Queue), `consume` (Queue), `bindQueue` (`Exchange ROUTES_TO Queue`); AWS SDK v3 `SendMessageCommand` / `SendMessageBatchCommand` / `ReceiveMessageCommand` (`QueueUrl`), `PublishCommand` (`TopicArn`: an `Exchange` with broker `sns`); sqs-consumer `Consumer.create({ queueUrl })` |
+| Python | confluent-kafka / kafka-python / aiokafka `<...producer>.produce/send/send_and_wait(topic)`, `subscribe([..])`, `KafkaConsumer(topic, ..)`; boto3 `send_message(_batch)` / `receive_message` (`QueueUrl=`), `publish(TopicArn=)`; pika `basic_publish(exchange=, routing_key=)` (empty exchange: a Queue named by the routing key), `basic_consume(queue=)`, `queue_bind` |
+| Go | kafka-go `kafka.Writer{Topic}` / `kafka.ReaderConfig{Topic}`; sarama `ProducerMessage{Topic}` / `ConsumePartition(topic)`; aws-sdk-go `SendMessageInput` / `ReceiveMessageInput` (`QueueUrl: aws.String(..)`), `PublishInput`; amqp091 `Publish` / `PublishWithContext` / `Consume` |
+| JVM (`.java .kt .scala`) | Spring Kafka (`@KafkaListener`, `@SendTo` on a listener, `<kafka\|producer\|template\|sender>.send/sendDefault/produce(..)`, `ProducerRecord`, reactor `SenderRecord.create`), `streamBridge.send(binding-or-destination, ..)`, Spring Cloud Stream bindings; Spring AMQP `rabbitTemplate.convertAndSend/send` (three arguments: an `Exchange`; two: a `Queue` through the default exchange) and `@RabbitListener(queues, queuesToDeclare)`; JMS `jmsTemplate.convertAndSend/send` and `@JmsListener(destination)`; Spring Cloud AWS `@SqsListener` and `sqsTemplate.send(..)` (also `to -> to.queue(..)`); AWS SDK v2 `SendMessageRequest` / `ReceiveMessageRequest` `.builder().queueUrl(..)`, `PublishRequest.builder().topicArn(..)` |
+
+`sendDefault(...)` takes its topic from `spring.kafka.template.default-topic`
+or a `setDefaultTopic(X)` call in the same module, else it is
+`unresolved:sendDefault`. `streamBridge.send(X, ..)` resolves
+`spring.cloud.stream.bindings.<X>.destination` (placeholders and comma lists
+apply), else uses `X` itself as the topic; when the binding's `binder` (or
+`spring.cloud.stream.default-binder`) contains `rabbit` the destination is an
+`Exchange` with broker `rabbitmq` instead. kombu / celery are not scanned.
+
+A queue or topic written as a URL (`https://sqs.<region>.amazonaws.com/<acct>/<name>`)
+or an ARN becomes its last path / `:` segment; the original value stays in
+`attributes.url` / `attributes.arn`. Entity keys: `KafkaTopic` keeps the
+topic name; `Queue` and `Exchange` are keyed `<broker>:<name>` with
+attributes `broker` (`sqs`, `sns`, `rabbitmq`, `amqp`, `jms`) and `name`.
+amqplib / pika / amqp091 sites use broker `amqp` and Spring AMQP uses
+`rabbitmq`, so the same RabbitMQ queue reached through both has two keys.
+Unresolved destinations become `<broker>:unresolved:...` candidates.
+
+#### Service attribution
+
+Edges start at the deployable `Service`, not the build module. Besides
+`Chart.yaml`, k8s workloads and a `Dockerfile` (the strongest signals), a
+module is a service (lower rank) when it:
+
+- applies `org.springframework.boot` (not `apply false`, not
+  `bootJar { enabled = false }`) or the `application` plugin, or declares
+  `bootJar` / `mainClass` (Gradle); has `spring-boot-maven-plugin` outside
+  `pluginManagement` with a packaging other than `pom` (Maven);
+- has a JVM source file with `@SpringBootApplication`, `fun main(` or
+  `static void main(`;
+- has `scripts.start` or `bin` in `package.json`;
+- has a Go file with `package main`;
+- has `[project.scripts]` in `pyproject.toml`, a `__main__.py`, or a `Procfile`.
+
+Service name: `Chart.yaml`, then a named k8s workload, then
+`spring.application.name` (`application*.properties|yml`, base file before
+profiles, `${X:default}` uses the default), then the package / module name
+(the directory name for a Dockerfile-only module). The `Service` attribute
+`detected_by` records the rule (`chart`, `k8s`, `dockerfile`,
+`spring_boot_plugin`, `gradle_application_plugin`, `gradle_main_class`,
+`maven_spring_boot_plugin`, `spring_boot_application`, `main_function`,
+`package_json_start`, `package_json_bin`, `go_package_main`, `python_scripts`,
+`python_main_module`, `procfile`).
+
+A messaging site in module M is attributed to: (1) the service of M; else
+(2) every service whose module transitively `DEPENDS_ON` M in the repo, one
+edge each with relation attribute `via_module = <M>` (deduplicated by
+relation, first evidence kept); else (3) the `Module` (schema 2+; schema 1
+skips the site). The counts are in `summary["attribution"]`
+(`edges_from_service`, `edges_via_dependency`, `edges_from_module`).
+
+Node: a `package.json` without `name` still forms a module (named after its
+directory, the repo name at the root; a nameless workspace root that only
+lists `workspaces` is not a module). A JS/TS tree with source above no build
+file gets a synthetic root module named after the repo, so its sites are
+never skipped.
 
 The scan is static: it follows no code paths, and CODEOWNERS matching
 approximates GitHub's gitignore-style rules. Review the manifest before
@@ -207,9 +282,10 @@ emit a manifest from its own script instead.
 
 #### Spring topics: placeholders and constants
 
-In Java, Kotlin and Scala sources the topic argument of `@KafkaListener`
-(`topics`, `topicPattern`), `<kafkaTemplate>.send(...)` and
-`new ProducerRecord<>(...)` may be a literal, a `"${key}"` /
+In Java, Kotlin and Scala sources the destination argument of Kafka, SQS,
+RabbitMQ and JMS calls (for Kafka: `@KafkaListener` `topics` /
+`topicPattern`, `<producer>.send(...)` and `new ProducerRecord<>(...)`) may
+be a literal, a `"${key}"` /
 `"${key:default}"` placeholder, a constant (`NAME` or `Class.NAME`, from
 `static final String`, Kotlin `const val`, or `val` in an `object` /
 `companion object`), a `@Value("${key}")` field of the same file, or a `+`
@@ -224,9 +300,10 @@ attribute. Values nest (up to 4 levels, cycle-guarded) and comma-separated
 values expand to several topics.
 
 Resolved topics carry `resolved_from` = `literal`, `property:<key>`,
-`default:<key>` (the `${key:default}` default was used) or `constant:<NAME>`.
-A topic that cannot be resolved (unknown property, SpEL `#{...}`, a local
-variable, a constant defined elsewhere) becomes a `KafkaTopic` keyed
+`default:<key>` (the `${key:default}` default was used), `constant:<NAME>`,
+`spel` (see below) or `env_default` (with `env: <NAME>`).
+A topic that cannot be resolved (unknown property, unsupported SpEL
+`#{...}`, a local variable, a constant defined elsewhere) becomes a `KafkaTopic` keyed
 `unresolved:<expression>` (e.g. `unresolved:messaging.orders-topic`)
 with attributes `unresolved = true` and `expression`; its edge is always
 `candidate`, even with `--heuristics verified`. A non-plain `topicPattern`
@@ -234,7 +311,42 @@ becomes `pattern:<regex>` with a `pattern` attribute. Expressions the scan
 does not understand (method calls, ...) produce no topic and show up as
 unmatched in the coverage report.
 
+Non-JVM sources resolve the same way through a generic constant index built
+in the first pass: JS/TS `const|let|var X = "lit"`, `export const Topics = {
+ORDERS: "orders" }` (`Topics.ORDERS`) and `enum T { A = "a" }`; Python
+module-level `X = "lit"`, class attributes and `self.x = "lit"`; Go
+`const X = "lit"` and `const ( ... )` blocks. Environment lookups resolve to
+their default and record `resolved_from = env_default` and `env`:
+`process.env.X ?? "d"`, `process.env.X || "d"`, `os.getenv("X", "d")`,
+`os.environ.get("X", "d")`; a lookup with no default is `unresolved:env:X`.
+JS template literals resolve when every `${name}` is a known constant.
+
+#### SpEL
+
+SpEL is evaluated by a small bounded evaluator (no `eval`); `${...}`
+placeholders inside it are expanded first, as Spring does. Supported:
+`#{'${a.b}'}`, `#{'${a.b}'.split(',')}` (the result is split on commas into
+several topics), `#{'literal'}`, `#{'a' + '${b}'}` and `+` concatenation,
+`#{T(com.x.Topics).ORDERS}` (constant index), `#{environment['a.b']}`,
+`#{environment.getProperty('a.b')}` / `getProperty('a.b', 'dflt')`,
+`#{systemProperties['a.b']}`, and `#{@beanName.field}` /
+`#{@beanName.getX()}` / `#{__listener.topic}` (an `@Value("${...}")` field or
+constant of that name in the class that decapitalises to the bean name, or the
+enclosing class for `__listener`). A resolved topic has `resolved_from =
+spel` and `attributes.spel` (the raw expression). Anything else stays
+`unresolved:#{...}` with the resolvable placeholders expanded in the stored
+text, `attributes.spel`, and `attributes.bean` for bean lookups.
+
 #### Coverage report and warnings
+
+`summary["messaging"]` has one entry per broker that had a site (`kafka`,
+`sqs`, `sns`, `rabbitmq`, `amqp`, `jms`): `sites`, `producer_sites`,
+`consumer_sites`, `matched_sites`, `unmatched_sites`, `unresolved`,
+`skipped_no_owner` (sites), `skipped_schema` and up to 5
+`unmatched_examples`. `summary["attribution"]` and `summary["destinations"]`
+(`KafkaTopic` / `Queue` / `Exchange` counts) complete it, and the warnings
+below apply to every broker. `summary["kafka"]` (described next) is kept for
+compatibility, with `producer_sites` / `consumer_sites` added.
 
 `summary["kafka"]` (and a table printed by `ncp ontology scan`; `--json`
 prints the whole summary as JSON, with the manifest under `manifest` unless
@@ -281,6 +393,16 @@ v2 is **opt-in**: writes that name no `schema_version` stay on v1 unless
 change while live relations reference it, so a namespace already seeded on
 v1 cannot be re-seeded as v2 in place: `seed` refuses up front and says so.
 Use a new namespace for v2, or revoke the v1 relations first.
+
+### Schema pack v3 (queues and exchanges)
+
+`infrastructure` v3 is a strict superset of v2: it adds `Queue` and
+`Exchange` (each requires `broker` and `name`; `Exchange` also covers SNS
+topics with broker `sns`), lets `PRODUCES` / `CONSUMES` reach `KafkaTopic`,
+`Queue` and `Exchange`, and adds `ROUTES_TO` (`Exchange`→`Queue`, dependency
+intent). It is opt-in like v2: pin `[ontology].pack_versions = {
+infrastructure = 3 }` (the scan's default manifest sets `schema_version = 3`
+itself).
 
 ### From Python
 
