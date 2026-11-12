@@ -7,6 +7,21 @@ from pydantic import Field, field_validator
 from ncp.ontology.models import Capability, Contract, Identifier, RetrievalMode
 
 
+class PromotionConfig(Contract):
+    """``[ontology.promotion]``: rules for promoting candidate relations to verified."""
+
+    auto: bool = Field(default=False, strict=True)
+    min_confidence: Annotated[float, Field(strict=False, ge=0.0, le=1.0)] = 0.6
+    # Hold back edges whose destination is a placeholder (``unresolved:*`` / ``pattern:*``).
+    require_resolved: bool = Field(default=True, strict=True)
+    # PRODUCES needs a CONSUMES on the same destination (and vice versa), in the
+    # same manifest or store.
+    require_counterpart: bool = Field(default=False, strict=True)
+    types: tuple[Identifier, ...] = ("PRODUCES", "CONSUMES", "ROUTES_TO")
+    # Promoted relations get at least this confidence.
+    verified_confidence: Annotated[float, Field(strict=False, ge=0.0, le=1.0)] = 0.9
+
+
 class OntologyConfig(Contract):
     enabled: bool = Field(default=False, strict=True)
     provider: Identifier = "builtin"
@@ -19,6 +34,9 @@ class OntologyConfig(Contract):
     pack_versions: dict[Identifier, Annotated[int, Field(strict=True, ge=1)]] = Field(
         default_factory=dict,
     )
+    # Custom schema pack JSON files (relative to the project root when loaded
+    # via ``load_config``); a custom pack id must still be listed in ``packs``.
+    pack_paths: tuple[str, ...] = ()
     retrieval_mode: RetrievalMode = "auto"
     max_hops: Annotated[int, Field(strict=True, ge=0, le=5)] = 2
     max_nodes: Annotated[int, Field(strict=True, ge=1, le=100)] = 30
@@ -36,6 +54,7 @@ class OntologyConfig(Contract):
     # Drop a memory chunk's text when a shown graph fact cites it (``ev:``).
     substitute_evidence: bool = Field(default=True, strict=True)
     verified_only: bool = Field(default=True, strict=True)
+    promotion: PromotionConfig = Field(default_factory=PromotionConfig)
     trigger_max_ms: Annotated[int, Field(strict=True, ge=1, le=1000)] = 10
     graph_timeout_ms: Annotated[int, Field(strict=True, ge=1, le=5000)] = 50
     fallback_to_memory: bool = Field(default=True, strict=True)

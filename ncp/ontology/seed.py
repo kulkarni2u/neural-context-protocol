@@ -72,6 +72,9 @@ from ncp.ontology.models import (
     GLOBAL_NAMESPACE, AuthContext, Contract, Entity, EvidenceRef, Identifier, Relation, Scope,
 )
 
+from ncp.ontology.policy import PromotionConfig
+from ncp.ontology.promotion import rule_label, select_promotions
+
 if TYPE_CHECKING:
     from ncp.ontology.registry import SchemaPack
 
@@ -145,6 +148,9 @@ class SeedReport:
     stale: list[str] = field(default_factory=list)
     pruned: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    auto_promote: bool = False
+    promoted: list[str] = field(default_factory=list)
+    held_back: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -161,6 +167,10 @@ class SeedReport:
             "stale": list(self.stale),
             "pruned": list(self.pruned),
             "warnings": list(self.warnings),
+            "promotion": {
+                "auto": self.auto_promote, "promoted": len(self.promoted),
+                "held_back": len(self.held_back), "held": list(self.held_back),
+            },
         }
 
 
@@ -589,6 +599,28 @@ def _assert(store: object, relation: Relation, auth: AuthContext, existing: Rela
         store.assert_relation(relation, auth=auth, idempotency_key=key)  # type: ignore[attr-defined]
 
 
+def _auto_promote(
+    manifest: SeedManifest, rules: PromotionConfig,
+) -> tuple[SeedManifest, list[str], list[str]]:
+    """Rewrite the manifest's qualifying candidates as verified (see promotion.py)."""
+    plan = select_promotions(manifest, rules)
+    label = rule_label(rules)
+    chosen = {int(d.item.key) for d in plan.promoted}
+    relations = list(manifest.relations)
+    for index in chosen:
+        rel = relations[index]
+        relations[index] = rel.model_copy(update={
+            "status": "verified", "confidence": max(rel.confidence, rules.verified_confidence),
+            "attestation": rel.attestation or f"auto-promote:{label}",
+            "attributes": {**rel.attributes, "promoted_by": f"auto:{label}"},
+        })
+    return (
+        manifest.model_copy(update={"relations": tuple(relations)}),
+        [d.item.ref for d in plan.promoted],
+        [f"{d.item.ref} ({d.reason})" for d in plan.held],
+    )
+
+
 def seed_ontology(
     facade: OntologyFacade,
     manifest: SeedManifest,
@@ -600,6 +632,7 @@ def seed_ontology(
     status_override: SeedStatus | None = None,
     now: datetime | None = None,
     where: Callable[[str, int], str] | None = None,
+    auto_promote: PromotionConfig | None = None,
 ) -> SeedReport:
     """Apply ``manifest`` to the ontology behind ``facade``.
 
@@ -608,7 +641,9 @@ def seed_ontology(
     chunk; it is required when any relation carries ``evidence`` text (and not
     called on a dry run). ``status_override`` forces every relation to one
     status, e.g. ``candidate`` to stage a manifest without verifying it.
-    ``where(kind, index)`` labels manifest items in errors (see
+    ``auto_promote`` (the ``[ontology.promotion]`` rules) writes candidates
+    that meet them as ``verified`` with attestation ``auto-promote:<rule>``
+    (ignored when ``status_override`` is set). ``where(kind, index)`` labels manifest items in errors (see
     :func:`merge_manifests`, which names the source file).
 
     Relation endpoints are matched against the manifest's entities first,
@@ -633,6 +668,10 @@ def seed_ontology(
             relation.model_copy(update={"status": status_override})
             for relation in manifest.relations
         )})
+    promoted: list[str] = []
+    held: list[str] = []
+    if auto_promote is not None and status_override is None:
+        manifest, promoted, held = _auto_promote(manifest, auto_promote)
     entities, planned, referenced = _plan(
         facade, manifest, scope, principal, where=where or _default_where,
     )
@@ -642,6 +681,8 @@ def seed_ontology(
     clock = now or datetime.now(timezone.utc)
     report = SeedReport(namespace=scope.namespace, principal_id=principal, dry_run=dry_run,
                         entities_referenced=len(referenced))
+    report.auto_promote = auto_promote is not None and status_override is None
+    report.promoted, report.held_back = promoted, held
 
     # Entities: upsert through the facade so its validation/redaction applies.
     with _translate_errors():

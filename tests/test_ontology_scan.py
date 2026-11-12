@@ -121,7 +121,7 @@ class TestScanV2:
     def test_modules_services_and_dependencies(self, repo: Path) -> None:
         result = scan_repository(repo, pipeline="shop")
         manifest = result.manifest
-        assert manifest.schema_version == 2 and manifest.source == "acme-monorepo"
+        assert manifest.schema_version == 3 and manifest.source == "acme-monorepo"
         assert _keys(manifest, "Module") == {
             "services/payments", "libs/ledger-client", "services/checkout", "libs/ui-kit",
             "tools/report", "libs/shared", "services/notifier", "libs/gokit", "jvm/app",
@@ -475,6 +475,8 @@ class TestSpringResolution:
         assert any("could not be resolved" in w for w in result.summary["warnings"])
 
     def test_spel_is_unresolved(self, tmp_path: Path) -> None:
+        # The split form resolves when the property exists (see test_ontology_scan_messaging);
+        # with the property missing it stays an unresolved candidate.
         root = _spring(tmp_path, {
             JAVA: """class K {\n  @KafkaListener(topics = "#{'${a}'.split(',')}") void a() {}\n}\n""",
         })
@@ -482,6 +484,16 @@ class TestSpringResolution:
         (key,) = _keys(manifest, "KafkaTopic")
         assert key.startswith("unresolved:#{")
         assert _topic(manifest, key).attributes["unresolved"] is True
+        assert _topic(manifest, key).attributes["spel"] == "#{'${a}'.split(',')}"
+
+    def test_spel_split_resolves_when_the_property_exists(self, tmp_path: Path) -> None:
+        root = _spring(tmp_path, {
+            "src/main/resources/application.properties": "a=x.one, x.two\n",
+            JAVA: """class K {\n  @KafkaListener(topics = "#{'${a}'.split(',')}") void a() {}\n}\n""",
+        })
+        manifest = scan_repository(root).manifest
+        assert _keys(manifest, "KafkaTopic") == {"x.one", "x.two"}
+        assert _topic(manifest, "x.one").attributes["resolved_from"] == "spel"
 
     def test_topic_pattern(self, tmp_path: Path) -> None:
         root = _spring(tmp_path, {

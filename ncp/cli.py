@@ -3168,6 +3168,11 @@ def ontology_group() -> None:
     "--status", "status_override", type=click.Choice(["verified", "candidate"]), default=None,
     help="Force every relation to this status (e.g. 'candidate' to stage a manifest unverified).",
 )
+@click.option(
+    "--auto-promote/--no-auto-promote", "auto_promote", default=None,
+    help="Write candidates that meet [ontology.promotion] as verified (default: the config's "
+         "'auto'). Ignored with --status.",
+)
 @click.option("--json", "--json-output", "json_output", is_flag=True, help="Emit the report as JSON.")
 def ontology_seed_command(
     manifests: tuple[Path, ...],
@@ -3177,6 +3182,7 @@ def ontology_seed_command(
     prune: bool,
     dry_run: bool,
     status_override: str | None,
+    auto_promote: bool | None,
     json_output: bool,
 ) -> None:
     """Seed entities and relations from one or more JSON/TOML/YAML MANIFESTS.
@@ -3205,7 +3211,9 @@ def ontology_seed_command(
             from ncp.ontology.stores.sqlite import SQLiteOntologyStore
 
             facade = OntologyFacade(
-                config.ontology, SQLiteOntologyStore(memory_db, SchemaRegistry.builtin()),
+                config.ontology, SQLiteOntologyStore(
+                    memory_db, SchemaRegistry.builtin(config.ontology.pack_paths),
+                ),
             )
             store = None
         else:
@@ -3226,6 +3234,11 @@ def ontology_seed_command(
             prune=prune, dry_run=dry_run,
             status_override=status_override,  # type: ignore[arg-type]
             where=merged.where,
+            auto_promote=(
+                config.ontology.promotion
+                if (config.ontology.promotion.auto if auto_promote is None else auto_promote)
+                else None
+            ),
         )
     except OntologyError as exc:
         hint = (" (offline dry run: only entities declared in the manifests are known)"
@@ -3253,6 +3266,13 @@ def ontology_seed_command(
         f"{relations['updated']} updated / {relations['reopened']} reopened / "  # type: ignore[index]
         f"{relations['unchanged']} unchanged / {relations['pruned']} pruned"  # type: ignore[index]
     )
+    if report.auto_promote:
+        console.print(
+            f"auto-promote: {len(report.promoted)} candidate(s) written as verified, "
+            f"{len(report.held_back)} held back"
+        )
+        for line in report.held_back:
+            console.print(f"  held back: {line}")
     for line in report.pruned:
         console.print(f"  pruned: {line}")
     if report.stale:
@@ -3271,6 +3291,290 @@ def ontology_seed_command(
         )
 
 
+def _scan_schema_default() -> str:
+    """The scanner's default schema version (imported lazily: ``ncp.ontology.scan`` is heavy)."""
+    from ncp.ontology.scan import DEFAULT_SCAN_SCHEMA_VERSION
+
+    return str(DEFAULT_SCAN_SCHEMA_VERSION)
+
+
+def _ontology_session(  # type: ignore[no-untyped-def]
+    cwd: Path | None, pipeline_id: str, allow_global: bool = False,
+):
+    """Config, enabled facade and local-operator auth (read/write/verify) for promote/demote.
+
+    The ``global`` namespace carries admin rights, so it needs an explicit ``--allow-global``."""
+    from ncp.config import load_config
+    from ncp.ontology.facade import OntologyError, OntologyFacade
+    from ncp.ontology.models import GLOBAL_NAMESPACE
+    from ncp.ontology.promotion import cli_auth
+
+    if pipeline_id.strip().lower() == GLOBAL_NAMESPACE and not allow_global:
+        raise click.UsageError(
+            "the 'global' namespace is shared and acts with admin rights; "
+            "pass --allow-global to confirm."
+        )
+
+    config = load_config(cwd=cwd or Path.cwd())
+    store = _resolve_runtime_store(config)
+    facade = OntologyFacade.from_config(config, store)
+    if not facade.enabled:
+        raise click.ClickException(
+            f"{facade.disabled_reason or 'ontology is disabled'}: add an [ontology] section "
+            "with enabled = true to .ncp/config.toml."
+        )
+    try:
+        return config, facade, cli_auth(pipeline_id)
+    except OntologyError as exc:
+        raise click.ClickException(f"[{exc.code}] {exc.message}") from exc
+
+
+def _relation_row(stored) -> dict[str, object]:  # type: ignore[no-untyped-def]
+    item = stored.item
+    return {
+        "id": item.key, "src": item.src, "type": item.type, "dst": item.dst,
+        "status": item.status, "confidence": item.confidence,
+        "evidence": [e.evidence_id for e in stored.relation.evidence],
+    }
+
+
+def _print_relation_rows(rows: list[dict[str, object]]) -> None:
+    for row in rows:
+        evidence = ", ".join(str(e) for e in row["evidence"])  # type: ignore[attr-defined]
+        click.echo(
+            f"{row['id']}  {float(row['confidence']):.2f}  "  # type: ignore[arg-type]
+            f"{row['src']} -{row['type']}-> {row['dst']}  [{evidence or 'no evidence'}]"
+        )
+
+
+def _select_by_ref(stored, ids, match, types):  # type: ignore[no-untyped-def]
+    """AND of the id / glob / type selectors; unknown ids are returned separately."""
+    import fnmatch
+
+    def hit(key: str, wanted: str) -> bool:
+        key = key.lower()
+        return key.startswith(wanted) if len(wanted) >= 8 else key == wanted
+
+    out = list(stored)
+    missing: list[str] = []
+    if ids:
+        wanted_ids = [i.strip().lower() for i in ids]
+        missing = [w for w in wanted_ids if not any(hit(s.item.key, w) for s in stored)]
+        out = [s for s in out if any(hit(s.item.key, w) for w in wanted_ids)]
+    if match:
+        out = [s for s in out if fnmatch.fnmatchcase(s.item.ref, match)]
+    if types:
+        wanted_types = {t.upper() for t in types}
+        out = [s for s in out if s.item.type in wanted_types]
+    return out, missing
+
+
+@ontology_group.command("promote")
+@click.argument("relation_ids", nargs=-1)
+@click.option("--pipeline-id", required=True, help="Namespace whose relations to promote.")
+@click.option("--allow-global", is_flag=True, help="Required to act on the shared 'global' namespace.")
+@click.option("--limit", type=click.IntRange(1), default=10_000, show_default=True,
+              help="Maximum relations loaded from the namespace (a warning is printed when hit).")
+@click.option("--cwd", default=None, type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("--list", "list_only", is_flag=True, help="List candidate relations (after any selectors) and exit.")
+@click.option("--match", default=None, help="Glob (fnmatch) on '<src> -<TYPE>-> <dst>', e.g. 'Service:order-* -PRODUCES-> *'.")
+@click.option("--type", "types", multiple=True, help="Relation type to include (repeatable).")
+@click.option("--min-confidence", type=click.FloatRange(0.0, 1.0), default=None, help="Only candidates at or above this confidence.")
+@click.option("--all", "select_all", is_flag=True, help="Select every candidate.")
+@click.option(
+    "--from-checklist", type=click.Path(exists=True, dir_okay=False, path_type=Path), default=None,
+    help="Markdown review file: promote relations on ticked '- [x] `src -TYPE-> dst`' lines.",
+)
+@click.option("--auto", "auto_rules", is_flag=True, help="Select by the [ontology.promotion] rules.")
+@click.option("--include-unresolved", is_flag=True, help="Also promote 'unresolved:*' / 'pattern:*' destinations.")
+@click.option("--dry-run", is_flag=True, help="Show what would change; write nothing.")
+@click.option("--allow-empty", is_flag=True, help="Exit 0 even when nothing matched.")
+@click.option("--json", "--json-output", "json_output", is_flag=True, help="Emit JSON.")
+def ontology_promote_command(
+    relation_ids: tuple[str, ...], pipeline_id: str, allow_global: bool, limit: int,
+    cwd: Path | None, list_only: bool,
+    match: str | None, types: tuple[str, ...], min_confidence: float | None, select_all: bool,
+    from_checklist: Path | None, auto_rules: bool, include_unresolved: bool, dry_run: bool,
+    allow_empty: bool, json_output: bool,
+) -> None:
+    """Promote reviewed candidate relations to verified so context can use them.
+
+    Context assembly only follows verified relations; `ncp ontology scan`
+    emits candidates. Selectors (ids, --match, --type, --min-confidence,
+    --from-checklist, --auto) combine with AND; --all takes every candidate.
+    Unresolved/pattern destinations are held back unless --include-unresolved.
+    Promotion keeps evidence/attestation, raises confidence to
+    [ontology.promotion].verified_confidence and records promoted_by/promoted_at.
+    Exit 1 when nothing was selected (unless --allow-empty). See
+    docs/NCP_ONTOLOGY.md#promoting-candidates.
+    """
+    from datetime import datetime, timezone
+
+    from ncp.ontology.facade import OntologyError
+    from ncp.ontology.promotion import (
+        checklist_matches, is_unresolved, load_relations, parse_checklist, promote_relation,
+        rule_label, select_promotions,
+    )
+
+    has_selector = bool(
+        relation_ids or match or types or min_confidence is not None or select_all
+        or from_checklist or auto_rules
+    )
+    if not has_selector and not list_only:
+        raise click.UsageError(
+            "nothing selected: pass relation ids, --match, --type, --min-confidence, "
+            "--from-checklist, --auto or --all (or --list to review)."
+        )
+    config, facade, auth = _ontology_session(cwd, pipeline_id, allow_global)
+    rules = config.ontology.promotion
+    try:
+        everything = load_relations(facade, auth, limit=limit)
+    except OntologyError as exc:
+        raise click.ClickException(f"[{exc.code}] {exc.message}") from exc
+    candidates = [s for s in everything if s.item.status == "candidate"]
+    selected, missing = _select_by_ref(candidates, relation_ids, match, types)
+    for w in missing:
+        click.echo(f"warning: no candidate relation with id {w}", err=True)
+    if min_confidence is not None:
+        selected = [s for s in selected if s.item.confidence >= min_confidence]
+    if from_checklist is not None:
+        entries = parse_checklist(from_checklist.read_text(encoding="utf-8"))
+        selected = [s for s in selected if checklist_matches(entries, s.item)]
+    reasons: dict[str, str] = {}
+    if auto_rules:
+        plan = select_promotions(
+            [s.item for s in candidates], rules,
+            context=[s.item for s in everything], include_unresolved=include_unresolved,
+        )
+        allowed = {d.item.key for d in plan.promoted}
+        reasons = {d.item.key: d.reason for d in plan.held}
+        selected = [s for s in selected if s.item.key in allowed or s.item.key in reasons]
+    by = f"auto:{rule_label(rules)}" if auto_rules else "cli"
+
+    held = []
+    if not list_only:
+        unresolved_rule = rules.require_resolved if auto_rules else True
+        keep = []
+        for s in selected:
+            if s.item.key in reasons:
+                held.append((s, reasons[s.item.key]))
+            elif unresolved_rule and not include_unresolved and is_unresolved(s.item.dst):
+                held.append((s, "unresolved or pattern destination"))
+            else:
+                keep.append(s)
+        selected = keep
+
+    rows = [_relation_row(s) for s in selected]
+    if list_only:
+        if json_output:
+            click.echo(json.dumps({"candidates": rows}, indent=2, sort_keys=True))
+        else:
+            _print_relation_rows(rows)
+            click.echo(f"{len(rows)} candidate relation(s) in {pipeline_id}")
+        return
+
+    failed: list[dict[str, str]] = []
+    done: list[dict[str, object]] = []
+    if not dry_run:
+        now = datetime.now(timezone.utc)
+        for s in selected:
+            try:
+                promote_relation(facade, auth, s.relation, by=by,
+                                 verified_confidence=rules.verified_confidence, now=now)
+                done.append(_relation_row(s))
+            except OntologyError as exc:
+                failed.append({"id": s.item.key, "error": f"[{exc.code}] {exc.message}"})
+    held_rows = [{**_relation_row(s), "reason": why} for s, why in held]
+    if json_output:
+        click.echo(json.dumps({
+            "dry_run": dry_run, "promoted_by": by,
+            "selected": rows, "promoted": done, "held_back": held_rows, "failed": failed,
+        }, indent=2, sort_keys=True))
+    else:
+        verb = "would promote" if dry_run else "promoted"
+        _print_relation_rows(rows if dry_run else done)
+        click.echo(f"{verb} {len(rows) if dry_run else len(done)} relation(s) in {pipeline_id}")
+        if held:
+            unresolved_held = sum(1 for _, why in held if "unresolved" in why)
+            click.echo(
+                f"held back {len(held)} ({unresolved_held} unresolved/pattern; "
+                "pass --include-unresolved to promote those):"
+            )
+            for s, why in held:
+                click.echo(f"  {s.item.ref}: {why}")
+        for item in failed:
+            click.echo(f"failed {item['id']}: {item['error']}", err=True)
+    if failed or (not rows and not allow_empty):
+        if not rows and not failed:
+            click.echo("nothing matched the selection.", err=True)
+        raise SystemExit(1)
+
+
+@ontology_group.command("demote")
+@click.argument("relation_ids", nargs=-1)
+@click.option("--pipeline-id", required=True, help="Namespace whose relations to demote.")
+@click.option("--allow-global", is_flag=True, help="Required to act on the shared 'global' namespace.")
+@click.option("--limit", type=click.IntRange(1), default=10_000, show_default=True,
+              help="Maximum relations loaded from the namespace (a warning is printed when hit).")
+@click.option("--cwd", default=None, type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("--match", default=None, help="Glob (fnmatch) on '<src> -<TYPE>-> <dst>'.")
+@click.option("--type", "types", multiple=True, help="Relation type to include (repeatable).")
+@click.option("--reason", required=True, help="Why the relation is no longer trusted (recorded as an attribute).")
+@click.option("--dry-run", is_flag=True, help="Show what would change; write nothing.")
+@click.option("--allow-empty", is_flag=True, help="Exit 0 even when nothing matched.")
+@click.option("--json", "--json-output", "json_output", is_flag=True, help="Emit JSON.")
+def ontology_demote_command(
+    relation_ids: tuple[str, ...], pipeline_id: str, allow_global: bool, limit: int,
+    cwd: Path | None, match: str | None,
+    types: tuple[str, ...], reason: str, dry_run: bool, allow_empty: bool, json_output: bool,
+) -> None:
+    """Turn verified relations back into candidates (they leave context).
+
+    Implemented as a re-assert with status 'candidate': evidence and history
+    are kept and the reason is stored in the 'demote_reason' attribute. To
+    withdraw a relation entirely use the revoke tool instead. Exit 1 when
+    nothing matched (unless --allow-empty).
+    """
+    from ncp.ontology.facade import OntologyError
+    from ncp.ontology.promotion import demote_relation, load_relations
+
+    if not (relation_ids or match or types):
+        raise click.UsageError("nothing selected: pass relation ids, --match or --type.")
+    if not reason.strip():
+        raise click.UsageError("--reason must not be empty.")
+    _config, facade, auth = _ontology_session(cwd, pipeline_id, allow_global)
+    try:
+        verified = [s for s in load_relations(facade, auth, limit=limit) if s.item.status == "verified"]
+    except OntologyError as exc:
+        raise click.ClickException(f"[{exc.code}] {exc.message}") from exc
+    selected, missing = _select_by_ref(verified, relation_ids, match, types)
+    for w in missing:
+        click.echo(f"warning: no verified relation with id {w}", err=True)
+    done: list[dict[str, object]] = []
+    failed: list[dict[str, str]] = []
+    if not dry_run:
+        for s in selected:
+            try:
+                demote_relation(facade, auth, s.relation, reason=reason.strip())
+                done.append(_relation_row(s))
+            except OntologyError as exc:
+                failed.append({"id": s.item.key, "error": f"[{exc.code}] {exc.message}"})
+    rows = [_relation_row(s) for s in selected]
+    if json_output:
+        click.echo(json.dumps({"dry_run": dry_run, "selected": rows, "demoted": done,
+                               "failed": failed}, indent=2, sort_keys=True))
+    else:
+        _print_relation_rows(rows if dry_run else done)
+        click.echo(f"{'would demote' if dry_run else 'demoted'} "
+                   f"{len(rows) if dry_run else len(done)} relation(s) in {pipeline_id}")
+        for item in failed:
+            click.echo(f"failed {item['id']}: {item['error']}", err=True)
+    if failed or (not rows and not allow_empty):
+        if not rows and not failed:
+            click.echo("nothing matched the selection.", err=True)
+        raise SystemExit(1)
+
+
 @ontology_group.command("scan")
 @click.argument("root", default=".", type=click.Path(exists=True, file_okay=False, path_type=Path))
 @click.option("-o", "--output", default=None, type=click.Path(dir_okay=False, path_type=Path),
@@ -3281,17 +3585,21 @@ def ontology_seed_command(
 @click.option("--environment", default="prod", show_default=True, help="'environment' attribute for detected services.")
 @click.option("--kafka-cluster", default="main", show_default=True, help="'cluster' attribute for detected Kafka topics.")
 @click.option(
-    "--schema-version", type=click.Choice(["1", "2"]), default="2", show_default=True,
-    help="2 emits Repo/Module nodes (infrastructure v2); 1 emits services, topics and teams only.",
+    "--schema-version", type=click.Choice(["1", "2", "3"]), default=_scan_schema_default,
+    help="3 adds Queue / Exchange nodes (SQS, SNS, RabbitMQ, JMS; infrastructure v3); 2 emits "
+         "Repo/Module nodes (infrastructure v2) and Kafka topics only; 1 emits services, "
+         "topics and teams only.",
 )
 @click.option(
     "--heuristics", type=click.Choice(["candidate", "verified", "off"]), default="candidate",
-    show_default=True, help="Status for Kafka edges inferred from code, or 'off' to skip them.",
+    show_default=True, help="Status for messaging edges inferred from code, or 'off' to skip them.",
 )
-@click.option("--include-tests", is_flag=True, help="Also read test files for Kafka usage.")
+@click.option("--include-tests", is_flag=True, help="Also read test files for messaging usage.")
+@click.option("--summary-out", default=None, type=click.Path(dir_okay=False, path_type=Path),
+              help="Also write the scan summary (coverage report) here as JSON, for `ncp ontology wiki --summary`.")
 @click.option(
     "--json", "--json-output", "json_output", is_flag=True,
-    help="Print the scan summary (with the Kafka coverage report) as JSON instead of the "
+    help="Print the scan summary (with the messaging coverage report) as JSON instead of the "
          "text summary; the manifest goes to -o, or is embedded under 'manifest' without it.",
 )
 def ontology_scan_command(
@@ -3305,15 +3613,19 @@ def ontology_scan_command(
     schema_version: str,
     heuristics: str,
     include_tests: bool,
+    summary_out: Path | None,
     json_output: bool,
 ) -> None:
     """Scan a (mono)repo at ROOT and write a seed manifest for `ncp ontology seed`.
 
     Reads build files (package.json, pyproject.toml, go.mod, Cargo.toml,
     pom.xml, build.gradle), Dockerfile / Chart.yaml / k8s workloads,
-    CODEOWNERS, Kafka client usage and hand-written ncp-ontology.* files.
-    Spring topic placeholders (${...}) and string constants are resolved; a
-    coverage report shows what was matched and warns when nothing was.
+    CODEOWNERS, messaging client usage (Kafka, SQS/SNS, RabbitMQ/AMQP, JMS in
+    JS/TS, Python, Go and JVM code) and hand-written ncp-ontology.* files.
+    Destinations are resolved from literals, constants, Spring ${...}
+    placeholders, simple SpEL and environment defaults; edges start at the
+    deployable service. A coverage report shows what was matched per broker
+    and warns when nothing was.
     Reads files only: no store, database or embedding model is opened.
     Review the manifest, then seed it.
     """
@@ -3331,6 +3643,9 @@ def ontology_scan_command(
         raise click.ClickException(f"[{exc.code}] {exc.message}") from exc
     text = result.to_json()
     summary = result.summary
+    if summary_out is not None:
+        summary_out.parent.mkdir(parents=True, exist_ok=True)
+        summary_out.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     if json_output:
         if output is not None:
             output.parent.mkdir(parents=True, exist_ok=True)
@@ -3360,6 +3675,7 @@ def ontology_scan_command(
         console.print(line)
         console.print(f"Wrote {output}. Review it, then: ncp ontology seed {output} --prune")
     kafka = summary["kafka"]
+    messaging = summary.get("messaging") or {}
     if kafka["kafka_like_sites"] or kafka["files_examined"]:  # type: ignore[index]
         table = Table(title="Kafka coverage", box=box.SIMPLE_HEAVY, show_header=False)
         for label, key in (
@@ -3373,13 +3689,253 @@ def ontology_scan_command(
         report_console.print(table)
         for example in kafka["unmatched_examples"]:  # type: ignore[index]
             report_console.print(f"  unmatched: {example}", markup=False, highlight=False)
-    if summary["schema_version"] == 2:
+    others = {name: item for name, item in messaging.items() if name != "kafka"}  # type: ignore[attr-defined]
+    if others:
+        table = Table(title="Messaging coverage", box=box.SIMPLE_HEAVY)
+        for column in ("broker", "sites", "produce", "consume", "matched", "unresolved",
+                       "unmatched", "no owner", "skipped schema"):
+            table.add_column(column, justify="left" if column == "broker" else "right")
+        for name, item in sorted(others.items()):
+            table.add_row(
+                name, str(item["sites"]), str(item["producer_sites"]),
+                str(item["consumer_sites"]), str(item["matched_sites"]), str(item["unresolved"]),
+                str(item["unmatched_sites"]), str(item["skipped_no_owner"]),
+                str(item["skipped_schema"]))
+        report_console.print(table)
+        for name, item in sorted(others.items()):
+            for example in item["unmatched_examples"]:
+                report_console.print(f"  unmatched ({name}): {example}", markup=False,
+                                     highlight=False)
+    attribution = summary.get("attribution") or {}
+    if any(attribution.values()):  # type: ignore[union-attr]
+        report_console.print(
+            "edges from: "
+            f"{attribution['edges_from_service']} service(s), "  # type: ignore[index]
+            f"{attribution['edges_via_dependency']} via dependency, "  # type: ignore[index]
+            f"{attribution['edges_from_module']} module(s)", markup=False, highlight=False)  # type: ignore[index]
+    if summary["schema_version"] >= 2:  # type: ignore[operator]
         click.echo(
-            "note: schema v2 (Repo/Module) — the manifest pins schema_version = 2; seed it into "
-            "a namespace that is not already on v1.", err=True,
+            f"note: schema v{summary['schema_version']} (Repo/Module/Queue/Exchange) — the manifest pins "
+            f"schema_version = {summary['schema_version']}; seed it into a namespace that is "
+            "not already on an older version (pin [ontology] pack_versions = "
+            f"{{ infrastructure = {summary['schema_version']} }}).", err=True,
         )
     for warning in summary["warnings"]:  # type: ignore[union-attr]
         click.echo(f"warning: {warning}", err=True)
+
+
+@ontology_group.command("wiki")
+@click.argument("manifest", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--summary", "summary_path", default=None, type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              help="Scan summary JSON (from `ncp ontology scan --summary-out`) for the coverage page.")
+@click.option("--compare", "compare_path", default=None, type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              help="Baseline (older) manifest; adds compare.md showing what changed.")
+@click.option("--out", "out_dir", default=Path(".ncp/ontology-wiki"), show_default=True,
+              type=click.Path(file_okay=False, path_type=Path), help="Output directory.")
+@click.option("--format", "fmt", type=click.Choice(["md"]), default="md", show_default=True)
+@click.option("--title", default="Ontology wiki", show_default=True, help="Title of index.md.")
+@click.option("--stdout-summary", is_flag=True, help="Print a one-line plain summary instead of the table.")
+def ontology_wiki_command(
+    manifest: Path,
+    summary_path: Path | None,
+    compare_path: Path | None,
+    out_dir: Path,
+    fmt: str,
+    title: str,
+    stdout_summary: bool,
+) -> None:
+    """Render a scan MANIFEST as a markdown wiki to review before promoting.
+
+    Writes index, per-service and per-destination pages (producers vs
+    consumers side by side), a messaging matrix, coverage, a candidate review
+    checklist for `ncp ontology promote --from-checklist`, and with --compare
+    a diff against an older manifest. Reads files only; no store is opened.
+    """
+    from ncp.ontology.wiki import build_wiki, problem_count, write_wiki
+
+    def load(path: Path) -> dict[str, object]:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise click.ClickException(f"cannot read {path}: {exc}") from exc
+        if not isinstance(data, dict):
+            raise click.ClickException(f"{path}: expected a JSON object")
+        return data
+
+    data = load(manifest)
+    pages = build_wiki(
+        data,
+        summary=load(summary_path) if summary_path else None,
+        baseline=load(compare_path) if compare_path else None,
+        title=title,
+    )
+    write_wiki(pages, out_dir)
+    problems = problem_count(data)
+    if stdout_summary:
+        click.echo(f"wrote {len(pages)} pages to {out_dir}; {problems} destination(s) with problems")
+        return
+    table = Table(title=f"Ontology wiki -> {out_dir}", box=box.SIMPLE_HEAVY, show_header=False)
+    table.add_row("pages written", str(len(pages)))
+    table.add_row("destinations with problems", str(problems))
+    console.print(table)
+    console.print(f"Open {out_dir / 'index.md'}; tick verified lines in {out_dir / 'candidates.md'}, then "
+                  "ncp ontology promote --from-checklist.")
+
+
+@ontology_group.group("pack")
+def ontology_pack_group() -> None:
+    """Inspect and validate schema packs (built-in and custom)."""
+
+
+def _pack_registry(cwd: Path | None):  # type: ignore[no-untyped-def]
+    from ncp.config import load_config
+    from ncp.ontology.registry import PackError, SchemaRegistry
+
+    config = load_config(cwd=cwd or Path.cwd())
+    try:
+        return config, SchemaRegistry.builtin(config.ontology.pack_paths)
+    except PackError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+@ontology_pack_group.command("list")
+@click.option("--cwd", default=None, type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("--json", "--json-output", "json_output", is_flag=True, help="Emit JSON.")
+def ontology_pack_list_command(cwd: Path | None, json_output: bool) -> None:
+    """List registered schema packs (built-in plus [ontology].pack_paths)."""
+    config, registry = _pack_registry(cwd)
+    ontology = config.ontology
+    rows = [
+        {
+            "id": pack.id, "version": pack.version,
+            "source": registry.source(pack.id, pack.version),
+            "entity_types": len(pack.entity_types), "relation_types": len(pack.relation_types),
+            "active": pack.id in ontology.packs,
+            "pinned": ontology.pack_versions.get(pack.id) == pack.version,
+        }
+        for pack in registry.packs()
+    ]
+    if json_output:
+        click.echo(json.dumps(rows, indent=2))
+        return
+    for row in rows:
+        flags = [name for name in ("active", "pinned") if row[name]]
+        click.echo(
+            f"{row['id']} v{row['version']}  source={row['source']}  "
+            f"entities={row['entity_types']} relations={row['relation_types']}  "
+            f"[{', '.join(flags) or 'inactive'}]"
+        )
+
+
+@ontology_pack_group.command("validate")
+@click.argument("files", nargs=-1, required=True, type=click.Path(dir_okay=False, path_type=Path))
+def ontology_pack_validate_command(files: tuple[Path, ...]) -> None:
+    """Validate pack FILES offline (no store). Files are loaded in order on top of
+    the built-in packs, so a later file may extend an earlier one. Exit 1 on error."""
+    from ncp.ontology.registry import PackError, SchemaRegistry
+
+    registry = SchemaRegistry.builtin()
+    failed = False
+    for file in files:
+        try:
+            pack = registry.load_file(file)
+        except PackError as exc:
+            failed = True
+            click.echo(f"FAIL {exc}", err=True)
+            continue
+        click.echo(f"OK   {file}: {pack.id} v{pack.version}")
+        click.echo(f"     entity types: {', '.join(sorted(pack.entity_types))}")
+        click.echo(f"     relation types: {', '.join(sorted(pack.relation_types))}")
+    if failed:
+        raise SystemExit(1)
+
+
+@ontology_pack_group.command("show")
+@click.argument("pack_id")
+@click.option("--version", "version", type=int, default=None, help="Default: the pack's default version.")
+@click.option("--cwd", default=None, type=click.Path(exists=True, file_okay=False, path_type=Path))
+def ontology_pack_show_command(pack_id: str, version: int | None, cwd: Path | None) -> None:
+    """Print the merged schema of PACK_ID as JSON."""
+    _config, registry = _pack_registry(cwd)
+    chosen = version if version is not None else registry.default_version(pack_id)
+    if chosen is None or not registry.has_version(pack_id, chosen):
+        raise click.ClickException(f"unknown schema pack {pack_id}" + (f" v{chosen}" if chosen else ""))
+    pack = next(p for p in registry.packs() if p.id == pack_id and p.version == chosen)
+    click.echo(json.dumps(pack.model_dump(mode="json", by_alias=True), indent=2))
+
+
+@ontology_group.command("eval")
+@click.argument("expected", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--actual", default=None, type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              help="A scanned manifest (or `scan --json` payload) to score.")
+@click.option("--scan", "scan_root", default=None,
+              type=click.Path(exists=True, file_okay=False, path_type=Path),
+              help="Scan this directory and score the result.")
+@click.option("--schema-version", type=click.Choice(["1", "2", "3"]), default=_scan_schema_default,
+              help="With --scan (default: the same as `ncp ontology scan`, 3).")
+@click.option("--include-tests", is_flag=True, help="With --scan: also read test files.")
+@click.option("--repo-name", default=None, help="With --scan: Repo entity name.")
+@click.option("--json", "--json-output", "json_output", is_flag=True, help="Emit the report as JSON.")
+@click.option("--min-precision", type=float, default=None, help="Exit 1 if relation precision is lower.")
+@click.option("--min-recall", type=float, default=None, help="Exit 1 if relation recall is lower.")
+@click.option("--show", type=int, default=10, show_default=True, help="Examples of FN/FP to list.")
+@click.option("--by-type", is_flag=True, help="Break metrics down per entity/relation type.")
+@click.option("--strict-status", is_flag=True, help="Also report status mismatches (verified vs candidate).")
+def ontology_eval_command(
+    expected: Path,
+    actual: Path | None,
+    scan_root: Path | None,
+    schema_version: str,
+    include_tests: bool,
+    repo_name: str | None,
+    json_output: bool,
+    min_precision: float | None,
+    min_recall: float | None,
+    show: int,
+    by_type: bool,
+    strict_status: bool,
+) -> None:
+    """Score a scan against a hand-curated EXPECTED manifest (precision/recall/F1).
+
+    EXPECTED is a normal seed manifest with an optional top-level "eval"
+    table (ignore_entity_types / ignore_relation_types). Thresholds apply to
+    relations. See docs/NCP_ONTOLOGY.md#evaluating-scan-accuracy.
+    """
+    from ncp.ontology.facade import OntologyError
+    from ncp.ontology.scan import scan_repository
+    from ncp.ontology.scan_eval import evaluate, load_raw, render_text
+
+    if (actual is None) == (scan_root is None):
+        raise click.UsageError("pass exactly one of --actual or --scan")
+    try:
+        if scan_root is not None:
+            actual_manifest = scan_repository(
+                scan_root, repo_name=repo_name, schema_version=int(schema_version),
+                include_tests=include_tests,
+            ).manifest
+            actual_raw: object = actual_manifest
+        else:
+            assert actual is not None
+            actual_raw = load_raw(actual)
+        report = evaluate(load_raw(expected), actual_raw, ignore_status=not strict_status)  # type: ignore[arg-type]
+    except OntologyError as exc:
+        raise click.ClickException(f"[{exc.code}] {exc.message}") from exc
+
+    failures = []
+    if min_precision is not None and report.relations.precision < min_precision:
+        failures.append(f"relation precision {report.relations.precision:.3f} < {min_precision}")
+    if min_recall is not None and report.relations.recall < min_recall:
+        failures.append(f"relation recall {report.relations.recall:.3f} < {min_recall}")
+    if json_output:
+        payload = report.to_dict()
+        payload["failures"] = failures
+        click.echo(json.dumps(payload, indent=2))
+    else:
+        click.echo(render_text(report, show=show, by_type=by_type))
+        for failure in failures:
+            click.echo(f"FAIL {failure}", err=True)
+    if failures:
+        raise SystemExit(1)
 
 
 @main.group("infra")

@@ -245,7 +245,7 @@ class TestStdioClient:
         assert capabilities["packs"][0]["id"] == "infrastructure"
         assert capabilities["packs"][0]["version"] == 1
         assert capabilities["packs"][0]["default"] is True
-        assert [(p["version"], p["default"]) for p in capabilities["packs"]] == [(1, True), (2, False)]
+        assert [(p["version"], p["default"]) for p in capabilities["packs"]] == [(1, True), (2, False), (3, False)]
         assert "DEPENDS_ON" in capabilities["packs"][0]["relation_types"]
         assert "Service" in capabilities["packs"][0]["entity_types"]
         assert capabilities["limits"]["max_hops"] == 2

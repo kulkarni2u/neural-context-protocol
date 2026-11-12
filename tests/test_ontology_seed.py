@@ -418,7 +418,7 @@ class TestSchemaV2:
         manifest = parse_manifest({k: v for k, v in MONOREPO_V2.items() if k != "schema_version"})
         assert seed_ontology(facade, manifest).relations_created == 5
         caps = facade.capabilities()
-        assert [(p["version"], p["default"]) for p in caps["packs"]] == [(1, False), (2, True)]  # type: ignore[index]
+        assert [(p["version"], p["default"]) for p in caps["packs"]] == [(1, False), (2, True), (3, False)]  # type: ignore[index]
 
     def test_bad_pin_is_rejected(self, tmp_path: Path) -> None:
         world = World(tmp_path)
