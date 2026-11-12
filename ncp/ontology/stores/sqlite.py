@@ -961,6 +961,29 @@ class SQLiteOntologyStore:
             )
             return [self._relation_from_row(connection, row) for row in rows]
 
+    def list_relations(
+        self, *, auth: AuthContext, status: str | None = None, limit: int = 1000,
+    ) -> list[Relation]:
+        """Active (not revoked, inside their validity window) relations in exactly the
+        caller's scope, optionally only those with ``status``, oldest first. Used by
+        ``ncp ontology promote`` to review candidates."""
+        _require(auth, "read")
+        extra, params = "", {
+            "tenant": auth.scope.tenant_id, "namespace": auth.scope.namespace,
+            "now": _ts(datetime.now(timezone.utc)), "limit": max(1, int(limit)),
+        }
+        if status is not None:
+            extra, params["status"] = " AND r.status = :status", status
+        with self._transaction(write=False) as connection:
+            rows = self._rows(
+                connection,
+                "SELECT r.* FROM ontology_relations r WHERE r.tenant_id = :tenant"
+                f" AND r.namespace = :namespace AND {_ACTIVE}{extra}"
+                " ORDER BY r.created_at, r.relation_id LIMIT :limit",
+                params,
+            )
+            return [self._relation_from_row(connection, row) for row in rows]
+
     def resolve_entities(
         self, key: str, *, auth: AuthContext, entity_type: str | None = None,
         schema_pack: str | None = None, limit: int = 20,

@@ -423,7 +423,7 @@ Node fillcolor indicates trust (green ≥0.8, amber 0.5–0.8, red <0.5); edge s
 
 Two further graph capabilities are opt-in: `[graph].infer_edges` (default off) infers `refines` edges between similar chunks at write time with a deterministic similarity ratio — no model calls — marking them `created_by="ncp:inferred"`; and outcome credit recorded via `ncp_record_outcome` propagates along the `caused_by` chain during `ncp calibrate --feedback`, reported as a "via outcome propagation" count. See [the graph engineering plan](./docs/NCP_GRAPH_ENGINEERING_PLAN.md) for the full model, multi-hop semantics, and compatibility details.
 
-Separately from this memory-evidence graph, an opt-in **domain ontology** (`[ontology] enabled = true`, off by default) holds an evidence-backed graph of services, databases, APIs, topics and teams: `ncp_get_context` can append verified dependency paths automatically, and `ncp_ontology_*` tools answer explicit graph questions. Populate it with `ncp ontology scan` (a static exporter that turns a monorepo's build files, CODEOWNERS, deploy manifests and Kafka usage into a reviewable manifest) and `ncp ontology seed` (loads one or more manifests idempotently, every relation evidence-cited, `--prune` to stay in sync); see [Seeding the graph](./docs/NCP_ONTOLOGY.md#seeding-the-graph). An opt-in `infrastructure` v2 schema pack adds repos, modules and tables. See [the ontology guide](./docs/NCP_ONTOLOGY.md), [`examples/13_ontology/`](./examples/13_ontology/README.md) and [its benchmark](./docs/NCP_BENCHMARK_ONTOLOGY.md) (measured on SQLite: fact recall 1.00 against 0.38 at an 800-token budget for about +7 ms p95, and about 20% fewer tokens at matched recall on low budgets; at a fixed 800-token budget it still uses more prompt tokens).
+Separately from this memory-evidence graph, an opt-in **domain ontology** (`[ontology] enabled = true`, off by default) holds an evidence-backed graph of services, databases, APIs, topics and teams: `ncp_get_context` can append verified dependency paths automatically, and `ncp_ontology_*` tools answer explicit graph questions. Populate it with `ncp ontology scan` (a static exporter that turns a monorepo's build files, CODEOWNERS, deploy manifests and Kafka usage into a reviewable manifest) and `ncp ontology seed` (loads one or more manifests idempotently, every relation evidence-cited, `--prune` to stay in sync); see [Seeding the graph](./docs/NCP_ONTOLOGY.md#seeding-the-graph). Opt-in `infrastructure` schema packs add repos, modules and tables (v2) and queues and exchanges (v3); `ncp ontology wiki` renders a scan for review, `promote` / `demote` turn reviewed candidates into verified facts, `pack` manages custom schema packs and `eval` scores a scan against a golden manifest. See [the ontology guide](./docs/NCP_ONTOLOGY.md), [`examples/13_ontology/`](./examples/13_ontology/README.md) and [its benchmark](./docs/NCP_BENCHMARK_ONTOLOGY.md) (measured on SQLite: fact recall 1.00 against 0.38 at an 800-token budget for about +7 ms p95, and about 20% fewer tokens at matched recall on low budgets; at a fixed 800-token budget it still uses more prompt tokens).
 
 -----
 
@@ -752,7 +752,11 @@ ncp overview    # ranked cross-pipeline summary: failed tasks, waiting results, 
 ncp consolidate # merge and compact memory
 ncp vacuum      # delete aged rows from append-only tables (--older-than 30d; previews unless --yes)
 ncp forget      # permanently delete specific chunks (--chunk / --agent / --pipeline; previews unless --yes)
-ncp ontology scan # write a seed manifest from a (mono)repo: modules, services, owners, Kafka edges
+ncp ontology scan # write a seed manifest from a (mono)repo: modules, services, owners, Kafka / SQS / SNS / RabbitMQ / JMS edges
+ncp ontology wiki # render a scan as linked markdown pages for review (--compare, --summary)
+ncp ontology promote # turn reviewed candidate relations into verified ones (also demote)
+ncp ontology pack # list / validate / show custom schema packs
+ncp ontology eval # score a scan against a golden manifest (precision / recall / F1)
 ncp ontology seed # load/sync the opt-in ontology from one or more manifests (--dry-run, --prune)
 ncp calibrate   # recalibrate trust (add --feedback for the self-improvement pass)
 ncp refine      # evidence-backed procedural self-refinement: ingest/show/propose/apply/rollback
