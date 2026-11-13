@@ -286,6 +286,7 @@ class OntologyFacade:
         ``AsyncPostgresOntologyStore`` for explicit awaitable graph operations.
         """
         from ncp.stores.pgvector import PgvectorStore
+        from ncp.stores.sqlite import SQLiteStore
 
         if config is None:
             return cls.disabled()
@@ -303,6 +304,7 @@ class OntologyFacade:
         if isinstance(store, PgvectorStore):
             registry = registry or SchemaRegistry.builtin(ontology.pack_paths)
             return cls(ontology, PostgresOntologyStore.inherit(store, registry))
+        assert isinstance(store, SQLiteStore)  # guaranteed by validate_ontology_backend
         registry = registry or SchemaRegistry.builtin(ontology.pack_paths)
         return cls(ontology, SQLiteOntologyStore.inherit(store, registry))
 
