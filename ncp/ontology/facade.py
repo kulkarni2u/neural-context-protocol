@@ -236,6 +236,18 @@ def validate_ontology_backend(store: object) -> None:
     )
 
 
+def validate_config_backend(config: NCPConfig | OntologyConfig | None, store: object) -> None:
+    """Config-owning entry points (server/API construction) call this so an
+    enabled builtin ontology on an unsupported backend is rejected up front,
+    independent of tool profile, fail mode and per-request mode. A disabled
+    ontology is a no-op on any backend."""
+    if config is None:
+        return
+    ontology = config if isinstance(config, OntologyConfig) else config.ontology
+    if ontology.enabled and ontology.provider == "builtin":
+        validate_ontology_backend(store)
+
+
 class OntologyFacade:
     """Capability discovery plus scoped query/explain/assert/revoke.
 

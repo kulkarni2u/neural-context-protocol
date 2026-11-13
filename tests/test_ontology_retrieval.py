@@ -1061,3 +1061,29 @@ def test_python_context_rejects_unsupported_enabled_backend_before_assembly(tmp_
     # No memory-store methods are called: the configuration error comes first.
     with pytest.raises(ValueError, match="object.*SQLiteStore or PgvectorStore"):
         api_get_context(agent=agent, store=object(), config=config)
+
+
+@pytest.mark.parametrize("profile", ["core", "standard", "full"])
+def test_make_handlers_rejects_unsupported_enabled_backend_in_every_profile(
+    tmp_path: Path, profile: str,
+) -> None:
+    config = load_config(cwd=_project(tmp_path, ENABLED + f'\n[tools]\nprofile = "{profile}"\n'))
+    assert config.tool_profile == profile
+    with pytest.raises(ValueError, match="object.*SQLiteStore or PgvectorStore"):
+        make_handlers(object(), config=config)  # type: ignore[arg-type]
+
+
+def test_api_context_rejects_unsupported_backend_even_for_request_mode_off(tmp_path: Path) -> None:
+    config = load_config(cwd=_project(tmp_path, ENABLED))
+    agent = ConsciousBlock(agent_id="a", role="test", owns=[], must_not=[],
+                           task="verify_backend", slot="config", intent="validate")
+    for off in (False, {"mode": "off"}):
+        with pytest.raises(ValueError, match="object.*SQLiteStore or PgvectorStore"):
+            api_get_context(agent=agent, store=object(), config=config, ontology=off)
+
+
+@pytest.mark.parametrize("toml", [None, "[ontology]\nenabled = false\n",
+                                  '[ontology]\nenabled = true\nprovider = "disabled"\n'])
+def test_disabled_ontology_is_noop_on_any_backend(tmp_path: Path, toml: str | None) -> None:
+    config = load_config(cwd=_project(tmp_path, toml))
+    assert make_handlers(object(), config=config)  # type: ignore[arg-type]

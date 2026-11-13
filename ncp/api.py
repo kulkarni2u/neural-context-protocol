@@ -111,7 +111,11 @@ def get_context(
     enricher = None
     if resolved_config.ontology.enabled:
         from ncp.ontology.enrichment import build_enricher
+        from ncp.ontology.facade import validate_config_backend
 
+        # Config-level check first: unsupported backends fail even for
+        # requests that opt out (mode off).
+        validate_config_backend(resolved_config, resolved_store)
         # In-process hosts have no transport principal: the facade's
         # unauthenticated capabilities apply (principal "local").
         enricher = build_enricher(resolved_config, resolved_store, request=ontology)

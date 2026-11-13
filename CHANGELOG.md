@@ -18,8 +18,15 @@ All notable changes to Neural Context Protocol will be documented in this file.
   buffered responses. The cap covers the final response object, not transport
   framing or the repeated context in section notifications.
 - Reject enabled ontology on unsupported synchronous host backends explicitly,
-  with guidance to the existing async ontology adapter. Disabled ontology and
-  transient backend fallback behavior are unchanged.
+  with guidance to the existing async ontology adapter. The check runs at
+  server (`make_handlers`, any tool profile) and `ncp.api.get_context`
+  construction, so it applies regardless of `fail_mode` and per-request
+  `ontology` mode (including `off`). Disabled ontology and transient backend
+  fallback behavior are unchanged.
+- `ncp_emit_whisper` rejects a non-string `pipeline_id` with a clear error
+  instead of a validation failure. Streamed `ncp_get_context` responses fall
+  back to a single `context` section when `post_assemble` middleware rewrote
+  the context, so the joined sections always equal the final `context`.
 - Make configured MCP servers return compact telemetry by default. Request
   `compact: false` for full diagnostics, or set `[tools].compact_default = false`
   to restore the previous default. Evidence IDs remain available.

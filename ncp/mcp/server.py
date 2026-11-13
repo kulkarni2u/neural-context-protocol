@@ -33,7 +33,12 @@ from ncp.config import NCPConfig, load_config
 from ncp.context_policy import ContextPolicyError, resolve_context_policy
 from ncp.drift import EmbeddingAdapter, compute_drift
 from ncp.ontology.enrichment import build_enricher
-from ncp.ontology.facade import OntologyFacade, cached_facade, make_tool_handlers as make_ontology_tool_handlers
+from ncp.ontology.facade import (
+    OntologyFacade,
+    cached_facade,
+    make_tool_handlers as make_ontology_tool_handlers,
+    validate_config_backend as validate_ontology_config_backend,
+)
 from ncp.principals import (
     AuthorizationError,
     Principal,
@@ -1037,6 +1042,8 @@ def make_handlers(
     config: NCPConfig | None = None,
     notifier: Notifier | None = None,
 ) -> dict[str, ToolHandler]:
+    # Configuration error at construction time, whatever the tool profile.
+    validate_ontology_config_backend(config, store)
     if notifier is None:
         notifier = InProcessNotifier() if config is None else get_process_notifier(config, store=store)
     notify_max_wait = config.notify_max_wait_seconds if config is not None else 60.0
@@ -1486,10 +1493,14 @@ def make_handlers(
 
             response = fit_response(response, response_max_tokens, reassemble=_refit)
         if stream:
-            return StreamResponse(
-                sections=assembler.sections_from_result(result=fitted_result, budget=budget),
-                handler_result=response,
-            )
+            sections = assembler.sections_from_result(result=fitted_result, budget=budget)
+            # post_assemble middleware (applied to the whole context, also by
+            # refit) is not applied per section. When it changed the text, the
+            # per-section view no longer reproduces the final context, so fall
+            # back to one section carrying the final context verbatim.
+            if "\n\n".join(text for _, text in sections) != response["context"]:
+                sections = [("context", str(response["context"]))]
+            return StreamResponse(sections=sections, handler_result=response)
         return response
 
     def _compact_response(response: dict[str, object]) -> None:
@@ -1876,6 +1887,8 @@ def make_handlers(
         ref = args.get("ref")
         from_agent = str(args["from"])
         pipeline_id = args.get("pipeline_id")
+        if pipeline_id is not None and not isinstance(pipeline_id, str):
+            raise ValueError("ncp_emit_whisper pipeline_id must be a string")
         signature = args.get("signature")
         in_reply_to = args.get("in_reply_to")
         thread_id = args.get("thread_id")

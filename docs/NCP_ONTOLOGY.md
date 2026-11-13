@@ -831,7 +831,7 @@ svc:billing <-OWNS- team:platform ev:att
 | Feature disabled | Legacy bytes. Ontology tools are `-32601 Tool not found`. |
 | Enabled; no entity, ambiguous alias, or entity without intent | No traversal, ordinary context. `reason_code` says why. |
 | Empty graph / zero verified paths | Ordinary context, no error |
-| Enabled with unsupported backend | Configuration error before graph or memory retrieval, independent of `fail_mode`. Explicitly off remains a no-op. |
+| Enabled with unsupported backend | Configuration error rejected at server/API construction (`make_handlers`, `ncp.api.get_context`), independent of tool profile, `fail_mode` and per-request `ontology` mode (including `off`). Disabled ontology (`enabled = false` or provider `disabled`) remains a no-op on any backend. |
 | Trigger or graph timeout; backend error during enrichment | With `fail_mode = "fallback"` and `fallback_to_memory = true`: ordinary context plus `fallback_reason`. Otherwise the call fails. No graph facts are ever fabricated. |
 | Authorization failure | Fails closed (`forbidden` / `-32003`) and is never retried unscoped |
 | Evidence superseded, expired or revoked | The relation drops out of verified traversal and automatic context. `explain` shows `evidence_supported: false`. |

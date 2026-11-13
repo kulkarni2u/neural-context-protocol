@@ -848,7 +848,9 @@ per section (`conscious`, `subconscious`, `ontology` when enriched, `whispers`,
 `budget_header`),
 terminated by the standard JSON-RPC result line. All sections derive from a
 single assembly pass, so the concatenated stream matches the non-streaming
-`context` exactly.
+`context` exactly. If `post_assemble` middleware rewrote the context (so the
+per-section text would no longer reproduce it), the stream falls back to a
+single section labelled `context` whose text is the final context.
 
 ## Content negotiation (SSE responses)
 

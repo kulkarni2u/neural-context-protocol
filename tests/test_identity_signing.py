@@ -618,3 +618,15 @@ class TestRoutingBoundWhispers:
         assert result['verified'] is True
         assert result['routing_verified'] is False
         assert result['signature_version'] == 1
+
+
+def test_emit_whisper_rejects_non_string_pipeline_id_before_persisting(tmp_path):
+    store = SQLiteStore(tmp_path / 'store.db')
+    handlers = make_handlers(store, config=_config(tmp_path, require_signatures=False))
+    args = {'from': 'a', 'target': 'reviewer', 'type': 'request', 'payload': {'ask': 'x'},
+            'confidence': 0.9}
+    for bad in (7, 1.5, True, ['p'], {'p': 1}):
+        message = _error(_handle_request(_call('ncp_emit_whisper', {**args, 'pipeline_id': bad}), handlers))['message']
+        assert 'ncp_emit_whisper pipeline_id must be a string' in message
+    assert not store.drain_whispers(agent_id='reviewer', pipeline_id='7', max_items=100)
+    assert not store.drain_whispers(agent_id='reviewer', pipeline_id=None, max_items=100)
