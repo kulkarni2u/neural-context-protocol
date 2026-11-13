@@ -484,3 +484,113 @@ class TestSignedAuthorship:
         assert store.drain_whispers(
             agent_id="reviewer", pipeline_id="pipe_sign", max_items=1
         ) == []
+
+
+class TestRoutingBoundWhispers:
+    def _signed_args(self, tmp_path, store, **overrides):
+        from ncp.identity import canonical_whisper_payload
+        from ncp.types import Whisper
+
+        identity_id = _make_identity(store, tmp_path / 'keys')
+        args = {
+            'from': identity_id, 'target': 'reviewer', 'type': 'share',
+            'payload': {'ask': 'review'}, 'confidence': 0.8,
+            'pipeline_id': 'pipe_sign', 'ttl_seconds': 1800,
+            'thread_id': 'thread_original', 'ref': 'chunk_original',
+            'in_reply_to': 'parent_original', 'task_id': 'task_original',
+        }
+        args.update(overrides)
+        whisper = Whisper(**{('from_agent' if k == 'from' else 'whisper_type' if k == 'type' else k): v
+                             for k, v in args.items()})
+        args['signature'] = sign(canonical_whisper_payload(whisper), identity_id=identity_id,
+                                 keystore_dir=tmp_path / 'keys')
+        args['signature_version'] = 2
+        return args
+
+    def test_v2_normalization_and_thread_resolution(self, tmp_path):
+        from ncp.identity import canonical_whisper_payload
+        from ncp.types import Whisper
+
+        store = SQLiteStore(tmp_path / 'store.db')
+        args = self._signed_args(tmp_path, store, thread_id=None, task_id=None,
+                                 in_reply_to='parent_gone')
+        config = _config(tmp_path, require_signatures=True)
+        config.values['identity']['require_routing_signatures'] = True
+        result = _content(_handle_request(_call('ncp_emit_whisper', args),
+                                         make_handlers(store, config=config)))
+        assert result['routing_verified'] is True
+        assert result['thread_id'] == 'parent_gone'
+        received = store.get_whisper(result['whisper_id'])
+        assert received.verified is True
+        # Unused ids/timestamps are not part of the request envelope.
+        one = Whisper(from_agent='a', target='b', whisper_type='share', payload={'ask': 'review'}, confidence=.8)
+        two = Whisper(from_agent='a', target='b', whisper_type='share', payload={'ask': 'review'}, confidence=.8)
+        assert canonical_whisper_payload(one) == canonical_whisper_payload(two)
+
+    def test_v2_accepts_structured_and_legacy_json_normalization(self, tmp_path):
+        from ncp.identity import canonical_whisper_payload
+        from ncp.types import Whisper
+
+        store = SQLiteStore(tmp_path / "store.db")
+        identity_id = _make_identity(store, tmp_path / "keys")
+        handlers = make_handlers(store, config=_config(tmp_path, require_signatures=True))
+        pairs = [
+            ("share", {"ask": "review"}, '{"ask": "review"}'),
+            ("alert", {"alert_code": "store_down", "description": "Store unavailable"},
+             '{"description":"Store unavailable","alert_code":"store_down"}'),
+            ("world_check", {"anchor_intent": "ship", "detected_drift": 0.25},
+             '{"detected_drift":0.2500,"anchor_intent":"ship"}'),
+        ]
+        for whisper_type, structured, legacy in pairs:
+            envelopes = []
+            for payload in (structured, legacy):
+                args = {"from": identity_id, "target": "reviewer", "type": whisper_type,
+                        "payload": payload, "confidence": .8, "pipeline_id": "pipe_sign"}
+                whisper = Whisper(from_agent=identity_id, target="reviewer", whisper_type=whisper_type,
+                                  payload=payload, confidence=.8, pipeline_id="pipe_sign")
+                envelope = canonical_whisper_payload(whisper)
+                envelopes.append(envelope)
+                args.update(signature=sign(envelope, identity_id=identity_id,
+                                           keystore_dir=tmp_path / "keys"), signature_version=2)
+                result = _content(_handle_request(_call("ncp_emit_whisper", args), handlers))
+                assert result["routing_verified"] is True
+            assert envelopes[0] == envelopes[1]
+
+    def test_v2_rejects_tampering_before_persisting(self, tmp_path):
+        store = SQLiteStore(tmp_path / 'store.db')
+        args = self._signed_args(tmp_path, store)
+        handlers = make_handlers(store, config=_config(tmp_path, require_signatures=True))
+        for field, replacement in {
+            'from': 'attacker', 'target': 'attacker', 'type': 'request',
+            'payload': {'ask': 'altered'}, 'pipeline_id': 'other', 'ref': 'other_chunk',
+            'thread_id': 'other_thread', 'in_reply_to': 'other_parent',
+            'task_id': 'other_task', 'confidence': .2, 'ttl_seconds': 1,
+        }.items():
+            result = _error(_handle_request(_call('ncp_emit_whisper', {**args, field: replacement}), handlers))
+            assert 'could not be verified' in result['message'], field
+        assert not store.drain_whispers(agent_id='reviewer', pipeline_id='pipe_sign', max_items=100)
+
+    def test_routing_required_rejects_legacy_and_unsigned(self, tmp_path):
+        store = SQLiteStore(tmp_path / 'store.db')
+        args = self._signed_args(tmp_path, store)
+        config = _config(tmp_path, require_signatures=False)
+        config.values['identity']['require_routing_signatures'] = True
+        handlers = make_handlers(store, config=config)
+        assert 'requires signature_version=2' in _error(_handle_request(
+            _call('ncp_emit_whisper', {**args, 'signature_version': 1}), handlers))['message']
+        unsigned = {key: value for key, value in args.items() if key != 'signature'}
+        assert 'could not be verified' in _error(_handle_request(
+            _call('ncp_emit_whisper', unsigned), handlers))['message']
+
+    def test_legacy_reports_unverified_routing(self, tmp_path):
+        store = SQLiteStore(tmp_path / 'store.db')
+        signer = _make_identity(store, tmp_path / 'keys')
+        signature = sign(canonical_authorship_payload(signer, 'hello', 'pipe_sign'),
+                         identity_id=signer, keystore_dir=tmp_path / 'keys')
+        result = _content(_handle_request(_call('ncp_emit_whisper', {
+            'from': signer, 'target': 'reviewer', 'type': 'nudge', 'payload': 'hello',
+            'confidence': .8, 'pipeline_id': 'pipe_sign', 'signature': signature, 'signature_version': 1,
+        }), make_handlers(store, config=_config(tmp_path, require_signatures=True))))
+        assert result['verified'] is True
+        assert result['routing_verified'] is False
+        assert result['signature_version'] == 1

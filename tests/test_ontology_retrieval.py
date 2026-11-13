@@ -141,7 +141,7 @@ class World:
     def get_context(self, **args: object) -> dict:
         handlers = make_handlers(self.store, config=self.config)
         payload = {"agent_id": "a1", "role": "build", "pipeline_id": "p1", "task": "idle",
-                   "slot": "x", "intent": "advance", **args}
+                   "slot": "x", "intent": "advance", "compact": False, **args}
         return handlers["ncp_get_context"](payload)  # type: ignore[return-value]
 
 
@@ -164,7 +164,7 @@ def _call(handlers: dict, tools: list, name: str, args: dict, *, principal=None,
 FIXED_ARGS = {
     "agent_id": "a1", "role": "build", "pipeline_id": "p1", "task": "fix_payroll_consumer_lag",
     "slot": "payroll", "intent": "why_is_payroll_lagging", "max_tokens": 400,
-    "ontology": {"mode": "always"},
+    "ontology": {"mode": "always"}, "compact": False,
 }
 # Response fields that legitimately vary between two runs (clocks, ids).
 _VOLATILE = ("session_id",)
@@ -514,6 +514,21 @@ class TestExpansion:
                                   response_max_tokens=300)
         assert "ontology" in refit
         assert refit["context"].startswith("[NCP:CONSCIOUS]")
+
+    def test_stream_response_budget_keeps_final_graph_and_sections_consistent(self, world: World) -> None:
+        from ncp.mcp.response_budget import response_tokens
+
+        self._wide_graph(world)
+        for ceiling in (150, 200, 400):
+            streamed = world.get_context(task="payroll_consumer_lag", slot="x", max_tokens=1500,
+                                         response_max_tokens=ceiling, stream=True, compact=False)
+            response = streamed.handler_result
+            assert response["truncated"]["fits"] is True
+            assert response_tokens(response) <= ceiling
+            assert "\n\n".join(text for _, text in streamed.sections) == response["context"]
+            assert (response["ontology"]["verified_path_count"] > 0) == (
+                "ontology" in [label for label, _ in streamed.sections])
+            assert "paths" not in response["ontology"]
 
     def test_graph_paths_are_not_credited_as_retrieved_evidence(self, world: World) -> None:
         facts = world.payroll()
@@ -1025,3 +1040,24 @@ class TestAsOf:
         assert calls == []
         assert assembler.assemble(conscious=conscious, budget=BudgetContext()).graph.text  # type: ignore[union-attr]
         assert calls == ["traverse"]
+
+
+def test_unsupported_backend_rejected_before_enrichment_or_memory_fallback() -> None:
+    """Configuration errors cannot disappear into ordinary context on fallback."""
+    for fail_mode in ("fallback", "closed"):
+        config = OntologyConfig(enabled=True, fail_mode=fail_mode)
+        with pytest.raises(ValueError, match="object.*SQLiteStore or PgvectorStore"):
+            build_enricher(config, object())
+    # Explicit opt-out and disabled feature preserve the legacy no-op path.
+    assert build_enricher(OntologyConfig(), object()) is None
+    assert build_enricher(OntologyConfig(enabled=True), object(), request=False) is None
+    assert build_enricher(OntologyConfig(enabled=True, provider="disabled"), object()) is None
+
+
+def test_python_context_rejects_unsupported_enabled_backend_before_assembly(tmp_path: Path) -> None:
+    config = load_config(cwd=_project(tmp_path, ENABLED))
+    agent = ConsciousBlock(agent_id="a", role="test", owns=[], must_not=[],
+                           task="verify_backend", slot="config", intent="validate")
+    # No memory-store methods are called: the configuration error comes first.
+    with pytest.raises(ValueError, match="object.*SQLiteStore or PgvectorStore"):
+        api_get_context(agent=agent, store=object(), config=config)

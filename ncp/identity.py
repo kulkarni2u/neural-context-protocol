@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import os
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
@@ -13,6 +15,10 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey,
     Ed25519PublicKey,
 )
+
+
+if TYPE_CHECKING:
+    from ncp.types import Whisper
 
 
 def identity_id_for_public_key(public_key: bytes) -> str:
@@ -72,6 +78,37 @@ def canonical_authorship_payload(
 
     content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
     return "|".join([written_by, content_hash, pipeline_id or ""]).encode("utf-8")
+
+
+def canonical_whisper_payload(whisper: Whisper) -> bytes:
+    """Version-2 signature envelope, built *before* server thread resolution.
+
+    Construct a ``Whisper`` with the same explicit fields sent to MCP, then
+    sign these bytes and pass ``signature_version=2``. The model normalizes
+    structured payloads; random server ids/timestamps and the derived thread
+    are excluded. The explicit parent/thread/task and every delivery control
+    are bound, so a valid signature cannot be redirected or reclassified.
+    """
+    from ncp.types import normalize_whisper_payload
+
+    # Whisper preserves accepted legacy JSON strings verbatim, while MCP
+    # normalizes their defaults and numeric types. Canonicalize typed JSON
+    # semantically so this helper works before *and* after MCP normalization
+    # without depending on legacy-vs-structured JSON key ordering.
+    normalized, _ = normalize_whisper_payload(whisper.whisper_type, whisper.payload)
+    if whisper.whisper_type not in {"nudge", "consolidation_ready"}:
+        normalized = json.dumps(json.loads(normalized), sort_keys=True, separators=(",", ":"), allow_nan=False)
+    envelope = {
+        "domain": "ncp:whisper", "version": 2,
+        "from": whisper.from_agent, "target": whisper.target,
+        "type": whisper.whisper_type,
+        "payload_sha256": hashlib.sha256(normalized.encode("utf-8")).hexdigest(),
+        "pipeline_id": whisper.pipeline_id, "ref": whisper.ref,
+        "in_reply_to": whisper.in_reply_to, "thread_id": whisper.thread_id,
+        "task_id": whisper.task_id, "confidence": whisper.confidence,
+        "ttl_seconds": whisper.ttl_seconds,
+    }
+    return json.dumps(envelope, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
 
 
 def sign(payload: bytes | str, *, identity_id: str, keystore_dir: Path) -> str:

@@ -5,6 +5,8 @@ on:
     branches:
       - main
   pull_request:
+  merge_group:
+  workflow_dispatch:
 
 # Every job only checks out and tests the code.
 permissions:
@@ -79,14 +81,15 @@ jobs:
   # "test" keeps working while the suite runs as a version matrix.
   test:
     if: always()
-    needs: tests
+    needs: [tests, minimum-python-import, pgvector-redis]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Require every matrix job to pass
         run: |
-          echo "tests result: ${{ needs.tests.result }}"
           test "${{ needs.tests.result }}" = "success"
+          test "${{ needs.minimum-python-import.result }}" = "success"
+          test "${{ needs.pgvector-redis.result }}" = "success"
 
   pgvector-redis:
     runs-on: ubuntu-latest
@@ -149,3 +152,4 @@ jobs:
           tests/test_async_redis_coordination.py
           tests/test_store_lifecycle_postgres.py
           tests/test_store_forget_postgres.py
+          tests/test_ontology_parity.py

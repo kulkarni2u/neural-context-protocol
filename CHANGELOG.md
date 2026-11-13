@@ -4,6 +4,28 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [Unreleased]
 
+### Security and reliability
+
+- Add version-2 whisper signatures binding sender, target, type, normalized
+  payload, pipeline, reference, parent/thread/task, confidence and TTL. Sign with
+  `ncp.identity.canonical_whisper_payload` and send `signature_version: 2`.
+  Enable `[identity].require_routing_signatures = true` after migrating clients
+  to reject legacy/unsigned whisper submissions. Legacy signatures remain
+  accepted by default and authenticate payload authorship only.
+- Apply `ncp_get_context.response_max_tokens` before emitting stream sections,
+  using the same context refit, evidence attribution and diagnostic trimming as
+  buffered responses. The cap covers the final response object, not transport
+  framing or the repeated context in section notifications.
+- Reject enabled ontology on unsupported synchronous host backends explicitly,
+  with guidance to the existing async ontology adapter. Disabled ontology and
+  transient backend fallback behavior are unchanged.
+- Make configured MCP servers return compact telemetry by default. Request
+  `compact: false` for full diagnostics, or set `[tools].compact_default = false`
+  to restore the previous default. Evidence IDs remain available.
+- Require the import and PostgreSQL/Redis jobs as well as every Python matrix
+  job for the stable CI `test` check. Include ontology parity in the database
+  integration job and support merge queues and manual workflow dispatch.
+
 ## [1.9.3] - 2026-11-11
 
 ### Release scope

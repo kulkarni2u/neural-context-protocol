@@ -42,6 +42,19 @@ def test_tool_profile_defaults_to_standard(tmp_path: Path) -> None:
     assert load_config(cwd=project).tool_profile == "standard"
 
 
+def test_compact_default_is_configurable_and_strict(tmp_path: Path) -> None:
+    project = tmp_path / "repo"
+    (project / ".git").mkdir(parents=True)
+    (project / ".ncp").mkdir()
+    assert load_config(cwd=project, env={}).tool_compact_default is True
+    path = project / ".ncp" / "config.toml"
+    path.write_text("[tools]\ncompact_default = false\n")
+    assert load_config(cwd=project, env={}).tool_compact_default is False
+    path.write_text('[tools]\ncompact_default = "false"\n')
+    with pytest.raises(ValueError, match="compact_default must be a boolean"):
+        load_config(cwd=project, env={}).tool_compact_default
+
+
 @pytest.mark.parametrize("profile", ["core", "standard", "full"])
 def test_tool_profile_accepts_supported_toml_values(tmp_path: Path, profile: str) -> None:
     project = tmp_path / "repo"

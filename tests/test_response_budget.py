@@ -9,8 +9,9 @@ from pathlib import Path
 
 import pytest
 
+from ncp.config import load_config
 from ncp.mcp.response_budget import compact_telemetry, fit_response, response_tokens
-from ncp.mcp.server import _handle_request, make_handlers
+from ncp.mcp.server import StreamResponse, _handle_request, make_handlers
 from ncp.stores.sqlite import SQLiteStore
 from ncp.types import SubconsciousChunk
 
@@ -180,3 +181,58 @@ def test_invalid_arguments_rejected(tmp_path: Path, bad: dict) -> None:
     request = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                "params": {"name": "ncp_get_context", "arguments": args}}
     assert "error" in json.loads(_handle_request(request, make_handlers(_store(tmp_path))))
+
+
+@pytest.mark.parametrize("compact", [False, True])
+def test_stream_budget_refits_before_emitting_sections(tmp_path: Path, compact: bool) -> None:
+    full_store = _store(tmp_path / "full_stream")
+    full = _get_context(make_handlers(full_store), compact=compact)
+    budget = response_tokens(full) * 3 // 4 if compact else response_tokens(full) // 2
+    store = _store(tmp_path / "fit_stream")
+    handler = make_handlers(store)["ncp_get_context"]
+    result = handler({
+        "agent_id": "executor", "role": "build", "owns": [], "must_not": [],
+        "task": "payment_retry", "slot": "budget", "intent": "fit", "pipeline_id": PIPELINE,
+        "max_tokens": 2000, "response_max_tokens": budget, "stream": True, "compact": compact,
+    })
+    assert isinstance(result, StreamResponse)
+    response = result.handler_result
+    assert response["truncated"]["fits"] is True
+    assert response_tokens(response) <= budget
+    assert "context_max_tokens" in response["truncated"]
+    assert "\n\n".join(text for _, text in result.sections) == response["context"]
+    assert 0 < len(response["retrieved_chunk_ids"]) < len(full["retrieved_chunk_ids"])
+    in_context = [cid for cid in full["retrieved_chunk_ids"]
+                  if f"marker{cid[-1]} " in response["context"]]
+    assert sorted(in_context) == sorted(response["retrieved_chunk_ids"])
+    assert _retrieval_counts(store) == _retrieval_counts(full_store)
+    if compact:
+        assert response["context_sha256"] == hashlib.sha256(response["context"].encode()).hexdigest()
+
+
+def test_stream_impossible_budget_reports_failure_without_losing_required_fields(tmp_path: Path) -> None:
+    result = make_handlers(_store(tmp_path))["ncp_get_context"]({
+        "agent_id": "executor", "role": "build", "task": "payment_retry", "slot": "budget",
+        "intent": "fit", "pipeline_id": PIPELINE, "stream": True, "response_max_tokens": 1,
+    })
+    assert isinstance(result, StreamResponse)
+    assert result.handler_result["truncated"]["fits"] is False
+    assert all(key in result.handler_result for key in REQUIRED)
+    assert "\n\n".join(text for _, text in result.sections) == result.handler_result["context"]
+
+
+def test_configured_compact_default_preserves_context_and_evidence(tmp_path: Path) -> None:
+    config = load_config(cwd=tmp_path)
+    handlers = make_handlers(_store(tmp_path), config=config)
+    compact = _get_context(handlers)
+    full = _get_context(handlers, compact=False)
+    assert compact["context"] == full["context"]
+    assert all(compact[key] == full[key] for key in REQUIRED)
+    assert response_tokens(compact) < response_tokens(full)
+    assert "active_features" not in compact["telemetry"]
+    assert "active_features" in full["telemetry"]
+    assert compact["context_sha256"] == hashlib.sha256(compact["context"].encode()).hexdigest()
+    config.values.setdefault("tools", {})["compact_default"] = False
+    configured_full = _get_context(make_handlers(_store(tmp_path / "full_default"), config=config))
+    assert "context_sha256" not in configured_full
+    assert "active_features" in configured_full["telemetry"]

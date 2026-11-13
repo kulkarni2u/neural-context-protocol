@@ -862,3 +862,31 @@ def test_reduce_fanin_surfaces_contradiction_without_dropping_either_claim(tmp_p
     # Contradictions are surfaced, never silently resolved -- both sides of
     # any reported pair must still be present in the assembled context.
     assert contradicting_ids <= kept_ids
+
+
+def test_stream_sections_preserve_contradiction_notes(tmp_path: Path) -> None:
+    from ncp.assembler import AssemblyResult
+
+    assembler = Assembler(store=SQLiteStore(tmp_path / "stream_contradictions.db"))
+    conscious = _make_conscious()
+    budget = BudgetContext()
+    chunks = [
+        SubconsciousChunk(chunk_id="yes", layer="semantic", content="guard resolves NPE", src="tool_result"),
+        SubconsciousChunk(chunk_id="no", layer="semantic", content="guard does not resolve NPE", src="tool_result"),
+    ]
+    notes = [("yes", "no")]
+    context = assembler.encoder.assemble(
+        conscious=conscious, chunks=chunks, whispers=[], budget=budget, contradiction_notes=notes,
+    )
+    result = AssemblyResult(
+        context=context, conscious=conscious, chunks=chunks, whispers=[], pending_whisper_ids=[],
+        evicted_high_relevance=[], evicted_whispers=[], fanin_contradictions=notes,
+    )
+    sections = assembler.sections_from_result(result=result, budget=budget)
+    assert "note:contradicts yes<->no" in dict(sections)["subconscious"]
+    assert "\n\n".join(text for _, text in sections) == context
+    refitted = assembler.refit(result, budget=budget, max_tokens=1, query_text="guard")
+    assert not refitted.chunks and not refitted.fanin_contradictions
+    assert "note:contradicts" not in refitted.context
+    assert "\n\n".join(text for _, text in assembler.sections_from_result(
+        result=refitted, budget=budget)) == refitted.context

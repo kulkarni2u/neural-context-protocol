@@ -459,10 +459,9 @@ class TestFacade:
             assert caught.value.code == "disabled"
             assert caught.value.to_result()["error"]["code"] == "disabled"
 
-    def test_non_sqlite_store_is_disabled_with_reason(self) -> None:
-        facade = OntologyFacade.from_config(OntologyConfig(enabled=True), object())
-        assert facade.capabilities() == {"enabled": False, "version": "1"}
-        assert facade.disabled_reason is not None and "object" in facade.disabled_reason
+    def test_unsupported_enabled_store_is_configuration_error(self) -> None:
+        with pytest.raises(ValueError, match="enabled=true.*object.*SQLiteStore or PgvectorStore"):
+            OntologyFacade.from_config(OntologyConfig(enabled=True), object())
 
     def test_unknown_provider_or_pack_fails_closed(self, tmp_path: Path) -> None:
         store = SQLiteStore(tmp_path / "s.db")

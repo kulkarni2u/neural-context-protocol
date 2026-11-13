@@ -582,8 +582,8 @@ class Whisper(NCPModel):
     dissent_target: str | None = None
     # CAP-T1/WI-013: authorship verification status (see SubconsciousChunk).
     verified: bool = False
-    # Coordination primitives A: request/reply linkage. Unsigned routing
-    # metadata -- authorship signatures still cover only the payload.
+    # Coordination primitives A: request/reply linkage. Legacy version-1
+    # signatures do not bind routing; version-2 MCP signatures do.
     in_reply_to: str | None = None
     thread_id: str | None = None
     # Coordination primitives C: the ledger task this whisper reports on.
