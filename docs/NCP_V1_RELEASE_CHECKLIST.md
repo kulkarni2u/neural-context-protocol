@@ -44,7 +44,11 @@
    - `ncp/version.py`
 6. Create and push `v<version>` at the verified merged `origin/main` commit.
 7. Wait for `.github/workflows/release.yml` to pass; its trusted-publishing
-   job builds the artifacts and uploads them to PyPI.
+   job builds the artifacts and uploads them to PyPI. If the tag-push run is
+   stuck (e.g. "queued" with no jobs after a GitHub Actions outage) or failed
+   for a transient reason, publish the same tag without re-tagging: Actions →
+   Release → Run workflow (from `main`) with `tag = v<version>`. The run
+   checks out and publishes that tag's code.
 8. Verify the version-specific PyPI JSON and clean-install the published
    package in a fresh virtual environment.
 9. Create the GitHub Release from the matching changelog section and read it

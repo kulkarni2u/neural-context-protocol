@@ -4,6 +4,15 @@ on:
   push:
     tags:
       - "v*"
+  # Re-publish an existing tag when its tag-push run is stuck or failed.
+  # The workflow definition comes from the branch you dispatch from; the code
+  # that is built, tested and published is the tag's.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to build and publish (e.g. v1.9.3)"
+        required: true
+        type: string
 
 jobs:
   build:
@@ -12,8 +21,20 @@ jobs:
       contents: read
 
     steps:
+      - name: Validate dispatched tag
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          if ! [[ "$INPUT_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-]?[A-Za-z0-9.]+)?$ ]]; then
+            echo "Input tag '$INPUT_TAG' is not a release tag like v1.2.3."
+            exit 1
+          fi
+
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.ref }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -22,8 +43,10 @@ jobs:
           cache: "pip"
 
       - name: Verify tag matches package version
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
         run: |
-          tag_version="${GITHUB_REF_NAME#v}"
+          tag_version="${RELEASE_TAG#v}"
           package_version="$(python - <<'PY'
           import tomllib
 
