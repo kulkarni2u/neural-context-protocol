@@ -8,7 +8,8 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 - Add version-2 whisper signatures binding sender, target, type, normalized
   payload, pipeline, reference, parent/thread/task, confidence and TTL. Sign with
-  `ncp.identity.canonical_whisper_payload` and send `signature_version: 2`.
+  `ncp.identity.canonical_whisper_payload` and send `signature_version: 2` with
+  an explicit positive integer `ttl_seconds` (v2 never uses the configured default).
   Enable `[identity].require_routing_signatures = true` after migrating clients
   to reject legacy/unsigned whisper submissions. Legacy signatures remain
   accepted by default and authenticate payload authorship only.

@@ -231,7 +231,7 @@ MCP_TOOLS: list[dict[str, object]] = [
                 "thread_id": {"type": "string", "description": "Optional explicit thread key (bound by signature_version=2)."},
                 "task_id": {"type": "string", "description": "Optional claimed task this progress/result reports on; `from` must own it (needs [tasks].enabled)."},
                 "signature": {"type": "string", "description": "Ed25519 signature. v1 covers sender/payload/pipeline; v2 binds routing and delivery (ncp.identity.canonical_whisper_payload)."},
-                "signature_version": {"type": "integer", "enum": [1, 2], "description": "Default 1 (legacy); use 2 to bind routing. Required with [identity].require_routing_signatures."},
+                "signature_version": {"type": "integer", "enum": [1, 2], "description": "Default 1 (legacy); use 2 to bind routing (requires explicit positive integer ttl_seconds). Required with [identity].require_routing_signatures."},
             },
             "required": ["from", "target", "type", "payload", "confidence"],
         },
@@ -1858,10 +1858,21 @@ def make_handlers(
             whisper_type,  # type: ignore[arg-type]
             args["payload"],
         )
-        try:
-            ttl_seconds = max(1, int(args.get("ttl_seconds", default_whisper_ttl)))
-        except (TypeError, ValueError):
-            ttl_seconds = default_whisper_ttl
+        signature_version = args.get("signature_version", 1)
+        if type(signature_version) is not int or signature_version not in (1, 2):
+            raise ValueError("ncp_emit_whisper signature_version must be 1 or 2")
+        if signature_version == 2:
+            explicit_ttl = args.get("ttl_seconds")
+            if type(explicit_ttl) is not int or explicit_ttl < 1:
+                raise ValueError(
+                    "ncp_emit_whisper signature_version=2 requires an explicit positive integer ttl_seconds"
+                )
+            ttl_seconds = explicit_ttl
+        else:
+            try:
+                ttl_seconds = max(1, int(args.get("ttl_seconds", default_whisper_ttl)))
+            except (TypeError, ValueError):
+                ttl_seconds = default_whisper_ttl
         ref = args.get("ref")
         from_agent = str(args["from"])
         pipeline_id = args.get("pipeline_id")
@@ -1883,9 +1894,6 @@ def make_handlers(
             thread_id=None if thread_id is None else str(thread_id),
             task_id=None if task_id is None else str(task_id),
         )
-        signature_version = args.get("signature_version", 1)
-        if type(signature_version) is not int or signature_version not in (1, 2):
-            raise ValueError("ncp_emit_whisper signature_version must be 1 or 2")
         routing_required = config.require_routing_signatures if config is not None else False
         if routing_required and signature_version != 2:
             raise ValueError("ncp_emit_whisper rejected: require_routing_signatures requires signature_version=2")

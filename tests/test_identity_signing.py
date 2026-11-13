@@ -545,9 +545,11 @@ class TestRoutingBoundWhispers:
             envelopes = []
             for payload in (structured, legacy):
                 args = {"from": identity_id, "target": "reviewer", "type": whisper_type,
-                        "payload": payload, "confidence": .8, "pipeline_id": "pipe_sign"}
+                        "payload": payload, "confidence": .8, "pipeline_id": "pipe_sign",
+                        "ttl_seconds": 1800}
                 whisper = Whisper(from_agent=identity_id, target="reviewer", whisper_type=whisper_type,
-                                  payload=payload, confidence=.8, pipeline_id="pipe_sign")
+                                  payload=payload, confidence=.8, pipeline_id="pipe_sign",
+                                  ttl_seconds=1800)
                 envelope = canonical_whisper_payload(whisper)
                 envelopes.append(envelope)
                 args.update(signature=sign(envelope, identity_id=identity_id,
@@ -555,6 +557,28 @@ class TestRoutingBoundWhispers:
                 result = _content(_handle_request(_call("ncp_emit_whisper", args), handlers))
                 assert result["routing_verified"] is True
             assert envelopes[0] == envelopes[1]
+
+    def test_v2_requires_explicit_positive_int_ttl(self, tmp_path):
+        store = SQLiteStore(tmp_path / 'store.db')
+        args = self._signed_args(tmp_path, store)
+        handlers = make_handlers(store, config=_config(tmp_path, require_signatures=True))
+        missing = {k: v for k, v in args.items() if k != 'ttl_seconds'}
+        for bad in (missing, {**args, 'ttl_seconds': 0}, {**args, 'ttl_seconds': -5},
+                    {**args, 'ttl_seconds': True}, {**args, 'ttl_seconds': '60'},
+                    {**args, 'ttl_seconds': 1.5}):
+            message = _error(_handle_request(_call('ncp_emit_whisper', bad), handlers))['message']
+            assert 'explicit positive integer ttl_seconds' in message
+        assert not store.drain_whispers(agent_id='reviewer', pipeline_id='pipe_sign', max_items=100)
+
+    def test_v2_explicit_ttl_verifies_with_custom_default_ttl(self, tmp_path):
+        store = SQLiteStore(tmp_path / 'store.db')
+        args = self._signed_args(tmp_path, store, ttl_seconds=90)
+        config = _config(tmp_path, require_signatures=True)
+        config.values['whispers']['default_ttl_seconds'] = 600
+        result = _content(_handle_request(_call('ncp_emit_whisper', args),
+                                         make_handlers(store, config=config)))
+        assert result['routing_verified'] is True
+        assert store.get_whisper(result['whisper_id']).ttl_seconds == 90
 
     def test_v2_rejects_tampering_before_persisting(self, tmp_path):
         store = SQLiteStore(tmp_path / 'store.db')

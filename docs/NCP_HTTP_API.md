@@ -388,8 +388,11 @@ to sign a domain-separated JSON envelope covering sender, target, type, normaliz
 payload hash, pipeline, ref, explicit parent/thread/task, confidence and TTL.
 Construct the `Whisper` with exactly the explicit request fields, **before**
 server thread resolution; then sign those bytes with `ncp.identity.sign`.
-With an explicit `signature_version`, the result also includes `signature_version`
-and `routing_verified`. Enable `[identity] require_routing_signatures = true` to
+`signature_version: 2` requires an explicit positive integer `ttl_seconds`; the
+server does not apply `[whispers].default_ttl_seconds` to signed v2 requests, so
+the signed value is always the one sent. `signature_version` and
+`routing_verified` are reported only when a `signature` is supplied; with an
+explicit `signature_version`, the result includes both. Enable `[identity] require_routing_signatures = true` to
 reject unsigned, invalid and legacy-version whisper signatures. This setting
 implies signature enforcement for whispers independently of `require_signatures`.
 Absent `signature_version` remains version 1 for compatibility; its `verified`
