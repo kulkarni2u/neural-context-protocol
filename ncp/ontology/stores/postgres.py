@@ -306,6 +306,7 @@ class PostgresOntologyStore:
         connection_source: ConnectionSource | None = None,
         lock_timeout: float = 5.0,
         max_pool_connections: int = 4,
+        parent: Any = None,
     ) -> None:
         self.dsn = dsn
         self.registry = registry
@@ -313,6 +314,9 @@ class PostgresOntologyStore:
         self.table_prefix = _identifier(table_prefix, field="table_prefix")
         self._lock_timeout_ms = max(1, int(lock_timeout * 1000))
         self._owned_pool: Any = None
+        # Strong ref to an inherited parent store: its pool closes when the
+        # PgvectorStore is garbage collected, so we must keep it alive.
+        self._parent: Any = parent
         if connection_source is None:
             connection_source = self._private_source(dsn, max_pool_connections)
         self._source = connection_source
@@ -336,9 +340,11 @@ class PostgresOntologyStore:
     def inherit(cls, store: PgvectorStore, registry: SchemaRegistry) -> PostgresOntologyStore:
         """``store = "inherit"``: the NCP pgvector store's database, schema,
         table prefix and connection pool."""
+        # The pool is closed when the PgvectorStore is garbage collected, so
+        # hold the store for this ontology store's lifetime.
         return cls(
             store.dsn, registry, schema=store.schema, table_prefix=store.table_prefix,
-            connection_source=_source_for(store),
+            connection_source=_source_for(store), parent=store,
         )
 
     def close(self) -> None:

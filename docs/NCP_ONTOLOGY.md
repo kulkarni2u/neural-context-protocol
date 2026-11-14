@@ -811,12 +811,15 @@ svc:billing <-OWNS- team:platform ev:att
   advisory locks and a `lock_timeout`. Reads use one `REPEATABLE READ READ
   ONLY` snapshot. Both backends return identical results; this is enforced
   by `tests/test_ontology_parity.py`.
-- **Async:** `AsyncPgvectorStore` never assembles context, so the facade
-  stays disabled for it. In-process async code can use
-  `ncp.ontology.stores.AsyncPostgresOntologyStore`, which runs the sync
-  store through `asyncio.to_thread`.
-- **Other backends** (memory, Redis-only, and so on): every ontology tool
-  answers `disabled`, and context is unchanged.
+- **Async:** `AsyncPgvectorStore` covers post-turn writes, not synchronous
+  context assembly. Enabling ontology with it in the synchronous facade or
+  context API raises an actionable configuration error. In-process async
+  code can use `ncp.ontology.stores.AsyncPostgresOntologyStore.inherit`,
+  which runs explicit graph operations through `asyncio.to_thread`.
+- **Other backends** (memory, Redis-only, and so on): an enabled synchronous
+  ontology facade or enrichment request fails configuration validation.
+  Disable ontology to retain ordinary context; unsupported configuration is
+  never treated as a transient backend failure or silently downgraded.
 - **Table creation.** Enrichment never creates tables. Under the `core` tool
   profile the store stays uninitialized (`reason_code:
   "ontology_uninitialized"`) until an ontology tool has run once.
@@ -828,6 +831,7 @@ svc:billing <-OWNS- team:platform ev:att
 | Feature disabled | Legacy bytes. Ontology tools are `-32601 Tool not found`. |
 | Enabled; no entity, ambiguous alias, or entity without intent | No traversal, ordinary context. `reason_code` says why. |
 | Empty graph / zero verified paths | Ordinary context, no error |
+| Enabled with unsupported backend | Configuration error rejected at server/API construction (`make_handlers`, `ncp.api.get_context`), independent of tool profile, `fail_mode` and per-request `ontology` mode (including `off`). Disabled ontology (`enabled = false` or provider `disabled`) remains a no-op on any backend. |
 | Trigger or graph timeout; backend error during enrichment | With `fail_mode = "fallback"` and `fallback_to_memory = true`: ordinary context plus `fallback_reason`. Otherwise the call fails. No graph facts are ever fabricated. |
 | Authorization failure | Fails closed (`forbidden` / `-32003`) and is never retried unscoped |
 | Evidence superseded, expired or revoked | The relation drops out of verified traversal and automatic context. `explain` shows `evidence_supported: false`. |

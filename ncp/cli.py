@@ -3218,7 +3218,10 @@ def ontology_seed_command(
             store = None
         else:
             store = _resolve_runtime_store(config)
-            facade = OntologyFacade.from_config(config, store)
+            try:
+                facade = OntologyFacade.from_config(config, store)
+            except ValueError as exc:
+                raise click.ClickException(str(exc)) from exc
         if not facade.enabled:
             raise click.ClickException(
                 f"{facade.disabled_reason or 'ontology is disabled'}: add an [ontology] section "
@@ -3317,7 +3320,10 @@ def _ontology_session(  # type: ignore[no-untyped-def]
 
     config = load_config(cwd=cwd or Path.cwd())
     store = _resolve_runtime_store(config)
-    facade = OntologyFacade.from_config(config, store)
+    try:
+        facade = OntologyFacade.from_config(config, store)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
     if not facade.enabled:
         raise click.ClickException(
             f"{facade.disabled_reason or 'ontology is disabled'}: add an [ontology] section "

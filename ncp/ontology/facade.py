@@ -2,8 +2,9 @@
 
 ``OntologyFacade.from_config`` builds an enabled facade only when
 ``[ontology] enabled = true``, the provider is ``builtin`` and the NCP store
-is SQLite or PostgreSQL (``PgvectorStore``); otherwise it is a *disabled*
-facade whose ``capabilities()`` is ``{"enabled": False, "version": "1"}`` and
+is SQLite or PostgreSQL (``PgvectorStore``). An unsupported enabled backend
+is a configuration error. When explicitly off, it is a *disabled* facade
+whose ``capabilities()`` is ``{"enabled": False, "version": "1"}`` and
 whose other operations raise ``OntologyError(code="disabled")``.
 
 Every operation takes a trusted :class:`AuthContext`. Hosts build it with
@@ -215,6 +216,38 @@ def entity_summary(entity: Entity) -> dict[str, object]:
     }
 
 
+def validate_ontology_backend(store: object) -> None:
+    """Reject unsupported synchronous ontology hosts without opening a connection.
+
+    This is configuration validation, not an operational availability check:
+    transient backend failures still follow the configured enrichment fail mode.
+    """
+    from ncp.stores.pgvector import PgvectorStore
+    from ncp.stores.sqlite import SQLiteStore
+
+    if isinstance(store, (SQLiteStore, PgvectorStore, SQLiteOntologyStore, PostgresOntologyStore)):
+        return
+    backend = type(store).__name__
+    raise ValueError(
+        f"[ontology] enabled=true is not supported by the {backend} backend in the "
+        "synchronous ontology facade/context API; use SQLiteStore or PgvectorStore, "
+        "or disable ontology. Async hosts can use AsyncPostgresOntologyStore.inherit "
+        "for explicit awaitable graph operations."
+    )
+
+
+def validate_config_backend(config: NCPConfig | OntologyConfig | None, store: object) -> None:
+    """Config-owning entry points (server/API construction) call this so an
+    enabled builtin ontology on an unsupported backend is rejected up front,
+    independent of tool profile, fail mode and per-request mode. A disabled
+    ontology is a no-op on any backend."""
+    if config is None:
+        return
+    ontology = config if isinstance(config, OntologyConfig) else config.ontology
+    if ontology.enabled and ontology.provider == "builtin":
+        validate_ontology_backend(store)
+
+
 class OntologyFacade:
     """Capability discovery plus scoped query/explain/assert/revoke.
 
@@ -260,10 +293,9 @@ class OntologyFacade:
         or (sync) pgvector store.
 
         An unknown provider name is a configuration error (raised), never a
-        dynamic import. Any other store -- including the async-only
-        ``AsyncPgvectorStore``, whose runtime never assembles context (use
-        ``AsyncPostgresOntologyStore`` from async hosts) -- yields a disabled
-        facade.
+        dynamic import. Any unsupported enabled store raises a configuration
+        error, including ``AsyncPgvectorStore``. Async hosts can use
+        ``AsyncPostgresOntologyStore`` for explicit awaitable graph operations.
         """
         from ncp.stores.pgvector import PgvectorStore
         from ncp.stores.sqlite import SQLiteStore
@@ -278,14 +310,13 @@ class OntologyFacade:
                 f"[ontology].provider {ontology.provider!r} is not available; "
                 "expected 'builtin' or 'disabled'"
             )
+        validate_ontology_backend(store)
         if isinstance(store, (SQLiteOntologyStore, PostgresOntologyStore)):
             return cls(ontology, store)
         if isinstance(store, PgvectorStore):
             registry = registry or SchemaRegistry.builtin(ontology.pack_paths)
             return cls(ontology, PostgresOntologyStore.inherit(store, registry))
-        if not isinstance(store, SQLiteStore):
-            backend = type(store).__name__
-            return cls.disabled(f"ontology storage is not available for the {backend} backend")
+        assert isinstance(store, SQLiteStore)  # guaranteed by validate_ontology_backend
         registry = registry or SchemaRegistry.builtin(ontology.pack_paths)
         return cls(ontology, SQLiteOntologyStore.inherit(store, registry))
 

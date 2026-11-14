@@ -107,3 +107,4 @@ model = "BAAI/bge-small-en-v1.5"
 # and recorded but never required. Set to true to REJECT any write/emit whose
 # authorship cannot be verified (missing/bad signature or revoked identity).
 # require_signatures = false
+# require_routing_signatures = false  # Require v2 signatures for MCP whispers.

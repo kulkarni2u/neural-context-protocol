@@ -191,3 +191,68 @@ def test_retention_cap_keeps_user_verified(schema: tuple[Any, str]) -> None:
     remaining = _working_ids(admin, name, "pipe")
     assert {"uv_0", "uv_1"} <= remaining
     assert len(remaining) == 3
+
+
+def _active_connections() -> int:
+    import psycopg
+
+    with psycopg.connect(LIVE_DSN, autocommit=True) as conn:
+        row = conn.execute(
+            "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database()"
+        ).fetchone()
+    return int(row[0])
+
+
+def _wait_for(predicate: Any, timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.05)
+    return predicate()
+
+
+def test_pool_connections_released_on_close_and_on_garbage_collection() -> None:
+    """Stores must not pin their pools: close() and plain GC both release them."""
+    import gc
+
+    baseline = _active_connections()
+
+    closed = PgvectorStore(LIVE_DSN, schema=f"ncp_lc_{uuid4().hex[:8]}")
+    closed.write(_chunk("pool-close-probe"))
+    assert _active_connections() > baseline
+    closed.close()
+    assert _wait_for(lambda: _active_connections() <= baseline)
+
+    dropped = PgvectorStore(LIVE_DSN, schema=f"ncp_lc_{uuid4().hex[:8]}")
+    dropped.write(_chunk("pool-gc-probe"))
+    assert _active_connections() > baseline
+    del dropped
+    gc.collect()
+    assert _wait_for(lambda: _active_connections() <= baseline)
+
+
+def test_inherited_ontology_store_keeps_parent_pool_alive() -> None:
+    """``inherit`` borrows the parent's pool, which closes when the parent is
+    garbage collected; the ontology store must pin the parent."""
+    import gc
+
+    from ncp.ontology.registry import SchemaRegistry
+    from ncp.ontology.stores.postgres import PostgresOntologyStore
+
+    baseline = _active_connections()
+    registry = SchemaRegistry.builtin()
+    schema = f"ncp_lc_{uuid4().hex[:8]}"
+
+    ontology = PostgresOntologyStore.inherit(PgvectorStore(LIVE_DSN, schema=schema), registry)
+    gc.collect()
+    ontology._migrate()  # real operation on the inherited pool; fails if it was closed
+    assert PostgresOntologyStore.initialized(ontology._parent)
+    assert _active_connections() > baseline
+
+    ontology.close()  # must not close the parent's pool
+    ontology._migrate()
+    ontology._parent.close()
+    del ontology
+    gc.collect()
+    assert _wait_for(lambda: _active_connections() <= baseline)

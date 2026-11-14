@@ -253,6 +253,28 @@ class TestCli:
         again = runner.invoke(main, args)
         assert json.loads(again.output[again.output.index("{"):])["relations"]["unchanged"] == 3
 
+    def test_unsupported_backend_is_a_clean_cli_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        class FakeBackendStore:
+            pass
+
+        (tmp_path / ".ncp").mkdir()
+        (tmp_path / ".ncp" / "config.toml").write_text(ENABLED, encoding="utf-8")
+        manifest = tmp_path / "manifest.json"
+        manifest.write_text(json.dumps(MANIFEST), encoding="utf-8")
+        monkeypatch.setattr("ncp.cli._resolve_runtime_store", lambda config: FakeBackendStore())
+        runner = CliRunner()
+        for args in (
+            ["ontology", "seed", str(manifest), "--cwd", str(tmp_path)],
+            ["ontology", "promote", "--pipeline-id", "shop", "--list", "--cwd", str(tmp_path)],
+        ):
+            result = runner.invoke(main, args)
+            assert result.exit_code != 0, args
+            assert "FakeBackendStore" in result.output, args
+            assert "Traceback" not in result.output, args
+            assert isinstance(result.exception, SystemExit), args
+
     def test_seed_command_requires_enabled_ontology(self, tmp_path: Path) -> None:
         root = tmp_path / "plain"
         (root / ".git").mkdir(parents=True)

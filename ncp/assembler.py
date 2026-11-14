@@ -613,7 +613,12 @@ class Assembler:
         sections: list[tuple[str, str]] = [("conscious", self.encoder._encode_conscious(result.conscious))]
 
         if result.chunks:
-            sections.append(("subconscious", self.encoder._encode_subconscious(result.chunks)))
+            subconscious = self.encoder._encode_subconscious(result.chunks)
+            if result.fanin_contradictions:
+                subconscious += "\n" + "\n".join(
+                    f"note:contradicts {a}<->{b}" for a, b in result.fanin_contradictions
+                )
+            sections.append(("subconscious", subconscious))
 
         if result.graph is not None and result.graph.text is not None:
             sections.append(("ontology", result.graph.text))

@@ -33,7 +33,12 @@ from ncp.config import NCPConfig, load_config
 from ncp.context_policy import ContextPolicyError, resolve_context_policy
 from ncp.drift import EmbeddingAdapter, compute_drift
 from ncp.ontology.enrichment import build_enricher
-from ncp.ontology.facade import OntologyFacade, cached_facade, make_tool_handlers as make_ontology_tool_handlers
+from ncp.ontology.facade import (
+    OntologyFacade,
+    cached_facade,
+    make_tool_handlers as make_ontology_tool_handlers,
+    validate_config_backend as validate_ontology_config_backend,
+)
 from ncp.principals import (
     AuthorizationError,
     Principal,
@@ -139,8 +144,8 @@ MCP_TOOLS: list[dict[str, object]] = [
                 "k": {"type": "integer", "description": "Subconscious chunks to retrieve (overrides the pressure-based default)."},
                 "diversity_limit": {"type": "integer", "description": "Max chunks per author (default 2)."},
                 "max_tokens": {"type": "integer", "description": "Estimated token ceiling for the context block. Omit to let the adaptive budget decide (see response budget_tokens)."},
-                "compact": {"type": "boolean", "description": "Compact telemetry; adds context_sha256."},
-                "response_max_tokens": {"type": "integer", "minimum": 1, "description": "Estimated token ceiling for the whole serialized response; diagnostics are dropped first, then context is re-fitted. Not applied to streams."},
+                "compact": {"type": "boolean", "description": "Compact telemetry (default); false requests full diagnostics."},
+                "response_max_tokens": {"type": "integer", "minimum": 1, "description": "Estimated token ceiling for the whole serialized response; diagnostics are dropped first, then context is re-fitted before streaming."},
                 "context_policy": {"type": "string", "description": "Name of a [context_policies.<name>] entry applied to this request only. Unknown or invalid names are rejected."},
                 "recent": {"type": "array", "items": {"type": "string"}},
                 "tried": {"type": "array", "items": {"type": "string"}},
@@ -228,9 +233,10 @@ MCP_TOOLS: list[dict[str, object]] = [
                 "ttl_seconds": {"type": "integer", "description": "Seconds before expiry (default 1800)."},
                 "ref": {"type": "string", "description": "Optional chunk_id referred to; for dissent, the disputed chunk (debits its trust)."},
                 "in_reply_to": {"type": "string", "description": "Optional whisper_id this answers; joins that thread."},
-                "thread_id": {"type": "string", "description": "Optional explicit thread key (unsigned routing metadata)."},
+                "thread_id": {"type": "string", "description": "Optional explicit thread key (bound by signature_version=2)."},
                 "task_id": {"type": "string", "description": "Optional claimed task this progress/result reports on; `from` must own it (needs [tasks].enabled)."},
-                "signature": {"type": "string", "description": "Optional base64 Ed25519 signature over from | sha256(payload) | pipeline_id. Required only if [identity].require_signatures."},
+                "signature": {"type": "string", "description": "Ed25519 signature. v1 covers sender/payload/pipeline; v2 binds routing and delivery (ncp.identity.canonical_whisper_payload)."},
+                "signature_version": {"type": "integer", "enum": [1, 2], "description": "Default 1 (legacy); use 2 to bind routing (requires explicit positive integer ttl_seconds). Required with [identity].require_routing_signatures."},
             },
             "required": ["from", "target", "type", "payload", "confidence"],
         },
@@ -1036,6 +1042,8 @@ def make_handlers(
     config: NCPConfig | None = None,
     notifier: Notifier | None = None,
 ) -> dict[str, ToolHandler]:
+    # Configuration error at construction time, whatever the tool profile.
+    validate_ontology_config_backend(config, store)
     if notifier is None:
         notifier = InProcessNotifier() if config is None else get_process_notifier(config, store=store)
     notify_max_wait = config.notify_max_wait_seconds if config is not None else 60.0
@@ -1348,7 +1356,7 @@ def make_handlers(
         )
 
     def _handle_get_context(args: dict[str, object]) -> object:
-        compact = args.get("compact", False)
+        compact = args.get("compact", config.tool_compact_default if config is not None else False)
         if not isinstance(compact, bool):
             raise ValueError("ncp_get_context 'compact' must be a boolean")
         response_max_tokens: int | None = None
@@ -1436,46 +1444,6 @@ def make_handlers(
             budget_snapshot=budget_snapshot,
             request_config=request_config,
         )
-        if stream:
-            stream_result = assembler.assemble(
-                conscious=conscious,
-                budget=budget,
-                query_text=search_text,
-                k=caller_k,
-                diversity_limit=caller_diversity_limit,
-                max_tokens=effective_max_tokens,
-                as_of=as_of,
-            )
-            sections = assembler.sections_from_result(result=stream_result, budget=budget)
-            handler_result: dict[str, object] = {
-                "context": stream_result.context,
-                "session_id": session_id,
-                "pending_whisper_ids": stream_result.pending_whisper_ids,
-                "retrieved_chunk_ids": _retrieved_chunk_ids(stream_result),
-                "telemetry": _context_telemetry(
-                    stream_result, session_id=session_id, request_config=request_config
-                ),
-            }
-            if policy_block is not None:
-                handler_result["context_policy"] = policy_block
-            if budget_snapshot is not None:
-                handler_result["budget"] = budget_snapshot.to_dict()
-            if tier_hints_enabled:
-                handler_result.update(_tier_signal(stream_result, budget=budget, search_text=search_text).to_dict())
-            if budget_tokens_block is not None:
-                handler_result["budget_tokens"] = budget_tokens_block
-            if drift_block is not None:
-                handler_result["drift"] = drift_block
-            if as_of is not None:
-                handler_result["as_of"] = as_of
-            if enricher is not None:
-                handler_result["ontology"] = stream_result.ontology
-            if compact:
-                _compact_response(handler_result)
-            return StreamResponse(
-                sections=sections,
-                handler_result=handler_result,
-            )
         result = assembler.assemble(
             conscious=conscious,
             budget=budget,
@@ -1508,9 +1476,12 @@ def make_handlers(
             response["ontology"] = result.ontology
         if compact:
             _compact_response(response)
+        fitted_result = result
         if response_max_tokens is not None:
             def _refit(ceiling: int) -> dict[str, object]:
+                nonlocal fitted_result
                 refitted = assembler.refit(result, budget=budget, max_tokens=ceiling, query_text=search_text)
+                fitted_result = refitted
                 refit_fields: dict[str, object] = {
                     "context": refitted.context,
                     "pending_whisper_ids": refitted.pending_whisper_ids,
@@ -1521,6 +1492,15 @@ def make_handlers(
                 return refit_fields
 
             response = fit_response(response, response_max_tokens, reassemble=_refit)
+        if stream:
+            sections = assembler.sections_from_result(result=fitted_result, budget=budget)
+            # post_assemble middleware (applied to the whole context, also by
+            # refit) is not applied per section. When it changed the text, the
+            # per-section view no longer reproduces the final context, so fall
+            # back to one section carrying the final context verbatim.
+            if "\n\n".join(text for _, text in sections) != response["context"]:
+                sections = [("context", str(response["context"]))]
+            return StreamResponse(sections=sections, handler_result=response)
         return response
 
     def _compact_response(response: dict[str, object]) -> None:
@@ -1889,13 +1869,26 @@ def make_handlers(
             whisper_type,  # type: ignore[arg-type]
             args["payload"],
         )
-        try:
-            ttl_seconds = max(1, int(args.get("ttl_seconds", default_whisper_ttl)))
-        except (TypeError, ValueError):
-            ttl_seconds = default_whisper_ttl
+        signature_version = args.get("signature_version", 1)
+        if type(signature_version) is not int or signature_version not in (1, 2):
+            raise ValueError("ncp_emit_whisper signature_version must be 1 or 2")
+        if signature_version == 2:
+            explicit_ttl = args.get("ttl_seconds")
+            if type(explicit_ttl) is not int or explicit_ttl < 1:
+                raise ValueError(
+                    "ncp_emit_whisper signature_version=2 requires an explicit positive integer ttl_seconds"
+                )
+            ttl_seconds = explicit_ttl
+        else:
+            try:
+                ttl_seconds = max(1, int(args.get("ttl_seconds", default_whisper_ttl)))
+            except (TypeError, ValueError):
+                ttl_seconds = default_whisper_ttl
         ref = args.get("ref")
         from_agent = str(args["from"])
         pipeline_id = args.get("pipeline_id")
+        if pipeline_id is not None and not isinstance(pipeline_id, str):
+            raise ValueError("ncp_emit_whisper pipeline_id must be a string")
         signature = args.get("signature")
         in_reply_to = args.get("in_reply_to")
         thread_id = args.get("thread_id")
@@ -1914,25 +1907,39 @@ def make_handlers(
             thread_id=None if thread_id is None else str(thread_id),
             task_id=None if task_id is None else str(task_id),
         )
+        routing_required = config.require_routing_signatures if config is not None else False
+        if routing_required and signature_version != 2:
+            raise ValueError("ncp_emit_whisper rejected: require_routing_signatures requires signature_version=2")
+        # Authenticate the explicit request before deriving its thread from a
+        # queued parent. Signing the derived thread would depend on queue state.
+        if signature_version == 2:
+            from ncp.identity import canonical_whisper_payload
+
+            verifier = getattr(store, "verify_authorship", None)
+            try:
+                verified = bool(signature is not None and callable(verifier) and verifier(
+                    from_agent, canonical_whisper_payload(whisper), str(signature),
+                ))
+            except Exception:
+                verified = False
+        else:
+            verified = _verify_authorship(
+                store, identity_id=from_agent, content=whisper.payload,
+                pipeline_id=None if pipeline_id is None else str(pipeline_id),
+                signature=None if signature is None else str(signature),
+            )
+        if (require_signatures or routing_required) and not verified:
+            raise ValueError(
+                "ncp_emit_whisper rejected: require_signatures or require_routing_signatures "
+                "is enabled and authorship could not be verified "
+                "(missing/invalid signature or revoked identity)."
+            )
         if whisper.task_id is not None and whisper_type in THREAD_REPLY_WHISPER_TYPES:
             task_service.check_task_owner(whisper)
         whisper = resolve_whisper_thread(
             whisper,
             None if whisper.in_reply_to is None else store.get_whisper(whisper.in_reply_to),
         )
-        # Signatures cover the exact normalized payload value that is stored.
-        verified = _verify_authorship(
-            store,
-            identity_id=from_agent,
-            content=whisper.payload,
-            pipeline_id=None if pipeline_id is None else str(pipeline_id),
-            signature=None if signature is None else str(signature),
-        )
-        if require_signatures and not verified:
-            raise ValueError(
-                "ncp_emit_whisper rejected: require_signatures is enabled and authorship "
-                "could not be verified (missing/invalid signature or revoked identity)."
-            )
         whisper.verified = verified
         emit_and_notify(store, notifier, whisper)
         result: dict[str, object] = {
@@ -1944,6 +1951,9 @@ def make_handlers(
             result["thread_id"] = whisper.thread_id
         if signature is not None:
             result["verified"] = verified
+            if "signature_version" in args:
+                result["signature_version"] = signature_version
+                result["routing_verified"] = verified and signature_version == 2
         if whisper_type == "dissent" and ref:
             # CAP-T5: identity_id enables per-identity dedup + reputation
             # gating in the store (see BaseStore.record_dissent).
