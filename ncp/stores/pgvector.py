@@ -5,7 +5,6 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import replace as dataclass_replace
-import atexit
 import hashlib
 import json
 import logging
@@ -14,6 +13,7 @@ import struct
 from pathlib import Path
 from typing import Any
 import time
+import weakref
 from uuid import uuid4
 
 from ncp.config import NCPConfig
@@ -417,6 +417,13 @@ def _validate_identifier(value: str, *, field: str) -> str:
     return cleaned
 
 
+def _close_pool(pool: Any) -> None:
+    try:
+        pool.close()
+    except Exception:
+        pass
+
+
 class PgvectorStore(BaseStore):
     """Postgres/pgvector-backed durable store for the 0.2.0 rollout."""
 
@@ -449,14 +456,20 @@ class PgvectorStore(BaseStore):
         else:
             try:
                 from psycopg_pool import ConnectionPool as _ConnectionPool  # type: ignore[import]
-                self._pool = _ConnectionPool(
+                pool = _ConnectionPool(
                     conninfo=dsn,
                     min_size=min_pool_connections,
                     max_size=max_pool_connections,
                     open=True,
                 )
-                self._connect_factory = lambda _dsn: self._pool.getconn()
-                atexit.register(self.close)
+                self._pool = pool
+                # Bind the pool, not ``self``: a closure over ``self`` makes a
+                # reference cycle and keeps the pool alive until a cyclic GC.
+                self._connect_factory = lambda _dsn: pool.getconn()
+                # Close the pool when the store is collected or at interpreter
+                # exit. ``atexit.register(self.close)`` pinned every store (and
+                # its connections) for the life of the process.
+                self._pool_finalizer = weakref.finalize(self, _close_pool, pool)
             except ImportError:  # pragma: no cover - psycopg_pool not installed
                 self._pool = None
                 self._connect_factory = _default_pgvector_connect
@@ -547,10 +560,11 @@ class PgvectorStore(BaseStore):
     def close(self) -> None:
         """Close all pooled connections. Call when the store is no longer needed."""
         if self._pool is not None:
-            try:
-                self._pool.close()
-            except Exception:
-                pass
+            finalizer = getattr(self, "_pool_finalizer", None)
+            if finalizer is not None:
+                finalizer()  # runs _close_pool once and detaches
+            else:
+                _close_pool(self._pool)
             self._pool = None
 
     def _connect_with_retry(self, *, attempts: int = 2, delay_seconds: float = 0.1) -> Any:
