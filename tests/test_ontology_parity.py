@@ -1400,13 +1400,13 @@ def test_pg_async_wrapper_matches_sync(postgres_backend: PostgresBackend) -> Non
         from_async.close()
 
 
-def test_async_pgvector_store_keeps_facade_disabled() -> None:
+def test_async_pgvector_store_rejects_sync_facade_configuration() -> None:
     pytest.importorskip("psycopg_pool")  # AsyncPgvectorStore needs the [pgvector] extra
     from ncp.stores.pgvector_async import AsyncPgvectorStore
 
     store = AsyncPgvectorStore("postgresql://unused.invalid/ncp")  # never connects
-    facade = OntologyFacade.from_config(ENABLED, store)
-    assert not facade.enabled and "AsyncPgvectorStore" in (facade.disabled_reason or "")
+    with pytest.raises(ValueError, match="AsyncPgvectorStore.*AsyncPostgresOntologyStore"):
+        OntologyFacade.from_config(ENABLED, store)
 
 
 @requires_pg

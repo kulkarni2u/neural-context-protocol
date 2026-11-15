@@ -164,8 +164,8 @@ class TestMcpGetContext:
         config = _config(tmp_path)
         handlers = make_handlers(store, config=config)
 
-        baseline = _get_context(handlers)
-        result = _get_context(handlers, context_policy="lean-v2")
+        baseline = _get_context(handlers, compact=False)
+        result = _get_context(handlers, context_policy="lean-v2", compact=False)
 
         assert "budget_tokens" not in baseline
         assert baseline["telemetry"]["active_features"]["adaptive_budget_enabled"] is False

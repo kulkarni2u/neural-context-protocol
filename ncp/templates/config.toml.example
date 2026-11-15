@@ -112,6 +112,9 @@ confidence_k = 20
 # lifecycle; "full" adds ncp_overview/remember/recall/improve/task and memo
 # tools (subject to their own flags).
 # profile = "standard"
+# Compact model-facing diagnostics by default; false restores full telemetry.
+# Each ncp_get_context call may override this with compact = false.
+# compact_default = true
 
 [embedding]
 # CAP-C4: local semantic embeddings for SQLite/pgvector hybrid lexical+vector
@@ -173,6 +176,7 @@ model = "BAAI/bge-small-en-v1.5"
 # and recorded but never required. Set to true to REJECT any write/emit whose
 # authorship cannot be verified (missing/bad signature or revoked identity).
 # require_signatures = false
+# require_routing_signatures = false  # Require v2 signatures for MCP whispers.
 
 # [tiering]
 # CAP-E3: advisory model-tiering signal (tier_hint/complexity_signal/factors)

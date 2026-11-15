@@ -175,8 +175,15 @@ def build_enricher(
     )
     if mode == "off":
         return None
+    from ncp.ontology.facade import cached_facade, validate_ontology_backend
+
+    validate_ontology_backend(store)
+    if ontology.provider != "builtin":
+        raise ValueError(
+            f"[ontology].provider {ontology.provider!r} is not available; "
+            "expected 'builtin' or 'disabled'"
+        )
     if facade_provider is None:
-        from ncp.ontology.facade import cached_facade
 
         def facade_provider() -> OntologyFacade:
             return cached_facade(ontology, store)

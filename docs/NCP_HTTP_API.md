@@ -382,8 +382,22 @@ the required JSON shape server-side. Dissent remains non-broadcast: a
 Structured-v1 values are stored as sorted, compact JSON. A successful response
 includes `whisper_id` and `payload_format` (`"legacy"` or `"structured-v1"`),
 plus `thread_id` when the whisper is threaded. If `signature` is provided, the
-response also includes `verified`; signatures cover the exact normalized
-payload that is stored, rather than the input object's key order.
+response also includes `verified` (authorship only for legacy version 1).
+`signature_version: 2` uses `ncp.identity.canonical_whisper_payload(Whisper(...))`
+to sign a domain-separated JSON envelope covering sender, target, type, normalized
+payload hash, pipeline, ref, explicit parent/thread/task, confidence and TTL.
+Construct the `Whisper` with exactly the explicit request fields, **before**
+server thread resolution; then sign those bytes with `ncp.identity.sign`.
+`signature_version: 2` requires an explicit positive integer `ttl_seconds`; the
+server does not apply `[whispers].default_ttl_seconds` to signed v2 requests, so
+the signed value is always the one sent. `signature_version` and
+`routing_verified` are reported only when a `signature` is supplied; with an
+explicit `signature_version`, the result includes both. Enable `[identity] require_routing_signatures = true` to
+reject unsigned, invalid and legacy-version whisper signatures. This setting
+implies signature enforcement for whispers independently of `require_signatures`.
+Absent `signature_version` remains version 1 for compatibility; its `verified`
+flag does not authenticate routing. Version 2 prevents field tampering, not
+replay of an identical message; hosts must deduplicate when replay matters.
 
 **Request/reply threads.** A `share`/`request` opens a thread keyed by its own
 `whisper_id`; the receiver sees it as `id:<whisper_id>` in its
@@ -407,7 +421,7 @@ otherwise uses `thread_id = in_reply_to`, so replying after acknowledging the
 request is fine. A newer `progress` on the same thread from the same sender
 replaces the older undelivered one. `result` is delivered regardless of
 `min_confidence` and ordered right after `alert`. `in_reply_to`/`thread_id`
-are unsigned routing metadata.
+are unsigned with legacy version 1, and bound with version 2.
 
 **Task-linked reports.** `progress`/`result` may instead carry `task_id` (see
 `ncp_task` below). The server then requires `[tasks].enabled = true`, `from`
@@ -819,8 +833,9 @@ both and requires identical transcripts).
   `DELETE` and `TRUNCATE`). Chunk evidence is checked against
   `{schema}.{table_prefix}chunks` and fails closed if that table is absent.
 - **Async hosts**: NCP's async runtime (`AsyncPgvectorStore`) covers only the
-  post-turn write path and never assembles context, so the facade stays
-  disabled for it. In-process async code can use
+  post-turn write path and never assembles context. Enabling ontology with
+  it in the synchronous facade/context API is a configuration error, even
+  with `fail_mode = "fallback"`. In-process async code can use
   `ncp.ontology.stores.AsyncPostgresOntologyStore`, a thin wrapper that runs
   the PostgreSQL store in worker threads (`asyncio.to_thread`) with identical
   results.
@@ -833,7 +848,9 @@ per section (`conscious`, `subconscious`, `ontology` when enriched, `whispers`,
 `budget_header`),
 terminated by the standard JSON-RPC result line. All sections derive from a
 single assembly pass, so the concatenated stream matches the non-streaming
-`context` exactly.
+`context` exactly. If `post_assemble` middleware rewrote the context (so the
+per-section text would no longer reproduce it), the stream falls back to a
+single section labelled `context` whose text is the final context.
 
 ## Content negotiation (SSE responses)
 
@@ -896,10 +913,16 @@ server does not validate arguments against `inputSchema`; handlers validate
   is set (then capped at `[budget].max_tokens_per_call`); when omitted and
   `[budget].adaptive_budget_enabled`, it is computed per turn (see
   `budget_tokens`; by default it never exceeds `context_token_budget`, see
-  `adaptive_allow_expand`). `compact` returns non-zero counts, flags and
+  `adaptive_allow_expand`). With a configured server, compact diagnostics are
+  the default (`[tools].compact_default = true`); pass `compact: false` for full
+  diagnostics, or set that configuration value to false to restore the previous
+  default. In-process `make_handlers(config=None)` retains its legacy full response.
+  `compact` returns non-zero counts, flags and
   contradicting ids only, omits tier-hint factors and adds `context_sha256`.
   `response_max_tokens` bounds the whole response: optional diagnostics drop
-  first, then context is re-fitted; `retrieved_chunk_ids`,
+  first, then context is re-fitted before any stream sections are emitted.
+  The cap measures the final serialized tool response (transport framing and
+  repeated context in stream frames are excluded); `retrieved_chunk_ids`,
   `pending_whisper_ids`, `session_id` and the policy identity are always kept
   and a `truncated` block is added. `drift_score` is ignored (and reported as
   `self_reported`) when `[drift].drift_computed_enabled`. `as_of` assembles
@@ -933,8 +956,8 @@ server does not validate arguments against `inputSchema`; handlers validate
   disputed chunk: it debits that chunk's trust and propagates along its
   `caused_by` edge in feedback calibration. `thread_id` defaults to the
   parent's thread for a reply, else the whisper's own id for share/request;
-  signatures cover only the payload. `signature` covers
-  `from | sha256(payload) | pipeline_id`.
+  legacy version-1 `signature` covers `from | sha256(payload) | pipeline_id`;
+  version 2 additionally authenticates routing and delivery (see above).
 - **`ncp_wait_whispers`**: peeks only; never drains, acknowledges or returns
   payloads.
 - **`ncp_task`**: `create` makes an open task (optional `assign_to` emits a

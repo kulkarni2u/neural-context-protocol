@@ -4,6 +4,63 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [Unreleased]
 
+## [1.9.4] - 2026-11-15
+
+### Release scope
+
+Security and reliability fixes on top of 1.9.3: routing-bound whisper
+signatures, response budgets enforced on streamed context, explicit
+configuration errors for unsupported ontology backends, and a PostgreSQL
+connection leak fix.
+
+### Upgrade notes
+
+- **Configured MCP servers now return compact telemetry by default.** Clients
+  that read full diagnostics (for example `telemetry.active_features`) must pass
+  `compact: false` or set `[tools].compact_default = false`.
+- **Enabled ontology on an unsupported backend is now a startup error** for
+  `ncp serve` (every tool profile) and `ncp.api.get_context`, instead of a
+  silently disabled facade. Set `[ontology] enabled = false` on such backends.
+- **Version-2 whisper signatures require an explicit `ttl_seconds`.** Legacy
+  (version 1) signatures are unchanged and remain the default.
+
+### Security and reliability
+
+- Add version-2 whisper signatures binding sender, target, type, normalized
+  payload, pipeline, reference, parent/thread/task, confidence and TTL. Sign with
+  `ncp.identity.canonical_whisper_payload` and send `signature_version: 2` with
+  an explicit positive integer `ttl_seconds` (v2 never uses the configured default).
+  Enable `[identity].require_routing_signatures = true` after migrating clients
+  to reject legacy/unsigned whisper submissions. Legacy signatures remain
+  accepted by default and authenticate payload authorship only.
+- Apply `ncp_get_context.response_max_tokens` before emitting stream sections,
+  using the same context refit, evidence attribution and diagnostic trimming as
+  buffered responses. The cap covers the final response object, not transport
+  framing or the repeated context in section notifications.
+- Reject enabled ontology on unsupported synchronous host backends explicitly,
+  with guidance to the existing async ontology adapter. The check runs at
+  server (`make_handlers`, any tool profile) and `ncp.api.get_context`
+  construction, so it applies regardless of `fail_mode` and per-request
+  `ontology` mode (including `off`). Disabled ontology and transient backend
+  fallback behavior are unchanged.
+- `ncp_emit_whisper` rejects a non-string `pipeline_id` with a clear error
+  instead of a validation failure. Streamed `ncp_get_context` responses fall
+  back to a single `context` section when `post_assemble` middleware rewrote
+  the context, so the joined sections always equal the final `context`.
+- Make configured MCP servers return compact telemetry by default. Request
+  `compact: false` for full diagnostics, or set `[tools].compact_default = false`
+  to restore the previous default. Evidence IDs remain available.
+- `PgvectorStore` no longer pins every instance through `atexit`. Its
+  connection pool is closed on `close()`, garbage collection or interpreter
+  exit, so long-lived processes that create stores no longer leak PostgreSQL
+  connections until `too many clients`. Inherited ontology stores keep their
+  parent store alive so a shared pool is never closed underneath them.
+- `ncp ontology seed`, `promote` and `demote` report an unsupported ontology
+  backend as a clean CLI error instead of a traceback.
+- Require the import and PostgreSQL/Redis jobs as well as every Python matrix
+  job for the stable CI `test` check. Include ontology parity in the database
+  integration job and support merge queues and manual workflow dispatch.
+
 ## [1.9.3] - 2026-11-11
 
 ### Release scope
