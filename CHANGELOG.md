@@ -4,6 +4,26 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [Unreleased]
 
+## [1.9.4] - 2026-11-15
+
+### Release scope
+
+Security and reliability fixes on top of 1.9.3: routing-bound whisper
+signatures, response budgets enforced on streamed context, explicit
+configuration errors for unsupported ontology backends, and a PostgreSQL
+connection leak fix.
+
+### Upgrade notes
+
+- **Configured MCP servers now return compact telemetry by default.** Clients
+  that read full diagnostics (for example `telemetry.active_features`) must pass
+  `compact: false` or set `[tools].compact_default = false`.
+- **Enabled ontology on an unsupported backend is now a startup error** for
+  `ncp serve` (every tool profile) and `ncp.api.get_context`, instead of a
+  silently disabled facade. Set `[ontology] enabled = false` on such backends.
+- **Version-2 whisper signatures require an explicit `ttl_seconds`.** Legacy
+  (version 1) signatures are unchanged and remain the default.
+
 ### Security and reliability
 
 - Add version-2 whisper signatures binding sender, target, type, normalized
@@ -30,6 +50,13 @@ All notable changes to Neural Context Protocol will be documented in this file.
 - Make configured MCP servers return compact telemetry by default. Request
   `compact: false` for full diagnostics, or set `[tools].compact_default = false`
   to restore the previous default. Evidence IDs remain available.
+- `PgvectorStore` no longer pins every instance through `atexit`. Its
+  connection pool is closed on `close()`, garbage collection or interpreter
+  exit, so long-lived processes that create stores no longer leak PostgreSQL
+  connections until `too many clients`. Inherited ontology stores keep their
+  parent store alive so a shared pool is never closed underneath them.
+- `ncp ontology seed`, `promote` and `demote` report an unsupported ontology
+  backend as a clean CLI error instead of a traceback.
 - Require the import and PostgreSQL/Redis jobs as well as every Python matrix
   job for the stable CI `test` check. Include ontology parity in the database
   integration job and support merge queues and manual workflow dispatch.
