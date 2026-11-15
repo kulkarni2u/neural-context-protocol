@@ -2651,6 +2651,7 @@ class TestComputedDrift:
         result = _content(_handle_request(
             _call("ncp_get_context", self._args(
                 pipeline_id="pipe_drift_wired",
+                compact=False,
                 task="astronomy",
                 slot="telescope",
                 drift_score=0.0,
@@ -3133,6 +3134,7 @@ class TestActiveFeaturesTelemetry:
                 "slot": "reviewing",
                 "intent": "find_relevant_facts",
                 "pipeline_id": "pipe_features_with_config",
+                "compact": False,
             }),
             handlers,
         ))
@@ -3235,6 +3237,7 @@ class TestRetrievalFallbackTelemetry:
                 "slot": "investigating",
                 "intent": "find_info",
                 "pipeline_id": "pipe_disabled",
+                "compact": False,
             }),
             handlers,
         ))

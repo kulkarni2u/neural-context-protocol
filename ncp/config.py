@@ -202,6 +202,7 @@ DEFAULT_CONFIG = {
     },
     "tools": {
         "profile": "standard",
+        "compact_default": True,
     },
     "decisions": {
         # Typed decision contract (spec 4h). `enabled` gates the typed path:
@@ -253,6 +254,8 @@ DEFAULT_CONFIG = {
         # authorship cannot be verified (missing/bad signature or revoked identity)
         # is rejected.
         "require_signatures": False,
+        # Require version-2 whisper signatures that bind routing and delivery.
+        "require_routing_signatures": False,
         # CAP-T2: OPT-IN grounded claims. When false (default) a chunk's
         # base_trust is derived purely from the self-declared `src` string (or
         # a caller-supplied base_trust), exactly as before. When true, a write
@@ -788,8 +791,24 @@ class NCPConfig:
         return profile if profile in {"core", "standard", "full"} else "standard"
 
     @property
+    def tool_compact_default(self) -> bool:
+        """Default model-facing diagnostics; callers may request full detail."""
+        value = self.values.get("tools", {}).get("compact_default", True)
+        if not isinstance(value, bool):
+            raise ValueError("[tools].compact_default must be a boolean")
+        return value
+
+    @property
     def require_signatures(self) -> bool:
         return bool(self.values.get("identity", {}).get("require_signatures", False))
+
+    @property
+    def require_routing_signatures(self) -> bool:
+        """Require valid v2 signatures for all MCP whisper emissions."""
+        value = self.values.get("identity", {}).get("require_routing_signatures", False)
+        if not isinstance(value, bool):
+            raise ValueError("[identity].require_routing_signatures must be a boolean")
+        return value
 
     @property
     def require_grounded_high_trust(self) -> bool:

@@ -9,8 +9,10 @@ from pathlib import Path
 
 import pytest
 
+from ncp.config import load_config
 from ncp.mcp.response_budget import compact_telemetry, fit_response, response_tokens
-from ncp.mcp.server import _handle_request, make_handlers
+from ncp.middleware.base import Middleware
+from ncp.mcp.server import StreamResponse, _handle_request, make_handlers
 from ncp.stores.sqlite import SQLiteStore
 from ncp.types import SubconsciousChunk
 
@@ -180,3 +182,121 @@ def test_invalid_arguments_rejected(tmp_path: Path, bad: dict) -> None:
     request = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                "params": {"name": "ncp_get_context", "arguments": args}}
     assert "error" in json.loads(_handle_request(request, make_handlers(_store(tmp_path))))
+
+
+@pytest.mark.parametrize("compact", [False, True])
+def test_stream_budget_refits_before_emitting_sections(tmp_path: Path, compact: bool) -> None:
+    full_store = _store(tmp_path / "full_stream")
+    full = _get_context(make_handlers(full_store), compact=compact)
+    budget = response_tokens(full) * 3 // 4 if compact else response_tokens(full) // 2
+    store = _store(tmp_path / "fit_stream")
+    handler = make_handlers(store)["ncp_get_context"]
+    result = handler({
+        "agent_id": "executor", "role": "build", "owns": [], "must_not": [],
+        "task": "payment_retry", "slot": "budget", "intent": "fit", "pipeline_id": PIPELINE,
+        "max_tokens": 2000, "response_max_tokens": budget, "stream": True, "compact": compact,
+    })
+    assert isinstance(result, StreamResponse)
+    response = result.handler_result
+    assert response["truncated"]["fits"] is True
+    assert response_tokens(response) <= budget
+    assert "context_max_tokens" in response["truncated"]
+    assert "\n\n".join(text for _, text in result.sections) == response["context"]
+    assert 0 < len(response["retrieved_chunk_ids"]) < len(full["retrieved_chunk_ids"])
+    in_context = [cid for cid in full["retrieved_chunk_ids"]
+                  if f"marker{cid[-1]} " in response["context"]]
+    assert sorted(in_context) == sorted(response["retrieved_chunk_ids"])
+    assert _retrieval_counts(store) == _retrieval_counts(full_store)
+    if compact:
+        assert response["context_sha256"] == hashlib.sha256(response["context"].encode()).hexdigest()
+
+
+def test_stream_impossible_budget_reports_failure_without_losing_required_fields(tmp_path: Path) -> None:
+    result = make_handlers(_store(tmp_path))["ncp_get_context"]({
+        "agent_id": "executor", "role": "build", "task": "payment_retry", "slot": "budget",
+        "intent": "fit", "pipeline_id": PIPELINE, "stream": True, "response_max_tokens": 1,
+    })
+    assert isinstance(result, StreamResponse)
+    assert result.handler_result["truncated"]["fits"] is False
+    assert all(key in result.handler_result for key in REQUIRED)
+    assert "\n\n".join(text for _, text in result.sections) == result.handler_result["context"]
+
+
+def test_configured_compact_default_preserves_context_and_evidence(tmp_path: Path) -> None:
+    config = load_config(cwd=tmp_path)
+    handlers = make_handlers(_store(tmp_path), config=config)
+    compact = _get_context(handlers)
+    full = _get_context(handlers, compact=False)
+    assert compact["context"] == full["context"]
+    assert all(compact[key] == full[key] for key in REQUIRED)
+    assert response_tokens(compact) < response_tokens(full)
+    assert "active_features" not in compact["telemetry"]
+    assert "active_features" in full["telemetry"]
+    assert compact["context_sha256"] == hashlib.sha256(compact["context"].encode()).hexdigest()
+    config.values.setdefault("tools", {})["compact_default"] = False
+    configured_full = _get_context(make_handlers(_store(tmp_path / "full_default"), config=config))
+    assert "context_sha256" not in configured_full
+    assert "active_features" in configured_full["telemetry"]
+
+
+# ── stream sections vs post_assemble middleware ─────────────────────────────
+
+
+class _Rewrite(Middleware):
+    def post_assemble(self, context: str) -> str | None:
+        return context.replace("marker", "MARK") + "\n[footer]"
+
+
+class _NoOp(Middleware):
+    def post_assemble(self, context: str) -> str | None:
+        return None
+
+
+def _stream_with_middleware(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mw: object,
+                            **extra: object) -> StreamResponse:
+    import ncp.mcp.server as server_module
+    from ncp.middleware.base import MiddlewarePipeline
+
+    base = server_module.Assembler
+
+    class _WithMiddleware(base):  # type: ignore[valid-type, misc]
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__(*args, middleware=MiddlewarePipeline([mw]), **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(server_module, "Assembler", _WithMiddleware)
+    result = make_handlers(_store(tmp_path))["ncp_get_context"]({
+        "agent_id": "executor", "role": "build", "owns": [], "must_not": [],
+        "task": "payment_retry", "slot": "budget", "intent": "fit", "pipeline_id": PIPELINE,
+        "max_tokens": 2000, "stream": True, **extra,
+    })
+    assert isinstance(result, StreamResponse)
+    return result
+
+
+@pytest.mark.parametrize("fit", [False, True])
+def test_stream_with_rewriting_middleware_joins_to_final_context(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, fit: bool,
+) -> None:
+    extra: dict[str, object] = {}
+    if fit:
+        full = _get_context(make_handlers(_store(tmp_path / "full")))
+        extra["response_max_tokens"] = response_tokens(full) // 2
+    result = _stream_with_middleware(monkeypatch, tmp_path / "mw", _Rewrite(), **extra)
+    context = result.handler_result["context"]
+    assert context.endswith("[footer]") and "MARK" in context
+    assert "\n\n".join(text for _, text in result.sections) == context
+    assert [label for label, _ in result.sections] == ["context"]
+
+
+@pytest.mark.parametrize("fit", [False, True])
+def test_stream_with_noop_middleware_keeps_per_section_output(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, fit: bool,
+) -> None:
+    extra: dict[str, object] = {}
+    if fit:
+        full = _get_context(make_handlers(_store(tmp_path / "full")))
+        extra["response_max_tokens"] = response_tokens(full) // 2
+    result = _stream_with_middleware(monkeypatch, tmp_path / "mw", _NoOp(), **extra)
+    assert "\n\n".join(text for _, text in result.sections) == result.handler_result["context"]
+    labels = [label for label, _ in result.sections]
+    assert labels[0] == "conscious" and labels[-1] == "budget_header"
