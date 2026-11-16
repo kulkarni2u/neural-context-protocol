@@ -288,7 +288,12 @@ A messaging site in module M is attributed to: (1) the service of M; else
 edge each with relation attribute `via_module = <M>` (deduplicated by
 relation, first evidence kept); else (3) the `Module` (schema 2+; schema 1
 skips the site). The counts are in `summary["attribution"]`
-(`edges_from_service`, `edges_via_dependency`, `edges_from_module`).
+(`edges_from_service`, `edges_via_dependency`, `edges_from_module`); these
+count **edges**, not services. `summary["services"]` is the number of distinct
+`Service` entities in the final manifest (the same number as the text summary
+and the manifest), and `summary["services_with_edges"]` is how many of them
+have at least one messaging edge (printed as `N of M services have a
+messaging edge`).
 
 Node: a `package.json` without `name` still forms a module (named after its
 directory, the repo name at the root; a nameless workspace root that only
@@ -365,7 +370,9 @@ text, `attributes.spel`, and `attributes.bean` for bean lookups.
 `summary["messaging"]` has one entry per broker that had a site (`kafka`,
 `sqs`, `sns`, `rabbitmq`, `jms`): `sites`, `producer_sites`,
 `consumer_sites`, `matched_sites`, `unmatched_sites`, `unresolved`,
-`skipped_no_owner` (sites), `skipped_schema` and up to 5
+`unresolved_unique_keys` (distinct unresolved destination keys, so
+`unresolved: 14 sites -> 5 unique keys` is `unresolved` and
+`unresolved_unique_keys`), `skipped_no_owner` (sites), `skipped_schema` and up to 5
 `unmatched_examples`. `summary["attribution"]` and `summary["destinations"]`
 (`KafkaTopic` / `Queue` / `Exchange` counts) complete it, and the warnings
 below apply to every broker. `summary["kafka"]` (described next) is kept for
@@ -379,7 +386,8 @@ prints the whole summary as JSON, with the manifest under `manifest` unless
 that looks like a client call, e.g. `subscribe`), `matched_sites` (sites that
 yielded at least one resolved topic; `resolved_via_property` /
 `resolved_via_constant` break these down), `unresolved_placeholders` (number
-of `unresolved:*` topic elements emitted; a matched site can contribute, e.g.
+of `unresolved:*` topic elements emitted, with `unresolved_unique_keys` the
+distinct keys they collapse into; a matched site can contribute, e.g.
 `topics = {Topics.A, "${missing}"}`), `unmatched_sites` (sites that yielded
 nothing at all), `skipped_no_owner` (files with Kafka usage that no module,
 or with `--schema-version 1` no service, owns, so they are not attributed;

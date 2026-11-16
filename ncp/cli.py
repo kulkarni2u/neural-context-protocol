@@ -3689,9 +3689,12 @@ def ontology_scan_command(
             ("matched", "matched_sites"), ("  via property", "resolved_via_property"),
             ("  via constant", "resolved_via_constant"),
             ("unresolved placeholders", "unresolved_placeholders"),
+            ("unresolved collapse", None),
             ("unmatched", "unmatched_sites"), ("skipped (no owner)", "skipped_no_owner"),
         ):
-            table.add_row(label, str(kafka[key]))  # type: ignore[index]
+            table.add_row(label, _unresolved_collapse(kafka["unresolved_placeholders"],  # type: ignore[index]
+                                                      kafka["unresolved_unique_keys"])  # type: ignore[index]
+                          if key is None else str(kafka[key]))  # type: ignore[index]
         report_console.print(table)
         for example in kafka["unmatched_examples"]:  # type: ignore[index]
             report_console.print(f"  unmatched: {example}", markup=False, highlight=False)
@@ -3709,16 +3712,23 @@ def ontology_scan_command(
                 str(item["skipped_schema"]))
         report_console.print(table)
         for name, item in sorted(others.items()):
+            if item["unresolved"]:
+                report_console.print(
+                    f"  unresolved ({name}): "
+                    f"{_unresolved_collapse(item['unresolved'], item['unresolved_unique_keys'])}",
+                    markup=False, highlight=False)
             for example in item["unmatched_examples"]:
                 report_console.print(f"  unmatched ({name}): {example}", markup=False,
                                      highlight=False)
     attribution = summary.get("attribution") or {}
     if any(attribution.values()):  # type: ignore[union-attr]
         report_console.print(
-            "edges from: "
-            f"{attribution['edges_from_service']} service(s), "  # type: ignore[index]
+            "edges: "
+            f"{attribution['edges_from_service']} from services, "  # type: ignore[index]
             f"{attribution['edges_via_dependency']} via dependency, "  # type: ignore[index]
-            f"{attribution['edges_from_module']} module(s)", markup=False, highlight=False)  # type: ignore[index]
+            f"{attribution['edges_from_module']} from modules; "  # type: ignore[index]
+            f"{summary['services_with_edges']} of {summary['services']} services have "
+            "a messaging edge", markup=False, highlight=False)
     if summary["schema_version"] >= 2:  # type: ignore[operator]
         click.echo(
             f"note: schema v{summary['schema_version']} (Repo/Module/Queue/Exchange) — the manifest pins "
@@ -3728,6 +3738,11 @@ def ontology_scan_command(
         )
     for warning in summary["warnings"]:  # type: ignore[union-attr]
         click.echo(f"warning: {warning}", err=True)
+
+
+def _unresolved_collapse(sites: object, keys: object) -> str:
+    """``14 sites -> 5 unique keys``: unresolved sites vs distinct unresolved destination keys."""
+    return f"{sites} sites -> {keys} unique keys"
 
 
 @ontology_group.command("wiki")

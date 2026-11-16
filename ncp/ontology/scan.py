@@ -1684,6 +1684,7 @@ class _Stats:
     via_property: int = 0
     via_constant: int = 0
     skipped_files: int = 0
+    unresolved_keys: set[str] = field(default_factory=set)
     examples: list[str] = field(default_factory=list)
 
     def public(self) -> dict[str, object]:
@@ -1691,6 +1692,7 @@ class _Stats:
             "sites": self.sites, "producer_sites": self.producer_sites,
             "consumer_sites": self.consumer_sites, "matched_sites": self.matched_sites,
             "unmatched_sites": self.unmatched_sites, "unresolved": self.unresolved,
+            "unresolved_unique_keys": len(self.unresolved_keys),
             "skipped_no_owner": self.skipped_no_owner, "skipped_schema": self.skipped_schema,
             "unmatched_examples": self.examples[:5],
         }
@@ -1964,6 +1966,7 @@ def scan_repository(
     stats: dict[str, _Stats] = {}
     attribution = {"edges_from_service": 0, "edges_via_dependency": 0, "edges_from_module": 0}
     files_examined = 0
+    services_with_edges: set[str] = set()
     if heuristics != "off":
         props = _PropIndex()
         consts = _ConstIndex()
@@ -2057,6 +2060,8 @@ def scan_repository(
                 if hit.entity != "KafkaTopic" and schema_version < 3:
                     continue
                 dest_ref = _destination_ref(hit, entity, kafka_cluster)
+                if hit.unresolved or _msg.is_unresolved_key(hit.topic):
+                    stats.setdefault(hit.broker, _Stats()).unresolved_keys.add(dest_ref)
                 if hit.direction == "ROUTES_TO" and hit.partner is not None:
                     relate(dest_ref, "ROUTES_TO", _destination_ref(hit.partner, entity, kafka_cluster),
                            (rel, hit.line), heuristic=True)
@@ -2068,6 +2073,8 @@ def scan_repository(
                         attribution[{"service": "edges_from_service",
                                      "dependency": "edges_via_dependency",
                                      "module": "edges_from_module"}[kind]] += 1
+                        if kind != "module":
+                            services_with_edges.add(src)
 
     raw = {
         "pipeline": pipeline, "source": source or _slug(repo), "schema_version": schema_version,
@@ -2097,6 +2104,10 @@ def scan_repository(
         statuses[relation.status] = statuses.get(relation.status, 0) + 1
     destinations = {name: sum(1 for item in manifest.entities if item.type == name)
                     for name in ("KafkaTopic", "Queue", "Exchange")}
+    # One definition of "services": distinct Service entities in the final manifest (several
+    # modules can share a service name, and hand-written manifests can add or replace some).
+    services = sum(1 for item in manifest.entities if item.type == "Service")
+    service_keys = {f"Service:{item.key}" for item in manifest.entities if item.type == "Service"}
     kafka_stats = stats.get("kafka", _Stats())
     kafka: dict[str, object] = {
         "files_examined": files_examined, "kafka_like_sites": kafka_stats.sites,
@@ -2104,6 +2115,7 @@ def scan_repository(
         "resolved_via_property": kafka_stats.via_property,
         "resolved_via_constant": kafka_stats.via_constant,
         "unresolved_placeholders": kafka_stats.unresolved,
+        "unresolved_unique_keys": len(kafka_stats.unresolved_keys),
         "unmatched_sites": kafka_stats.unmatched_sites,
         "skipped_no_owner": kafka_stats.skipped_files,
         "unmatched_examples": kafka_stats.examples[:5],
@@ -2113,7 +2125,8 @@ def scan_repository(
     messaging = {broker: item.public() for broker, item in sorted(stats.items()) if item.sites}
     summary = {
         "root": str(base), "files": len(files), "modules": len(modules),
-        "services": len(service_ref), "teams": teams,
+        "services": services, "services_with_edges": len(services_with_edges & service_keys),
+        "teams": teams,
         "topics": destinations["KafkaTopic"],
         "entities": len(manifest.entities), "relations": by_type, "statuses": statuses,
         "codeowners": codeowners_file, "hand_manifests": hand, "warnings": warnings,

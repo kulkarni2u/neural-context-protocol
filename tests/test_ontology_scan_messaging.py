@@ -865,7 +865,8 @@ def test_summary_shape(tmp_path: Path) -> None:
     amqp = summary["messaging"]["rabbitmq"]
     assert set(amqp) == {
         "sites", "producer_sites", "consumer_sites", "matched_sites", "unmatched_sites",
-        "unresolved", "skipped_no_owner", "skipped_schema", "unmatched_examples"}
+        "unresolved", "unresolved_unique_keys", "skipped_no_owner", "skipped_schema",
+        "unmatched_examples"}
     assert (amqp["sites"], amqp["producer_sites"], amqp["consumer_sites"]) == (3, 2, 1)
     assert (amqp["matched_sites"], amqp["unresolved"], amqp["unmatched_sites"]) == (1, 1, 1)
     assert amqp["unmatched_examples"] == ["svc/a.ts:6: ch.consume(build(), f)"]
@@ -896,7 +897,8 @@ def test_cli_prints_messaging_coverage_and_attribution(tmp_path: Path) -> None:
     result = CliRunner().invoke(main, ["ontology", "scan", str(root), "-o", str(tmp_path / "m.json")])
     assert result.exit_code == 0, result.output
     assert "Messaging coverage" in result.output and "jms" in result.output
-    assert "edges from:" in result.output and "via dependency" in result.output
+    assert "edges:" in result.output and "via dependency" in result.output
+    assert "services have a messaging edge" in " ".join(result.output.split())
     assert "schema_version = 3" in result.output
     as_json = CliRunner().invoke(main, ["ontology", "scan", str(root), "--json"])
     payload = json.loads(as_json.output)
@@ -1097,3 +1099,42 @@ def test_scan_defaults_to_one_shared_schema_version(tmp_path: Path, monkeypatch)
     assert runner.invoke(main, ["ontology", "eval", str(expected), "--scan", str(root),
                                 "--schema-version", "2"]).exit_code == 0
     assert seen[-1] == 2
+
+
+def test_service_counts_agree_across_summary_cli_and_manifest(tmp_path: Path) -> None:
+    root = _write(tmp_path / "r", {
+        **SCAFFOLD[".ts"],
+        "svc/a.ts": "import 'amqplib'\nch.sendToQueue('q1', b)\n",
+        "svc2/package.json": json.dumps({"name": "idle", "scripts": {"start": "node ."}}),
+        "svc2/Dockerfile": "FROM node\n",
+    })
+    result = scan_repository(root)
+    in_manifest = sum(1 for e in result.manifest.entities if e.type == "Service")
+    assert in_manifest >= 1
+    assert result.summary["services"] == in_manifest
+    assert 1 <= result.summary["services_with_edges"] <= in_manifest
+    out = tmp_path / "m.json"
+    cli = CliRunner().invoke(main, ["ontology", "scan", str(root), "--json", "-o", str(out)])
+    payload = json.loads(cli.output)["summary"]
+    manifest = json.loads(out.read_text())
+    assert payload["services"] == sum(1 for e in manifest["entities"] if e["type"] == "Service")
+    text = CliRunner().invoke(main, ["ontology", "scan", str(root), "-o", str(out)])
+    assert f"{payload['services']} services," in text.output
+    assert (f"{payload['services_with_edges']} of {payload['services']} services have a "
+            "messaging edge") in " ".join(text.output.split())
+
+
+def test_unresolved_sites_collapse_into_unique_keys(tmp_path: Path) -> None:
+    root = _write(tmp_path / "r", {
+        **SCAFFOLD[".ts"],
+        "svc/a.ts": ("import 'amqplib'\nch.sendToQueue(dynamic, b)\nch.sendToQueue(dynamic, b)\n"
+                     "ch.sendToQueue(other, b)\nch.sendToQueue('q1', b)\n")})
+    summary = scan_repository(root).summary
+    amqp = summary["messaging"]["rabbitmq"]
+    assert amqp["unresolved"] == 3 and amqp["unresolved_unique_keys"] == 2
+    assert summary["kafka"]["unresolved_unique_keys"] == 0
+    out = tmp_path / "m.json"
+    cli = CliRunner().invoke(main, ["ontology", "scan", str(root), "-o", str(out)])
+    assert "3 sites -> 2 unique keys" in " ".join(cli.output.split())
+    as_json = json.loads(CliRunner().invoke(main, ["ontology", "scan", str(root), "--json"]).output)
+    assert as_json["summary"]["messaging"]["rabbitmq"]["unresolved_unique_keys"] == 2

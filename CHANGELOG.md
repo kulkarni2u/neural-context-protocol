@@ -4,6 +4,18 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- `ncp ontology scan`: per-broker coverage (`summary["kafka"]`, `summary["messaging"][broker]`,
+  text tables) reports `unresolved_unique_keys`, e.g. `unresolved: 14 sites -> 5 unique keys`,
+  and `summary["services_with_edges"]`.
+
+### Fixed
+
+- `ncp ontology scan`: the service count is now one number everywhere (distinct `Service`
+  entities in the manifest). The `edges from: N service(s)` line counted edges, not services;
+  it now reads `N from services ... ; X of Y services have a messaging edge`.
+
 ## [1.9.4] - 2026-11-15
 
 ### Release scope
