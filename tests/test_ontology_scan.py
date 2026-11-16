@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 import time
@@ -482,9 +483,10 @@ class TestSpringResolution:
         })
         manifest = scan_repository(root).manifest
         (key,) = _keys(manifest, "KafkaTopic")
-        assert key.startswith("unresolved:#{")
+        assert re.fullmatch(r"unresolved:spel:[0-9a-f]{12}", key)
         assert _topic(manifest, key).attributes["unresolved"] is True
         assert _topic(manifest, key).attributes["spel"] == "#{'${a}'.split(',')}"
+        assert _topic(manifest, key).attributes["expression"] == "#{'${a}'.split(',')}"
 
     def test_spel_split_resolves_when_the_property_exists(self, tmp_path: Path) -> None:
         root = _spring(tmp_path, {

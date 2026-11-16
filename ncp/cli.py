@@ -3601,6 +3601,18 @@ def ontology_demote_command(
     show_default=True, help="Status for messaging edges inferred from code, or 'off' to skip them.",
 )
 @click.option("--include-tests", is_flag=True, help="Also read test files for messaging usage.")
+@click.option(
+    "--properties-file", "properties_files", multiple=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="External property values (.properties / .yml / .yaml) for ${...} placeholders; "
+         "they override the repo's values. Repeatable (later wins).",
+)
+@click.option(
+    "--env-file", "env_files", multiple=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="dotenv file (KEY=VALUE) of deploy-time values; KAFKA_TOPIC_ORDERS also satisfies "
+         "kafka.topic.orders. Overrides the repo's values and --properties-file. Repeatable.",
+)
 @click.option("--summary-out", default=None, type=click.Path(dir_okay=False, path_type=Path),
               help="Also write the scan summary (coverage report) here as JSON, for `ncp ontology wiki --summary`.")
 @click.option(
@@ -3619,6 +3631,8 @@ def ontology_scan_command(
     schema_version: str,
     heuristics: str,
     include_tests: bool,
+    properties_files: tuple[Path, ...],
+    env_files: tuple[Path, ...],
     summary_out: Path | None,
     json_output: bool,
 ) -> None:
@@ -3631,12 +3645,14 @@ def ontology_scan_command(
     Destinations are resolved from literals, constants, Spring ${...}
     placeholders, simple SpEL and environment defaults; edges start at the
     deployable service. A coverage report shows what was matched per broker
-    and warns when nothing was.
+    and warns when nothing was. `--properties-file` / `--env-file` supply
+    deploy-time values for placeholders the repo does not (or only by default)
+    define.
     Reads files only: no store, database or embedding model is opened.
     Review the manifest, then seed it.
     """
     from ncp.ontology.facade import OntologyError
-    from ncp.ontology.scan import scan_repository
+    from ncp.ontology.scan import load_extra_properties, scan_repository
 
     try:
         result = scan_repository(
@@ -3644,6 +3660,7 @@ def ontology_scan_command(
             environment=environment, kafka_cluster=kafka_cluster,
             schema_version=int(schema_version), heuristics=heuristics,  # type: ignore[arg-type]
             include_tests=include_tests,
+            extra_properties=load_extra_properties(properties_files, env_files) or None,
         )
     except OntologyError as exc:
         raise click.ClickException(f"[{exc.code}] {exc.message}") from exc

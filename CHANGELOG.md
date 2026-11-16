@@ -4,6 +4,22 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- `ncp ontology scan`: `--properties-file` / `--env-file` (repeatable) and
+  `scan_repository(extra_properties=...)` supply deploy-time property values that
+  override the repo's (`KAFKA_TOPIC_ORDERS` satisfies `kafka.topic.orders`).
+- Scan SpEL: parentheses, double-quoted literals, `==` / `!=` ternaries and literal
+  folding; an undecidable ternary emits both branches as candidate topics.
+- Scan resolves `@ConfigurationProperties(prefix)` getters (`config.getTopic()`,
+  `props.getOrders().getTopic()`, Kotlin `config.topic`) to `<prefix>.<field>`.
+
+### Changed
+
+- Scan: SpEL / complex unresolved destinations are keyed
+  `unresolved:spel:<sha1[:12]>` (the expression stays in `attributes.expression`)
+  instead of the raw expression, so one expression is one entity across files.
+
 ## [1.9.4] - 2026-11-15
 
 ### Release scope

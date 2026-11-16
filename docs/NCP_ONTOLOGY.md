@@ -327,8 +327,11 @@ Resolved topics carry `resolved_from` = `literal`, `property:<key>`,
 `spel` (see below) or `env_default` (with `env: <NAME>`).
 A topic that cannot be resolved (unknown property, unsupported SpEL
 `#{...}`, a local variable, a constant defined elsewhere) becomes a `KafkaTopic` keyed
-`unresolved:<expression>` (e.g. `unresolved:messaging.orders-topic`)
-with attributes `unresolved = true` and `expression`; its edge is always
+`unresolved:<key>` (a plain placeholder keeps its key, e.g.
+`unresolved:messaging.orders-topic`; a SpEL / complex expression becomes
+`unresolved:spel:<sha1(expression, whitespace outside quotes removed)[:12]>`, so
+the same expression in two files is one entity)
+with attributes `unresolved = true` and `expression` (the original text); its edge is always
 `candidate`, even with `--heuristics verified`. A non-plain `topicPattern`
 becomes `pattern:<regex>` with a `pattern` attribute. Expressions the scan
 does not understand (method calls, ...) produce no topic and show up as
@@ -357,8 +360,42 @@ several topics), `#{'literal'}`, `#{'a' + '${b}'}` and `+` concatenation,
 constant of that name in the class that decapitalises to the bean name, or the
 enclosing class for `__listener`). A resolved topic has `resolved_from =
 spel` and `attributes.spel` (the raw expression). Anything else stays
-`unresolved:#{...}` with the resolvable placeholders expanded in the stored
-text, `attributes.spel`, and `attributes.bean` for bean lookups.
+`unresolved:spel:<hash>` with `attributes.expression` / `attributes.spel` (the
+original text) and `attributes.bean` for bean lookups.
+
+Also evaluated: parentheses, string literals in `'...'` or `"..."`, and the
+ternary `cond ? a : b` (nestable) where `cond` is `==` / `!=` between
+operands. `#{'A'=='A' ? 'X' : 'Y'}` folds to `X`; `#{'${mode}'=='A' ? 'X' :
+'Y'}` picks a branch when `mode` is known. When `mode` is unknown both
+branches are emitted as candidate topics (`resolved_from = spel`,
+`ternary` = the condition, `ternary_branch` = `true` / `false`; the edges stay
+`candidate` with confidence 0.4 even with `--heuristics verified` and are not
+counted as unresolved). A branch that cannot be evaluated falls back to
+`unresolved:spel:<hash>`.
+
+#### External values and `@ConfigurationProperties`
+
+`--properties-file PATH` (`.properties` / `.yml` / `.yaml`) and `--env-file PATH`
+(dotenv `KEY=VALUE`) supply deploy-time property values; both are repeatable
+(later wins, env files after properties files). Programmatically:
+`scan_repository(root, extra_properties={...})` and
+`ncp.ontology.scan.load_extra_properties(properties_files, env_files)`.
+These values **override** the repo's `application*.properties|yml` values
+(deploy-time configuration wins over packaged defaults, as in Spring);
+`${key:default}` defaults apply only when neither defines the key. Keys match
+exactly, case / `-` / `_` insensitively, and env style: `KAFKA_TOPIC_ORDERS`
+also satisfies `kafka.topic.orders`. There is no `[ontology.scan]` config
+section: the scan reads no configuration, so pass the flags.
+
+Topics read from a `@ConfigurationProperties(prefix = "app.kafka")` (or
+`("app.kafka")`) class resolve to the property `<prefix>.<field>`: Java
+`config.getTopic()`, `props.getOrders().getTopic()`, record `config.topic()`
+and Kotlin `config.topic` / `config.orders.topic` (one level of nesting, the
+nested class declared in the same file; the receiver is a variable declared with
+the config class as its type, or named after the decapitalised class). Resolved
+values record `resolved_from = property:app.kafka.topic` and
+`config_class`; unknown values become `unresolved:app.kafka.topic`. The same
+fields are available to `#{@kafkaProps.topic}`.
 
 #### Coverage report and warnings
 
