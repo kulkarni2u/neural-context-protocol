@@ -856,22 +856,23 @@ class _Alt:
 _MAX_ALTS = 8
 
 
-def _spel_key(expr: str) -> str:
+def _spel_key(expr: str, kind: str = "spel") -> str:
     """Stable entity key of an unresolvable SpEL / complex expression: the same expression
-    (whitespace outside quotes ignored) always maps to the same key, in any file."""
+    (whitespace outside quotes ignored) always maps to the same key, in any file. ``kind``
+    names the expression language (``spel``, ``tpl`` for JS template literals)."""
     kept: list[str] = []
     quote = ""
     for char in expr:
         if quote:
             quote = "" if char == quote else quote
-        elif char in "\"'":
+        elif char in "\"'`":
             quote = char
         elif char.isspace():
             continue
         kept.append(char)
     digest = hashlib.sha1("".join(kept).encode("utf-8", "replace"),
                           usedforsecurity=False).hexdigest()
-    return f"unresolved:spel:{digest[:12]}"
+    return f"unresolved:{kind}:{digest[:12]}"
 
 
 def _top_positions(text: str) -> Iterator[int]:
@@ -882,7 +883,7 @@ def _top_positions(text: str) -> Iterator[int]:
         if quote:
             if char == quote:  # a doubled quote ('') closes and reopens: harmless here
                 quote = ""
-        elif char in "\"'":
+        elif char in "\"'`":
             quote = char
         elif char in "([{":
             depth += 1
@@ -1290,7 +1291,7 @@ class _Resolver:
             const = (self.consts.find(inner[start + 2:end].strip(), rel, module)
                      if end > 0 else None)
             if const is None:
-                return _Term(None, unresolved="unresolved:" + _collapse(expr))
+                return _Term(None, unresolved=_spel_key(expr, "tpl"))
             out.append(inner[position:start] + const.value)
             position = end + 1
 

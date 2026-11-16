@@ -350,7 +350,9 @@ module-level `X = "lit"`, class attributes and `self.x = "lit"`; Go
 their default and record `resolved_from = env_default` and `env`:
 `process.env.X ?? "d"`, `process.env.X || "d"`, `os.getenv("X", "d")`,
 `os.environ.get("X", "d")`; a lookup with no default is `unresolved:env:X`.
-JS template literals resolve when every `${name}` is a known constant.
+JS template literals resolve when every `${name}` is a known constant; otherwise the
+key is `unresolved:tpl:<sha1(literal)[:12]>` (the literal stays in
+`attributes.expression`), so the same literal in two files is one entity.
 
 #### SpEL
 

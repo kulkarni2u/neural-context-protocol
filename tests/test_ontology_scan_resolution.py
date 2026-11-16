@@ -288,3 +288,35 @@ def test_ternary_send_with_one_known_branch_counts_one_unresolved_site(tmp_path:
     assert kafka["unresolved_placeholders"] == 1
     assert kafka["unresolved_unique_keys"] == 1
     assert "known.topic" in _topics(result)
+
+
+# -- template-literal keys ---------------------------------------------------------------
+
+
+def _js(tmp_path: Path, files: dict[str, str]) -> Path:
+    root = tmp_path / "jsrepo"
+    base = {"svc/package.json": json.dumps({"name": "svc", "scripts": {"start": "node ."}}),
+            "svc/Dockerfile": "FROM node\n"}
+    for rel, text in {**base, **{f"svc/{k}": v for k, v in files.items()}}.items():
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    return root
+
+
+def test_unresolved_template_literal_key_is_hashed_and_stable(tmp_path: Path) -> None:
+    send = "await producer.send({ topic: `orders.${region}.v1`, messages })\n"
+    root = _js(tmp_path, {
+        "src/a.ts": "import { Kafka } from 'kafkajs'\n" + send,
+        "src/b.ts": "import { Kafka } from 'kafkajs'\n" + send,
+        "src/c.ts": ("import { Kafka } from 'kafkajs'\n"
+                     "await producer.send({ topic: `orders.${ region }.v1`, messages })\n"
+                     "await producer.send({ topic: `orders .${region}.v1`, messages })\n")})
+    topics = _topics(scan_repository(root))
+    keys = sorted(k for k in topics if k.startswith("unresolved:"))
+    assert all(re.fullmatch(r"unresolved:tpl:[0-9a-f]{12}", k) for k in keys), keys
+    # a.ts and b.ts share one key; text inside backticks is kept verbatim, so c.ts's two
+    # differently spaced literals get keys of their own.
+    assert len(keys) == 3
+    exprs = {topics[k].attributes["expression"] for k in keys}
+    assert "`orders.${region}.v1`" in exprs
