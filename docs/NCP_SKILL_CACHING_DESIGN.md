@@ -1,5 +1,3 @@
-Status: removed in the next release; the v1 module had no runtime callers.
-
 # NCP Skill & Reference-Content Caching (CAP-C9)
 
 > **Status:** v1 implemented in `ncp/skill_cache.py` (this branch), scoped to

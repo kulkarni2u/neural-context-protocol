@@ -4,6 +4,14 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Restored the `ncp.skill_cache` module (`cache_skill`, `ensure_cached`,
+  `fetch_skill`, `recall_skills`) and the `[skill_cache]` config keys
+  (`default_trust`, `default_expiry_days`, `window_chars`) removed in 1.9.2.
+  Library-mode subagent harnesses still use it. The design doc is back at
+  `docs/NCP_SKILL_CACHING_DESIGN.md`.
+
 ## [1.9.4] - 2026-11-15
 
 ### Release scope
