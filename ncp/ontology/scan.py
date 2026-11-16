@@ -1744,6 +1744,8 @@ def _jvm_hits(
             continue
         items = _split_top(text[paren + 1:end], ",", paren + 1)
         first_offset, first = items[0]
+        if method == "send" and _msg.CREATOR.match(items[-1][1]):
+            continue  # ``template.send(dest, s -> ...)``: a JMS MessageCreator, not Kafka
         site = line_at(at)
         site_hits = []
         if method == "sendDefault":
