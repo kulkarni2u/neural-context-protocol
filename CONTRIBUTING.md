@@ -82,6 +82,22 @@ commands are in `.github/workflows/ci.yml`. CI also runs `python -m build`.
 - Documents under `docs/archive/` are historical and are not updated when
   behaviour changes.
 
+## Removing or deprecating public surface
+
+Config keys and public modules are never removed without a warning release:
+
+1. Release N: call `ncp.deprecations.warn_deprecated(name, since=..., removal=...,
+   replacement=...)` where the old surface is used (emits one
+   `DeprecationWarning` per process) and add a `DEPRECATED` entry in
+   `ncp/deprecations.py`.
+2. Release N+1 or later: remove the code, move the entry to `REMOVED`, and list
+   it under `### Removed` / upgrade notes in `CHANGELOG.md`.
+
+`ncp doctor` reads both lists and flags configs that still use them. If you
+add a config table that is read outside `DEFAULT_CONFIG`, add it to
+`_EXTRA_READ_SECTIONS` in `ncp/deprecations.py` so doctor does not report it
+as unknown.
+
 ## Agent contributors
 
 `AGENTS.md` holds the conventions for agents working in this repository:

@@ -4,13 +4,60 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- `ncp ontology scan` keys SpEL / complex unresolved destinations as
+  `unresolved:spel:<sha1[:12]>` instead of the raw expression. Re-run the scan;
+  manifests seeded from an older scan keep their old `unresolved:#{...}` entities.
+- The scan summary's `services` is now the number of `Service` entities in the
+  manifest; the attribution line no longer reads "edges from: N service(s)".
+
 ### Added
 
 - Restored the `ncp.skill_cache` module (`cache_skill`, `ensure_cached`,
-  `fetch_skill`, `recall_skills`) and the `[skill_cache]` config keys
-  (`default_trust`, `default_expiry_days`, `window_chars`) removed in 1.9.2.
-  Library-mode subagent harnesses still use it. The design doc is back at
+  `fetch_skill`, `recall_skills`, signatures unchanged) and the `[skill_cache]`
+  config keys (`default_trust`, `default_expiry_days`, `window_chars`) removed in
+  1.9.2. Library-mode subagent harnesses still use it. The design doc is back at
   `docs/NCP_SKILL_CACHING_DESIGN.md`.
+- `ncp ontology scan`: `--properties-file` / `--env-file` (repeatable) and
+  `scan_repository(extra_properties=...)` supply deploy-time property values that
+  override the repo's (`KAFKA_TOPIC_ORDERS` satisfies `kafka.topic.orders`).
+- Scan SpEL: parentheses, double-quoted literals, `==` / `!=` ternaries and literal
+  folding; an undecidable ternary emits both branches as candidate topics.
+- Scan resolves `@ConfigurationProperties(prefix)` getters (`config.getTopic()`,
+  `props.getOrders().getTopic()`, Kotlin `config.topic`) to `<prefix>.<field>`.
+- Scan coverage (`summary["kafka"]`, `summary["messaging"][broker]`, text tables)
+  reports `unresolved_unique_keys`, e.g. `3 sites -> 2 unique keys`, and
+  `summary["services_with_edges"]`.
+- `ncp --cwd PATH <subcommand>`: a group-level project directory that every
+  subcommand (including nested groups) uses unless given its own `--cwd`.
+- `ncp doctor` reports stale configuration: unknown tables/keys in
+  `.ncp/config.toml` that NCP ignores, and entries in the new
+  `ncp/deprecations.py` registry (`REMOVED` / `DEPRECATED`). The module provides
+  `warn_deprecated(name, *, since, removal, replacement)`, which emits a
+  `DeprecationWarning` once per process; the one-release-of-warnings policy for
+  removing public surface is documented in `CONTRIBUTING.md`.
+
+### Changed
+
+- Scan: SpEL / complex unresolved destinations are keyed
+  `unresolved:spel:<sha1[:12]>` (the expression stays in `attributes.expression`),
+  so one expression is one entity across files.
+
+### Fixed
+
+- `ncp ontology scan` matches JMS sends with a lambda or anonymous `MessageCreator`
+  (`template.send(queue, s -> ...)`); the no-destination form is recorded as a
+  matched site without a destination. Such sends are no longer misread as Kafka topics.
+- `ncp ontology scan` matches AWS SDK v2 SQS Consumer-builder calls
+  (`sendMessage(r -> r.queueUrl(u))`, `receiveMessage(r -> r.queueUrl(u))`) and
+  `queueName(...)` in request builders.
+- `ncp ontology scan`: the service count is one number everywhere (distinct
+  `Service` entities in the manifest). The `edges from: N service(s)` line counted
+  edges, not services; it now reads `... ; X of Y services have a messaging edge`.
+- The "Semantic retrieval disabled ... embedding adapter" warning (for example
+  `fastembed` not installed) is logged once per process and provider instead of
+  on every `create_store()` call.
 
 ## [1.9.4] - 2026-11-15
 
