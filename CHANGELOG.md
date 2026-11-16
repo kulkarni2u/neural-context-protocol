@@ -4,11 +4,24 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [Unreleased]
 
+## [1.9.5] - 2026-11-16
+
+### Release scope
+
+Restores `ncp.skill_cache` (removed in 1.9.2 but still used by library-mode
+harnesses) and acts on field feedback: `ncp ontology scan` resolves more Spring
+destinations (SpEL ternaries and literals, external property overlays,
+`@ConfigurationProperties` getters), matches more JMS / SQS call shapes, keys
+unresolved destinations stably and reports consistent counts; the CLI gains a
+global `--cwd`, a stale-config `ncp doctor` check and a quieter embeddings
+fallback warning.
+
 ### Upgrade notes
 
-- `ncp ontology scan` keys SpEL / complex unresolved destinations as
-  `unresolved:spel:<sha1[:12]>` instead of the raw expression. Re-run the scan;
-  manifests seeded from an older scan keep their old `unresolved:#{...}` entities.
+- `ncp ontology scan` keys SpEL and JS template-literal unresolved destinations
+  as `unresolved:spel:<sha1[:12]>` / `unresolved:tpl:<sha1[:12]>` instead of the
+  raw expression. Re-run the scan; manifests seeded from an older scan keep their
+  old `unresolved:#{...}` / ``unresolved:`...` `` entities.
 - The scan summary's `services` is now the number of `Service` entities in the
   manifest; the attribution line no longer reads "edges from: N service(s)".
 
@@ -41,8 +54,10 @@ All notable changes to Neural Context Protocol will be documented in this file.
 ### Changed
 
 - Scan: SpEL / complex unresolved destinations are keyed
-  `unresolved:spel:<sha1[:12]>` (the expression stays in `attributes.expression`),
-  so one expression is one entity across files.
+  `unresolved:spel:<sha1[:12]>` and unresolved JS template literals
+  `unresolved:tpl:<sha1[:12]>` (the expression stays in `attributes.expression`),
+  so one expression is one entity across files. `${key}` and `env:` keys are
+  unchanged.
 
 ### Fixed
 
