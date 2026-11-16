@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from pathlib import Path
 
@@ -171,6 +172,31 @@ RULE_CASES = [
         '  @JmsListener(destination = "jms.three") void h(String m) {}\n}\n'
     ), {("PRODUCES", "Queue:jms:jms.one"), ("PRODUCES", "Queue:jms:jms.two"),
         ("CONSUMES", "Queue:jms:jms.three")}, id="jms"),
+    pytest.param(".java", (
+        "class A {\n"
+        '  void a() { jmsTemplate.send("jl.one", session -> session.createTextMessage(x)); }\n'
+        '  void b() { template.send("jl.two", s -> s.createTextMessage(x)); }\n'
+        '  void c() { template.send("jl.three", new MessageCreator() {\n'
+        "    public Message createMessage(Session s) { return s.createTextMessage(x); } }); }\n"
+        '  void d() { jmsTemplate.send(session -> session.createTextMessage(x)); }\n'
+        '  void e() { template.send(session -> session.createTextMessage(x)); }\n'
+        '  void f() { jmsTemplate.convertAndSend("jl.four", payload, pp -> pp); }\n}\n'
+    ), {("PRODUCES", "Queue:jms:jl.one"), ("PRODUCES", "Queue:jms:jl.two"),
+        ("PRODUCES", "Queue:jms:jl.three"), ("PRODUCES", "Queue:jms:jl.four")},
+        id="jms-creators"),
+    pytest.param(".java", (
+        "class A {\n"
+        "  void a() { sqsClient.receiveMessage(ReceiveMessageRequest.builder()\n"
+        '      .queueUrl("https://sqs.us-east-1.amazonaws.com/1/br-in").maxNumberOfMessages(10)\n'
+        "      .build()); }\n"
+        '  void b() { sqsClient.receiveMessage(r -> r.queueUrl("br-lambda-in")); }\n'
+        '  void c() { sqsAsyncClient.sendMessage(SendMessageRequest.builder()'
+        '.queueUrl("br-out").messageBody(b).build()); }\n'
+        '  void d() { sqsAsyncClient.sendMessage(r -> r.queueUrl("br-lambda-out").messageBody(b)); }\n'
+        '  void e() { sqsClient.sendMessage((r) -> r.queueName("br-named")); }\n}\n'
+    ), {("CONSUMES", "Queue:sqs:br-in"), ("CONSUMES", "Queue:sqs:br-lambda-in"),
+        ("PRODUCES", "Queue:sqs:br-out"), ("PRODUCES", "Queue:sqs:br-lambda-out"),
+        ("PRODUCES", "Queue:sqs:br-named")}, id="sqs-builders"),
     pytest.param(".java", (
         "class A {\n"
         '  @SqsListener("sl.one") void a(String m) {}\n'
@@ -500,7 +526,9 @@ def test_spel_unresolved_forms(tmp_path: Path, expr: str) -> None:
 def test_spel_unresolved_keeps_expanded_placeholders(tmp_path: Path) -> None:
     result = _spel(tmp_path, "#{@x.y('${single}')} ${nope}", PROPS)
     (key,) = _topics(result)
-    assert key == "unresolved:#{@x.y('solo')} ${nope}"
+    assert re.fullmatch(r"unresolved:spel:[0-9a-f]{12}", key)
+    assert _entity(result.manifest, "KafkaTopic", key).attributes["expression"] == (
+        "#{@x.y('${single}')} ${nope}")
 
 
 def test_spel_beans_and_listener(tmp_path: Path) -> None:
@@ -517,9 +545,10 @@ def test_spel_beans_and_listener(tmp_path: Path) -> None:
             '  @KafkaListener(topics = "#{__listener.topic}") void d() {}\n'
             '  @KafkaListener(topics = "#{@ghostBean.topic}") void e() {}\n}\n')})
     result = scan_repository(root)
-    assert _topics(result) == {
-        "from.bean", "bean.const", "from.own", "unresolved:#{@ghostBean.topic}"}
-    ghost = _entity(result.manifest, "KafkaTopic", "unresolved:#{@ghostBean.topic}")
+    (ghost_key,) = [key for key in _topics(result) if key.startswith("unresolved:")]
+    assert re.fullmatch(r"unresolved:spel:[0-9a-f]{12}", ghost_key)
+    assert _topics(result) == {"from.bean", "bean.const", "from.own", ghost_key}
+    ghost = _entity(result.manifest, "KafkaTopic", ghost_key)
     assert ghost.attributes["bean"] == "ghostBean" and ghost.attributes["spel"] == "#{@ghostBean.topic}"
 
 
@@ -865,7 +894,8 @@ def test_summary_shape(tmp_path: Path) -> None:
     amqp = summary["messaging"]["rabbitmq"]
     assert set(amqp) == {
         "sites", "producer_sites", "consumer_sites", "matched_sites", "unmatched_sites",
-        "unresolved", "skipped_no_owner", "skipped_schema", "unmatched_examples"}
+        "unresolved", "unresolved_unique_keys", "skipped_no_owner", "skipped_schema",
+        "unmatched_examples"}
     assert (amqp["sites"], amqp["producer_sites"], amqp["consumer_sites"]) == (3, 2, 1)
     assert (amqp["matched_sites"], amqp["unresolved"], amqp["unmatched_sites"]) == (1, 1, 1)
     assert amqp["unmatched_examples"] == ["svc/a.ts:6: ch.consume(build(), f)"]
@@ -896,7 +926,8 @@ def test_cli_prints_messaging_coverage_and_attribution(tmp_path: Path) -> None:
     result = CliRunner().invoke(main, ["ontology", "scan", str(root), "-o", str(tmp_path / "m.json")])
     assert result.exit_code == 0, result.output
     assert "Messaging coverage" in result.output and "jms" in result.output
-    assert "edges from:" in result.output and "via dependency" in result.output
+    assert "edges:" in result.output and "via dependency" in result.output
+    assert "services have a messaging edge" in " ".join(result.output.split())
     assert "schema_version = 3" in result.output
     as_json = CliRunner().invoke(main, ["ontology", "scan", str(root), "--json"])
     payload = json.loads(as_json.output)
@@ -1097,3 +1128,86 @@ def test_scan_defaults_to_one_shared_schema_version(tmp_path: Path, monkeypatch)
     assert runner.invoke(main, ["ontology", "eval", str(expected), "--scan", str(root),
                                 "--schema-version", "2"]).exit_code == 0
     assert seen[-1] == 2
+
+
+def test_jms_default_destination_site_is_matched_without_destination() -> None:
+    sites = msg.find_sites(".java", "jmsTemplate.send(session -> session.createTextMessage(x));\n"
+                                    "template.send(new MessageCreator() { });\n")
+    assert [(s.rule.id, s.dests) for s in sites] == [("jms.send", []), ("jms.send.creator", [])]
+
+
+def test_creator_send_on_unrelated_object_is_not_a_jms_site() -> None:
+    text = 'class A { void f() { template.send("x", s -> s.go()); executor.send(x -> x); } }\n'
+    assert msg.find_sites(".java", text) == []
+    assert msg.find_sites(".java", text, context={"kafka"}) == []
+    with_jms = msg.find_sites(".java", text, context={"jms"})
+    assert [s.rule.id for s in with_jms] == ["jms.send.creator"]  # not ``executor``
+
+
+def test_creator_rule_does_not_double_count_jms_or_sqs_receivers() -> None:
+    text = ('jmsTemplate.send("a", s -> s);\n myJmsTemplate.send("b", s -> s);\n'
+            'sqsTemplate.send(to -> to.queue("c"));\n')
+    ids = [s.rule.id for s in msg.find_sites(".java", text, context={"jms"})]
+    assert "jms.send.creator" not in ids
+
+
+def test_service_counts_agree_across_summary_cli_and_manifest(tmp_path: Path) -> None:
+    root = _write(tmp_path / "r", {
+        **SCAFFOLD[".ts"],
+        "svc/a.ts": "import 'amqplib'\nch.sendToQueue('q1', b)\n",
+        "svc2/package.json": json.dumps({"name": "idle", "scripts": {"start": "node ."}}),
+        "svc2/Dockerfile": "FROM node\n",
+    })
+    result = scan_repository(root)
+    in_manifest = sum(1 for e in result.manifest.entities if e.type == "Service")
+    assert in_manifest >= 1
+    assert result.summary["services"] == in_manifest
+    assert 1 <= result.summary["services_with_edges"] <= in_manifest
+    out = tmp_path / "m.json"
+    cli = CliRunner().invoke(main, ["ontology", "scan", str(root), "--json", "-o", str(out)])
+    payload = json.loads(cli.output)["summary"]
+    manifest = json.loads(out.read_text())
+    assert payload["services"] == sum(1 for e in manifest["entities"] if e["type"] == "Service")
+    text = CliRunner().invoke(main, ["ontology", "scan", str(root), "-o", str(out)])
+    assert f"{payload['services']} services," in text.output
+    assert (f"{payload['services_with_edges']} of {payload['services']} services have a "
+            "messaging edge") in " ".join(text.output.split())
+
+
+def test_unresolved_sites_collapse_into_unique_keys(tmp_path: Path) -> None:
+    root = _write(tmp_path / "r", {
+        **SCAFFOLD[".ts"],
+        "svc/a.ts": ("import 'amqplib'\nch.sendToQueue(dynamic, b)\nch.sendToQueue(dynamic, b)\n"
+                     "ch.sendToQueue(other, b)\nch.sendToQueue('q1', b)\n")})
+    summary = scan_repository(root).summary
+    amqp = summary["messaging"]["rabbitmq"]
+    assert amqp["unresolved"] == 3 and amqp["unresolved_unique_keys"] == 2
+    assert summary["kafka"]["unresolved_unique_keys"] == 0
+    out = tmp_path / "m.json"
+    cli = CliRunner().invoke(main, ["ontology", "scan", str(root), "-o", str(out)])
+    assert "3 sites -> 2 unique keys" in " ".join(cli.output.split())
+    as_json = json.loads(CliRunner().invoke(main, ["ontology", "scan", str(root), "--json"]).output)
+    assert as_json["summary"]["messaging"]["rabbitmq"]["unresolved_unique_keys"] == 2
+
+
+_KAFKA_CALLBACKS = (
+    'class A {\n'
+    '  void f() { template.send("t", "v").whenComplete((r, e) -> { log(r); }); }\n'
+    '  void g() { template.send("t", "v").addCallback(r -> {}, e -> {}); }\n'
+    '}\n')
+
+
+def test_kafka_send_callbacks_are_not_jms_creator_sites() -> None:
+    assert msg.find_sites(".java", _KAFKA_CALLBACKS, context={"jms"}) == []
+    assert msg.find_sites(".java", 'jms.x(); template.send("q", s -> s.go());\n')[0].dests[0].expr \
+        == '"q"'
+
+
+def test_kafka_send_callbacks_in_jms_module_create_no_queue(tmp_path: Path) -> None:
+    root = _write(tmp_path / "r", {
+        "svc/pom.xml": "<project><dependencies>activemq jms</dependencies></project>\n",
+        "svc/Dockerfile": "FROM x\n",
+        "svc/src/main/java/A.java": _KAFKA_CALLBACKS,
+    })
+    result = scan_repository(root)
+    assert not [e for e in result.manifest.entities if e.type == "Queue"]

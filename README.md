@@ -827,6 +827,9 @@ ncp cost --cwd /path/to/project
 ncp explain --cwd /path/to/project
 ```
 
+`--cwd` can also be given once before the subcommand, for example
+`ncp --cwd /path/to/project status`; a subcommand's own `--cwd` overrides it.
+
 - `ncp status` shows store and activity metrics.
 - `ncp cost` shows token and USD rollups once turns are logged. For provider adapters these are **measured** — actual token usage threaded from the SDK and priced via the `[providers]` table; for the local/mock in-process path they are **estimated** (chars/4) and flagged `cost_source=estimated`.
 - `ncp explain` gives a human-readable runtime summary.

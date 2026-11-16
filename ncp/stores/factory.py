@@ -11,6 +11,18 @@ from ncp.stores.sqlite import SQLiteStore
 
 logger = logging.getLogger("ncp")
 
+# Providers whose "embedding adapter unavailable" warning was already logged
+# in this process. create_store() runs on every CLI/API call, and the fallback
+# (lexical-only retrieval) is identical each time, so warn once per provider.
+_warned_embedding_providers: set[str] = set()
+
+
+def _warn_embedding_unavailable_once(provider: str, message: str, *args: object) -> None:
+    if provider in _warned_embedding_providers:
+        return
+    _warned_embedding_providers.add(provider)
+    logger.warning(message, *args)
+
 
 def _build_embedding_adapter(cfg: NCPConfig) -> object | None:
     """Construct the configured embedding adapter, or None.
@@ -52,7 +64,8 @@ def _build_embedding_adapter(cfg: NCPConfig) -> object | None:
         try:
             return OpenAIEmbeddingAdapter(model=cfg.embedding_model)
         except Exception as exc:
-            logger.warning(
+            _warn_embedding_unavailable_once(
+                "openai",
                 "Semantic retrieval disabled: could not construct the OpenAI "
                 "embedding adapter (%s: %s). Falling back to lexical-only "
                 "retrieval. Set OPENAI_API_KEY and install "
@@ -66,7 +79,8 @@ def _build_embedding_adapter(cfg: NCPConfig) -> object | None:
         try:
             return LocalEmbeddingAdapter(model=cfg.embedding_model)
         except Exception as exc:
-            logger.warning(
+            _warn_embedding_unavailable_once(
+                "local",
                 "Semantic retrieval disabled: could not construct the local "
                 "fastembed embedding adapter (%s: %s). Falling back to "
                 "lexical-only retrieval. Install the optional dependency "

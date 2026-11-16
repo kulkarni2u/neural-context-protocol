@@ -537,10 +537,50 @@ def _apply_migrations_now(cwd: Path) -> tuple[bool, list | str]:
                 pass
 
 
-@click.group()
+_GLOBAL_CWD_META_KEY = "ncp.global_cwd"
+
+
+class _CwdCommand(click.Command):
+    """Command whose ``--cwd`` falls back to the group-level ``ncp --cwd`` value.
+
+    Click runs the group callback before parsing the subcommand, so the group
+    stores its value in ``ctx.meta`` and each subcommand adopts it only when
+    its own ``--cwd`` was not given explicitly (defaults, whether ``Path.cwd``
+    or ``None``, are replaced). Unlike ``os.chdir`` this leaves relative
+    file arguments untouched.
+    """
+
+    def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
+        rest = super().parse_args(ctx, args)
+        global_cwd = ctx.find_root().meta.get(_GLOBAL_CWD_META_KEY)
+        if (
+            global_cwd is not None
+            and "cwd" in ctx.params
+            and ctx.get_parameter_source("cwd") in (None, click.core.ParameterSource.DEFAULT)
+        ):
+            ctx.params["cwd"] = global_cwd
+        return rest
+
+
+class _CwdGroup(click.Group):
+    command_class = _CwdCommand
+    group_class = type  # nested groups are also _CwdGroup
+
+
+@click.group(cls=_CwdGroup)
 @click.version_option(version=ncp.__version__, prog_name="ncp")
-def main() -> None:
+@click.option(
+    "--cwd",
+    "global_cwd",
+    type=click.Path(path_type=Path, exists=True, file_okay=False),
+    default=None,
+    help="Project directory for every subcommand (a subcommand's own --cwd wins).",
+)
+@click.pass_context
+def main(ctx: click.Context, global_cwd: Path | None) -> None:
     """Neural Context Protocol CLI."""
+    if global_cwd is not None:
+        ctx.meta[_GLOBAL_CWD_META_KEY] = global_cwd
 
 
 @main.command("init")
@@ -3107,6 +3147,42 @@ def _doctor_embeddings(config: NCPConfig) -> dict[str, str]:
                   "pip install 'neural-context-protocol[local-embeddings]' or set [embedding].enabled = false.")
 
 
+def _doctor_stale_config(config: NCPConfig) -> list[dict[str, str]]:
+    """Flag keys in the user's config.toml that NCP ignores, removed or deprecated."""
+    import tomllib
+
+    from ncp.deprecations import deprecated_config_usage, unknown_config_keys
+
+    path = config.project_root / ".ncp" / "config.toml"
+    if not path.is_file():
+        return []
+    try:
+        with path.open("rb") as handle:
+            raw = tomllib.load(handle)
+    except (OSError, ValueError):
+        return []
+    checks: list[dict[str, str]] = []
+    for label, entry in deprecated_config_usage(raw):
+        note = f" ({entry.replacement})" if entry.replacement else ""
+        if label == "removed":
+            checks.append(_check(f"removed config: {entry.name}", "warn",
+                                 f"removed in {entry.since} and now ignored{note}",
+                                 f"Delete {entry.name} from .ncp/config.toml."))
+        else:
+            checks.append(_check(f"deprecated config: {entry.name}", "warn",
+                                 f"deprecated since {entry.since}, removal in {entry.removal}{note}",
+                                 f"Migrate off {entry.name} before {entry.removal}."))
+    registered = {e.name for _, e in deprecated_config_usage(raw)}
+    unknown = [name for name in unknown_config_keys(raw) if name not in registered]
+    if unknown:
+        checks.append(_check("config keys", "warn",
+                             "unknown keys NCP ignores: " + ", ".join(unknown),
+                             "Check for typos or keys removed in a newer release; see CHANGELOG.md."))
+    elif not checks:
+        checks.append(_check("config keys", "ok", "no unknown, removed or deprecated keys"))
+    return checks
+
+
 def _doctor_extras() -> dict[str, str]:
     found = [f"{mod} [{extra}]" for mod, extra in _OPTIONAL_MODULES if _module_available(mod)]
     absent = [mod for mod, _ in _OPTIONAL_MODULES if not _module_available(mod)]
@@ -3132,6 +3208,7 @@ def doctor_command(cwd: Path, host: str, port: int, json_output: bool) -> None:
         checks.append(_doctor_server(host, port))
         checks.append(_doctor_auth(config))
         checks.append(_doctor_embeddings(config))
+        checks.extend(_doctor_stale_config(config))
     checks.append(_doctor_extras())
 
     failed = any(c["status"] == "fail" for c in checks)
@@ -3601,6 +3678,18 @@ def ontology_demote_command(
     show_default=True, help="Status for messaging edges inferred from code, or 'off' to skip them.",
 )
 @click.option("--include-tests", is_flag=True, help="Also read test files for messaging usage.")
+@click.option(
+    "--properties-file", "properties_files", multiple=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="External property values (.properties / .yml / .yaml) for ${...} placeholders; "
+         "they override the repo's values. Repeatable (later wins).",
+)
+@click.option(
+    "--env-file", "env_files", multiple=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="dotenv file (KEY=VALUE) of deploy-time values; KAFKA_TOPIC_ORDERS also satisfies "
+         "kafka.topic.orders. Overrides the repo's values and --properties-file. Repeatable.",
+)
 @click.option("--summary-out", default=None, type=click.Path(dir_okay=False, path_type=Path),
               help="Also write the scan summary (coverage report) here as JSON, for `ncp ontology wiki --summary`.")
 @click.option(
@@ -3619,6 +3708,8 @@ def ontology_scan_command(
     schema_version: str,
     heuristics: str,
     include_tests: bool,
+    properties_files: tuple[Path, ...],
+    env_files: tuple[Path, ...],
     summary_out: Path | None,
     json_output: bool,
 ) -> None:
@@ -3631,12 +3722,14 @@ def ontology_scan_command(
     Destinations are resolved from literals, constants, Spring ${...}
     placeholders, simple SpEL and environment defaults; edges start at the
     deployable service. A coverage report shows what was matched per broker
-    and warns when nothing was.
+    and warns when nothing was. `--properties-file` / `--env-file` supply
+    deploy-time values for placeholders the repo does not (or only by default)
+    define.
     Reads files only: no store, database or embedding model is opened.
     Review the manifest, then seed it.
     """
     from ncp.ontology.facade import OntologyError
-    from ncp.ontology.scan import scan_repository
+    from ncp.ontology.scan import load_extra_properties, scan_repository
 
     try:
         result = scan_repository(
@@ -3644,6 +3737,7 @@ def ontology_scan_command(
             environment=environment, kafka_cluster=kafka_cluster,
             schema_version=int(schema_version), heuristics=heuristics,  # type: ignore[arg-type]
             include_tests=include_tests,
+            extra_properties=load_extra_properties(properties_files, env_files) or None,
         )
     except OntologyError as exc:
         raise click.ClickException(f"[{exc.code}] {exc.message}") from exc
@@ -3689,9 +3783,12 @@ def ontology_scan_command(
             ("matched", "matched_sites"), ("  via property", "resolved_via_property"),
             ("  via constant", "resolved_via_constant"),
             ("unresolved placeholders", "unresolved_placeholders"),
+            ("unresolved collapse", None),
             ("unmatched", "unmatched_sites"), ("skipped (no owner)", "skipped_no_owner"),
         ):
-            table.add_row(label, str(kafka[key]))  # type: ignore[index]
+            table.add_row(label, _unresolved_collapse(kafka["unresolved_placeholders"],  # type: ignore[index]
+                                                      kafka["unresolved_unique_keys"])  # type: ignore[index]
+                          if key is None else str(kafka[key]))  # type: ignore[index]
         report_console.print(table)
         for example in kafka["unmatched_examples"]:  # type: ignore[index]
             report_console.print(f"  unmatched: {example}", markup=False, highlight=False)
@@ -3709,16 +3806,23 @@ def ontology_scan_command(
                 str(item["skipped_schema"]))
         report_console.print(table)
         for name, item in sorted(others.items()):
+            if item["unresolved"]:
+                report_console.print(
+                    f"  unresolved ({name}): "
+                    f"{_unresolved_collapse(item['unresolved'], item['unresolved_unique_keys'])}",
+                    markup=False, highlight=False)
             for example in item["unmatched_examples"]:
                 report_console.print(f"  unmatched ({name}): {example}", markup=False,
                                      highlight=False)
     attribution = summary.get("attribution") or {}
     if any(attribution.values()):  # type: ignore[union-attr]
         report_console.print(
-            "edges from: "
-            f"{attribution['edges_from_service']} service(s), "  # type: ignore[index]
+            "edges: "
+            f"{attribution['edges_from_service']} from services, "  # type: ignore[index]
             f"{attribution['edges_via_dependency']} via dependency, "  # type: ignore[index]
-            f"{attribution['edges_from_module']} module(s)", markup=False, highlight=False)  # type: ignore[index]
+            f"{attribution['edges_from_module']} from modules; "  # type: ignore[index]
+            f"{summary['services_with_edges']} of {summary['services']} services have "
+            "a messaging edge", markup=False, highlight=False)
     if summary["schema_version"] >= 2:  # type: ignore[operator]
         click.echo(
             f"note: schema v{summary['schema_version']} (Repo/Module/Queue/Exchange) — the manifest pins "
@@ -3728,6 +3832,11 @@ def ontology_scan_command(
         )
     for warning in summary["warnings"]:  # type: ignore[union-attr]
         click.echo(f"warning: {warning}", err=True)
+
+
+def _unresolved_collapse(sites: object, keys: object) -> str:
+    """``14 sites -> 5 unique keys``: unresolved sites vs distinct unresolved destination keys."""
+    return f"{sites} sites -> {keys} unique keys"
 
 
 @ontology_group.command("wiki")

@@ -388,7 +388,13 @@ _RULES: list[Rule] = [
           r"@RabbitListener\s*\(\s*" + _ARGS, "annotation",
           keys=("queues", "queuesToDeclare")),
     _rule("jms.send", "jms", "Queue", "PRODUCES", JVM,
-          r"[Jj]ms\w{0,30}\s*\.\s*(?:convertAndSend|send)\s*\(\s*" + _ARGS),
+          r"[Jj]ms\w{0,30}\s*\.\s*(?:convertAndSend|send)\s*\(\s*" + _ARGS, "jms_send"),
+    # ``template.send(queue, s -> ...)`` / ``send(queue, new MessageCreator() {...})`` on a
+    # template whose name does not say JMS: only with a lambda / anonymous creator, only in a
+    # module that mentions jms, and never for the receivers another rule already owns.
+    _rule("jms.send.creator", "jms", "Queue", "PRODUCES", JVM,
+          r"\b(?:(?![Jj]ms|[Ss]qs|[Rr]abbit|[Aa]mqp|[Kk]afka)\w){0,40}[Tt]emplate\s*\.\s*send"
+          r"\s*\(\s*" + _ARGS, "jms_send_creator", requires=("jms",)),
     _rule("jms.JmsListener", "jms", "Queue", "CONSUMES", JVM,
           r"@JmsListener\s*\(\s*" + _ARGS, "annotation", keys=("destination",)),
     _rule("spring-aws.SqsListener", "sqs", "Queue", "CONSUMES", JVM,
@@ -400,10 +406,17 @@ _RULES: list[Rule] = [
           + _ARGS),
     _rule("aws2.SendMessageRequest", "sqs", "Queue", "PRODUCES", JVM,
           r"SendMessage(?:Batch)?Request\s*\.\s*builder\s*\(\s*\)[^;]{0,400}?"
-          r"\.\s*queueUrl\s*\(\s*" + _ARGS),
+          r"\.\s*queue(?:Url|Name)\s*\(\s*" + _ARGS),
     _rule("aws2.ReceiveMessageRequest", "sqs", "Queue", "CONSUMES", JVM,
           r"ReceiveMessageRequest\s*\.\s*builder\s*\(\s*\)[^;]{0,400}?"
-          r"\.\s*queueUrl\s*\(\s*" + _ARGS),
+          r"\.\s*queue(?:Url|Name)\s*\(\s*" + _ARGS),
+    # Consumer-builder overloads: ``client.sendMessage(r -> r.queueUrl(url).messageBody(b))``.
+    _rule("aws2.sendMessage.lambda", "sqs", "Queue", "PRODUCES", JVM,
+          r"\.\s*sendMessage\s*\(\s*\(?\s*\w{1,30}\s*\)?\s*->[^;]{0,400}?"
+          r"\.\s*queue(?:Url|Name)\s*\(\s*" + _ARGS, requires=("sqs",)),
+    _rule("aws2.receiveMessage.lambda", "sqs", "Queue", "CONSUMES", JVM,
+          r"\.\s*receiveMessage\s*\(\s*\(?\s*\w{1,30}\s*\)?\s*->[^;]{0,400}?"
+          r"\.\s*queue(?:Url|Name)\s*\(\s*" + _ARGS, requires=("sqs",)),
     _rule("aws2.PublishRequest", "sns", "Exchange", "PRODUCES", JVM,
           r"PublishRequest\s*\.\s*builder\s*\(\s*\)[^;]{0,400}?\.\s*topicArn\s*\(\s*" + _ARGS),
 ]
@@ -465,6 +478,31 @@ def _mode_first(rule: Rule, args: str, base: int, line_at: _LineAt) -> list[Dest
     items, _end = call_args(args)
     picked = _pick(items, 0, rule.keys)
     return [_dest(rule.entity, picked, base, line_at)] if picked else []
+
+
+CREATOR = re.compile(r"\s*(?:\(?\s*\w{1,30}\s*\)?\s*->|new\s+\w{1,60}\s*\(\s*\)\s*\{)")
+
+
+def _mode_jms_send(rule: Rule, args: str, base: int, line_at: _LineAt) -> list[Dest]:
+    """``send(destination, creator)``: the first argument names the queue. A lone lambda /
+    anonymous ``MessageCreator`` uses the template's default destination, which cannot be
+    read from the call, so the site is matched without a destination."""
+    items = call_args(args)[0]
+    if not items or (len(items) == 1 and CREATOR.match(items[0][1])):
+        return []
+    return [_dest(rule.entity, items[0], base, line_at)]
+
+
+def _mode_jms_send_creator(
+    rule: Rule, args: str, base: int, line_at: _LineAt,
+) -> list[Dest] | None:
+    """:func:`_mode_jms_send` for a receiver not named JMS: the last top-level argument of the
+    call itself must be a lambda / anonymous creator, else (``None``) there is no site, so a
+    Kafka ``send(t, v).whenComplete(x -> ...)`` is never taken for a JMS send."""
+    items = call_args(args)[0]
+    if not items or not CREATOR.match(items[-1][1]):
+        return None
+    return _mode_jms_send(rule, args, base, line_at)
 
 
 def _mode_list(rule: Rule, args: str, base: int, line_at: _LineAt) -> list[Dest]:
@@ -562,8 +600,9 @@ def _mode_annotation(rule: Rule, args: str, base: int, line_at: _LineAt) -> list
     return out
 
 
-_MODES: dict[str, Callable[[Rule, str, int, _LineAt], list[Dest]]] = {
-    "first": _mode_first, "list": _mode_list, "leading": _mode_leading, "batch": _mode_batch,
+_MODES: dict[str, Callable[[Rule, str, int, _LineAt], list[Dest] | None]] = {
+    "first": _mode_first, "jms_send": _mode_jms_send,
+    "jms_send_creator": _mode_jms_send_creator, "list": _mode_list, "leading": _mode_leading, "batch": _mode_batch,
     "publish": _mode_publish, "bind": _mode_bind, "spring_amqp": _mode_spring_amqp,
     "annotation": _mode_annotation,
 }
@@ -624,8 +663,9 @@ def find_sites(
             if text[starts[line - 1]:match.start()].lstrip().startswith(_COMMENT):
                 continue
             args = match.group(rule.group)
-            sites.append(Site(rule, line, rule.direction,
-                              mode(rule, args, match.start(rule.group), line_at)))
+            dests = mode(rule, args, match.start(rule.group), line_at)
+            if dests is not None:  # ``None``: the mode rejects the match, no site at all
+                sites.append(Site(rule, line, rule.direction, dests))
     sites.sort(key=lambda site: site.line)
     return sites
 

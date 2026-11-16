@@ -106,6 +106,12 @@ confidence_k = 20
 # signature match is what ships today).
 # similarity_threshold = 0.95
 
+# [skill_cache]
+# Library-mode skill/reference caching (ncp.skill_cache; CAP-C9).
+# default_trust = 0.60       # base_trust for src="skill_ref" writes
+# default_expiry_days = 30   # safety-net TTL for cached skill chunks
+# window_chars = 1800        # per-chunk window (under the 2000-char cap)
+
 # [tools]
 # MCP tool surface: "standard" (default) = per-turn lifecycle plus outcome,
 # decision and wait_whispers tools; "core" = only the bounded per-turn
