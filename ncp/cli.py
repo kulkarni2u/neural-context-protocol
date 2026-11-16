@@ -537,10 +537,50 @@ def _apply_migrations_now(cwd: Path) -> tuple[bool, list | str]:
                 pass
 
 
-@click.group()
+_GLOBAL_CWD_META_KEY = "ncp.global_cwd"
+
+
+class _CwdCommand(click.Command):
+    """Command whose ``--cwd`` falls back to the group-level ``ncp --cwd`` value.
+
+    Click runs the group callback before parsing the subcommand, so the group
+    stores its value in ``ctx.meta`` and each subcommand adopts it only when
+    its own ``--cwd`` was not given explicitly (defaults, whether ``Path.cwd``
+    or ``None``, are replaced). Unlike ``os.chdir`` this leaves relative
+    file arguments untouched.
+    """
+
+    def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
+        rest = super().parse_args(ctx, args)
+        global_cwd = ctx.find_root().meta.get(_GLOBAL_CWD_META_KEY)
+        if (
+            global_cwd is not None
+            and "cwd" in ctx.params
+            and ctx.get_parameter_source("cwd") in (None, click.core.ParameterSource.DEFAULT)
+        ):
+            ctx.params["cwd"] = global_cwd
+        return rest
+
+
+class _CwdGroup(click.Group):
+    command_class = _CwdCommand
+    group_class = type  # nested groups are also _CwdGroup
+
+
+@click.group(cls=_CwdGroup)
 @click.version_option(version=ncp.__version__, prog_name="ncp")
-def main() -> None:
+@click.option(
+    "--cwd",
+    "global_cwd",
+    type=click.Path(path_type=Path, exists=True, file_okay=False),
+    default=None,
+    help="Project directory for every subcommand (a subcommand's own --cwd wins).",
+)
+@click.pass_context
+def main(ctx: click.Context, global_cwd: Path | None) -> None:
     """Neural Context Protocol CLI."""
+    if global_cwd is not None:
+        ctx.meta[_GLOBAL_CWD_META_KEY] = global_cwd
 
 
 @main.command("init")
@@ -3107,6 +3147,42 @@ def _doctor_embeddings(config: NCPConfig) -> dict[str, str]:
                   "pip install 'neural-context-protocol[local-embeddings]' or set [embedding].enabled = false.")
 
 
+def _doctor_stale_config(config: NCPConfig) -> list[dict[str, str]]:
+    """Flag keys in the user's config.toml that NCP ignores, removed or deprecated."""
+    import tomllib
+
+    from ncp.deprecations import deprecated_config_usage, unknown_config_keys
+
+    path = config.project_root / ".ncp" / "config.toml"
+    if not path.is_file():
+        return []
+    try:
+        with path.open("rb") as handle:
+            raw = tomllib.load(handle)
+    except (OSError, ValueError):
+        return []
+    checks: list[dict[str, str]] = []
+    for label, entry in deprecated_config_usage(raw):
+        note = f" ({entry.replacement})" if entry.replacement else ""
+        if label == "removed":
+            checks.append(_check(f"removed config: {entry.name}", "warn",
+                                 f"removed in {entry.since} and now ignored{note}",
+                                 f"Delete {entry.name} from .ncp/config.toml."))
+        else:
+            checks.append(_check(f"deprecated config: {entry.name}", "warn",
+                                 f"deprecated since {entry.since}, removal in {entry.removal}{note}",
+                                 f"Migrate off {entry.name} before {entry.removal}."))
+    registered = {e.name for _, e in deprecated_config_usage(raw)}
+    unknown = [name for name in unknown_config_keys(raw) if name not in registered]
+    if unknown:
+        checks.append(_check("config keys", "warn",
+                             "unknown keys NCP ignores: " + ", ".join(unknown),
+                             "Check for typos or keys removed in a newer release; see CHANGELOG.md."))
+    elif not checks:
+        checks.append(_check("config keys", "ok", "no unknown, removed or deprecated keys"))
+    return checks
+
+
 def _doctor_extras() -> dict[str, str]:
     found = [f"{mod} [{extra}]" for mod, extra in _OPTIONAL_MODULES if _module_available(mod)]
     absent = [mod for mod, _ in _OPTIONAL_MODULES if not _module_available(mod)]
@@ -3132,6 +3208,7 @@ def doctor_command(cwd: Path, host: str, port: int, json_output: bool) -> None:
         checks.append(_doctor_server(host, port))
         checks.append(_doctor_auth(config))
         checks.append(_doctor_embeddings(config))
+        checks.extend(_doctor_stale_config(config))
     checks.append(_doctor_extras())
 
     failed = any(c["status"] == "fail" for c in checks)

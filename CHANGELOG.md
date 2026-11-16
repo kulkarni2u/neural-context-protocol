@@ -4,6 +4,24 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- `ncp --cwd PATH <subcommand>`: a group-level project directory that every
+  subcommand (including nested groups) uses unless it is given its own
+  `--cwd`. Subcommands that have no `--cwd` option are unaffected.
+- `ncp doctor` reports stale configuration: unknown tables/keys in
+  `.ncp/config.toml` that NCP ignores, and entries listed in the new
+  `ncp/deprecations.py` registry (`REMOVED` / `DEPRECATED`). The module also
+  provides `warn_deprecated(name, *, since, removal, replacement)`, which
+  emits a `DeprecationWarning` once per process; the one-release-of-warnings
+  policy is documented in `CONTRIBUTING.md`.
+
+### Fixed
+
+- The "Semantic retrieval disabled ... embedding adapter" warning (for example
+  `fastembed` not installed) is logged once per process and provider instead
+  of on every `create_store()` call.
+
 ## [1.9.4] - 2026-11-15
 
 ### Release scope
