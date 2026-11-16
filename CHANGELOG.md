@@ -4,6 +4,15 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- `ncp ontology scan` matches JMS sends with a lambda or anonymous `MessageCreator`
+  (`template.send(queue, s -> ...)`); the no-destination form is recorded as a matched
+  site without a destination. Such sends are no longer misread as Kafka topics.
+- `ncp ontology scan` matches AWS SDK v2 SQS Consumer-builder calls
+  (`sendMessage(r -> r.queueUrl(u))`, `receiveMessage(r -> r.queueUrl(u))`) and
+  `queueName(...)` in request builders.
+
 ## [1.9.4] - 2026-11-15
 
 ### Release scope

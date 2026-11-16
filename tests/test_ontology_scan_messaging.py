@@ -173,6 +173,31 @@ RULE_CASES = [
         ("CONSUMES", "Queue:jms:jms.three")}, id="jms"),
     pytest.param(".java", (
         "class A {\n"
+        '  void a() { jmsTemplate.send("jl.one", session -> session.createTextMessage(x)); }\n'
+        '  void b() { template.send("jl.two", s -> s.createTextMessage(x)); }\n'
+        '  void c() { template.send("jl.three", new MessageCreator() {\n'
+        "    public Message createMessage(Session s) { return s.createTextMessage(x); } }); }\n"
+        '  void d() { jmsTemplate.send(session -> session.createTextMessage(x)); }\n'
+        '  void e() { template.send(session -> session.createTextMessage(x)); }\n'
+        '  void f() { jmsTemplate.convertAndSend("jl.four", payload, pp -> pp); }\n}\n'
+    ), {("PRODUCES", "Queue:jms:jl.one"), ("PRODUCES", "Queue:jms:jl.two"),
+        ("PRODUCES", "Queue:jms:jl.three"), ("PRODUCES", "Queue:jms:jl.four")},
+        id="jms-creators"),
+    pytest.param(".java", (
+        "class A {\n"
+        "  void a() { sqsClient.receiveMessage(ReceiveMessageRequest.builder()\n"
+        '      .queueUrl("https://sqs.us-east-1.amazonaws.com/1/br-in").maxNumberOfMessages(10)\n'
+        "      .build()); }\n"
+        '  void b() { sqsClient.receiveMessage(r -> r.queueUrl("br-lambda-in")); }\n'
+        '  void c() { sqsAsyncClient.sendMessage(SendMessageRequest.builder()'
+        '.queueUrl("br-out").messageBody(b).build()); }\n'
+        '  void d() { sqsAsyncClient.sendMessage(r -> r.queueUrl("br-lambda-out").messageBody(b)); }\n'
+        '  void e() { sqsClient.sendMessage((r) -> r.queueName("br-named")); }\n}\n'
+    ), {("CONSUMES", "Queue:sqs:br-in"), ("CONSUMES", "Queue:sqs:br-lambda-in"),
+        ("PRODUCES", "Queue:sqs:br-out"), ("PRODUCES", "Queue:sqs:br-lambda-out"),
+        ("PRODUCES", "Queue:sqs:br-named")}, id="sqs-builders"),
+    pytest.param(".java", (
+        "class A {\n"
         '  @SqsListener("sl.one") void a(String m) {}\n'
         '  @SqsListener(value = "${sqs.q}") void b(String m) {}\n'
         '  void c() { sqsTemplate.send("sl.send", payload); }\n'
@@ -1097,3 +1122,24 @@ def test_scan_defaults_to_one_shared_schema_version(tmp_path: Path, monkeypatch)
     assert runner.invoke(main, ["ontology", "eval", str(expected), "--scan", str(root),
                                 "--schema-version", "2"]).exit_code == 0
     assert seen[-1] == 2
+
+
+def test_jms_default_destination_site_is_matched_without_destination() -> None:
+    sites = msg.find_sites(".java", "jmsTemplate.send(session -> session.createTextMessage(x));\n"
+                                    "template.send(new MessageCreator() { });\n")
+    assert [(s.rule.id, s.dests) for s in sites] == [("jms.send", []), ("jms.send.creator", [])]
+
+
+def test_creator_send_on_unrelated_object_is_not_a_jms_site() -> None:
+    text = 'class A { void f() { template.send("x", s -> s.go()); executor.send(x -> x); } }\n'
+    assert msg.find_sites(".java", text) == []
+    assert msg.find_sites(".java", text, context={"kafka"}) == []
+    with_jms = msg.find_sites(".java", text, context={"jms"})
+    assert [s.rule.id for s in with_jms] == ["jms.send.creator"]  # not ``executor``
+
+
+def test_creator_rule_does_not_double_count_jms_or_sqs_receivers() -> None:
+    text = ('jmsTemplate.send("a", s -> s);\n myJmsTemplate.send("b", s -> s);\n'
+            'sqsTemplate.send(to -> to.queue("c"));\n')
+    ids = [s.rule.id for s in msg.find_sites(".java", text, context={"jms"})]
+    assert "jms.send.creator" not in ids

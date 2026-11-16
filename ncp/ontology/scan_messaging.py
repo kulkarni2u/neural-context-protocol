@@ -388,7 +388,14 @@ _RULES: list[Rule] = [
           r"@RabbitListener\s*\(\s*" + _ARGS, "annotation",
           keys=("queues", "queuesToDeclare")),
     _rule("jms.send", "jms", "Queue", "PRODUCES", JVM,
-          r"[Jj]ms\w{0,30}\s*\.\s*(?:convertAndSend|send)\s*\(\s*" + _ARGS),
+          r"[Jj]ms\w{0,30}\s*\.\s*(?:convertAndSend|send)\s*\(\s*" + _ARGS, "jms_send"),
+    # ``template.send(queue, s -> ...)`` / ``send(queue, new MessageCreator() {...})`` on a
+    # template whose name does not say JMS: only with a lambda / anonymous creator, only in a
+    # module that mentions jms, and never for the receivers another rule already owns.
+    _rule("jms.send.creator", "jms", "Queue", "PRODUCES", JVM,
+          r"\b(?:(?![Jj]ms|[Ss]qs|[Rr]abbit|[Aa]mqp|[Kk]afka)\w){0,40}[Tt]emplate\s*\.\s*send"
+          r"\s*\(\s*(?=[^;]{0,300}?(?:->|\bnew\s+\w{1,60}\s*\(\s*\)\s*\{))" + _ARGS,
+          "jms_send", requires=("jms",)),
     _rule("jms.JmsListener", "jms", "Queue", "CONSUMES", JVM,
           r"@JmsListener\s*\(\s*" + _ARGS, "annotation", keys=("destination",)),
     _rule("spring-aws.SqsListener", "sqs", "Queue", "CONSUMES", JVM,
@@ -400,10 +407,17 @@ _RULES: list[Rule] = [
           + _ARGS),
     _rule("aws2.SendMessageRequest", "sqs", "Queue", "PRODUCES", JVM,
           r"SendMessage(?:Batch)?Request\s*\.\s*builder\s*\(\s*\)[^;]{0,400}?"
-          r"\.\s*queueUrl\s*\(\s*" + _ARGS),
+          r"\.\s*queue(?:Url|Name)\s*\(\s*" + _ARGS),
     _rule("aws2.ReceiveMessageRequest", "sqs", "Queue", "CONSUMES", JVM,
           r"ReceiveMessageRequest\s*\.\s*builder\s*\(\s*\)[^;]{0,400}?"
-          r"\.\s*queueUrl\s*\(\s*" + _ARGS),
+          r"\.\s*queue(?:Url|Name)\s*\(\s*" + _ARGS),
+    # Consumer-builder overloads: ``client.sendMessage(r -> r.queueUrl(url).messageBody(b))``.
+    _rule("aws2.sendMessage.lambda", "sqs", "Queue", "PRODUCES", JVM,
+          r"\.\s*sendMessage\s*\(\s*\(?\s*\w{1,30}\s*\)?\s*->[^;]{0,400}?"
+          r"\.\s*queue(?:Url|Name)\s*\(\s*" + _ARGS, requires=("sqs",)),
+    _rule("aws2.receiveMessage.lambda", "sqs", "Queue", "CONSUMES", JVM,
+          r"\.\s*receiveMessage\s*\(\s*\(?\s*\w{1,30}\s*\)?\s*->[^;]{0,400}?"
+          r"\.\s*queue(?:Url|Name)\s*\(\s*" + _ARGS, requires=("sqs",)),
     _rule("aws2.PublishRequest", "sns", "Exchange", "PRODUCES", JVM,
           r"PublishRequest\s*\.\s*builder\s*\(\s*\)[^;]{0,400}?\.\s*topicArn\s*\(\s*" + _ARGS),
 ]
@@ -465,6 +479,19 @@ def _mode_first(rule: Rule, args: str, base: int, line_at: _LineAt) -> list[Dest
     items, _end = call_args(args)
     picked = _pick(items, 0, rule.keys)
     return [_dest(rule.entity, picked, base, line_at)] if picked else []
+
+
+CREATOR = re.compile(r"\s*(?:\(?\s*\w{1,30}\s*\)?\s*->|new\s+\w{1,60}\s*\(\s*\)\s*\{)")
+
+
+def _mode_jms_send(rule: Rule, args: str, base: int, line_at: _LineAt) -> list[Dest]:
+    """``send(destination, creator)``: the first argument names the queue. A lone lambda /
+    anonymous ``MessageCreator`` uses the template's default destination, which cannot be
+    read from the call, so the site is matched without a destination."""
+    items = call_args(args)[0]
+    if not items or (len(items) == 1 and CREATOR.match(items[0][1])):
+        return []
+    return [_dest(rule.entity, items[0], base, line_at)]
 
 
 def _mode_list(rule: Rule, args: str, base: int, line_at: _LineAt) -> list[Dest]:
@@ -563,7 +590,7 @@ def _mode_annotation(rule: Rule, args: str, base: int, line_at: _LineAt) -> list
 
 
 _MODES: dict[str, Callable[[Rule, str, int, _LineAt], list[Dest]]] = {
-    "first": _mode_first, "list": _mode_list, "leading": _mode_leading, "batch": _mode_batch,
+    "first": _mode_first, "jms_send": _mode_jms_send, "list": _mode_list, "leading": _mode_leading, "batch": _mode_batch,
     "publish": _mode_publish, "bind": _mode_bind, "spring_amqp": _mode_spring_amqp,
     "annotation": _mode_annotation,
 }
