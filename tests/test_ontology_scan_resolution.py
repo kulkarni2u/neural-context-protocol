@@ -258,3 +258,33 @@ def test_different_spel_expressions_get_different_keys(tmp_path: Path) -> None:
                     "  @KafkaListener(topics = \"#{@b.y}\") void b() {}\n}\n")}
     keys = set(_topics(scan_repository(_spring(tmp_path, files))))
     assert len(keys) == 2 and all(SPEL_KEY.fullmatch(k) for k in keys)
+
+
+# -- unresolved is counted per site, not per ternary branch -------------------------------
+
+_TERNARY = "#{${m.a}=='A' ? '${x.t1}' : '${x.t2}'}"
+
+
+def _ternary_send(props: str) -> dict[str, str]:
+    return {
+        APP: props,
+        JAVA: ('class K {\n  @Value("' + _TERNARY + '") private String topic;\n'
+               "  void a() { kafkaTemplate.send(topic, v); }\n}\n"),
+    }
+
+
+def test_ternary_send_with_all_unresolved_is_one_site_and_one_key(tmp_path: Path) -> None:
+    result = scan_repository(_spring(tmp_path, _ternary_send("other=1\n")))
+    kafka = result.summary["kafka"]
+    assert kafka["unresolved_placeholders"] == 1
+    assert kafka["unresolved_unique_keys"] == 1
+    produces = [r for r in result.manifest.relations if r.type == "PRODUCES"]
+    assert len(produces) == 1
+
+
+def test_ternary_send_with_one_known_branch_counts_one_unresolved_site(tmp_path: Path) -> None:
+    result = scan_repository(_spring(tmp_path, _ternary_send("x.t1=known.topic\n")))
+    kafka = result.summary["kafka"]
+    assert kafka["unresolved_placeholders"] == 1
+    assert kafka["unresolved_unique_keys"] == 1
+    assert "known.topic" in _topics(result)

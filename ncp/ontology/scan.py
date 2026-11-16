@@ -1582,6 +1582,9 @@ def _topic_hits(
             for found in _topic_hits(alternative, direction, line, site_line, pattern=pattern,
                                      entity=entity, broker=broker):
                 found.candidate = True
+                if found.unresolved and any(
+                        other.unresolved and other.topic == found.topic for other in branches):
+                    continue  # branches sharing one placeholder key: a single unresolved hit
                 branches.append(found)
         return branches
     if outcome.unresolved is not None:
@@ -1909,9 +1912,11 @@ def _source_kind(hits: list[_Hit]) -> str:
 def _site_result(rule_broker: str, rule_entity: str, line: int, direction: str,
                  site_hits: list[_Hit]) -> _Res:
     good = [hit for hit in site_hits if not hit.unresolved]
+    # A site counts once however many hits (ternary branches) it yields.
+    unresolved = 1 if len(good) < len(site_hits) else 0
     return _Res(site_hits[0].broker if site_hits else rule_broker,
                 site_hits[0].entity if site_hits else rule_entity, line, direction,
-                _source_kind(good) if good else None, len(site_hits) - len(good))
+                _source_kind(good) if good else None, unresolved)
 
 
 def _file_results(
@@ -1974,9 +1979,8 @@ def _route_hits(
                             entity="Exchange", broker=rule.broker)
     queues = _topic_hits(outcomes[1], "ROUTES_TO", site.dests[1].line, site.line,
                          entity="Queue", broker=rule.broker)
-    unresolved = sum(hit.unresolved for hit in exchanges + queues)
-    if unresolved:
-        return [], _Res(rule.broker, "Exchange", site.line, "ROUTES_TO", None, unresolved)
+    if any(hit.unresolved for hit in exchanges + queues):  # one unresolved site, not per hit
+        return [], _Res(rule.broker, "Exchange", site.line, "ROUTES_TO", None, 1)
     routes = [_Hit("ROUTES_TO", ex.topic, ex.line, site.line, ex.attributes, False, "Exchange",
                    ex.broker, partner=queue)
               for ex in exchanges for queue in queues]

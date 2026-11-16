@@ -1188,3 +1188,26 @@ def test_unresolved_sites_collapse_into_unique_keys(tmp_path: Path) -> None:
     assert "3 sites -> 2 unique keys" in " ".join(cli.output.split())
     as_json = json.loads(CliRunner().invoke(main, ["ontology", "scan", str(root), "--json"]).output)
     assert as_json["summary"]["messaging"]["rabbitmq"]["unresolved_unique_keys"] == 2
+
+
+_KAFKA_CALLBACKS = (
+    'class A {\n'
+    '  void f() { template.send("t", "v").whenComplete((r, e) -> { log(r); }); }\n'
+    '  void g() { template.send("t", "v").addCallback(r -> {}, e -> {}); }\n'
+    '}\n')
+
+
+def test_kafka_send_callbacks_are_not_jms_creator_sites() -> None:
+    assert msg.find_sites(".java", _KAFKA_CALLBACKS, context={"jms"}) == []
+    assert msg.find_sites(".java", 'jms.x(); template.send("q", s -> s.go());\n')[0].dests[0].expr \
+        == '"q"'
+
+
+def test_kafka_send_callbacks_in_jms_module_create_no_queue(tmp_path: Path) -> None:
+    root = _write(tmp_path / "r", {
+        "svc/pom.xml": "<project><dependencies>activemq jms</dependencies></project>\n",
+        "svc/Dockerfile": "FROM x\n",
+        "svc/src/main/java/A.java": _KAFKA_CALLBACKS,
+    })
+    result = scan_repository(root)
+    assert not [e for e in result.manifest.entities if e.type == "Queue"]

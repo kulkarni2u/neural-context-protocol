@@ -394,8 +394,7 @@ _RULES: list[Rule] = [
     # module that mentions jms, and never for the receivers another rule already owns.
     _rule("jms.send.creator", "jms", "Queue", "PRODUCES", JVM,
           r"\b(?:(?![Jj]ms|[Ss]qs|[Rr]abbit|[Aa]mqp|[Kk]afka)\w){0,40}[Tt]emplate\s*\.\s*send"
-          r"\s*\(\s*(?=[^;]{0,300}?(?:->|\bnew\s+\w{1,60}\s*\(\s*\)\s*\{))" + _ARGS,
-          "jms_send", requires=("jms",)),
+          r"\s*\(\s*" + _ARGS, "jms_send_creator", requires=("jms",)),
     _rule("jms.JmsListener", "jms", "Queue", "CONSUMES", JVM,
           r"@JmsListener\s*\(\s*" + _ARGS, "annotation", keys=("destination",)),
     _rule("spring-aws.SqsListener", "sqs", "Queue", "CONSUMES", JVM,
@@ -494,6 +493,18 @@ def _mode_jms_send(rule: Rule, args: str, base: int, line_at: _LineAt) -> list[D
     return [_dest(rule.entity, items[0], base, line_at)]
 
 
+def _mode_jms_send_creator(
+    rule: Rule, args: str, base: int, line_at: _LineAt,
+) -> list[Dest] | None:
+    """:func:`_mode_jms_send` for a receiver not named JMS: the last top-level argument of the
+    call itself must be a lambda / anonymous creator, else (``None``) there is no site, so a
+    Kafka ``send(t, v).whenComplete(x -> ...)`` is never taken for a JMS send."""
+    items = call_args(args)[0]
+    if not items or not CREATOR.match(items[-1][1]):
+        return None
+    return _mode_jms_send(rule, args, base, line_at)
+
+
 def _mode_list(rule: Rule, args: str, base: int, line_at: _LineAt) -> list[Dest]:
     items, _end = call_args(args)
     picked = _pick(items, 0, rule.keys)
@@ -589,8 +600,9 @@ def _mode_annotation(rule: Rule, args: str, base: int, line_at: _LineAt) -> list
     return out
 
 
-_MODES: dict[str, Callable[[Rule, str, int, _LineAt], list[Dest]]] = {
-    "first": _mode_first, "jms_send": _mode_jms_send, "list": _mode_list, "leading": _mode_leading, "batch": _mode_batch,
+_MODES: dict[str, Callable[[Rule, str, int, _LineAt], list[Dest] | None]] = {
+    "first": _mode_first, "jms_send": _mode_jms_send,
+    "jms_send_creator": _mode_jms_send_creator, "list": _mode_list, "leading": _mode_leading, "batch": _mode_batch,
     "publish": _mode_publish, "bind": _mode_bind, "spring_amqp": _mode_spring_amqp,
     "annotation": _mode_annotation,
 }
@@ -651,8 +663,9 @@ def find_sites(
             if text[starts[line - 1]:match.start()].lstrip().startswith(_COMMENT):
                 continue
             args = match.group(rule.group)
-            sites.append(Site(rule, line, rule.direction,
-                              mode(rule, args, match.start(rule.group), line_at)))
+            dests = mode(rule, args, match.start(rule.group), line_at)
+            if dests is not None:  # ``None``: the mode rejects the match, no site at all
+                sites.append(Site(rule, line, rule.direction, dests))
     sites.sort(key=lambda site: site.line)
     return sites
 
