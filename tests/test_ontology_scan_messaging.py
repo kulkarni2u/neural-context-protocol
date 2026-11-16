@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from pathlib import Path
 
@@ -500,7 +501,9 @@ def test_spel_unresolved_forms(tmp_path: Path, expr: str) -> None:
 def test_spel_unresolved_keeps_expanded_placeholders(tmp_path: Path) -> None:
     result = _spel(tmp_path, "#{@x.y('${single}')} ${nope}", PROPS)
     (key,) = _topics(result)
-    assert key == "unresolved:#{@x.y('solo')} ${nope}"
+    assert re.fullmatch(r"unresolved:spel:[0-9a-f]{12}", key)
+    assert _entity(result.manifest, "KafkaTopic", key).attributes["expression"] == (
+        "#{@x.y('${single}')} ${nope}")
 
 
 def test_spel_beans_and_listener(tmp_path: Path) -> None:
@@ -517,9 +520,10 @@ def test_spel_beans_and_listener(tmp_path: Path) -> None:
             '  @KafkaListener(topics = "#{__listener.topic}") void d() {}\n'
             '  @KafkaListener(topics = "#{@ghostBean.topic}") void e() {}\n}\n')})
     result = scan_repository(root)
-    assert _topics(result) == {
-        "from.bean", "bean.const", "from.own", "unresolved:#{@ghostBean.topic}"}
-    ghost = _entity(result.manifest, "KafkaTopic", "unresolved:#{@ghostBean.topic}")
+    (ghost_key,) = [key for key in _topics(result) if key.startswith("unresolved:")]
+    assert re.fullmatch(r"unresolved:spel:[0-9a-f]{12}", ghost_key)
+    assert _topics(result) == {"from.bean", "bean.const", "from.own", ghost_key}
+    ghost = _entity(result.manifest, "KafkaTopic", ghost_key)
     assert ghost.attributes["bean"] == "ghostBean" and ghost.attributes["spel"] == "#{@ghostBean.topic}"
 
 

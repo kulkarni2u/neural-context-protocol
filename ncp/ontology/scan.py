@@ -46,13 +46,14 @@ Review the manifest (or seed with ``--status candidate``) before trusting it.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import subprocess
 import tomllib
 import xml.etree.ElementTree as ET
 from bisect import bisect_right
-from collections.abc import Callable, Collection, Iterable, Iterator
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Literal
@@ -559,10 +560,25 @@ class _PropIndex:
 
     by_module: dict[str, dict[str, list[_Prop]]] = field(default_factory=dict)
     repo: dict[str, list[_Prop]] = field(default_factory=dict)
+    # External (deploy-time) values; they win over every repo-defined value.
+    overlay: dict[str, _Prop] = field(default_factory=dict)
 
     @staticmethod
     def _norm(key: str) -> str:
         return "\0" + key.lower().replace("-", "").replace("_", "")
+
+    @staticmethod
+    def _flat(key: str) -> str:
+        """Spring relaxed-binding form: separators dropped, so ``KAFKA_TOPIC_ORDERS`` equals
+        ``kafka.topic.orders`` and ``kafka.topic-orders``."""
+        return "\1" + re.sub(r"[._-]", "", key).lower()
+
+    def add_overlay(self, rel: str, items: Mapping[str, tuple[str, int]]) -> None:
+        """Register external values (later calls win)."""
+        for key, (value, line) in items.items():
+            prop = _Prop(None, value, rel, line)
+            for name in (key, self._norm(key), self._flat(key)):
+                self.overlay[name] = prop
 
     def add(self, module: str, profile: str | None, rel: str,
             items: dict[str, tuple[str, int]]) -> None:
@@ -587,6 +603,11 @@ class _PropIndex:
         return pool[0]
 
     def lookup(self, key: str, module: str) -> _Prop | None:
+        if self.overlay:
+            for name in (key, self._norm(key), self._flat(key)):
+                found = self.overlay.get(name)
+                if found is not None:
+                    return found
         for name in (key, self._norm(key)):
             local = self.by_module.get(module, {}).get(name)
             if local:
@@ -804,6 +825,7 @@ class _Term:
     profile: str | None = None
     unresolved: str | None = None  # entity key of the placeholder when value is None
     extra: dict[str, object] = field(default_factory=dict)  # spel / bean / env attributes
+    alts: list[_Term] | None = None  # undecidable ternary: one term per branch
 
 
 @dataclass
@@ -814,6 +836,7 @@ class _Outcome:
     unresolved: str | None
     expression: str
     extra: dict[str, object] = field(default_factory=dict)
+    alternatives: list[_Outcome] | None = None  # ternary branches (candidates)
 
 
 @dataclass
@@ -821,6 +844,72 @@ class _Fail:
     """A SpEL expression the evaluator does not understand (``bean`` names a looked-up bean)."""
 
     bean: str | None = None
+
+
+@dataclass
+class _Alt:
+    """An undecidable SpEL ternary: ``(condition, branch, value)`` per branch."""
+
+    options: list[tuple[str, str, str | _Fail]]
+
+
+_MAX_ALTS = 8
+
+
+def _spel_key(expr: str) -> str:
+    """Stable entity key of an unresolvable SpEL / complex expression: the same expression
+    (whitespace outside quotes ignored) always maps to the same key, in any file."""
+    kept: list[str] = []
+    quote = ""
+    for char in expr:
+        if quote:
+            quote = "" if char == quote else quote
+        elif char in "\"'":
+            quote = char
+        elif char.isspace():
+            continue
+        kept.append(char)
+    digest = hashlib.sha1("".join(kept).encode("utf-8", "replace"),
+                          usedforsecurity=False).hexdigest()
+    return f"unresolved:spel:{digest[:12]}"
+
+
+def _top_positions(text: str) -> Iterator[int]:
+    """Indexes of the characters outside quotes and brackets."""
+    depth = 0
+    quote = ""
+    for index, char in enumerate(text):
+        if quote:
+            if char == quote:  # a doubled quote ('') closes and reopens: harmless here
+                quote = ""
+        elif char in "\"'":
+            quote = char
+        elif char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+        elif depth == 0:
+            yield index
+
+
+def _spel_ternary(text: str) -> tuple[str, str, str] | None:
+    """``cond ? yes : no`` split at the top level (nested ternaries in ``yes`` / ``no`` ok)."""
+    question = -1
+    nesting = 0
+    for index in _top_positions(text):
+        char = text[index]
+        if char == "?":
+            if text[index + 1:index + 2] in (".", ":"):  # safe navigation / elvis
+                continue
+            if question < 0:
+                question = index
+            else:
+                nesting += 1
+        elif char == ":" and question >= 0:
+            if nesting == 0:
+                return text[:question], text[question + 1:index], text[index + 1:]
+            nesting -= 1
+    return None
 
 
 # SpEL forms (all patterns are anchored, bounded and free of nested quantifiers).
@@ -846,6 +935,67 @@ class _Resolver:
         self.beans: dict[str, tuple[str, dict[str, str]]] = {}
         # module path -> (file, expression, @Value fields) of ``setDefaultTopic(...)``
         self.default_topics: dict[str, tuple[str, str, dict[str, str]]] = {}
+        # @ConfigurationProperties classes by name; per file: variable -> config class
+        self.config_classes: dict[str, _ConfigClass] = {}
+        self.var_types: dict[str, dict[str, str]] = {}
+        self._var_patterns: tuple[re.Pattern[str], re.Pattern[str]] | None = None
+
+    def config_vars(self, text: str) -> dict[str, str]:
+        """``variable -> @ConfigurationProperties class`` for ``Type name`` (Java) and
+        ``name: Type`` (Kotlin) declarations in one file."""
+        if not self.config_classes:
+            return {}
+        if self._var_patterns is None:
+            names = "|".join(re.escape(name) for name in
+                             sorted(self.config_classes, key=len, reverse=True))
+            self._var_patterns = (
+                re.compile(rf"\b({names})\s+([a-z_]\w{{0,100}})\b"),
+                re.compile(rf"\b([a-z_]\w{{0,100}})\s*:\s*({names})\b"))
+        java, kotlin = self._var_patterns
+        found: dict[str, str] = {}
+        for cls, var in (m.groups() for m in java.finditer(text)):
+            if var not in _NOT_A_VARIABLE:
+                found.setdefault(var, cls)
+        for var, cls in (m.groups() for m in kotlin.finditer(text)):
+            found.setdefault(var, cls)
+        return found
+
+    def _config_term(self, expr: str, rel: str, module: str) -> _Term | None:
+        """``config.getTopic()`` / ``props.getOrders().getTopic()`` / ``config.topic`` on a
+        ``@ConfigurationProperties(prefix)`` variable -> the placeholder ``prefix.topic``."""
+        compact = "".join(expr.split())
+        if not self.config_classes or not _ACCESS_CHAIN.fullmatch(compact):
+            return None
+        segments = compact.split(".")
+        if segments[0] == "this":
+            segments = segments[1:]
+        if len(segments) < 2:
+            return None
+        cls = self.var_types.get(rel, {}).get(segments[0]) or next(
+            (name for name in self.config_classes if _decapitalize(name) == segments[0]), None)
+        config = self.config_classes.get(cls or "")
+        if config is None:
+            return None
+        path, fields = config.prefix, config.fields
+        for index, segment in enumerate(segments[1:], 1):
+            bare = segment[:-2] if segment.endswith("()") else segment
+            name = next((cand for cand in (
+                bare, _decapitalize(bare[3:]) if bare.startswith("get") else "",
+                _decapitalize(bare[2:]) if bare.startswith("is") else "") if cand in fields), None)
+            if name is None:
+                return None
+            path += "." + name
+            kind = fields[name]
+            if index == len(segments) - 1:
+                if kind in config.nested:
+                    return None  # a nested object, not a value
+            elif kind in config.nested:
+                fields = config.nested[kind]
+            else:
+                return None
+        term = self._text("${" + path + "}", None, module, rel)
+        term.extra["config_class"] = cls or ""
+        return term
 
     def expand(self, text: str, module: str, used: list[tuple[str, str, str | None]],
                depth: int = 0, trail: tuple[str, ...] = ()) -> str | None:
@@ -938,7 +1088,7 @@ class _Resolver:
         used: list[tuple[str, str, str | None]] = []
         expanded = self.expand_partial(text, module, used)
         extra: dict[str, object] = {"spel": _collapse(text, 300)}
-        out: list[str] = []
+        out: list[str | _Alt] = []
         position = 0
         while True:
             start = expanded.find("#{", position)
@@ -948,22 +1098,82 @@ class _Resolver:
             out.append(expanded[position:start])
             end = _matching(expanded, start + 1)
             if end < 0:
-                return _Term(None, unresolved="unresolved:" + _collapse(expanded), extra=extra)
+                return _Term(None, unresolved=_spel_key(text), extra=extra)
             value = self._spel_expr(expanded[start + 2:end], module, rel, fields, used)
             if isinstance(value, _Fail):
                 if value.bean:
                     extra["bean"] = value.bean
-                return _Term(None, unresolved="unresolved:" + _collapse(expanded), extra=extra)
+                return _Term(None, unresolved=_spel_key(text), extra=extra)
+            if isinstance(value, _Alt) and any(isinstance(piece, _Alt) for piece in out):
+                return _Term(None, unresolved=_spel_key(text), extra=extra)
             out.append(value)
             position = end + 1
-        value = "".join(out)
+        profile = next((item[2] for item in used if item[2]), None)
+        alt = next((piece for piece in out if isinstance(piece, _Alt)), None)
+        if alt is not None:
+            alts: list[_Term] = []
+            for cond, branch, option in alt.options:
+                branch_extra = {**extra, "ternary": cond, "ternary_branch": branch}
+                if isinstance(option, _Fail):
+                    alts.append(_Term(None, unresolved=_spel_key(text), extra=branch_extra))
+                    continue
+                joined = "".join(option if piece is alt else str(piece) for piece in out)
+                if "${" in joined or "#{" in joined:
+                    alts.append(_Term(None, unresolved=_spel_key(text), extra=branch_extra))
+                else:
+                    alts.append(_Term(joined, "spel", profile, extra=branch_extra))
+            return _Term(None, extra=extra, alts=alts)
+        value = "".join(str(piece) for piece in out)
         if "${" in value or "#{" in value:
-            return _Term(None, unresolved="unresolved:" + _collapse(expanded), extra=extra)
-        return _Term(value, "spel", next((item[2] for item in used if item[2]), None),
-                     extra=extra)
+            return _Term(None, unresolved=_spel_key(text), extra=extra)
+        return _Term(value, "spel", profile, extra=extra)
 
     def _spel_expr(self, inner: str, module: str, rel: str, fields: dict[str, str],
-                   used: list[tuple[str, str, str | None]]) -> str | _Fail:
+                   used: list[tuple[str, str, str | None]]) -> str | _Alt | _Fail:
+        """``cond ? a : b`` (``==`` / ``!=`` conditions) over ``+`` concatenations. A
+        condition that depends on an unknown property yields an :class:`_Alt`."""
+        inner = inner.strip()
+        while inner[:1] == "(" and _matching(inner, 0) == len(inner) - 1:
+            inner = inner[1:-1].strip()
+        split = _spel_ternary(inner)
+        if split is None:
+            return self._spel_sum(inner, module, rel, fields, used)
+        cond, yes, no = split
+        verdict = self._spel_cond(cond, module, rel, fields, used)
+        if isinstance(verdict, _Fail):
+            return verdict
+        if verdict is not None:
+            return self._spel_expr(yes if verdict else no, module, rel, fields, used)
+        cond_text = _collapse(cond, 200)
+        options: list[tuple[str, str, str | _Fail]] = []
+        for branch, text in (("true", yes), ("false", no)):
+            value = self._spel_expr(text, module, rel, fields, used)
+            if isinstance(value, _Alt):
+                options.extend(value.options)
+            else:
+                options.append((cond_text, branch, value))
+        return _Alt(options) if len(options) <= _MAX_ALTS else _Fail()
+
+    def _spel_cond(self, cond: str, module: str, rel: str, fields: dict[str, str],
+                   used: list[tuple[str, str, str | None]]) -> bool | None | _Fail:
+        """``a == b`` / ``a != b``: True / False, None when an operand is an unknown
+        ``${property}``, or a failure for anything else."""
+        index = next((i for i in _top_positions(cond) if cond[i:i + 2] in ("==", "!=")), -1)
+        if index < 0:
+            return _Fail()
+        sides: list[str] = []
+        for side in (cond[:index], cond[index + 2:]):
+            value = self._spel_sum(side.strip(), module, rel, fields, used)
+            if isinstance(value, _Fail):
+                return value
+            sides.append(value)
+        if any("${" in value for value in sides):
+            return None
+        same = sides[0] == sides[1]
+        return same if cond[index] == "=" else not same
+
+    def _spel_sum(self, inner: str, module: str, rel: str, fields: dict[str, str],
+                  used: list[tuple[str, str, str | None]]) -> str | _Fail:
         parts: list[str] = []
         for _offset, operand in _split_top(inner, "+"):
             value = self._spel_operand(operand.strip(), module, rel, fields, used)
@@ -976,6 +1186,11 @@ class _Resolver:
                       used: list[tuple[str, str, str | None]]) -> str | _Fail:
         if not operand:
             return _Fail()
+        if operand[0] == "(" and _matching(operand, 0) == len(operand) - 1:
+            inner = self._spel_expr(operand[1:-1], module, rel, fields, used)
+            return inner if isinstance(inner, str) else _Fail()
+        if operand.startswith("${") and _brace_end(operand, 1) == len(operand) - 1:
+            return operand  # an unexpanded placeholder: the caller treats it as unknown
         if operand[0] in "'\"":
             quote = operand[0]
             index = 1
@@ -1096,6 +1311,10 @@ class _Resolver:
                 if default is None:
                     return _Term(None, unresolved=f"unresolved:env:{name}")
                 return _Term(default, "env_default", extra={"env": name})
+        if spring:
+            configured = self._config_term(expr, rel, module)
+            if configured is not None:
+                return configured
         if not _IDENT_CHAIN.fullmatch(expr):
             return None  # method call, cast, ... : not understood
         bare = expr[5:] if expr.startswith(("this.", "self.")) else expr
@@ -1131,6 +1350,14 @@ class _Resolver:
         extra: dict[str, object] = {}
         for term in terms:
             extra.update(term.extra)
+        branching = [term for term in terms if term.alts]
+        if branching:
+            if len(branching) > 1:
+                return _Outcome([], "", None, _spel_key(raw), raw, extra)
+            alternatives = [
+                _Resolver._finish([alt if term is branching[0] else term for term in terms], raw)
+                for alt in branching[0].alts or []]
+            return _Outcome([], "", None, None, raw, extra, alternatives)
         failed = next((term for term in terms if term.value is None), None)
         if failed is not None:
             return _Outcome([], "", None, failed.unresolved, raw, extra)
@@ -1175,6 +1402,130 @@ def _value_fields(text: str) -> dict[str, str]:
     return fields
 
 
+# -- @ConfigurationProperties classes (bounded, heuristic) -------------------------------
+
+_CONFIG_PROPS = re.compile(
+    r"@ConfigurationProperties\s*\(\s*(?:(?:prefix|value)\s*=\s*)?\"([A-Za-z0-9._-]{1,200})\""
+    r"[^)]{0,200}\)")
+_CLASS_NAME = re.compile(r"\b(?:class|record|object)\s+([A-Za-z_]\w*)")
+_TYPE_KEYWORD = re.compile(r"\b(?:class|record|object|interface|enum|fun|val|var)\b")
+_KT_FIELD = re.compile(r"\b(?:val|var)\s+([A-Za-z_]\w*)\s*:\s*([A-Za-z_][\w.]{0,100})")
+_ANNOTATION = re.compile(r"@[A-Za-z_][\w.]{0,60}(?:\([^()]{0,200}\))?")
+_TYPE_BASE = re.compile(r"[A-Za-z_][\w.]*")
+_ACCESS_CHAIN = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*(?:\(\))?){1,4}")
+_FIELD_MODIFIERS = frozenset({
+    "private", "public", "protected", "final", "static", "transient", "volatile", "lateinit",
+    "internal", "override"})
+_NOT_A_VARIABLE = frozenset({"extends", "implements", "throws", "new", "class", "record"})
+_MAX_CLASS_BODY = 100_000
+
+
+@dataclass(frozen=True)
+class _ConfigClass:
+    """A ``@ConfigurationProperties(prefix)`` class: ``field -> type`` plus the field tables of
+    every class declared in the same file (one level of nesting is followed)."""
+
+    prefix: str
+    fields: dict[str, str]
+    nested: dict[str, dict[str, str]]
+
+
+def _type_base(raw: str) -> str:
+    match = _TYPE_BASE.match(raw.strip())
+    return match.group(0).rsplit(".", 1)[-1] if match else ""
+
+
+def _depth_one(text: str, open_index: int) -> str:
+    """The characters of the ``{...}`` block at ``open_index`` that are not inside a nested
+    block; each nested block leaves a ``;`` + newline separator behind."""
+    out: list[str] = []
+    depth = 0
+    for index in range(open_index, min(len(text), open_index + _MAX_CLASS_BODY)):
+        char = text[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                break
+            if depth == 1:
+                out.append(";\n")
+        elif depth == 1:
+            out.append(char)
+    return "".join(out)
+
+
+def _declared_fields(params: str, body: str) -> dict[str, str]:
+    """``name -> type`` of constructor / record parameters and of the body's field
+    declarations (Java ``Type name;``, Kotlin ``val|var name: Type``)."""
+    found: dict[str, str] = {}
+    for _offset, param in _split_top(params, ","):
+        param = _ANNOTATION.sub("", param).strip()
+        kotlin = _KT_FIELD.search(param)
+        if kotlin:
+            found[kotlin.group(1)] = _type_base(kotlin.group(2))
+            continue
+        tokens = [token for token in param.replace("=", " = ").split("=")[0].split()
+                  if token not in _FIELD_MODIFIERS]
+        if len(tokens) >= 2 and _IDENTIFIER.fullmatch(tokens[-1]):
+            found[tokens[-1]] = _type_base(tokens[-2])
+    for line in body.split("\n"):
+        for statement in line.split(";"):
+            statement = _ANNOTATION.sub("", statement).strip()
+            if not statement or len(statement) > 300:
+                continue
+            kotlin = _KT_FIELD.search(statement)
+            if kotlin:
+                found[kotlin.group(1)] = _type_base(kotlin.group(2))
+                continue
+            head = statement.split("=", 1)[0]
+            if "(" in head or "<" in head and ">" not in head:
+                continue
+            tokens = [token for token in head.split() if token not in _FIELD_MODIFIERS]
+            if (len(tokens) >= 2 and _IDENTIFIER.fullmatch(tokens[-1])
+                    and not _TYPE_KEYWORD.search(head)):
+                found[tokens[-1]] = _type_base(tokens[-2])
+    return found
+
+
+def _class_tables(text: str) -> dict[str, dict[str, str]]:
+    """``class name -> {field: type}`` for every class / record / object of one file."""
+    tables: dict[str, dict[str, str]] = {}
+    for match in _CLASS_NAME.finditer(text):
+        cursor = match.end()
+        while cursor < len(text) and text[cursor] in " \t\r\n":
+            cursor += 1
+        params = ""
+        if cursor < len(text) and text[cursor] == "(":
+            close = _matching(text, cursor)
+            if close < 0:
+                continue
+            params = text[cursor + 1:close]
+            cursor = close + 1
+        segment = text[cursor:cursor + 300]
+        brace = segment.find("{")
+        body = ""
+        if brace >= 0 and not _TYPE_KEYWORD.search(segment[:brace]):
+            body = _depth_one(text, cursor + brace)
+        tables[match.group(1)] = _declared_fields(params, body)
+    return tables
+
+
+def _config_classes(text: str) -> dict[str, _ConfigClass]:
+    """``@ConfigurationProperties(prefix = "a.b")`` / ``("a.b")`` classes of a JVM file."""
+    found: dict[str, _ConfigClass] = {}
+    tables: dict[str, dict[str, str]] | None = None
+    for match in _CONFIG_PROPS.finditer(text):
+        named = _CLASS_NAME.search(text, match.end(), match.end() + 600)
+        if named is None:
+            continue
+        if tables is None:
+            tables = _class_tables(text)
+        name = named.group(1)
+        found[name] = _ConfigClass(match.group(1).strip("."), tables.get(name, {}), tables)
+    return found
+
+
 @dataclass
 class _Hit:
     direction: str  # PRODUCES / CONSUMES / ROUTES_TO
@@ -1186,6 +1537,7 @@ class _Hit:
     entity: str = "KafkaTopic"  # KafkaTopic | Queue | Exchange
     broker: str = "kafka"
     partner: _Hit | None = None  # ROUTES_TO: the queue the exchange routes to
+    candidate: bool = False  # one of several possible destinations (ternary branch)
 
 
 @dataclass
@@ -1224,6 +1576,14 @@ def _topic_hits(
     def hit(topic: str, attributes: dict[str, object], unresolved: bool = False) -> _Hit:
         return _Hit(direction, topic, line, site_line, attributes, unresolved, entity, broker)
 
+    if outcome.alternatives is not None:  # undecidable ternary: every branch is a candidate
+        branches: list[_Hit] = []
+        for alternative in outcome.alternatives:
+            for found in _topic_hits(alternative, direction, line, site_line, pattern=pattern,
+                                     entity=entity, broker=broker):
+                found.candidate = True
+                branches.append(found)
+        return branches
     if outcome.unresolved is not None:
         return [hit(outcome.unresolved, {"unresolved": True, "expression": outcome.expression,
                                          **outcome.extra}, True)]
@@ -1481,6 +1841,10 @@ def _bridge_hits(
     if outcome.unresolved is not None:
         return _topic_hits(outcome, "PRODUCES", line, site)
     found: list[_Hit] = []
+    for alternative in outcome.alternatives or ():
+        for branch in _bridge_hits(alternative, site, line, resolver, module):
+            branch.candidate = True
+            found.append(branch)
     for name in outcome.names:
         key = f"spring.cloud.stream.bindings.{name}.destination"
         prop = resolver.props.lookup(key, module)
@@ -1707,8 +2071,17 @@ def scan_repository(
     schema_version: int = DEFAULT_SCAN_SCHEMA_VERSION,
     heuristics: HeuristicMode = "candidate",
     include_tests: bool = False,
+    extra_properties: Mapping[str, str] | None = None,
 ) -> ScanResult:
-    """Scan ``root`` and return a seed manifest plus a summary of what was found."""
+    """Scan ``root`` and return a seed manifest plus a summary of what was found.
+
+    ``extra_properties`` supplies external (deploy-time) property values for ``${...}``
+    placeholders, e.g. from :func:`load_extra_properties`. They **override** the values
+    defined in the repository's ``application*.properties|yml`` (deploy-time configuration
+    wins over packaged defaults, as in Spring); the repo values and ``${key:default}``
+    defaults are used for every key the overlay does not define. Keys match Spring-style:
+    exactly, case/``-``/``_``-insensitively, and environment style, so ``KAFKA_TOPIC_ORDERS``
+    also satisfies ``kafka.topic.orders``."""
     base = Path(root).resolve()
     if not base.is_dir():
         raise OntologyError("invalid", f"{root} is not a directory")
@@ -1966,7 +2339,11 @@ def scan_repository(
     files_examined = 0
     if heuristics != "off":
         props = _PropIndex()
+        if extra_properties:
+            props.add_overlay("<extra_properties>",
+                              {str(key): (str(value), 0) for key, value in extra_properties.items()})
         consts = _ConstIndex()
+        config_classes: dict[str, _ConfigClass] = {}
         beans: dict[str, tuple[str, dict[str, str]]] = {}
         default_topics: dict[str, tuple[str, str, dict[str, str]]] = {}
         cache: dict[str, str] = {}
@@ -2004,6 +2381,13 @@ def scan_repository(
                     if members:
                         existing = beans.get(_decapitalize(primary), (primary, {}))[1]
                         beans[_decapitalize(primary)] = (primary, {**existing, **members})
+                if "ConfigurationProperties" in text:
+                    for cfg_name, cfg in _config_classes(text).items():
+                        config_classes[cfg_name] = cfg
+                        leaf = {name: f"${{{cfg.prefix}.{name}}}"
+                                for name, kind in cfg.fields.items() if kind not in cfg.nested}
+                        known = beans.get(_decapitalize(cfg_name), (cfg_name, {}))[1]
+                        beans[_decapitalize(cfg_name)] = (cfg_name, {**leaf, **known})
                 declared = _default_topic_decl(text, rel)
                 if declared is not None:
                     default_topics.setdefault(module_path, declared)
@@ -2019,7 +2403,10 @@ def scan_repository(
         resolver = _Resolver(props, consts)
         resolver.beans = beans
         resolver.default_topics = default_topics
+        resolver.config_classes = config_classes
         for rel, text in cache.items():
+            if config_classes and PurePosixPath(rel).suffix in _JVM_SUFFIXES:
+                resolver.var_types[rel] = resolver.config_vars(text)
             home = _owning_module(rel, modules)
             sources = sources_for(home) if home is not None else []
             hits, results = _file_results(rel, text, text.lower(), home.path if home else "",
@@ -2063,7 +2450,7 @@ def scan_repository(
                     continue
                 for src, via, kind in sources:
                     if relate(src, hit.direction, dest_ref, (rel, hit.line), heuristic=True,
-                              candidate_only=hit.unresolved,
+                              candidate_only=hit.unresolved or hit.candidate,
                               attributes={"via_module": via} if via else None):
                         attribution[{"service": "edges_from_service",
                                      "dependency": "edges_via_dependency",
@@ -2122,6 +2509,53 @@ def scan_repository(
     }
     warnings.extend(_messaging_warnings(stats, manifest, schema_version))
     return ScanResult(manifest=manifest, summary=summary)
+
+
+def _parse_env_file(text: str) -> dict[str, tuple[str, int]]:
+    """dotenv lines: ``KEY=VALUE`` (optional ``export``, quotes and ``#`` comments)."""
+    out: dict[str, tuple[str, int]] = {}
+    for number, raw in enumerate(text.split("\n"), 1):
+        line = raw.strip()
+        if not line or line[0] == "#" or len(line) > _MAX_LINE:
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        key, equals, value = line.partition("=")
+        key, value = key.strip(), value.strip()
+        if not equals or not _IDENTIFIER.fullmatch(key):
+            continue
+        if value[:1] in "\"'" and len(value) > 1:
+            end = value.find(value[0], 1)
+            value = value[1:end] if end > 0 else value[1:]
+        else:
+            cut = value.find(" #")
+            value = (value[:cut] if cut >= 0 else value).strip()
+        out[key] = (value, number)
+    return out
+
+
+def load_extra_properties(
+    properties_files: Iterable[str | Path] = (), env_files: Iterable[str | Path] = (),
+) -> dict[str, str]:
+    """Read external property values for ``scan_repository(extra_properties=...)``:
+    ``.properties`` / ``.yml`` / ``.yaml`` files, then dotenv files. Later files win;
+    environment-style keys (``KAFKA_TOPIC_ORDERS``) also satisfy ``kafka.topic.orders``."""
+    merged: dict[str, str] = {}
+    sources = [(Path(item), False) for item in properties_files]
+    sources += [(Path(item), True) for item in env_files]
+    for path, is_env in sources:
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            raise OntologyError("invalid", f"cannot read {path}: {exc.strerror or exc}") from exc
+        if is_env:
+            parsed = _parse_env_file(text)
+        elif path.suffix.lower() in (".yml", ".yaml"):
+            parsed = _parse_yaml_props(text)
+        else:
+            parsed = _parse_properties(text)
+        merged.update({key: value for key, (value, _line) in parsed.items()})
+    return merged
 
 
 def _note_spring_name(
@@ -2204,4 +2638,4 @@ def _slug(value: str) -> str:
     return slug or "repo"
 
 
-__all__ = ["HAND_MANIFEST_NAMES", "ScanResult", "scan_repository"]
+__all__ = ["HAND_MANIFEST_NAMES", "ScanResult", "load_extra_properties", "scan_repository"]
