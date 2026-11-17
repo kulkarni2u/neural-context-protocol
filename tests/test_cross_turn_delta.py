@@ -100,8 +100,22 @@ def test_default_session_never_uses_delta(tmp_path: Path) -> None:
     second = _call(handlers, args)
     assert first["session_id"] == "__default__"
     assert "seen:1" not in second["context"]
-    assert second["telemetry"]["delta"] == {"applied": False, "reason": "default_session"}
+    assert second["telemetry"]["delta"] == {"applied": False, "reason": "session_id_required"}
     assert second["retrieved_chunk_ids"] == first["retrieved_chunk_ids"]
+
+
+def test_delta_without_explicit_session_id_is_not_applied(tmp_path: Path) -> None:
+    # Two agents sharing an agent id (no session_id) must not share delivered state.
+    handlers = make_handlers(_store(tmp_path))
+    args = {k: v for k, v in _args(delta=True).items() if k != "session_id"}
+    first = _call(handlers, args)
+    second = _call(handlers, args)
+    assert "seen:1" not in second["context"]
+    assert second["telemetry"]["delta"] == {"applied": False, "reason": "session_id_required"}
+    assert second["retrieved_chunk_ids"] == first["retrieved_chunk_ids"]
+    # An explicit-session caller is unaffected by the sessionless calls.
+    _call(handlers, _args(delta=True))
+    assert "seen:1" in _call(handlers, _args(delta=True))["context"]
 
 
 def test_new_session_id_resets_delivered_state(tmp_path: Path) -> None:

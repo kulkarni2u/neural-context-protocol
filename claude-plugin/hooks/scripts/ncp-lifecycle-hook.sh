@@ -12,7 +12,10 @@
 #
 # Env (optional): NCP_HOST (127.0.0.1), NCP_PORT (4242), NCP_TASK, NCP_SLOT,
 # NCP_AGENT_ID (claude; session agent id), NCP_HOOKS_DISABLE=1,
-# NCP_HOOK_<EVENT>_DISABLE=1 with EVENT in SESSIONSTART|SUBAGENTSTART|SUBAGENTSTOP|STOP.
+# NCP_HOOK_<EVENT>_DISABLE=1 with EVENT in SESSIONSTART|SUBAGENTSTART|SUBAGENTSTOP|STOP,
+# NCP_HOOK_POST_FULL=1 (also post result_full; default posts only result_summary).
+# Every call carries a session_id (<claude session>[:<subagent agent_id>]); posted
+# turns set redact:true so the server redacts secrets before they enter shared memory.
 set -uo pipefail
 trap 'exit 0' EXIT
 
@@ -65,12 +68,17 @@ slug() {
 build_args() {
   if [ "$HAVE_JQ" = "1" ]; then
     jq -cn --arg a "$1" --arg r "$2" --arg t "$3" --arg s "$4" --arg i "$5" \
-      --argjson x "${6:-$EMPTY_OBJ}" '{agent_id:$a,role:$r,task:$t,slot:$s,intent:$i} + $x'
+      --argjson x "${6:-$EMPTY_OBJ}" --arg sid "${NCP_SID:-}" \
+      '{agent_id:$a,role:$r,task:$t,slot:$s,intent:$i} + (if $sid == "" then {} else {session_id:$sid} end) + $x'
   else
     python3 -c 'import json,sys
 a=sys.argv
-print(json.dumps(dict(agent_id=a[1],role=a[2],task=a[3],slot=a[4],intent=a[5],**json.loads(a[6]))))' \
-      "$1" "$2" "$3" "$4" "$5" "${6:-$EMPTY_OBJ}"
+d=dict(agent_id=a[1],role=a[2],task=a[3],slot=a[4],intent=a[5])
+if a[7]:
+    d["session_id"]=a[7]
+d.update(json.loads(a[6]))
+print(json.dumps(d))' \
+      "$1" "$2" "$3" "$4" "$5" "${6:-$EMPTY_OBJ}" "${NCP_SID:-}"
   fi
 }
 
@@ -118,6 +126,7 @@ print(json.dumps({"hookSpecificOutput":{"hookEventName":sys.argv[1],"additionalC
 SESSION_ID="$(jget session_id)"
 SHORT="$(slug "${SESSION_ID:0:8}" session)"
 SESSION_AGENT="$(slug "${NCP_AGENT_ID:-claude}" claude)"
+NCP_SID="$SESSION_ID"
 
 case "$MODE" in
   session-restart|stop)
@@ -125,6 +134,9 @@ case "$MODE" in
     TASK="${NCP_TASK:-session_${SHORT}}"; SLOT="${NCP_SLOT:-session}" ;;
   *)
     AGENT_ID="$(slug "$(jget agent_type)" subagent)"; ROLE="$AGENT_ID"
+    # Per-subagent session so concurrent subagents never share server-side state.
+    SUB_ID="$(jget agent_id)"; [ -n "$SUB_ID" ] || SUB_ID="$AGENT_ID"
+    [ -n "$SESSION_ID" ] && NCP_SID="${SESSION_ID}:${SUB_ID}"
     TASK="${NCP_TASK:-session_${SHORT}}"; SLOT="${NCP_SLOT:-$AGENT_ID}" ;;
 esac
 TASK="$(slug "$TASK" session)"; SLOT="$(slug "$SLOT" session)"
@@ -143,12 +155,18 @@ case "$MODE" in
     MSG="$(jget last_assistant_message)"
     [ -n "$MSG" ] || exit 0
     INTENT=session_stop; [ "$MODE" = "subagent-stop" ] && INTENT=subagent_stop
-    FULL="${MSG:0:8000}"; SUMMARY="${MSG:0:400}"
+    # Truncate by characters inside jq/python so a multi-byte character is never split.
+    POST_FULL=0; [ "${NCP_HOOK_POST_FULL:-0}" = "1" ] && POST_FULL=1
     if [ "$HAVE_JQ" = "1" ]; then
-      EXTRA="$(jq -cn --arg s "$SUMMARY" --arg f "$FULL" '{result_summary:$s,result_full:$f}')"
+      EXTRA="$(jq -cn --arg m "$MSG" --argjson full "$POST_FULL" \
+        '{result_summary:$m[0:400],redact:true} + (if $full == 1 then {result_full:$m[0:8000]} else {} end)')"
     else
       EXTRA="$(python3 -c 'import json,sys
-print(json.dumps({"result_summary":sys.argv[1],"result_full":sys.argv[2]}))' "$SUMMARY" "$FULL")"
+m=sys.argv[1]
+d={"result_summary":m[:400],"redact":True}
+if sys.argv[2]=="1":
+    d["result_full"]=m[:8000]
+print(json.dumps(d))' "$MSG" "$POST_FULL")"
     fi
     ARGS="$(build_args "$AGENT_ID" "$ROLE" "$TASK" "$SLOT" "$INTENT" "$EXTRA")"
     call ncp_post_turn "$ARGS" >/dev/null || true ;;

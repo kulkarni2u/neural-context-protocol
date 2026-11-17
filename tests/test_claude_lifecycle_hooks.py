@@ -111,7 +111,8 @@ def test_session_restart_injects_capped_context(bus):
     name, args = _args(bus)
     assert name == "ncp_get_context"
     assert args == {"agent_id": "claude", "role": "claude", "task": "session_abcdef12",
-                    "slot": "session", "intent": "session_restart", "delta": False}
+                    "slot": "session", "intent": "session_restart", "delta": False,
+                    "session_id": "abcdef123456"}
 
 
 def test_subagent_start_derivation_and_cap(bus):
@@ -121,7 +122,8 @@ def test_subagent_start_derivation_and_cap(bus):
     assert out["additionalContext"] == "C" * 4000
     _, args = _args(bus)
     assert args == {"agent_id": "pravaha", "role": "pravaha", "task": "session_abcdef12",
-                    "slot": "pravaha", "intent": "subagent_start"}
+                    "slot": "pravaha", "intent": "subagent_start",
+                    "session_id": "abcdef123456:pravaha"}
 
 
 def test_subagent_start_env_task_slot(bus):
@@ -142,7 +144,41 @@ def test_stop_posts_turn_silently(bus, mode, agent, intent):
     assert name == "ncp_post_turn"
     assert args["agent_id"] == agent and args["intent"] == intent
     assert args["result_summary"] == "m" * 400
-    assert args["result_full"] == "m" * 8000
+    assert args["redact"] is True
+    assert "result_full" not in args
+    assert args["session_id"] == ("abcdef123456:nirnaya" if mode == "subagent-stop" else "abcdef123456")
+
+
+def test_stop_posts_full_only_when_opted_in(bus):
+    msg = "m" * 9000
+    _run("stop", {"session_id": "abcdef123456", "last_assistant_message": msg}, bus.port,
+         {"NCP_HOOK_POST_FULL": "1"})
+    _, args = _args(bus)
+    assert args["result_full"] == "m" * 8000 and args["redact"] is True
+
+
+def test_subagent_stop_session_uses_stdin_agent_id(bus):
+    _run("subagent-stop", {"session_id": "sess1", "agent_type": "nirnaya", "agent_id": "agent-42",
+                           "last_assistant_message": "done"}, bus.port)
+    _, args = _args(bus)
+    assert args["session_id"] == "sess1:agent-42"
+
+
+@pytest.mark.parametrize("no_jq", [False, True])
+def test_truncation_never_splits_multibyte_characters(bus, tmp_path, no_jq):
+    path = None
+    if no_jq:
+        for tool in ("bash", "python3", "curl", "cat", "tr", "cut"):
+            (tmp_path / tool).symlink_to(shutil.which(tool))
+        path = str(tmp_path)
+    elif shutil.which("jq") is None:
+        pytest.skip("jq not installed")
+    msg = "\u00e9\u4e2d" * 5000
+    _run("stop", {"session_id": "s1", "last_assistant_message": msg}, bus.port,
+         {"NCP_HOOK_POST_FULL": "1", "LC_ALL": "C"}, path=path)
+    _, args = _args(bus)
+    assert args["result_summary"] == msg[:400]
+    assert args["result_full"] == msg[:8000]
 
 
 def test_stop_skips_empty_message(bus):

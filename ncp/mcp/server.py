@@ -156,7 +156,7 @@ MCP_TOOLS: list[dict[str, object]] = [
                 "diversity_limit": {"type": "integer", "description": "Max chunks per author (default 2)."},
                 "max_tokens": {"type": "integer", "description": "Estimated token ceiling for the context block. Omit to let the adaptive budget decide (see response budget_tokens)."},
                 "compact": {"type": "boolean", "description": "Compact telemetry (default); false requests full diagnostics."},
-                "delta": {"type": "boolean", "description": "Default false. true renders chunks this session already received unchanged as 'chunk:<id> seen:1'; false resets that state. Never for the shared default session."},
+                "delta": {"type": "boolean", "description": "Default false. true renders chunks this session already received unchanged as 'chunk:<id> seen:1'; false resets that state. Needs an explicit session_id."},
                 "echo_ids": {"type": "boolean", "description": "Default true. false omits pending_whisper_ids and retrieved_chunk_ids; ncp_post_turn then uses the ids the server holds for this session."},
                 "response_max_tokens": {"type": "integer", "minimum": 1, "description": "Estimated token ceiling for the whole serialized response; diagnostics are dropped first, then context is re-fitted before streaming."},
                 "context_policy": {"type": "string", "description": "Name of a [context_policies.<name>] entry applied to this request only. Unknown or invalid names are rejected."},
@@ -1526,8 +1526,17 @@ def make_handlers(
         session_id = _session_id_from_args(args)
         pipeline_id = args.get("pipeline_id")
         normalized_pipeline_id = None if pipeline_id is None else str(pipeline_id)
-        delta_applied = delta and session_id != DEFAULT_FETCH_SESSION_ID
+        explicit_session = bool(args.get("session_id"))
+        delta_applied = delta and explicit_session and session_id != DEFAULT_FETCH_SESSION_ID
         prior_delivered: dict[str, str] = {}
+        preserved_delivered: dict[str, str] | None = None
+        if delta and not explicit_session:
+            # Derived keys (agent_id / pipeline) can be shared by several agents;
+            # behave as delta:false but leave whatever is stored untouched.
+            with sessions_lock:
+                existing = sessions.get(session_id)
+                if existing is not None:
+                    preserved_delivered = dict(existing.delivered)
         if delta_applied:
             # Carry delivered state across the per-call session reset below,
             # unless the entry expired (TTL) or never existed (new session_id).
@@ -1679,7 +1688,10 @@ def make_handlers(
             extra_telemetry["delta"] = (
                 {"applied": True, "seen": len(_seen_ids(result, prior_delivered))}
                 if delta_applied
-                else {"applied": False, "reason": "default_session"}
+                else {
+                    "applied": False,
+                    "reason": "default_session" if explicit_session else "session_id_required",
+                }
             )
         if extra_telemetry and isinstance(response.get("telemetry"), dict):
             response["telemetry"].update(extra_telemetry)  # type: ignore[union-attr]
@@ -1706,7 +1718,7 @@ def make_handlers(
                 held.pending_whisper_ids = list(fitted_result.pending_whisper_ids)
                 held.retrieved_chunk_ids = _retrieved_chunk_ids(fitted_result)
                 # delta:false (or a reset session) starts from an empty set.
-                delivered = dict(prior_delivered) if delta_applied else {}
+                delivered = dict(prior_delivered) if delta_applied else dict(preserved_delivered or {})
                 delivered.update(fitted_result.delivered_hashes)
                 while len(delivered) > _DELIVERED_MAX:
                     del delivered[next(iter(delivered))]

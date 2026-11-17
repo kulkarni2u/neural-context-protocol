@@ -6,7 +6,7 @@
 ![PyPI](https://img.shields.io/pypi/v/neural-context-protocol)
 
 **Bounded, trust-weighted memory for multi-agent systems.**
-MCP-native. Agents share context without replaying full transcripts. Fewer tokens than replaying history: about 1.44x fewer than a sliding window and about 13x fewer than raw replay in the 4-agent coding benchmark. The raw-replay figure is a worst-case floor that grows with turn count — see [Benchmarks](#benchmarks).
+MCP-native. Agents share context without replaying full transcripts. Fewer tokens than replaying history: about 1.48x fewer than a sliding window and about 13x fewer than raw replay in the 4-agent coding benchmark. The raw-replay figure is a worst-case floor that grows with turn count — see [Benchmarks](#benchmarks).
 
 -----
 
@@ -604,16 +604,16 @@ NCP adds bounded retrieval, provenance, optional authenticated authorship, disse
 
 | Scenario                               | Baseline       | Baseline tokens | NCP tokens | Result     | Caveat |
 |----------------------------------------|----------------|----------------:|-----------:|-----------:|--------|
-| 4-agent coding pipeline (40 turns)     | sliding window | 377             | 261        | **1.44x**  | Closest accounting comparison for a bounded recent-context baseline. |
-| 4-agent coding pipeline (40 turns)     | plain RAG (BM25) | 358           | 260        | **1.38x**  | Token accounting only, at the same 340-token ceiling; says nothing about context quality. |
-| 4-agent coding pipeline (40 turns)     | raw replay     | 3,426           | 261        | **13.13x** | Worst-case floor; the ratio scales with turn count. |
-| 4-agent coding pipeline (40 turns)     | rolling summary| 2,096           | 261        | **8.03x**  | Token accounting only; does not score summary quality. |
-| 6-role research pipeline (36 turns)    | raw replay     | 3,277           | 267        | **12.27x** | Worst-case floor for a deterministic synthetic research trace. |
+| 4-agent coding pipeline (40 turns)     | sliding window | 377             | 255        | **1.48x**  | Closest accounting comparison for a bounded recent-context baseline. |
+| 4-agent coding pipeline (40 turns)     | plain RAG (BM25) | 358           | 255        | **1.40x**  | Token accounting only, at the same 340-token ceiling; says nothing about context quality. |
+| 4-agent coding pipeline (40 turns)     | raw replay     | 3,426           | 255        | **13.44x** | Worst-case floor; the ratio scales with turn count. |
+| 4-agent coding pipeline (40 turns)     | rolling summary| 2,096           | 255        | **8.22x**  | Token accounting only; does not score summary quality. |
+| 6-role research pipeline (36 turns)    | raw replay     | 3,277           | 259        | **12.65x** | Worst-case floor for a deterministic synthetic research trace. |
 | Cross-host handoff (Claude -> OpenCode)| window baseline| 0.0 success     | 0.8 success| **+0.8**   | Local harness with a noise-only control, not a distributed-host reliability study. |
 | Needle recall at budget 4              | sliding window | 0.00            | 1.00       | **+1.00**  | Synthetic budget-stress recall check. |
 | Needle recall at budget 4              | plain RAG (BM25) | 1.00          | 1.00       | **tie**    | Lexical task: any BM25 retriever solves it; shows NCP is not worse than ordinary retrieval, not that it is better. |
 | Task success at matched budget 400 (12 tasks, mock) | sliding window | 0.00 | 1.00 | **+1.00** | Context adequacy with a deterministic mock provider, not live model success. |
-| Task success at matched budget 400 (12 tasks, mock) | plain RAG (BM25) | 1.00 | 1.00 | **tie** | Ties at every budget tried (150-800); mock scoring only checks the fact is present. NCP used fewer tokens at budget 800 (568 vs 783 median). |
+| Task success at matched budget 400 (12 tasks, mock) | plain RAG (BM25) | 1.00 | 1.00 | **tie** | Ties at every budget tried (150-800); mock scoring only checks the fact is present. NCP used fewer tokens at budget 800 (559 vs 783 median). |
 | HotpotQA-style multi-hop QA at matched budget 300 (15 tasks) | sliding window | 0.00 | 1.00 | **+1.00** | Synthetic, HotpotQA-shaped context-adequacy check — not the official HotpotQA dataset or PlugMem's own eval harness (see [the benchmark's README](./benchmarks/hotpotqa_style/README.md)). |
 | HotpotQA-style multi-hop QA at matched budget 300 (15 tasks) | plain RAG (BM25) | 1.00 | 1.00 | **tie** | Plain RAG **beats** NCP at tighter budgets: 1.00 vs 0.60 at budget 150 and 1.00 vs 0.87 at 200. |
 | Conflicting / low-trust memory, true claim ranked first at k=1 (60 tasks) | plain RAG (BM25) | 0.33 | 0.98 | **+0.65** | Claims differ only by value, so BM25 ties; NCP uses trust, supersedes, outcomes and dissent. NCP's one miss per seed is a retrieval ranking issue (a common word outweighs the topical terms), and it loses when the wrong claim is the trusted one (0.00 vs 0.58). Seed 7; NCP is 0.98 on all five seeds tried. See `docs/NCP_BENCHMARK_CONFLICT_TRUST.md`. |

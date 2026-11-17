@@ -15,6 +15,7 @@ from ncp.tokens import estimate_budget_tokens, estimate_tokens, reset_encoder_ca
 from ncp.types import (
     CONSCIOUS_ITEM_MAX_CHARS,
     CONSCIOUS_LIST_CAPS,
+    CONSCIOUS_MAX_SKILLS,
     BudgetContext,
     ConsciousBlock,
     SubconsciousChunk,
@@ -101,18 +102,74 @@ def test_block_never_exceeds_budget_under_tiktoken(
 
 def test_conscious_lists_are_capped_keeping_most_recent() -> None:
     block = _conscious(
-        owns=[f"o{i}" for i in range(40)],
         recent=[f"r{i}" for i in range(30)],
         tried=[f"t{i}" for i in range(30)],
         failed=["f" * 500, *[f"f{i}" for i in range(30)]],
     )
-    capped = block.capped()
-    assert len(capped.owns) == CONSCIOUS_LIST_CAPS["owns"] and capped.owns[0] == "o0"
+    capped, truncated = block.capped_report()
+    assert truncated is True
     assert capped.tried[-1] == "t29" and len(capped.tried) == CONSCIOUS_LIST_CAPS["tried"]
     assert capped.recent[-1] == "r29"
     assert capped.failed[-1] == "f29"
-    assert _conscious(failed=["f" * 500]).capped().failed == ["f" * CONSCIOUS_ITEM_MAX_CHARS]
+    cut = _conscious(failed=["f" * 500]).capped().failed[0]
+    assert len(cut) == CONSCIOUS_ITEM_MAX_CHARS and cut.endswith("\u2026")
+    assert _conscious(tried=["t" * 500]).capped().tried[0].endswith("\u2026")
     assert block.tried[0] == "t0"  # original untouched
+    assert _conscious().capped_report()[1] is False
+
+
+def test_owns_and_must_not_are_never_truncated(tmp_path: Path) -> None:
+    owns = [f"owns_item_{i}_" + "o" * 400 for i in range(40)]
+    must_not = [f"must_not_item_{i}_" + "m" * 400 for i in range(40)]
+    block = _conscious(owns=owns, must_not=must_not)
+    capped = block.capped()
+    assert capped.owns == owns and capped.must_not == must_not
+    assembler = Assembler(store=SQLiteStore(tmp_path / "ncp.db"))
+    result = assembler.assemble(conscious=block, budget=BudgetContext(), query_text="x")
+    assert result.conscious.owns == owns and result.conscious.must_not == must_not
+    for item in [*owns, *must_not]:
+        assert item in result.context
+    assert result.conscious_truncated is False
+
+
+def test_conscious_truncated_flag_on_assembly(tmp_path: Path) -> None:
+    assembler = Assembler(store=SQLiteStore(tmp_path / "ncp.db"))
+    result = assembler.assemble(
+        conscious=_conscious(tried=["t" * 500]), budget=BudgetContext(), query_text="x",
+    )
+    assert result.conscious_truncated is True
+
+
+def test_over_budget_when_never_evict_part_exceeds_budget(tmp_path: Path) -> None:
+    store = _mixed_store(tmp_path / "ncp.db")
+    assembler = Assembler(store=store)
+    must_not = [f"never_do_{i}_" + "x" * 300 for i in range(10)]
+    result = assembler.assemble(
+        conscious=_conscious(must_not=must_not), budget=BudgetContext(), query_text="payment retry",
+        max_tokens=100, k=8,
+    )
+    assert result.over_budget is True
+    assert result.chunks == [] and result.whispers == []
+    assert result.conscious_tokens > 100
+    for item in must_not:
+        assert item in result.context
+
+
+def test_budget_counts_digits_as_alphanumerics_and_cjk_per_char() -> None:
+    digit_prose = "order 12345 shipped on 20240115 with 678 items and 90 boxes " * 20
+    assert estimate_budget_tokens(digit_prose) == estimate_budget_tokens(
+        "order abcde shipped on abcdefgh with abc items and ab boxes " * 20
+    )
+    cjk = "\u4f60\u597d\u4e16\u754c" * 25
+    assert estimate_budget_tokens(cjk) == len(cjk)
+    assert estimate_tokens(cjk) == len(cjk) // 4  # public unit unchanged
+
+
+def test_more_than_eight_skills_rejected() -> None:
+    ok = [f"skill{i}@abcdef123456" for i in range(CONSCIOUS_MAX_SKILLS)]
+    assert _conscious(skills=ok).skills == ok
+    with pytest.raises(ValueError, match="at most 8"):
+        _conscious(skills=[*ok, "extra@abcdef123456"])
 
 
 def test_assembly_caps_conscious_lists(tmp_path: Path) -> None:
