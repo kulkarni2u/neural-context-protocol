@@ -104,3 +104,83 @@ def test_old_clients_unchanged(env) -> None:
     assert res["recorded"] is True and res["calibrated"] is False
     got = store.get_outcome(res["outcome_id"])
     assert got is not None and got.eval_source == "self_report" and got.model is None
+
+
+# ── review fixes: admin keys and ambiguous suffix borrow ─────────────────────
+
+
+def _admin(monkeypatch: pytest.MonkeyPatch, name: str = "router"):  # type: ignore[no-untyped-def]
+    from ncp.principals import Principal
+
+    principal = Principal(name=name, agent_id=None, pipelines=None, capabilities=frozenset({"admin"}))
+    monkeypatch.setattr(server_mod, "current_principal", lambda: principal)
+    return principal
+
+
+def test_admin_dash_key_falls_back_to_held_context(env, monkeypatch: pytest.MonkeyPatch) -> None:
+    store, h = env
+    admin = _admin(monkeypatch)
+    # get_context keyed with the pipeline; record_outcome omits it -> key ends in "-".
+    h["ncp_get_context"]({**CTX, "session_id": f"{admin.fetch_session_key}:pipe:a1"})
+    res = h["ncp_record_outcome"](
+        {"success": True, "chunk_ids": ["c1"], "session_id": f"{admin.fetch_session_key}:-:-"}
+    )
+    got = store.get_outcome(res["outcome_id"])
+    assert got is not None and (got.task, got.slot, got.pipeline_id) == ("fix_bug", "payment", "pipe")
+
+
+def test_admin_fallback_refuses_ambiguous_pipelines(env, monkeypatch: pytest.MonkeyPatch) -> None:
+    store, h = env
+    admin = _admin(monkeypatch)
+    h["ncp_get_context"]({**CTX, "session_id": f"{admin.fetch_session_key}:pipe:a1"})
+    h["ncp_get_context"]({**CTX, "pipeline_id": "other", "task": "t2",
+                          "session_id": f"{admin.fetch_session_key}:other:a1"})
+    res = h["ncp_record_outcome"](
+        {"success": True, "chunk_ids": ["c1"], "session_id": f"{admin.fetch_session_key}:-:-"}
+    )
+    got = store.get_outcome(res["outcome_id"])
+    assert got is not None and (got.task, got.slot, got.pipeline_id) == (None, None, None)
+    # An explicit pipeline disambiguates.
+    res = h["ncp_record_outcome"](
+        {"success": True, "chunk_ids": ["c1"], "pipeline_id": "other",
+         "session_id": f"{admin.fetch_session_key}:other:-"}
+    )
+    got = store.get_outcome(res["outcome_id"])
+    assert got is not None and got.task == "t2"
+
+
+def test_agent_suffix_borrow_requires_unique_or_matching_pipeline(env) -> None:
+    store, h = env
+    h["ncp_get_context"](dict(CTX))
+    h["ncp_get_context"]({**CTX, "pipeline_id": "other", "task": "t2"})
+    # Two pipelines for agent a1: no pipeline given -> no borrow.
+    res = h["ncp_record_outcome"]({"success": True, "chunk_ids": ["c1"], "agent_id": "a1"})
+    got = store.get_outcome(res["outcome_id"])
+    assert got is not None and got.task is None and got.pipeline_id is None
+    # Explicit pipeline matching one held context borrows only that one.
+    res = h["ncp_record_outcome"]({"success": True, "chunk_ids": ["c1"], "agent_id": "a1", "pipeline_id": "pipe"})
+    got = store.get_outcome(res["outcome_id"])
+    assert got is not None and got.task == "fix_bug"
+
+
+def test_non_admin_principal_without_agent_id_still_records(tmp_path: Path) -> None:
+    from ncp.principals import Principal, ToolAuthorizer
+
+    config = load_config(cwd=tmp_path, env={})
+    config.values["calibration"]["auto_on_outcome"] = False
+    store = SQLiteStore(tmp_path / "ncp.db")
+    store.write(SubconsciousChunk(
+        chunk_id="c1", layer="semantic", content="payment bug fix notes", src="tool_result",
+        pipeline_id="pipe", written_by="x",
+    ))
+    h = make_handlers(store, config=config)
+    principal = Principal(
+        name="bob", agent_id="bob", pipelines=None, capabilities=frozenset({"record_outcome"})
+    )
+    auth = ToolAuthorizer(store)
+    ctx = auth.check_call(principal, "ncp_get_context", dict(CTX, agent_id="bob"))
+    h["ncp_get_context"](ctx)
+    args = auth.check_call(principal, "ncp_record_outcome", {"success": True, "chunk_ids": ["c1"]})
+    res = h["ncp_record_outcome"](args)
+    got = store.get_outcome(res["outcome_id"])
+    assert got is not None and got.task == "fix_bug" and got.pipeline_id == "pipe"

@@ -30,8 +30,8 @@ GET_CTX = {"agent_id": "a", "role": "r", "task": "t", "slot": "s", "intent": "i"
 # Character budget per profile for json.dumps(tools, separators=(",", ":")):
 # ~5% above the measured size, so catalog growth fails CI and must be a
 # deliberate decision (raise the number in the same change).
-PROFILE_CHAR_BUDGETS = {"minimal": 5110, "core": 10870, "standard": 18400, "full": 26200}
-PROFILE_TOOL_COUNTS = {"minimal": 2, "core": 5, "standard": 11, "full": 19}
+PROFILE_CHAR_BUDGETS = {"minimal": 5110, "core": 10870, "standard": 16300, "full": 25700}
+PROFILE_TOOL_COUNTS = {"minimal": 2, "core": 5, "standard": 10, "full": 19}
 
 
 def _free_port() -> int:
@@ -143,7 +143,7 @@ class TestHttpProfiles:
             minimal_q = srv.names(path="/mcp?profile=minimal")
             minimal_h = srv.names(headers={"X-NCP-Tool-Profile": "minimal"})
             core = srv.names(path="/mcp?profile=core")
-        assert len(default) == 11
+        assert len(default) == 10
         assert sorted(minimal_q) == sorted(minimal_h) == ["ncp_get_context", "ncp_write_memory"]
         assert len(core) == 5
 
@@ -198,7 +198,7 @@ agent_id = "bob"
         with _serve(tmp_path, self.TOML) as srv:
             assert sorted(srv.names(token="tok-a")) == ["ncp_get_context", "ncp_post_turn"]
             assert srv.names(token="tok-a", path="/mcp?profile=minimal") == ["ncp_get_context"]
-            assert len(srv.names(token="tok-b")) == 11
+            assert len(srv.names(token="tok-b")) == 10
             denied = srv.rpc("tools/call", {"name": "ncp_write_memory", "arguments": {}}, token="tok-a")
             assert denied["error"]["code"] == -32601
 

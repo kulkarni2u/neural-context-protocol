@@ -34,12 +34,14 @@ def _record(call, **extra):  # type: ignore[no-untyped-def]
 
 
 def test_tool_in_profiles_and_schema_terse(tmp_path: Path) -> None:
-    assert "ncp_improvement_log" in STANDARD_TOOL_NAMES
+    assert "ncp_improvement_log" not in STANDARD_TOOL_NAMES
     tool = next(t for t in MCP_TOOLS if t["name"] == "ncp_improvement_log")
     assert tool["inputSchema"]["required"] == ["action"]  # type: ignore[index]
-    for profile in ("standard", "full"):
-        cfg = _cfg(tmp_path, tools={"profile": profile})
-        assert "ncp_improvement_log" in {t["name"] for t in tools_for_config(cfg)}
+    assert "agent_id" not in tool["inputSchema"]["properties"]  # type: ignore[index]
+    full = _cfg(tmp_path, tools={"profile": "full"})
+    assert "ncp_improvement_log" in {t["name"] for t in tools_for_config(full)}
+    standard = _cfg(tmp_path, tools={"profile": "standard"})
+    assert "ncp_improvement_log" not in {t["name"] for t in tools_for_config(standard)}
     core = _cfg(tmp_path, tools={"profile": "core"})
     assert "ncp_improvement_log" not in {t["name"] for t in tools_for_config(core)}
 
@@ -124,3 +126,59 @@ def test_oversize_telemetry_uses_config(tmp_path: Path) -> None:
     _record(call, problem_name="p", what="x" * 200)
     tel = call({"action": "get"})["telemetry"]
     assert tel["oversize"] is True and tel["chars"] > 200
+
+
+def test_record_attempt_rejects_refine_candidate(tmp_path: Path) -> None:
+    from ncp.refine import ingest_procedure, propose_refinement
+    from ncp.types import OutcomeRecord
+
+    store = SQLiteStore(tmp_path / "s.db")
+    call = make_handlers(store)["ncp_improvement_log"]
+    head = ingest_procedure(store, key="rule", content="Always validate input.")
+    for i in range(3):
+        store.record_outcome(
+            OutcomeRecord(outcome_id=f"o{i}", chunk_ids=[head.chunk_id], success=False, note="skipped validation")
+        )
+    result = propose_refinement(store, key="rule")
+    assert result.new_chunk is not None
+    with pytest.raises(ValueError, match="candidate_chunk_id"):
+        _record(call, problem_name="p", candidate_chunk_id=result.new_chunk.chunk_id)
+    # A chunk with no refine attempt is still citable.
+    assert _record(call, problem_name="p", candidate_chunk_id="chunk_free")["candidate_chunk_id"] == "chunk_free"
+
+
+def test_principal_cannot_touch_other_pipeline_records(tmp_path: Path) -> None:
+    from ncp.principals import AuthorizationError, Principal, ToolAuthorizer
+
+    store = SQLiteStore(tmp_path / "s.db")
+    call = make_handlers(store)["ncp_improvement_log"]
+    att_a = _record(call, problem_name="pa", pipeline_id="A")
+    att_b = _record(call, problem_name="pb", pipeline_id="B")
+    prob_a, prob_b = att_a["problem_id"], att_b["problem_id"]
+    auth = ToolAuthorizer(store)
+    pa = Principal(name="pa", agent_id="x", pipelines=frozenset({"A"}), capabilities=frozenset())
+    base = {"pipeline_id": "A"}
+    auth.check_call(pa, "ncp_improvement_log", {**base, "action": "resolve_attempt", "attempt_id": att_a["attempt_id"]})
+    auth.check_call(pa, "ncp_improvement_log", {**base, "action": "record_attempt", "problem_id": prob_a})
+    for bad in (
+        {"action": "resolve_attempt", "attempt_id": att_b["attempt_id"]},
+        {"action": "record_attempt", "problem_id": prob_b},
+        {"action": "merge", "src_problem_id": prob_a, "dst_problem_id": prob_b},
+        {"action": "merge", "src_problem_id": prob_b, "dst_problem_id": prob_a},
+    ):
+        with pytest.raises(AuthorizationError, match="pipeline"):
+            auth.check_call(pa, "ncp_improvement_log", {**base, **bad})
+    # Claiming pipeline B is refused outright; admins/unrestricted callers may act on any.
+    with pytest.raises(AuthorizationError):
+        auth.check_call(pa, "ncp_improvement_log", {"action": "get", "pipeline_id": "B"})
+    admin = Principal(name="adm", agent_id=None, pipelines=None, capabilities=frozenset({"admin"}))
+    auth.check_call(admin, "ncp_improvement_log", {"action": "resolve_attempt", "attempt_id": att_b["attempt_id"]})
+
+
+def test_list_and_get_are_pipeline_limited(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "s.db")
+    call = make_handlers(store)["ncp_improvement_log"]
+    _record(call, problem_name="pa", pipeline_id="A")
+    _record(call, problem_name="pb", pipeline_id="B")
+    names = [p["name"] for p in call({"action": "list_problems", "pipeline_id": "A"})["problems"]]
+    assert names == ["pa"]

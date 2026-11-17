@@ -37,8 +37,12 @@ Design and acceptance criteria:
 6. **Rollback.** `ncp refine rollback KEY` writes the previous content as a new
    version and marks the attempt `rolled_back`. Nothing is deleted.
 
-Proposing never changes the head. `apply` also refuses a stale candidate (its
-predecessor is no longer the head), even with `--force`.
+Proposing never changes the head. `apply` also refuses, even with `--force`:
+a stale candidate (its predecessor is no longer the head), a candidate whose
+attempt is no longer `proposed` (already applied, rejected or rolled back), and
+a candidate with no `source_refs`. At apply time the prune anchor is recomputed
+from the predecessor's current outcomes, and outcomes that reference both the
+head and the candidate are excluded from both sides of the comparison.
 
 ## Improvement records
 
@@ -56,13 +60,17 @@ consolidated or superseded.
   `model` and `benchmark` it was evaluated on. Rejected and rolled-back
   attempts stay in the history.
 - **Aliases**: `ncp improvements merge SRC DST` makes SRC an alias of DST and
-  moves its attempts. Nothing is deleted.
+  moves its attempts. Nothing is deleted. Both problems must be in the same
+  pipeline.
 
 `ncp refine propose` and `prune` file their attempts automatically. If you do
 not name a problem the default is `recurring failures in KEY` (repair) or
 `token cost of KEY` (prune). Edits made outside NCP (an `AGENTS.md` rule, a
-harness file) are logged with `ncp_improvement_log`. Improvement records need
-the sqlite or pgvector store.
+harness file) are logged with `ncp_improvement_log`. `record_attempt`
+refuses a `candidate_chunk_id` already owned by a repair or prune attempt, and
+`record_attempt`, `resolve_attempt` and `merge` enforce pipeline ownership.
+`ncp_improvement_log` is available in the `full` tool profile. Improvement
+records need the sqlite or pgvector store.
 
 ## Outcome context
 
@@ -74,6 +82,12 @@ the sqlite or pgvector store.
 | `model`, `benchmark` | What the evaluation ran against. |
 | `eval_source` | `self_report` (default), `verifier` or `human`. |
 | `output_tokens`, `input_tokens`, `turns` | Cost of the run; the prune gate compares mean output tokens. |
+
+`eval_source` is an honor-system field: NCP does not verify it, so any client
+allowed to call `ncp_record_outcome` can claim `verifier` or `human`. Grant that
+tool accordingly. `has_success_outcome`, which the unproven-slot budget
+protection uses, counts any success outcome regardless of weight or
+`eval_source`.
 
 Pass the same `model` to `refine propose`/`prune` (`--model`) and the gate
 only counts outcomes from that model.

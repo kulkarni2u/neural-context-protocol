@@ -283,3 +283,72 @@ def test_prune_without_outcome_stats_raises_refine_error(tmp_path: Path, monkeyp
     monkeypatch.setattr(store, "outcome_stats", boom)
     with pytest.raises(RefineError):
         propose_prune(store, key="deploy", content=SHORT)
+
+
+# ── review fixes: gate bypass, trial contamination, attempt status ───────────
+
+
+def test_manual_attempt_cannot_bypass_prune_gate(tmp_path: Path) -> None:
+    import time
+
+    from ncp.stores.improvement_common import new_attempt_id
+    from ncp.types import ImprovementAttempt, ImprovementProblem
+
+    store, _ = _anchored(tmp_path)
+    cand_id = _prune(store)
+    store.upsert_improvement_problem(
+        ImprovementProblem(problem_id="prob_x", scope="deploy", name="n", opened_at=time.time())
+    )
+    time.sleep(0.01)
+    store.record_improvement_attempt(
+        ImprovementAttempt(
+            attempt_id=new_attempt_id(), problem_id="prob_x", kind="manual", what="w",
+            candidate_chunk_id=cand_id, created_at=time.time(),
+        )
+    )
+    with pytest.raises(RefineGateError):
+        apply_refinement(store, chunk_id=cand_id)
+
+
+def test_shared_outcomes_do_not_count_for_candidate_trial(tmp_path: Path) -> None:
+    store, head_id = _anchored(tmp_path)
+    cand_id = _prune(store)
+    for i in range(5):  # outcomes crediting head AND candidate are no trial evidence
+        store.record_outcome(
+            OutcomeRecord(outcome_id=f"s{i}", chunk_ids=[head_id, cand_id], success=True, output_tokens=10)
+        )
+    with pytest.raises(RefineGateError):
+        apply_refinement(store, chunk_id=cand_id)
+
+
+def test_anchor_recomputed_at_apply_time_excludes_candidate(tmp_path: Path) -> None:
+    store, head_id = _anchored(tmp_path)
+    cand_id = _prune(store)
+    for i in range(5):
+        _out(store, f"c{i}", cand_id, True, tokens=50)
+    # Head degrades after the proposal; a stale stored anchor of 1.0 would block 5/5 trial.
+    for i in range(5):
+        _out(store, f"h{i}", head_id, False, tokens=100)
+    apply_refinement(store, chunk_id=cand_id)
+    att = _attempt(store, cand_id)
+    assert att.status == "applied" and att.anchor_rate == 0.5
+
+
+def test_apply_refused_when_attempt_not_proposed_even_with_force(tmp_path: Path) -> None:
+    store, _ = _anchored(tmp_path)
+    cand_id = _prune(store)
+    reject_refinement(store, chunk_id=cand_id)
+    with pytest.raises(RefineError, match="already rejected"):
+        apply_refinement(store, chunk_id=cand_id, force=True)
+
+
+def test_apply_refused_when_candidate_has_no_source_key(tmp_path: Path) -> None:
+    from ncp.types import SubconsciousChunk
+
+    store, head_id = _anchored(tmp_path)
+    store.write(SubconsciousChunk(
+        chunk_id="orphan", layer="procedural", content="orphan procedure text", src="tool_result",
+        written_by="x", supersedes=head_id, source_refs=[],
+    ))
+    with pytest.raises(RefineError, match="cannot verify head"):
+        apply_refinement(store, chunk_id="orphan")

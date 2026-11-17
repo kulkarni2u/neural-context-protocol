@@ -366,6 +366,10 @@ class BaseStore(ABC):
         """Update whitelisted fields of an attempt; unknown fields raise ``ValueError``."""
         raise NotImplementedError("improvement records require the sqlite or pgvector store")
 
+    def get_improvement_attempt(self, attempt_id: str) -> ImprovementAttempt | None:
+        """Fetch one attempt by id, or None."""
+        raise NotImplementedError("improvement records require the sqlite or pgvector store")
+
     def list_improvement_attempts(
         self,
         *,
@@ -376,8 +380,17 @@ class BaseStore(ABC):
         """List attempts ordered by ``created_at``."""
         raise NotImplementedError("improvement records require the sqlite or pgvector store")
 
-    def outcome_stats(self, *, chunk_ids: Sequence[str], model: str | None = None) -> OutcomeStats:
-        """Aggregate every outcome touching ``chunk_ids`` (optionally one ``model``)."""
+    def outcome_stats(
+        self,
+        *,
+        chunk_ids: Sequence[str],
+        model: str | None = None,
+        exclude_chunk_ids: Sequence[str] = (),
+    ) -> OutcomeStats:
+        """Aggregate every outcome touching ``chunk_ids`` (optionally one ``model``).
+
+        Outcomes that also credit any of ``exclude_chunk_ids`` are not counted.
+        """
         raise NotImplementedError("improvement records require the sqlite or pgvector store")
 
     def has_success_outcome(
@@ -431,9 +444,15 @@ class BaseStore(ABC):
         return await anyio.to_thread.run_sync(fn)
 
     async def async_outcome_stats(
-        self, *, chunk_ids: Sequence[str], model: str | None = None
+        self,
+        *,
+        chunk_ids: Sequence[str],
+        model: str | None = None,
+        exclude_chunk_ids: Sequence[str] = (),
     ) -> OutcomeStats:
-        fn = partial(self.outcome_stats, chunk_ids=chunk_ids, model=model)
+        fn = partial(
+            self.outcome_stats, chunk_ids=chunk_ids, model=model, exclude_chunk_ids=exclude_chunk_ids
+        )
         return await anyio.to_thread.run_sync(fn)
 
     async def async_has_success_outcome(

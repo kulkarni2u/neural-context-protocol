@@ -488,12 +488,22 @@ def _find_attempt(store: BaseStore, chunk_id: str) -> ImprovementAttempt | None:
         attempts = store.list_improvement_attempts(candidate_chunk_id=chunk_id)
     except NotImplementedError:
         return None
-    return attempts[-1] if attempts else None
+    # Only refine attempts gate a candidate: a manual log entry citing the
+    # candidate must never displace the prune/repair attempt (gate bypass).
+    refine = [a for a in attempts if a.kind in ("repair", "prune")]
+    return refine[-1] if refine else None
 
 
-def _safe_stats(store: BaseStore, chunk_id: str, model: str | None) -> OutcomeStats | None:
+def _safe_stats(
+    store: BaseStore,
+    chunk_id: str,
+    model: str | None,
+    exclude_chunk_ids: Sequence[str] = (),
+) -> OutcomeStats | None:
     try:
-        return store.outcome_stats(chunk_ids=[chunk_id], model=model)
+        return store.outcome_stats(
+            chunk_ids=[chunk_id], model=model, exclude_chunk_ids=exclude_chunk_ids
+        )
     except NotImplementedError:
         return None
 
@@ -661,16 +671,34 @@ def apply_refinement(
         raise ValueError(f"chunk '{chunk_id}' is not a refinement proposal (no predecessor)")
 
     key = candidate.source_refs[0] if candidate.source_refs else None
-    if key is not None:
-        head = find_procedure_head(store, key=key, pipeline_id=candidate.pipeline_id)
-        if head is not None and head.chunk_id != candidate.supersedes:
-            raise RefineError(
-                f"stale candidate '{chunk_id}': it supersedes '{candidate.supersedes}' but the "
-                f"current head of '{key}' is '{head.chunk_id}'; propose again"
-            )
+    if key is None:
+        raise RefineError(f"cannot verify head for candidate '{chunk_id}': it has no source_refs key")
+    head = find_procedure_head(store, key=key, pipeline_id=candidate.pipeline_id)
+    if head is not None and head.chunk_id != candidate.supersedes:
+        raise RefineError(
+            f"stale candidate '{chunk_id}': it supersedes '{candidate.supersedes}' but the "
+            f"current head of '{key}' is '{head.chunk_id}'; propose again"
+        )
 
     attempt = _find_attempt(store, candidate.chunk_id)
-    stats = _safe_stats(store, candidate.chunk_id, attempt.model if attempt else None)
+    if attempt is not None and attempt.status != "proposed":
+        raise RefineError(
+            f"candidate '{chunk_id}' attempt '{attempt.attempt_id}' is already {attempt.status}; "
+            "propose again"
+        )
+    model = attempt.model if attempt else None
+    # Outcomes crediting both head and candidate belong to neither trial.
+    stats = _safe_stats(store, candidate.chunk_id, model, [candidate.supersedes])
+    if attempt is not None and attempt.kind == "prune":
+        # Recompute the anchor now: outcomes since the proposal are evidence too.
+        anchor = _safe_stats(store, candidate.supersedes, model, [candidate.chunk_id])
+        if anchor is not None:
+            attempt = attempt.model_copy(
+                update={
+                    "anchor_rate": anchor.success_rate,
+                    "anchor_output_tokens": anchor.mean_output_tokens,
+                }
+            )
     if attempt is not None and attempt.kind == "prune" and not force:
         _check_prune_gate(
             attempt, stats, gate_ratio=gate_ratio, min_trial_outcomes=min_trial_outcomes
@@ -690,6 +718,11 @@ def apply_refinement(
                 status="applied",
                 accepted=True,
                 resolved_at=time.time(),
+                **(
+                    {"anchor_rate": attempt.anchor_rate, "anchor_output_tokens": attempt.anchor_output_tokens}
+                    if attempt.kind == "prune"
+                    else {}
+                ),
                 **_observed_fields(attempt, stats),
             )
         except NotImplementedError:

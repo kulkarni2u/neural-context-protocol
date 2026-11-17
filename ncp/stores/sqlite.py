@@ -1614,6 +1614,13 @@ class SQLiteStore(BaseStore):
             raise ValueError(f"unknown improvement attempt {attempt_id!r}")
         return self._attempt_from_row(row)
 
+    def get_improvement_attempt(self, attempt_id: str) -> ImprovementAttempt | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM improvement_attempts WHERE attempt_id = ?", (attempt_id,)
+            ).fetchone()
+        return self._attempt_from_row(row) if row is not None else None
+
     def list_improvement_attempts(
         self,
         *,
@@ -1638,7 +1645,13 @@ class SQLiteStore(BaseStore):
             ).fetchall()
         return [self._attempt_from_row(r) for r in rows]
 
-    def outcome_stats(self, *, chunk_ids: Sequence[str], model: str | None = None) -> OutcomeStats:
+    def outcome_stats(
+        self,
+        *,
+        chunk_ids: Sequence[str],
+        model: str | None = None,
+        exclude_chunk_ids: Sequence[str] = (),
+    ) -> OutcomeStats:
         ids = list(dict.fromkeys(str(c) for c in chunk_ids))
         if not ids:
             return OutcomeStats(
@@ -1653,6 +1666,13 @@ class SQLiteStore(BaseStore):
         if model is not None:
             scope += " AND model = ?"
             params.append(model)
+        excluded = list(dict.fromkeys(str(c) for c in exclude_chunk_ids))
+        if excluded:
+            scope += (
+                " AND NOT EXISTS (SELECT 1 FROM json_each(outcomes.chunk_ids) x"
+                " WHERE x.value IN (SELECT value FROM json_each(?)))"
+            )
+            params.append(json.dumps(excluded))
         with self._connect() as connection:
             agg = connection.execute(
                 "SELECT COUNT(*) AS n, COALESCE(SUM(weight), 0.0) AS tw,"

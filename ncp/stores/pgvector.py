@@ -1867,6 +1867,19 @@ class PgvectorStore(BaseStore):
             raise ValueError(f"unknown improvement attempt {attempt_id!r}")
         return self._row_to_attempt(row)
 
+    def get_improvement_attempt(self, attempt_id: str) -> ImprovementAttempt | None:
+        with self._connect() as connection:
+            cursor = connection.cursor()
+            try:
+                cursor.execute(
+                    self._sql("SELECT * FROM {schema}.{prefix}improvement_attempts WHERE attempt_id = %s"),
+                    (attempt_id,),
+                )
+                row = self._fetchone(cursor)
+            finally:
+                self._close_cursor(cursor)
+        return self._row_to_attempt(row) if row is not None else None
+
     def list_improvement_attempts(
         self,
         *,
@@ -1899,7 +1912,13 @@ class PgvectorStore(BaseStore):
                 self._close_cursor(cursor)
         return [self._row_to_attempt(r) for r in rows]
 
-    def outcome_stats(self, *, chunk_ids: Sequence[str], model: str | None = None) -> OutcomeStats:
+    def outcome_stats(
+        self,
+        *,
+        chunk_ids: Sequence[str],
+        model: str | None = None,
+        exclude_chunk_ids: Sequence[str] = (),
+    ) -> OutcomeStats:
         ids = list(dict.fromkeys(str(c) for c in chunk_ids))
         if not ids:
             return OutcomeStats(
@@ -1916,6 +1935,13 @@ class PgvectorStore(BaseStore):
         if model is not None:
             scope += " AND o.model = %s"
             params.append(model)
+        excluded = list(dict.fromkeys(str(c) for c in exclude_chunk_ids))
+        if excluded:
+            scope += (
+                " AND NOT EXISTS (SELECT 1 FROM jsonb_array_elements_text(o.chunk_ids::jsonb) x(value)"
+                " WHERE x.value = ANY(%s))"
+            )
+            params.append(excluded)
         with self._connect() as connection:
             cursor = connection.cursor()
             try:

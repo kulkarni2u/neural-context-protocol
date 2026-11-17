@@ -33,12 +33,24 @@ which prunes only after a working anchor exists, under an accuracy gate. See
 - `ncp refine apply` (and `apply_refinement`) refuses a stale candidate whose
   predecessor is no longer the procedure head, even with `--force`. Propose
   again from the current head.
-- `ncp_improvement_log` joins the `standard` tool profile (and `full`), so the
-  standard `tools/list` catalog grows from 10 to 11 tools and about 2,000 more
-  characters. Use `--profile core` or `minimal` to avoid it.
 - `ncp_record_outcome` accepts `agent_id` and the new context fields. Under
   `[principals]` it now checks `agent_id` against the principal, and an
   explicit `pipeline_id` against the principal's pipelines.
+- `ncp_improvement_log` is in the `full` tool profile only (not `standard`).
+  It enforces pipeline ownership for `record_attempt`, `resolve_attempt` and
+  `merge`; a merge needs both problems in the same pipeline, and
+  `record_attempt` refuses a `candidate_chunk_id` already owned by a repair or
+  prune attempt.
+- `apply_refinement` also refuses a candidate whose attempt is not `proposed`
+  (already applied, rejected or rolled back) and a candidate with no
+  `source_refs`. At apply time the prune anchor is recomputed from the
+  predecessor's current outcomes, and outcomes that reference both the head and
+  the candidate are excluded from both sides (`outcome_stats` gains
+  `exclude_chunk_ids`).
+- `eval_source` is an honor-system field: any client allowed to call
+  `ncp_record_outcome` can claim `verifier` or `human`. `has_success_outcome`
+  (used by the unproven-slot budget protection) counts any success outcome
+  regardless of weight or `eval_source`.
 - `RefineError` now subclasses `ValueError`, so callers catching `ValueError`
   also catch refine errors.
 - Prune candidates (`ncp refine prune`) are applied only through the gate:
@@ -62,7 +74,7 @@ which prunes only after a working anchor exists, under an accuracy gate. See
   `--rationale`, `--predict` and `--model`. New: `ncp refine prune KEY --file`,
   `ncp refine reject`, `--gate-ratio` / `--min-trial-outcomes` /
   `--force` on `apply`, and a rollback that marks the attempt `rolled_back`.
-- `ncp_improvement_log` MCP tool (`get`, `list_problems`, `record_attempt`,
+- `ncp_improvement_log` MCP tool (full profile; `get`, `list_problems`, `record_attempt`,
   `resolve_attempt`, `merge`), `ncp improvements show|merge`, and the
   `[NCP:IMPROVEMENT]` block, never truncated (`[improvement].warn_chars`
   reports oversize) and flagging attempts evaluated on another model.

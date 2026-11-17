@@ -55,7 +55,6 @@ STANDARD_TOOL_NAMES = [
     "ncp_wait_whispers",
     "ncp_post_turn",
     "ncp_fetch",
-    "ncp_improvement_log",
     "ncp_record_decision",
     "ncp_get_decision",
     "ncp_compile_decision_query",
@@ -345,7 +344,7 @@ class TestToolsList:
         config = load_config(cwd=tmp_path)
         config.values["tools"]["profile"] = "full"
         size = len(json.dumps(tools_for_config(config)))
-        assert size < 21_000, f"full-profile tools/list grew to {size} chars"
+        assert size < 20_800, f"full-profile tools/list grew to {size} chars"
 
     def test_tool_profile_core_tools_list_advertises_only_context_lifecycle(self, tmp_path: Path) -> None:
         project = tmp_path / "repo"

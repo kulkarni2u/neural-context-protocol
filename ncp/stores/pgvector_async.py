@@ -2043,7 +2043,11 @@ class AsyncPgvectorStore(BaseStore):
         raise NotImplementedError(self._IMPROVEMENT_UNSUPPORTED)
 
     async def async_outcome_stats(
-        self, *, chunk_ids: Sequence[str], model: str | None = None
+        self,
+        *,
+        chunk_ids: Sequence[str],
+        model: str | None = None,
+        exclude_chunk_ids: Sequence[str] = (),
     ) -> OutcomeStats:
         ids = list(dict.fromkeys(str(c) for c in chunk_ids))
         if not ids:
@@ -2059,6 +2063,13 @@ class AsyncPgvectorStore(BaseStore):
         if model is not None:
             scope += " AND o.model = %s"
             params.append(model)
+        excluded = list(dict.fromkeys(str(c) for c in exclude_chunk_ids))
+        if excluded:
+            scope += (
+                " AND NOT EXISTS (SELECT 1 FROM jsonb_array_elements_text(o.chunk_ids::jsonb) x(value)"
+                " WHERE x.value = ANY(%s))"
+            )
+            params.append(excluded)
         async with self._aconnect() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(

@@ -245,3 +245,30 @@ def test_base_store_defaults() -> None:
     ):
         with pytest.raises(NotImplementedError, match="improvement records require"):
             getattr(BaseStore, name)(object(), **kwargs)
+
+
+def test_outcome_stats_exclude_chunk_ids(store: SQLiteStore) -> None:
+    store.record_outcome(OutcomeRecord(outcome_id="o1", chunk_ids=["a"], success=True))
+    store.record_outcome(OutcomeRecord(outcome_id="o2", chunk_ids=["a", "b"], success=True))
+    store.record_outcome(OutcomeRecord(outcome_id="o3", chunk_ids=["b"], success=False))
+    assert store.outcome_stats(chunk_ids=["a"]).n == 2
+    assert store.outcome_stats(chunk_ids=["a"], exclude_chunk_ids=["b"]).n == 1
+    assert store.outcome_stats(chunk_ids=["a", "b"], exclude_chunk_ids=["b"]).n == 1
+    assert store.outcome_stats(chunk_ids=["a"], exclude_chunk_ids=[]).n == 2
+
+
+def test_merge_across_pipelines_refused(store: SQLiteStore) -> None:
+    src = store.upsert_improvement_problem(_problem(pipeline="pa"))
+    dst = store.upsert_improvement_problem(_problem(pipeline="pb"))
+    with pytest.raises(ValueError, match="across pipelines"):
+        store.merge_improvement_problems(src_problem_id=src.problem_id, dst_problem_id=dst.problem_id)
+    got = store.get_improvement_problem(src.problem_id)
+    assert got is not None and got.alias_of is None
+
+
+def test_get_improvement_attempt(store: SQLiteStore) -> None:
+    prob = store.upsert_improvement_problem(_problem())
+    att = store.record_improvement_attempt(_attempt(prob.problem_id))
+    got = store.get_improvement_attempt(att.attempt_id)
+    assert got is not None and got.attempt_id == att.attempt_id
+    assert store.get_improvement_attempt("att_nope") is None

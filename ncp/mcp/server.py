@@ -482,17 +482,13 @@ MCP_TOOLS: list[dict[str, object]] = [
     },
     {
         "name": "ncp_improvement_log",
-        "description": (
-            "Improvement history (problems -> attempts): get block, list_problems, "
-            "record_attempt (cite problem_id or problem_name), resolve_attempt, merge."
-        ),
+        "description": "Improvement history: get, list_problems, record_attempt, resolve_attempt, merge.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "action": {"type": "string", "enum": ["get", "list_problems", "record_attempt", "resolve_attempt", "merge"]},
                 "scope": {"type": "string"},
                 "pipeline_id": {"type": "string"},
-                "agent_id": {"type": "string"},
                 "model": {"type": "string"},
                 "problem_id": {"type": "string"},
                 "problem_name": {"type": "string"},
@@ -883,7 +879,6 @@ STANDARD_TOOL_NAMES = CORE_TOOL_NAMES | frozenset({
     "ncp_get_decision",
     "ncp_compile_decision_query",
     "ncp_wait_whispers",
-    "ncp_improvement_log",
 })
 MEMO_TOOL_NAMES = frozenset({"ncp_lookup_memo", "ncp_record_memo", "ncp_verify_memo"})
 NOTIFY_TOOL_NAMES = frozenset({"ncp_wait_whispers"})
@@ -2772,6 +2767,15 @@ def make_handlers(
                 kind = _str("kind") or "manual"
                 if kind != "manual":
                     raise ValueError("ncp_improvement_log record_attempt kind must be 'manual'")
+                candidate_chunk_id = _str("candidate_chunk_id")
+                if candidate_chunk_id and any(
+                    a.kind in ("repair", "prune")
+                    for a in store.list_improvement_attempts(candidate_chunk_id=candidate_chunk_id)
+                ):
+                    raise ValueError(
+                        "ncp_improvement_log 'candidate_chunk_id' already has a refine attempt; "
+                        "manual attempts cannot cite a repair/prune candidate"
+                    )
                 attempt = store.record_improvement_attempt(
                     ImprovementAttempt(
                         attempt_id=f"att_{int(time.time() * 1000)}_{uuid4().hex[:12]}",
@@ -2780,7 +2784,7 @@ def make_handlers(
                         what=what,
                         rationale=rationale,
                         files=_str_list("files"),
-                        candidate_chunk_id=_str("candidate_chunk_id"),
+                        candidate_chunk_id=candidate_chunk_id,
                         predicted=_str_list("predicted"),
                         model=_str("model"),
                         benchmark=_str("benchmark"),
@@ -3257,15 +3261,33 @@ def make_handlers(
             if out_session != DEFAULT_FETCH_SESSION_ID:
                 with sessions_lock:
                     held_session = sessions.get(out_session)
-                    if held_session is None and not args.get("session_id") and args.get("pipeline_id") is None:
-                        # get_context keys sessions as "<pipeline>:<agent>"; with only an
-                        # agent_id, borrow that agent's most recently used session.
-                        suffix = f":{out_session}"
+                    if held_session is None or held_session.last_context is None:
+                        # Fall back to a sibling session: an admin's key embeds the
+                        # pipeline/agent of the call ("-" when omitted), and an
+                        # unauthenticated get_context keys "<pipeline>:<agent>".
+                        # Borrow only when unambiguous: the held pipeline must equal
+                        # an explicit pipeline_id, and without one exactly one
+                        # candidate pipeline may exist.
+                        agent = args.get("agent_id")
+                        caller = current_principal()
+                        if caller is not None and caller.is_admin:
+                            base = caller.fetch_session_key
+                            in_scope = [
+                                (key, sess) for key, sess in sessions.items()
+                                if key.startswith(f"{base}:") and (not agent or key.endswith(f":{agent}"))
+                            ]
+                        elif not args.get("session_id") and agent:
+                            in_scope = [(k, v) for k, v in sessions.items() if k.endswith(f":{out_session}")]
+                        else:
+                            in_scope = []
                         matches = [
-                            sess for key, sess in sessions.items()
-                            if key.endswith(suffix) and sess.last_context is not None
+                            sess for _, sess in in_scope
+                            if sess.last_context is not None
+                            and (out_pipeline is None or sess.last_context[0] == out_pipeline)
                         ]
-                        held_session = max(matches, key=lambda sess: sess.last_access, default=None)
+                        held_session = None
+                        if out_pipeline is not None or len({m.last_context[0] for m in matches if m.last_context}) == 1:
+                            held_session = max(matches, key=lambda sess: sess.last_access, default=None)
                     last = held_session.last_context if held_session is not None else None
                 # An explicit pipeline that differs from the held one is a different
                 # context: do not borrow its task/slot.

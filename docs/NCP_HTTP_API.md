@@ -221,7 +221,7 @@ additionally adds `ncp_overview`, `ncp_remember`, `ncp_recall` and
   profile when memoization is enabled (`[memoization].enabled`, off by default).
 
 - `ncp_skill` — only when `[skill_cache].enabled = true` (standard and full).
-- `ncp_improvement_log` — improvement history (standard and full). Not
+- `ncp_improvement_log` — improvement history (full profile only). Not
   available on a store without improvement records (sqlite and pgvector have
   them).
 
