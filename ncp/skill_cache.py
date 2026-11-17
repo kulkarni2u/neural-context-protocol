@@ -768,3 +768,54 @@ def recall_skills(
             if chunk.chunk_id not in seen:
                 hits.append(chunk)
     return [chunk for chunk in hits if chunk.src == "skill_ref" and "kind:workflow" not in chunk.conditions][:k]
+
+
+_OUTLINE_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s")
+_OUTLINE_FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})\s*(\S*)")
+_OUTLINE_SIGNATURE_RE = re.compile(r"^\s*(async\s+def|def|class)\s")
+
+
+def outline_skill(text: str) -> str:
+    """Return a deterministic outline of skill ``text``.
+
+    Keeps every markdown heading, the first non-empty non-heading line under
+    each heading, and reduces fenced code blocks: python/py/untagged fences keep
+    only ``def``/``async def``/``class`` signature lines followed by a
+    ``  ... (<n> lines; detail:full for code)`` marker; other fences keep just
+    the opening marker line. All other prose is dropped.
+    """
+
+    out: list[str] = []
+    fence: tuple[str, bool] | None = None  # (marker, is_python)
+    body_lines = 0
+    first_taken = False
+    for line in text.splitlines():
+        if fence is not None:
+            marker, is_python = fence
+            stripped = line.strip()
+            if stripped.startswith(marker) and not stripped.strip(marker[0]):
+                if is_python:
+                    out.append(f"  ... ({body_lines} lines; detail:full for code)")
+                    out.append(line)
+                fence = None
+                continue
+            body_lines += 1
+            if is_python and _OUTLINE_SIGNATURE_RE.match(line):
+                out.append(line)
+            continue
+        fence_match = _OUTLINE_FENCE_RE.match(line)
+        if fence_match:
+            lang = fence_match.group(2).lower()
+            fence = (fence_match.group(1), lang in ("", "python", "py"))
+            body_lines = 0
+            out.append(line)
+            continue
+        if _OUTLINE_HEADING_RE.match(line):
+            out.append(line)
+            first_taken = False
+        elif line.strip() and not first_taken:
+            out.append(line)
+            first_taken = True
+    if fence is not None and fence[1]:
+        out.append(f"  ... ({body_lines} lines; detail:full for code)")
+    return "\n".join(out)

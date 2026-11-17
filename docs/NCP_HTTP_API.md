@@ -668,8 +668,11 @@ curl -s $BASE/mcp -H "$AUTH" -H 'Content-Type: application/json' -d '{
 
 - `action` (required) — `get` | `recall` | `list`.
 - `get` — `skill_id` (`<namespace>/<name>`), optional `content_hash` to pin a
-  version (default newest). Returns only user-registered skills, as an
-  `[NCP:SKILL]` block.
+  version (default newest), optional `detail` (`full` default, or `outline`).
+  Returns only user-registered skills, as an `[NCP:SKILL]` block. `outline`
+  returns headings, the first line under each heading and python code reduced
+  to `def`/`class` signatures, and appends ` detail:outline` to the header;
+  outline reads are not deduplicated by `session_id`.
 - `recall` — `query`, optional `k` (max 4). Returns ranked sections and uses
   one slot of the `ncp_fetch` budget.
 - `list` — registered skills.

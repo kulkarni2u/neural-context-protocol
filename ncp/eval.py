@@ -34,8 +34,10 @@ the chunk/turn IDs that informed the scored response.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+import math
 import tempfile
 
 from ncp.api import agent as make_agent
@@ -53,6 +55,8 @@ __all__ = [
     "sliding_window_condition",
     "raw_replay_condition",
     "matched_budget_conditions",
+    "PairedResult",
+    "paired_comparison",
 ]
 
 
@@ -269,3 +273,59 @@ def matched_budget_conditions(
         "sliding_window": sliding_window_condition(turns, budget=budget),
         "raw_replay": raw_replay_condition(turns),
     }
+
+
+# ---------------------------------------------------------------------------
+# Paired comparison
+# ---------------------------------------------------------------------------
+
+# Two-sided 95% Student-t critical values, df 1..30.
+_T_95: tuple[float, ...] = (
+    12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228,
+    2.201, 2.179, 2.160, 2.145, 2.131, 2.120, 2.110, 2.101, 2.093, 2.086,
+    2.080, 2.074, 2.069, 2.064, 2.060, 2.056, 2.052, 2.048, 2.045, 2.042,
+)
+
+
+@dataclass(frozen=True)
+class PairedResult:
+    """Paired comparison of series ``a`` and ``b`` (difference = b - a)."""
+
+    n: int
+    mean_diff: float
+    ci95_low: float
+    ci95_high: float
+    wins: int
+    losses: int
+    ties: int
+    sign_test_p: float
+
+
+def paired_comparison(a: Sequence[float], b: Sequence[float]) -> PairedResult:
+    """Compare paired samples: mean(b - a), 95% t-CI, wins/losses and sign test."""
+
+    if len(a) != len(b):
+        raise ValueError(f"paired series differ in length: {len(a)} != {len(b)}")
+    n = len(a)
+    if n == 0:
+        raise ValueError("paired_comparison requires at least one pair")
+    diffs = [float(y) - float(x) for x, y in zip(a, b)]
+    mean = sum(diffs) / n
+    if n < 2:
+        low = high = mean
+    else:
+        sd = math.sqrt(sum((d - mean) ** 2 for d in diffs) / (n - 1))
+        t = _T_95[n - 2] if n - 1 <= len(_T_95) else 1.96
+        half = t * sd / math.sqrt(n)
+        low, high = mean - half, mean + half
+    wins = sum(1 for d in diffs if d > 0)
+    losses = sum(1 for d in diffs if d < 0)
+    ties = n - wins - losses
+    m = wins + losses
+    if m == 0:
+        p = 1.0
+    else:
+        k = min(wins, losses)
+        tail = sum(math.comb(m, i) for i in range(k + 1)) / 2**m
+        p = min(1.0, 2 * tail)
+    return PairedResult(n, mean, low, high, wins, losses, ties, p)

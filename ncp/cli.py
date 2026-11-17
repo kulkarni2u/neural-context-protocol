@@ -1690,11 +1690,20 @@ def skill_list_command(pipeline_id: str | None, cwd: Path, as_json: bool) -> Non
 @click.argument("skill_id")
 @click.option("--hash", "content_hash", default=None, help="Exact content hash (default: latest).")
 @click.option("--pipeline", "pipeline_id", default=None)
+@click.option(
+    "--detail",
+    type=click.Choice(["full", "outline"]),
+    default="full",
+    show_default=True,
+    help="full: verbatim content; outline: headings, first lines, code signatures.",
+)
 @click.option("--cwd", type=click.Path(path_type=Path), default=Path.cwd)
-def skill_show_command(skill_id: str, content_hash: str | None, pipeline_id: str | None, cwd: Path) -> None:
-    """Print a cached skill's verbatim content."""
+def skill_show_command(
+    skill_id: str, content_hash: str | None, pipeline_id: str | None, detail: str, cwd: Path
+) -> None:
+    """Print a cached skill's verbatim content (or its outline)."""
 
-    from ncp.skill_cache import fetch_skill
+    from ncp.skill_cache import fetch_skill, outline_skill
 
     config, store = _skill_store(cwd)
     try:
@@ -1705,6 +1714,9 @@ def skill_show_command(skill_id: str, content_hash: str | None, pipeline_id: str
         raise click.ClickException(str(exc)) from exc
     if content is None:
         raise click.ClickException(f"skill {skill_id!r} is not cached.")
+    if detail == "outline":
+        click.echo(outline_skill(content))
+        return
     click.echo(content, nl=False)
 
 
