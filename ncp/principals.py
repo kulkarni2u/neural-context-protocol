@@ -58,6 +58,9 @@ IDENTITY_ARGS: dict[str, tuple[tuple[str, bool], ...]] = {
     "ncp_skill": (("agent_id", True),),
     "ncp_record_decision": (("agent_id", True),),
     "ncp_compile_decision_query": (("agent_id", True),),
+    # No pipeline_id argument: the server derives the outcome's pipeline from the
+    # caller's held context or the credited chunks, and _check_record_outcome
+    # requires those chunks to sit in the principal's allowed pipelines.
     "ncp_record_outcome": (("agent_id", True),),
     "ncp_remember": (("written_by", True),),
 }
@@ -82,9 +85,6 @@ PIPELINE_SCOPED_TOOLS = frozenset({
     "ncp_remember",
     "ncp_recall",
     "ncp_improve",
-    # pipeline_id is optional context here; _check_pipeline_scope only checks it
-    # when given (outcome scope is otherwise verified through the chunk ids).
-    "ncp_record_outcome",
     "ncp_ontology_query",
     "ncp_ontology_explain",
     "ncp_ontology_assert",
@@ -446,8 +446,6 @@ class ToolAuthorizer:
             # a pipeline_id passed alongside must still be allowed.
             if action in _TASK_ID_ACTIONS and _str_or_none(args.get("pipeline_id")) is None:
                 return
-        if tool == "ncp_record_outcome" and _str_or_none(args.get("pipeline_id")) is None:
-            return
         if tool in ONTOLOGY_NAMESPACE_TOOLS and _str_or_none(args.get("pipeline_id")) == ONTOLOGY_GLOBAL_NAMESPACE:
             return
         if tool in _MEMO_TOOLS and args.get("signature") is not None:

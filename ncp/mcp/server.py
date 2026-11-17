@@ -595,29 +595,24 @@ MCP_TOOLS: list[dict[str, object]] = [
     {
         "name": "ncp_record_outcome",
         "description": (
-            "Record a task outcome for outcome-calibrated reputation. Give chunk_ids or "
-            "turn_id. success=true raises author reputation; false lowers it."
+            "Record a task outcome. Give chunk_ids or turn_id; success raises author "
+            "reputation, failure lowers it."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "success": {"type": "boolean", "description": "Whether the outcome was successful"},
+                "success": {"type": "boolean"},
                 "chunk_ids": {"type": "array", "items": {"type": "string"}, "description": "Contributing chunk ids. Exclusive with turn_id."},
                 "turn_id": {"type": "string", "description": "Turn resolved to chunk_ids. Exclusive with chunk_ids."},
-                "decision_id": {"type": "string", "description": "Optional typed decision (dec_...) this resolves."},
+                "decision_id": {"type": "string", "description": "Typed decision (dec_...) resolved."},
                 "outcome_id": {"type": "string"},
-                "weight": {"type": "number", "description": "Evidence weight, 0 < weight <= 1 (default 1.0); others rejected."},
+                "weight": {"type": "number", "description": "0 < weight <= 1 (default 1)."},
                 "note": {"type": "string"},
-                "pipeline_id": {"type": "string"},
-                "task": {"type": "string"},
-                "slot": {"type": "string"},
-                "agent_id": {"type": "string", "description": "Omitted pipeline_id/task/slot default to this agent's last get_context."},
-                "model": {"type": "string"},
-                "benchmark": {"type": "string"},
-                "eval_source": {"type": "string", "enum": ["self_report", "verifier", "human"]},
-                "output_tokens": {"type": "integer"},
-                "input_tokens": {"type": "integer"},
-                "turns": {"type": "integer"},
+                "agent_id": {"type": "string", "description": "Pipeline/task/slot default from its last context."},
+                "ctx": {
+                    "type": "object",
+                    "description": "Optional: task, slot, model, benchmark, eval_source (self_report|verifier|human), output_tokens, input_tokens, turns",
+                },
             },
         },
     },
@@ -1149,6 +1144,10 @@ class FetchSession:
 
 
 _RESULT_RAW_MAX_WINDOWS = 20
+
+_OUTCOME_CTX_KEYS = frozenset({
+    "task", "slot", "model", "benchmark", "eval_source", "output_tokens", "input_tokens", "turns",
+})
 
 # Bound the in-memory fetch-session table so a client rotating session_ids
 # cannot grow it without limit. Entries older than the TTL are dropped; if the
@@ -3248,77 +3247,87 @@ def make_handlers(
         if note is not None and not isinstance(note, str):
             raise ValueError("ncp_record_outcome 'note' must be a string or null")
 
+        raw_ctx = args.get("ctx")
+        if raw_ctx is None:
+            raw_ctx = {}
+        if not isinstance(raw_ctx, dict):
+            raise ValueError("ncp_record_outcome 'ctx' must be an object")
+        unknown_ctx = sorted(set(raw_ctx) - _OUTCOME_CTX_KEYS)
+        if unknown_ctx:
+            raise ValueError(
+                f"ncp_record_outcome 'ctx' has unknown keys {unknown_ctx}; allowed: {sorted(_OUTCOME_CTX_KEYS)}"
+            )
+
         def _opt_str(name: str) -> str | None:
-            value = args.get(name)
+            value = raw_ctx.get(name)
             if value is None:
                 return None
             if not isinstance(value, str):
-                raise ValueError(f"ncp_record_outcome '{name}' must be a string or null")
+                raise ValueError(f"ncp_record_outcome ctx.{name} must be a string or null")
             return value.strip() or None
 
         def _opt_count(name: str) -> int | None:
-            value = args.get(name)
+            value = raw_ctx.get(name)
             if value is None:
                 return None
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-                raise ValueError(f"ncp_record_outcome '{name}' must be an integer >= 0")
+                raise ValueError(f"ncp_record_outcome ctx.{name} must be an integer >= 0")
             return value
 
-        out_pipeline = _opt_str("pipeline_id")
         out_task = _opt_str("task")
         out_slot = _opt_str("slot")
         out_model = _opt_str("model")
         out_benchmark = _opt_str("benchmark")
-        eval_source = args.get("eval_source", "self_report")
+        eval_source = raw_ctx.get("eval_source", "self_report")
         if eval_source is None:
             eval_source = "self_report"
         if eval_source not in ("self_report", "verifier", "human"):
-            raise ValueError("ncp_record_outcome 'eval_source' must be one of self_report, verifier, human")
+            raise ValueError("ncp_record_outcome ctx.eval_source must be one of self_report, verifier, human")
         output_tokens = _opt_count("output_tokens")
         input_tokens = _opt_count("input_tokens")
         turns = _opt_count("turns")
 
-        # Server-held defaults: an omitted task/slot/pipeline_id comes from this
-        # session's last ncp_get_context (never for the shared default session).
-        if out_task is None or out_slot is None or out_pipeline is None:
-            out_session = _session_id_from_args(args)
-            if out_session != DEFAULT_FETCH_SESSION_ID:
-                with sessions_lock:
-                    held_session = sessions.get(out_session)
-                    if held_session is None or held_session.last_context is None:
-                        # Fall back to a sibling session: an admin's key embeds the
-                        # pipeline/agent of the call ("-" when omitted), and an
-                        # unauthenticated get_context keys "<pipeline>:<agent>".
-                        # Borrow only when unambiguous: the held pipeline must equal
-                        # an explicit pipeline_id, and without one exactly one
-                        # candidate pipeline may exist.
-                        agent = args.get("agent_id")
-                        caller = current_principal()
-                        if caller is not None and caller.is_admin:
-                            base = caller.fetch_session_key
-                            in_scope = [
-                                (key, sess) for key, sess in sessions.items()
-                                if key.startswith(f"{base}:") and (not agent or key.endswith(f":{agent}"))
-                            ]
-                        elif not args.get("session_id") and agent:
-                            in_scope = [(k, v) for k, v in sessions.items() if k.endswith(f":{out_session}")]
-                        else:
-                            in_scope = []
-                        matches = [
-                            sess for _, sess in in_scope
-                            if sess.last_context is not None
-                            and (out_pipeline is None or sess.last_context[0] == out_pipeline)
+        # The pipeline is never a client argument (a stale top-level pipeline_id is
+        # ignored, so an outcome cannot be attributed to a pipeline the caller did
+        # not work in). Server-held defaults: pipeline/task/slot come from this
+        # session's last ncp_get_context (never for the shared default session);
+        # ctx.task/ctx.slot override.
+        out_pipeline: str | None = None
+        out_session = _session_id_from_args({k: v for k, v in args.items() if k != "pipeline_id"})
+        if out_session != DEFAULT_FETCH_SESSION_ID:
+            with sessions_lock:
+                held_session = sessions.get(out_session)
+                if held_session is None or held_session.last_context is None:
+                    # Fall back to a sibling session: an admin's key embeds the
+                    # pipeline/agent of the call ("-" when omitted), and an
+                    # unauthenticated get_context keys "<pipeline>:<agent>".
+                    # Borrow only when exactly one candidate pipeline exists.
+                    agent = args.get("agent_id")
+                    caller = current_principal()
+                    if caller is not None and caller.is_admin:
+                        base = caller.fetch_session_key
+                        in_scope = [
+                            (key, sess) for key, sess in sessions.items()
+                            if key.startswith(f"{base}:") and (not agent or key.endswith(f":{agent}"))
                         ]
-                        held_session = None
-                        if out_pipeline is not None or len({m.last_context[0] for m in matches if m.last_context}) == 1:
-                            held_session = max(matches, key=lambda sess: sess.last_access, default=None)
-                    last = held_session.last_context if held_session is not None else None
-                # An explicit pipeline that differs from the held one is a different
-                # context: do not borrow its task/slot.
-                if last is not None and (out_pipeline is None or out_pipeline == last[0]):
-                    out_pipeline = out_pipeline if out_pipeline is not None else last[0]
-                    out_task = out_task if out_task is not None else last[1]
-                    out_slot = out_slot if out_slot is not None else last[2]
+                    elif not args.get("session_id") and agent:
+                        in_scope = [(k, v) for k, v in sessions.items() if k.endswith(f":{out_session}")]
+                    else:
+                        in_scope = []
+                    matches = [sess for _, sess in in_scope if sess.last_context is not None]
+                    held_session = None
+                    if len({m.last_context[0] for m in matches if m.last_context}) == 1:
+                        held_session = max(matches, key=lambda sess: sess.last_access, default=None)
+                last = held_session.last_context if held_session is not None else None
+            if last is not None:
+                out_pipeline = last[0]
+                out_task = out_task if out_task is not None else last[1]
+                out_slot = out_slot if out_slot is not None else last[2]
+        if out_pipeline is None and chunk_ids:
+            # No held context: use the pipeline the credited chunks share, if one.
+            pipelines = {c.pipeline_id for c in store.get_chunks_by_ids(chunk_ids)}
+            if len(pipelines) == 1:
+                out_pipeline = next(iter(pipelines))
 
         outcome = OutcomeRecord(
             outcome_id=outcome_id or f"out_{int(time.time() * 1000)}_{uuid4().hex[:12]}",

@@ -177,3 +177,37 @@ def test_config_accessors_clamp(tmp_path: Path) -> None:
     assert config.calibration_self_report_weight == 1.0
     config.values["calibration"]["auto_min_interval_seconds"] = -5
     assert config.calibration_auto_min_interval_seconds == 60.0
+
+
+def test_outcome_step_scales_evidence() -> None:
+    outs = [OutcomeRecord(outcome_id="a", chunk_ids=["c"], success=True, weight=1.0)]
+    assert compute_outcome_evidence(outs) == {"c": 1.0}
+    assert compute_outcome_evidence(outs, outcome_step=0.1) == {"c": pytest.approx(0.1)}
+    fail = [OutcomeRecord(outcome_id="b", chunk_ids=["c"], success=False, weight=0.5)]
+    assert compute_outcome_evidence(fail, outcome_step=0.1) == {"c": pytest.approx(-0.05)}
+
+
+def test_auto_calibration_passes_bounded_step_and_moves_trust_gently(tmp_path: Path) -> None:
+    store, config = _setup(tmp_path, auto_min_interval_seconds=0)
+    store.write(SubconsciousChunk(
+        chunk_id="mid", layer="semantic", content="auto step subject", src="tool_result",
+        pipeline_id="p1", written_by="author", base_trust=0.6,
+    ))
+    calls = _spy(store)
+    h = make_handlers(store, config=config)
+    h["ncp_record_outcome"]({"success": True, "chunk_ids": ["mid"]})
+    assert calls[0]["outcome_step"] == pytest.approx(0.1)
+    assert 0.6 < _trust(store, "mid") <= 0.7
+
+
+@pytest.mark.parametrize("raw,expected", [(0.25, 0.25), (5, 1.0), (0, 0.1), (-1, 0.1), ("x", 0.1), (True, 0.1)])
+def test_auto_outcome_step_is_clamped(tmp_path: Path, raw: Any, expected: float) -> None:
+    _, config = _setup(tmp_path, auto_outcome_step=raw)
+    assert config.calibration_auto_outcome_step == pytest.approx(expected)
+
+
+def test_manual_calibrate_keeps_full_step(tmp_path: Path) -> None:
+    store, _ = _setup(tmp_path)
+    store.record_outcome(OutcomeRecord(outcome_id="m", chunk_ids=["c1"], success=True))
+    store.calibrate(feedback_mode=True, pipeline_id="p1")
+    assert _trust(store, "c1") >= 0.9

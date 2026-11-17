@@ -30,7 +30,7 @@ GET_CTX = {"agent_id": "a", "role": "r", "task": "t", "slot": "s", "intent": "i"
 # Character budget per profile for json.dumps(tools, separators=(",", ":")):
 # ~5% above the measured size, so catalog growth fails CI and must be a
 # deliberate decision (raise the number in the same change).
-PROFILE_CHAR_BUDGETS = {"minimal": 5110, "core": 10870, "standard": 16300, "full": 25700}
+PROFILE_CHAR_BUDGETS = {"minimal": 5110, "core": 10870, "standard": 16000, "full": 25700}
 PROFILE_TOOL_COUNTS = {"minimal": 2, "core": 5, "standard": 10, "full": 19}
 
 

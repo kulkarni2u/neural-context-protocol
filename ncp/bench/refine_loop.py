@@ -221,7 +221,7 @@ def run_refine_loop_benchmark(*, workdir: str | Path) -> dict[str, object]:
     result: dict[str, Any] = {}
     for _ in range(3):
         result = handlers["ncp_record_outcome"](
-            {"success": True, "chunk_ids": ["calib_fact"], "pipeline_id": "bench_refine", "eval_source": "verifier"}
+            {"success": True, "chunk_ids": ["calib_fact"], "ctx": {"eval_source": "verifier"}}
         )
     after = store.get_chunks_by_ids(["calib_fact"])[0].base_trust
     checks["auto_calibration_changed_trust"] = bool(result) and after != before
