@@ -8,7 +8,9 @@ assignment identically. Keeping this backend-agnostic (it operates on plain
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
+import json
 
 from ncp.types import OutcomeRecord
 
@@ -331,18 +333,59 @@ def settled_outcome_ids(
     ]
 
 
-def compute_outcome_evidence(outcomes: list[OutcomeRecord]) -> dict[str, float]:
+def compute_outcome_evidence(
+    outcomes: list[OutcomeRecord], *, self_report_weight: float = 1.0
+) -> dict[str, float]:
     """Aggregate outcome evidence into per-chunk deltas.
 
     Returns ``{chunk_id: net_delta}`` where success outcomes contribute
-    ``+weight`` and failures contribute ``-weight``.
+    ``+weight`` and failures contribute ``-weight``. Outcomes whose
+    ``eval_source`` is ``"self_report"`` are scaled by ``self_report_weight``
+    (``[calibration].self_report_weight``; 1.0 leaves behavior unchanged).
     """
     evidence: dict[str, float] = {}
     for out in outcomes:
-        delta = out.weight if out.success else -out.weight
+        weight = out.weight
+        if out.eval_source == "self_report":
+            weight *= self_report_weight
+        delta = weight if out.success else -weight
         for cid in out.chunk_ids:
             evidence[cid] = evidence.get(cid, 0.0) + delta
     return evidence
+
+
+def registered_skill_chunk_ids(
+    rows: Iterable[tuple[str, Sequence[str] | str | None]],
+) -> set[str]:
+    """Chunk ids belonging to user-registered skill versions (R9 decay exemption).
+
+    ``rows`` are ``(chunk_id, conditions)`` for ``src="skill_ref"`` chunks;
+    ``conditions`` may be a list or its JSON text.
+    ``skill_cache`` marks only a version's manifest with ``registered_by:user``;
+    its sections carry the same ``skill:<id>`` and ``hash:<h>`` conditions, so
+    every chunk sharing a ``(skill, hash)`` pair with a marked manifest is exempt.
+    """
+    materialized: list[tuple[str, list[str]]] = []
+    for cid, conds in rows:
+        if isinstance(conds, str):
+            try:
+                conds = json.loads(conds)
+            except ValueError:
+                conds = []
+        materialized.append((cid, [str(c) for c in (conds or [])]))
+    marked: set[tuple[str, str]] = set()
+    for _cid, conds in materialized:
+        if "registered_by:user" in conds:
+            skill = next((c for c in conds if c.startswith("skill:")), "")
+            chash = next((c for c in conds if c.startswith("hash:")), "")
+            marked.add((skill, chash))
+    exempt: set[str] = set()
+    for cid, conds in materialized:
+        skill = next((c for c in conds if c.startswith("skill:")), "")
+        chash = next((c for c in conds if c.startswith("hash:")), "")
+        if "registered_by:user" in conds or (skill, chash) in marked:
+            exempt.add(cid)
+    return exempt
 
 
 def rollup_reputation(

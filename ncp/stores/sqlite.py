@@ -25,12 +25,14 @@ from ncp.stores.base import (
     merge_outcome_chunk_rows,
     resolve_gc_limits,
 )
+from ncp.stores.improvement_common import ATTEMPT_LIST_FIELDS, validate_attempt_fields
 from ncp.stores.calibration import (
     EQUIVALENT_CONSOLIDATION,
     MAX_ALIAS_DEPTH,
     FeedbackRow,
     ReputationUpdate,
     compute_feedback_updates,
+    registered_skill_chunk_ids,
     rollup_reputation,
     validate_chunk_alias,
 )
@@ -75,7 +77,10 @@ from ncp.types import (
     ConsciousBlock,
     NCPResponse,
     DecisionRecord,
+    ImprovementAttempt,
+    ImprovementProblem,
     OutcomeRecord,
+    OutcomeStats,
     SubconsciousChunk,
     TaskOpResult,
     TaskRecord,
@@ -295,7 +300,16 @@ CREATE TABLE IF NOT EXISTS outcomes (
     weight REAL NOT NULL DEFAULT 1.0,
     note TEXT,
     created_at REAL NOT NULL,
-    consumed INTEGER NOT NULL DEFAULT 0
+    consumed INTEGER NOT NULL DEFAULT 0,
+    pipeline_id TEXT,
+    task TEXT,
+    slot TEXT,
+    model TEXT,
+    benchmark TEXT,
+    eval_source TEXT NOT NULL DEFAULT 'self_report',
+    output_tokens INTEGER,
+    input_tokens INTEGER,
+    turns INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS outcome_applications (
@@ -408,6 +422,47 @@ CREATE TABLE IF NOT EXISTS dissent_log (
     created_at REAL NOT NULL,
     PRIMARY KEY (chunk_id, identity_id)
 );
+
+-- v1.9.7 improvement records: problems -> attempts. Tables (not chunks) so
+-- they are never decayed or consolidated.
+CREATE TABLE IF NOT EXISTS improvement_problems (
+    problem_id TEXT PRIMARY KEY,
+    pipeline_id TEXT,
+    scope TEXT NOT NULL,
+    name TEXT NOT NULL,
+    opened_at REAL NOT NULL,
+    alias_of TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_improvement_problems_scope ON improvement_problems(pipeline_id, scope);
+
+CREATE TABLE IF NOT EXISTS improvement_attempts (
+    attempt_id TEXT PRIMARY KEY,
+    problem_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'proposed',
+    accepted INTEGER NOT NULL DEFAULT 0,
+    what TEXT NOT NULL,
+    rationale TEXT,
+    files TEXT NOT NULL DEFAULT '[]',
+    candidate_chunk_id TEXT,
+    predicted TEXT NOT NULL DEFAULT '[]',
+    fixed TEXT NOT NULL DEFAULT '[]',
+    missed TEXT NOT NULL DEFAULT '[]',
+    passed REAL,
+    total REAL,
+    mean_output_tokens REAL,
+    anchor_rate REAL,
+    anchor_output_tokens REAL,
+    model TEXT,
+    benchmark TEXT,
+    note TEXT,
+    created_at REAL NOT NULL,
+    resolved_at REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_improvement_attempts_problem ON improvement_attempts(problem_id);
+CREATE INDEX IF NOT EXISTS idx_improvement_attempts_candidate ON improvement_attempts(candidate_chunk_id);
 """
 
 
@@ -595,6 +650,16 @@ class SQLiteStore(BaseStore):
                 "CREATE TABLE IF NOT EXISTS turn_chunks (turn_id TEXT NOT NULL, chunk_id TEXT NOT NULL, relation TEXT NOT NULL, created_at REAL NOT NULL, PRIMARY KEY (turn_id, chunk_id, relation))",
                 "CREATE TABLE IF NOT EXISTS outcome_applications (outcome_id TEXT NOT NULL, chunk_id TEXT NOT NULL, applied_at REAL NOT NULL, PRIMARY KEY (outcome_id, chunk_id))",
                 "CREATE TABLE IF NOT EXISTS chunk_aliases (alias_id TEXT PRIMARY KEY, target_id TEXT NOT NULL, reason TEXT NOT NULL, pipeline_id TEXT, created_at REAL NOT NULL)",
+                "ALTER TABLE outcomes ADD COLUMN pipeline_id TEXT",  # v1.9.7 outcome context
+                "ALTER TABLE outcomes ADD COLUMN task TEXT",
+                "ALTER TABLE outcomes ADD COLUMN slot TEXT",
+                "ALTER TABLE outcomes ADD COLUMN model TEXT",
+                "ALTER TABLE outcomes ADD COLUMN benchmark TEXT",
+                "ALTER TABLE outcomes ADD COLUMN eval_source TEXT NOT NULL DEFAULT 'self_report'",
+                "ALTER TABLE outcomes ADD COLUMN output_tokens INTEGER",
+                "ALTER TABLE outcomes ADD COLUMN input_tokens INTEGER",
+                "ALTER TABLE outcomes ADD COLUMN turns INTEGER",
+                "CREATE INDEX IF NOT EXISTS idx_outcomes_task_slot ON outcomes(task, slot)",
                 "INSERT INTO chunks_fts(chunks_fts) VALUES ('rebuild')",
             ):
                 try:
@@ -1278,8 +1343,9 @@ class SQLiteStore(BaseStore):
                 chunk_ids = merge_outcome_chunk_rows(linked, legacy)
             cursor = connection.execute(
                 """
-                INSERT OR IGNORE INTO outcomes (outcome_id, turn_id, chunk_ids, success, weight, note, created_at, consumed)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+                INSERT OR IGNORE INTO outcomes (outcome_id, turn_id, chunk_ids, success, weight, note, created_at, consumed,
+                    pipeline_id, task, slot, model, benchmark, eval_source, output_tokens, input_tokens, turns)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     outcome.outcome_id,
@@ -1289,6 +1355,15 @@ class SQLiteStore(BaseStore):
                     outcome.weight,
                     outcome.note,
                     outcome.created_at,
+                    outcome.pipeline_id,
+                    outcome.task,
+                    outcome.slot,
+                    outcome.model,
+                    outcome.benchmark,
+                    outcome.eval_source,
+                    outcome.output_tokens,
+                    outcome.input_tokens,
+                    outcome.turns,
                 ),
             )
             # A replayed outcome_id is a no-op so host retries record exactly once.
@@ -1301,12 +1376,35 @@ class SQLiteStore(BaseStore):
             ).fetchone()
         if row is None:
             return None
+        return self._outcome_from_row(
+            row, json.loads(row["chunk_ids"]) if row["chunk_ids"] else []
+        )
+
+    @staticmethod
+    def _outcome_from_row(row: sqlite3.Row, chunk_ids: list[str]) -> OutcomeRecord:
+        keys = set(row.keys())
+
+        def opt(name: str) -> Any:
+            return row[name] if name in keys else None
+
         return OutcomeRecord(
-            outcome_id=str(row["outcome_id"]), turn_id=row["turn_id"],
-            chunk_ids=json.loads(row["chunk_ids"]) if row["chunk_ids"] else [],
-            success=bool(row["success"]), weight=float(row["weight"]),
-            note=row["note"], created_at=float(row["created_at"]),
+            outcome_id=str(row["outcome_id"]),
+            turn_id=row["turn_id"],
+            chunk_ids=chunk_ids,
+            success=bool(row["success"]),
+            weight=float(row["weight"]),
+            note=row["note"],
+            created_at=float(row["created_at"]),
             consumed=bool(row["consumed"]),
+            pipeline_id=opt("pipeline_id"),
+            task=opt("task"),
+            slot=opt("slot"),
+            model=opt("model"),
+            benchmark=opt("benchmark"),
+            eval_source=opt("eval_source") or "self_report",
+            output_tokens=opt("output_tokens"),
+            input_tokens=opt("input_tokens"),
+            turns=opt("turns"),
         )
 
     def list_outcomes(
@@ -1341,21 +1439,259 @@ class SQLiteStore(BaseStore):
             row_chunk_ids = json.loads(row["chunk_ids"]) if row["chunk_ids"] else []
             if wanted is not None and wanted.isdisjoint(row_chunk_ids):
                 continue
-            results.append(
-                OutcomeRecord(
-                    outcome_id=str(row["outcome_id"]),
-                    turn_id=row["turn_id"],
-                    chunk_ids=row_chunk_ids,
-                    success=bool(row["success"]),
-                    weight=float(row["weight"]),
-                    note=row["note"],
-                    created_at=float(row["created_at"]),
-                    consumed=bool(row["consumed"]),
-                )
-            )
+            results.append(self._outcome_from_row(row, row_chunk_ids))
             if len(results) >= limit:
                 break
         return results
+
+    # ------------------------------------------------------------------
+    # Improvement records (v1.9.7)
+
+    @staticmethod
+    def _problem_from_row(row: sqlite3.Row) -> ImprovementProblem:
+        return ImprovementProblem(
+            problem_id=str(row["problem_id"]),
+            pipeline_id=row["pipeline_id"],
+            scope=str(row["scope"]),
+            name=str(row["name"]),
+            opened_at=float(row["opened_at"]),
+            alias_of=row["alias_of"],
+        )
+
+    @staticmethod
+    def _attempt_from_row(row: sqlite3.Row) -> ImprovementAttempt:
+        def lst(name: str) -> list[str]:
+            return [str(x) for x in json.loads(row[name] or "[]")]
+
+        return ImprovementAttempt(
+            attempt_id=str(row["attempt_id"]),
+            problem_id=str(row["problem_id"]),
+            kind=row["kind"],
+            status=row["status"],
+            accepted=bool(row["accepted"]),
+            what=str(row["what"]),
+            rationale=row["rationale"],
+            files=lst("files"),
+            candidate_chunk_id=row["candidate_chunk_id"],
+            predicted=lst("predicted"),
+            fixed=lst("fixed"),
+            missed=lst("missed"),
+            passed=row["passed"],
+            total=row["total"],
+            mean_output_tokens=row["mean_output_tokens"],
+            anchor_rate=row["anchor_rate"],
+            anchor_output_tokens=row["anchor_output_tokens"],
+            model=row["model"],
+            benchmark=row["benchmark"],
+            note=row["note"],
+            created_at=float(row["created_at"]),
+            resolved_at=row["resolved_at"],
+        )
+
+    @staticmethod
+    def _resolve_problem_row(connection: sqlite3.Connection, problem_id: str) -> sqlite3.Row | None:
+        """Follow ``alias_of`` (cycle-guarded) to the surviving problem row."""
+        seen: set[str] = set()
+        current = problem_id
+        row = None
+        while current not in seen:
+            seen.add(current)
+            row = connection.execute(
+                "SELECT * FROM improvement_problems WHERE problem_id = ?", (current,)
+            ).fetchone()
+            if row is None or not row["alias_of"]:
+                return row
+            current = str(row["alias_of"])
+        return row
+
+    def upsert_improvement_problem(self, problem: ImprovementProblem) -> ImprovementProblem:
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO improvement_problems"
+                " (problem_id, pipeline_id, scope, name, opened_at, alias_of) VALUES (?, ?, ?, ?, ?, ?)",
+                (problem.problem_id, problem.pipeline_id, problem.scope, problem.name,
+                 problem.opened_at, problem.alias_of),
+            )
+            row = self._resolve_problem_row(connection, problem.problem_id)
+        assert row is not None
+        return self._problem_from_row(row)
+
+    def get_improvement_problem(self, problem_id: str) -> ImprovementProblem | None:
+        with self._connect() as connection:
+            row = self._resolve_problem_row(connection, problem_id)
+        return self._problem_from_row(row) if row is not None else None
+
+    def list_improvement_problems(
+        self,
+        *,
+        pipeline_id: str | None = None,
+        scope: str | None = None,
+        limit: int = 100,
+    ) -> list[ImprovementProblem]:
+        clauses = ["alias_of IS NULL"]
+        params: list[Any] = []
+        if pipeline_id is not None:
+            clauses.append("pipeline_id = ?")
+            params.append(pipeline_id)
+        if scope is not None:
+            clauses.append("scope = ?")
+            params.append(scope)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM improvement_problems WHERE {' AND '.join(clauses)}"
+                " ORDER BY opened_at, problem_id LIMIT ?",
+                [*params, max(1, int(limit))],
+            ).fetchall()
+        return [self._problem_from_row(r) for r in rows]
+
+    def merge_improvement_problems(self, *, src_problem_id: str, dst_problem_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            src = self._resolve_problem_row(connection, src_problem_id)
+            dst = self._resolve_problem_row(connection, dst_problem_id)
+            if src is None:
+                raise ValueError(f"unknown improvement problem {src_problem_id!r}")
+            if dst is None:
+                raise ValueError(f"unknown improvement problem {dst_problem_id!r}")
+            src_id, dst_id = str(src["problem_id"]), str(dst["problem_id"])
+            if src_id == dst_id:
+                return
+            connection.execute(
+                "UPDATE improvement_problems SET alias_of = ? WHERE problem_id = ?", (dst_id, src_id)
+            )
+            connection.execute(
+                "UPDATE improvement_attempts SET problem_id = ? WHERE problem_id = ?", (dst_id, src_id)
+            )
+
+    def record_improvement_attempt(self, attempt: ImprovementAttempt) -> ImprovementAttempt:
+        with self._connect() as connection:
+            row = self._resolve_problem_row(connection, attempt.problem_id)
+            if row is None:
+                raise ValueError(f"unknown improvement problem {attempt.problem_id!r}")
+            stored = attempt.model_copy(update={"problem_id": str(row["problem_id"])})
+            connection.execute(
+                "INSERT INTO improvement_attempts (attempt_id, problem_id, kind, status, accepted,"
+                " what, rationale, files, candidate_chunk_id, predicted, fixed, missed, passed, total,"
+                " mean_output_tokens, anchor_rate, anchor_output_tokens, model, benchmark, note,"
+                " created_at, resolved_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    stored.attempt_id, stored.problem_id, stored.kind, stored.status,
+                    1 if stored.accepted else 0, stored.what, stored.rationale,
+                    json.dumps(stored.files), stored.candidate_chunk_id,
+                    json.dumps(stored.predicted), json.dumps(stored.fixed), json.dumps(stored.missed),
+                    stored.passed, stored.total, stored.mean_output_tokens, stored.anchor_rate,
+                    stored.anchor_output_tokens, stored.model, stored.benchmark, stored.note,
+                    stored.created_at, stored.resolved_at,
+                ),
+            )
+        return stored
+
+    def update_improvement_attempt(self, attempt_id: str, **fields: Any) -> ImprovementAttempt:
+        validate_attempt_fields(fields)
+        sets: list[str] = []
+        params: list[Any] = []
+        for name, value in fields.items():
+            if name in ATTEMPT_LIST_FIELDS:
+                value = json.dumps(list(value or []))
+            elif name == "accepted":
+                value = 1 if value else 0
+            sets.append(f"{name} = ?")
+            params.append(value)
+        with self._connect() as connection:
+            if sets:
+                cursor = connection.execute(
+                    f"UPDATE improvement_attempts SET {', '.join(sets)} WHERE attempt_id = ?",
+                    [*params, attempt_id],
+                )
+                if cursor.rowcount == 0:
+                    raise ValueError(f"unknown improvement attempt {attempt_id!r}")
+            row = connection.execute(
+                "SELECT * FROM improvement_attempts WHERE attempt_id = ?", (attempt_id,)
+            ).fetchone()
+        if row is None:
+            raise ValueError(f"unknown improvement attempt {attempt_id!r}")
+        return self._attempt_from_row(row)
+
+    def list_improvement_attempts(
+        self,
+        *,
+        problem_id: str | None = None,
+        candidate_chunk_id: str | None = None,
+        limit: int = 200,
+    ) -> list[ImprovementAttempt]:
+        with self._connect() as connection:
+            clauses: list[str] = []
+            params: list[Any] = []
+            if problem_id is not None:
+                resolved = self._resolve_problem_row(connection, problem_id)
+                clauses.append("problem_id = ?")
+                params.append(str(resolved["problem_id"]) if resolved is not None else problem_id)
+            if candidate_chunk_id is not None:
+                clauses.append("candidate_chunk_id = ?")
+                params.append(candidate_chunk_id)
+            where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+            rows = connection.execute(
+                f"SELECT * FROM improvement_attempts {where} ORDER BY created_at, attempt_id LIMIT ?",
+                [*params, max(1, int(limit))],
+            ).fetchall()
+        return [self._attempt_from_row(r) for r in rows]
+
+    def outcome_stats(self, *, chunk_ids: Sequence[str], model: str | None = None) -> OutcomeStats:
+        ids = list(dict.fromkeys(str(c) for c in chunk_ids))
+        if not ids:
+            return OutcomeStats(
+                n=0, total_weight=0.0, success_weight=0.0, success_rate=None,
+                mean_output_tokens=None, mean_turns=None,
+            )
+        scope = (
+            "EXISTS (SELECT 1 FROM json_each(outcomes.chunk_ids) j"
+            " WHERE j.value IN (SELECT value FROM json_each(?)))"
+        )
+        params: list[Any] = [json.dumps(ids)]
+        if model is not None:
+            scope += " AND model = ?"
+            params.append(model)
+        with self._connect() as connection:
+            agg = connection.execute(
+                "SELECT COUNT(*) AS n, COALESCE(SUM(weight), 0.0) AS tw,"
+                " COALESCE(SUM(CASE WHEN success = 1 THEN weight ELSE 0 END), 0.0) AS sw,"
+                " AVG(output_tokens) AS mot, AVG(turns) AS mt"
+                f" FROM outcomes WHERE {scope}",
+                params,
+            ).fetchone()
+            task_rows = connection.execute(
+                f"SELECT DISTINCT task, success FROM outcomes WHERE task IS NOT NULL AND {scope}",
+                params,
+            ).fetchall()
+        total = float(agg["tw"])
+        success = float(agg["sw"])
+        return OutcomeStats(
+            n=int(agg["n"]),
+            total_weight=total,
+            success_weight=success,
+            success_rate=(success / total) if total > 0 else None,
+            mean_output_tokens=float(agg["mot"]) if agg["mot"] is not None else None,
+            mean_turns=float(agg["mt"]) if agg["mt"] is not None else None,
+            tasks_succeeded=sorted({str(r["task"]) for r in task_rows if r["success"]}),
+            tasks_failed=sorted({str(r["task"]) for r in task_rows if not r["success"]}),
+        )
+
+    def has_success_outcome(
+        self, *, pipeline_id: str | None = None, task: str, slot: str | None = None
+    ) -> bool:
+        clauses = ["success = 1", "task = ?"]
+        params: list[Any] = [task]
+        if slot is not None:
+            clauses.append("slot = ?")
+            params.append(slot)
+        if pipeline_id is not None:
+            clauses.append("pipeline_id = ?")
+            params.append(pipeline_id)
+        with self._connect() as connection:
+            row = connection.execute(
+                f"SELECT 1 FROM outcomes WHERE {' AND '.join(clauses)} LIMIT 1", params
+            ).fetchone()
+        return row is not None
 
     def record_memo(
         self,
@@ -1475,16 +1811,7 @@ class SQLiteStore(BaseStore):
         ).fetchall()
         results: list[OutcomeRecord] = []
         for row in rows:
-            results.append(OutcomeRecord(
-                outcome_id=str(row["outcome_id"]),
-                turn_id=row["turn_id"],
-                chunk_ids=json.loads(str(row["chunk_ids"])),
-                success=bool(row["success"]),
-                weight=float(row["weight"]),
-                note=row["note"],
-                created_at=float(row["created_at"]),
-                consumed=bool(row["consumed"]),
-            ))
+            results.append(self._outcome_from_row(row, json.loads(str(row["chunk_ids"]))))
         return results
 
     def _load_outcome_applications(
@@ -2432,7 +2759,8 @@ class SQLiteStore(BaseStore):
 
             query = (
                 "SELECT chunk_id, base_trust, src, written_by, generation, created_at,"
-                " retrieval_count, caused_by, dissent_count FROM chunks"
+                " retrieval_count, caused_by, dissent_count,"
+                " CASE WHEN src = 'skill_ref' THEN conditions END AS skill_conditions FROM chunks"
                 " WHERE chunk_id NOT IN (SELECT chunk_id FROM tombstones)"
             )
             params: list = []
@@ -2447,6 +2775,12 @@ class SQLiteStore(BaseStore):
                 if not dry_run:
                     connection.execute("BEGIN IMMEDIATE")
                 rows = connection.execute(query, params).fetchall()
+                # R9: user-registered skills are never batch-decayed.
+                exempt_skill_ids = registered_skill_chunk_ids(
+                    (str(r["chunk_id"]), r["skill_conditions"])
+                    for r in rows
+                    if r["skill_conditions"]
+                )
                 updates: list[tuple[float, str]] = []
                 feedback_rows: list[FeedbackRow] = []
                 chunk_author: dict[str, str] = {}
@@ -2464,7 +2798,9 @@ class SQLiteStore(BaseStore):
                         continue
 
                     if not feedback_mode:
-                        if age_seconds > cutoff_age and base_trust > 0.5 and generation == 0:
+                        if cid in exempt_skill_ids:
+                            report.protected += 1
+                        elif age_seconds > cutoff_age and base_trust > 0.5 and generation == 0:
                             new_trust = max(0.0, base_trust * decay_factor)
                             report.change_log.append({
                                 "chunk_id": cid, "old_trust": base_trust,
@@ -2530,7 +2866,10 @@ class SQLiteStore(BaseStore):
                             outcomes, {r.chunk_id for r in feedback_rows}, prior_pairs
                         )
                         if scoped:
-                            outcome_evidence = compute_outcome_evidence(scoped)
+                            outcome_evidence = compute_outcome_evidence(
+                                scoped,
+                                self_report_weight=self.config.calibration_self_report_weight if self.config is not None else 1.0,
+                            )
                         applied_now = [
                             (o.outcome_id, cid) for o in scoped for cid in o.chunk_ids
                         ]

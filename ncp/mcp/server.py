@@ -70,6 +70,7 @@ from ncp.skill_cache import (
     SKILL_AUTHOR_PREFIX,
     ensure_cached,
     fetch_skill,
+    outline_skill,
     is_reserved_skill_identity,
     latest_registered_skill,
     list_skills,
@@ -469,6 +470,7 @@ MCP_TOOLS: list[dict[str, object]] = [
                 "action": {"type": "string", "enum": ["get", "recall", "list"]},
                 "skill_id": {"type": "string", "description": "get: <namespace>/<name>."},
                 "content_hash": {"type": "string", "description": "get: pin a version (default newest)."},
+                "detail": {"type": "string", "enum": ["full", "outline"], "description": "get: full (default) or outline (headings, first lines, code signatures)."},
                 "query": {"type": "string", "description": "recall."},
                 "k": {"type": "integer", "description": "recall: max 4."},
                 "pipeline_id": {"type": "string"},
@@ -574,6 +576,16 @@ MCP_TOOLS: list[dict[str, object]] = [
                 "outcome_id": {"type": "string"},
                 "weight": {"type": "number", "description": "Evidence weight, 0 < weight <= 1 (default 1.0); others rejected."},
                 "note": {"type": "string"},
+                "pipeline_id": {"type": "string"},
+                "task": {"type": "string"},
+                "slot": {"type": "string"},
+                "agent_id": {"type": "string", "description": "Omitted pipeline_id/task/slot default to this agent's last get_context."},
+                "model": {"type": "string"},
+                "benchmark": {"type": "string"},
+                "eval_source": {"type": "string", "enum": ["self_report", "verifier", "human"]},
+                "output_tokens": {"type": "integer"},
+                "input_tokens": {"type": "integer"},
+                "turns": {"type": "integer"},
             },
         },
     },
@@ -1090,6 +1102,10 @@ class FetchSession:
     # ncp_post_turn defaults to them when it omits the matching fields (never
     # for the shared default key). Value: (pending_whisper_ids, retrieved_chunk_ids).
     held_ids: dict[str, tuple[list[str], list[str]]] = field(default_factory=dict)
+    # (pipeline_id, task, slot) of this session's last ncp_get_context; unlike
+    # held_ids it survives ncp_post_turn, so ncp_record_outcome can default
+    # task/slot/pipeline_id to it. Never kept for the shared default key.
+    last_context: tuple[str | None, str, str] | None = None
     # Skill content hashes already returned by ncp_skill get in this session.
     skill_hashes: set[str] = field(default_factory=set)
     # Cross-turn delta: chunk_id -> content hash already delivered to this
@@ -1214,6 +1230,10 @@ def make_handlers(
 
     sessions: dict[str, FetchSession] = {}
     sessions_lock = threading.Lock()
+    # Debounce state for auto-calibration after ncp_record_outcome: pipeline_id
+    # ("" = none) -> monotonic time of the last attempt.
+    auto_calibrate_last: dict[str, float] = {}
+    auto_calibrate_lock = threading.Lock()
     coordination = getattr(store, "coordination", None)
     default_whisper_ttl = config.whisper_ttl_default if config is not None else 1800
     require_signatures = config.require_signatures if config is not None else False
@@ -1758,6 +1778,7 @@ def make_handlers(
                 while len(slots) > _HELD_SLOTS_MAX:
                     del slots[next(iter(slots))]
                 held.held_ids = slots
+                held.last_context = (normalized_pipeline_id, conscious.task, conscious.slot)
                 # delta:false (or a reset session) starts from an empty set.
                 delivered = dict(prior_delivered) if delta_applied else dict(preserved_delivered or {})
                 delivered.update(fitted_result.delivered_hashes)
@@ -2596,8 +2617,12 @@ def make_handlers(
             info = latest
         if info is None:
             return not_found
+        detail = str(args.get("detail") or "full")
+        if detail not in ("full", "outline"):
+            raise ValueError("ncp_skill get 'detail' must be 'full' or 'outline'")
+        outline = detail == "outline"
         session_id = _session_id_from_args(args)
-        if session_id != DEFAULT_FETCH_SESSION_ID:
+        if session_id != DEFAULT_FETCH_SESSION_ID and not outline:
             with sessions_lock:
                 seen = sessions.setdefault(session_id, FetchSession())
                 seen.last_access = time.monotonic()
@@ -2608,10 +2633,13 @@ def make_handlers(
         )
         if text is None:
             return not_found
-        if session_id != DEFAULT_FETCH_SESSION_ID:
+        if session_id != DEFAULT_FETCH_SESSION_ID and not outline:
             with sessions_lock:
                 sessions.setdefault(session_id, FetchSession()).skill_hashes.add(info.content_hash)
         header = f"[NCP:SKILL] skill:{skill_id}@{info.content_hash[:12]} kind:{info.kind}"
+        if outline:
+            header += " detail:outline"
+            text = outline_skill(text)
         return {"result": f"{header}\n{text}"}
 
     def _typed_decision_args(args: dict[str, object]) -> bool:
@@ -3011,6 +3039,60 @@ def make_handlers(
         if note is not None and not isinstance(note, str):
             raise ValueError("ncp_record_outcome 'note' must be a string or null")
 
+        def _opt_str(name: str) -> str | None:
+            value = args.get(name)
+            if value is None:
+                return None
+            if not isinstance(value, str):
+                raise ValueError(f"ncp_record_outcome '{name}' must be a string or null")
+            return value.strip() or None
+
+        def _opt_count(name: str) -> int | None:
+            value = args.get(name)
+            if value is None:
+                return None
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"ncp_record_outcome '{name}' must be an integer >= 0")
+            return value
+
+        out_pipeline = _opt_str("pipeline_id")
+        out_task = _opt_str("task")
+        out_slot = _opt_str("slot")
+        out_model = _opt_str("model")
+        out_benchmark = _opt_str("benchmark")
+        eval_source = args.get("eval_source", "self_report")
+        if eval_source is None:
+            eval_source = "self_report"
+        if eval_source not in ("self_report", "verifier", "human"):
+            raise ValueError("ncp_record_outcome 'eval_source' must be one of self_report, verifier, human")
+        output_tokens = _opt_count("output_tokens")
+        input_tokens = _opt_count("input_tokens")
+        turns = _opt_count("turns")
+
+        # Server-held defaults: an omitted task/slot/pipeline_id comes from this
+        # session's last ncp_get_context (never for the shared default session).
+        if out_task is None or out_slot is None or out_pipeline is None:
+            out_session = _session_id_from_args(args)
+            if out_session != DEFAULT_FETCH_SESSION_ID:
+                with sessions_lock:
+                    held_session = sessions.get(out_session)
+                    if held_session is None and not args.get("session_id") and args.get("pipeline_id") is None:
+                        # get_context keys sessions as "<pipeline>:<agent>"; with only an
+                        # agent_id, borrow that agent's most recently used session.
+                        suffix = f":{out_session}"
+                        matches = [
+                            sess for key, sess in sessions.items()
+                            if key.endswith(suffix) and sess.last_context is not None
+                        ]
+                        held_session = max(matches, key=lambda sess: sess.last_access, default=None)
+                    last = held_session.last_context if held_session is not None else None
+                # An explicit pipeline that differs from the held one is a different
+                # context: do not borrow its task/slot.
+                if last is not None and (out_pipeline is None or out_pipeline == last[0]):
+                    out_pipeline = out_pipeline if out_pipeline is not None else last[0]
+                    out_task = out_task if out_task is not None else last[1]
+                    out_slot = out_slot if out_slot is not None else last[2]
+
         outcome = OutcomeRecord(
             outcome_id=outcome_id or f"out_{int(time.time() * 1000)}_{uuid4().hex[:12]}",
             turn_id=turn_id,
@@ -3018,6 +3100,15 @@ def make_handlers(
             success=success,
             weight=weight,
             note=note,
+            pipeline_id=out_pipeline,
+            task=out_task,
+            slot=out_slot,
+            model=out_model,
+            benchmark=out_benchmark,
+            eval_source=eval_source,
+            output_tokens=output_tokens,
+            input_tokens=input_tokens,
+            turns=turns,
         )
         recorded = store.record_outcome(outcome)
         response: dict[str, object] = {"recorded": recorded, "outcome_id": outcome.outcome_id}
@@ -3029,7 +3120,36 @@ def make_handlers(
             response["decision_linked"] = bool(
                 store.link_decision_outcome(decision_id, outcome.outcome_id)
             )
+        response["calibrated"] = bool(recorded) and _auto_calibrate(out_pipeline)
         return response
+
+    def _auto_calibrate(pipeline_id: str | None) -> bool:
+        """Debounced feedback calibration after a recorded outcome.
+
+        Feedback mode applies outcome/retrieval evidence only (it never runs the
+        batch gen-0 decay). Failures are logged, never raised to the client.
+        """
+        if config is not None and not config.calibration_auto_on_outcome:
+            return False
+        calibrate_fn = getattr(store, "calibrate", None)
+        if not callable(calibrate_fn):
+            return False
+        interval = config.calibration_auto_min_interval_seconds if config is not None else 60.0
+        key = pipeline_id or ""
+        now = time.monotonic()
+        with auto_calibrate_lock:
+            last_run = auto_calibrate_last.get(key)
+            if last_run is not None and now - last_run < interval:
+                return False
+            auto_calibrate_last[key] = now
+        try:
+            calibrate_fn(feedback_mode=True, pipeline_id=pipeline_id)
+        except NotImplementedError:
+            return False
+        except Exception as exc:
+            _err(f"ncp_record_outcome: auto-calibration failed: {type(exc).__name__}: {exc}")
+            return False
+        return True
 
     def _memo_counters() -> dict[str, int] | None:
         """Cheap hits/misses totals for hosts (S4.1 memoization telemetry)."""

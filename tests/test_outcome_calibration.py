@@ -258,9 +258,9 @@ def test_ncp_record_outcome_with_turn_id(tmp_path: Path) -> None:
         handlers,
     ))
     assert result["recorded"] is True
-    with store._connect() as conn:
-        loaded = store._load_unconsumed_outcomes(conn)
-    assert len(loaded) == 1
-    assert len(loaded[0].chunk_ids) == 2
-    assert "c1" in loaded[0].chunk_ids
-    assert "c2" in loaded[0].chunk_ids
+    # Read by id: auto-calibration (on by default) may already have consumed it.
+    stored = store.get_outcome(result["outcome_id"])
+    assert stored is not None
+    assert len(stored.chunk_ids) == 2
+    assert "c1" in stored.chunk_ids
+    assert "c2" in stored.chunk_ids

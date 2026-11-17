@@ -235,6 +235,15 @@ DEFAULT_CONFIG = {
         # functions in ncp.skill_cache work regardless.
         "enabled": False,
     },
+    "calibration": {
+        # Weight applied to outcomes whose eval_source is "self_report" during
+        # feedback calibration (1.0 = unchanged; lower to favor verifier/human).
+        "self_report_weight": 1.0,
+        # Run feedback calibration automatically after ncp_record_outcome,
+        # at most once per auto_min_interval_seconds per pipeline.
+        "auto_on_outcome": True,
+        "auto_min_interval_seconds": 60,
+    },
     "tools": {
         "profile": "standard",
         "compact_default": True,
@@ -841,6 +850,25 @@ class NCPConfig:
         """Inline registry entries from [decision_schemas], keyed by schema_id."""
         raw = self.values.get("decision_schemas", {})
         return dict(raw) if isinstance(raw, dict) else {}
+
+    @property
+    def calibration_self_report_weight(self) -> float:
+        """``[calibration].self_report_weight`` clamped to [0, 1]; invalid -> 1.0."""
+        raw = self.values.get("calibration", {}).get("self_report_weight", 1.0)
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            return 1.0
+        return min(1.0, max(0.0, float(raw)))
+
+    @property
+    def calibration_auto_on_outcome(self) -> bool:
+        return bool(self.values.get("calibration", {}).get("auto_on_outcome", True))
+
+    @property
+    def calibration_auto_min_interval_seconds(self) -> float:
+        raw = self.values.get("calibration", {}).get("auto_min_interval_seconds", 60)
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)) or raw < 0:
+            return 60.0
+        return float(raw)
 
     @property
     def skill_cache_default_trust(self) -> float:

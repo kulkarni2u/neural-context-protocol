@@ -58,6 +58,7 @@ IDENTITY_ARGS: dict[str, tuple[tuple[str, bool], ...]] = {
     "ncp_skill": (("agent_id", True),),
     "ncp_record_decision": (("agent_id", True),),
     "ncp_compile_decision_query": (("agent_id", True),),
+    "ncp_record_outcome": (("agent_id", True),),
     "ncp_remember": (("written_by", True),),
 }
 
@@ -80,6 +81,9 @@ PIPELINE_SCOPED_TOOLS = frozenset({
     "ncp_remember",
     "ncp_recall",
     "ncp_improve",
+    # pipeline_id is optional context here; _check_pipeline_scope only checks it
+    # when given (outcome scope is otherwise verified through the chunk ids).
+    "ncp_record_outcome",
     "ncp_ontology_query",
     "ncp_ontology_explain",
     "ncp_ontology_assert",
@@ -102,7 +106,7 @@ ONTOLOGY_GLOBAL_NAMESPACE = "global"
 # Tools with no acting-agent argument and no pipeline_id, scoped by lookups
 # instead (documented so the catalog check can tell "reviewed" from "missed").
 LOOKUP_SCOPED_TOOLS = frozenset({
-    "ncp_overview", "ncp_get_decision", "ncp_record_outcome",
+    "ncp_overview", "ncp_get_decision",
     # Static server metadata: no pipeline data, nothing to scope.
     "ncp_ontology_capabilities",
 })
@@ -380,7 +384,7 @@ class ToolAuthorizer:
         if tool in PIPELINE_SCOPED_TOOLS:
             self._check_pipeline_scope(principal, tool, args)
 
-        if tool in ("ncp_get_context", "ncp_fetch", "ncp_post_turn", "ncp_skill"):
+        if tool in ("ncp_get_context", "ncp_fetch", "ncp_post_turn", "ncp_skill", "ncp_record_outcome"):
             # The per-turn ncp_fetch budget (and the ids ncp_post_turn defaults
             # to from ncp_get_context) is keyed by principal, never by a
             # caller-chosen session_id. Admin acts for many agents, so its
@@ -439,6 +443,8 @@ class ToolAuthorizer:
             # a pipeline_id passed alongside must still be allowed.
             if action in _TASK_ID_ACTIONS and _str_or_none(args.get("pipeline_id")) is None:
                 return
+        if tool == "ncp_record_outcome" and _str_or_none(args.get("pipeline_id")) is None:
+            return
         if tool in ONTOLOGY_NAMESPACE_TOOLS and _str_or_none(args.get("pipeline_id")) == ONTOLOGY_GLOBAL_NAMESPACE:
             return
         if tool in _MEMO_TOOLS and args.get("signature") is not None:

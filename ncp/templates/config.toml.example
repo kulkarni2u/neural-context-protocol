@@ -120,6 +120,12 @@ confidence_k = 20
 # signature match is what ships today).
 # similarity_threshold = 0.95
 
+# [calibration]
+# Trust calibration knobs (see `ncp calibrate`).
+# self_report_weight = 1.0        # [0,1] scale for outcomes with eval_source="self_report"
+# auto_on_outcome = true          # run feedback calibrate after ncp_record_outcome
+# auto_min_interval_seconds = 60  # debounce per pipeline
+
 # [skill_cache]
 # Library-mode skill/reference caching (ncp.skill_cache; CAP-C9).
 # default_trust = 0.60       # base_trust for src="skill_ref" writes

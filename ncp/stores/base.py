@@ -17,7 +17,10 @@ from ncp.types import (
     ConsciousBlock,
     NCPResponse,
     DecisionRecord,
+    ImprovementAttempt,
+    ImprovementProblem,
     OutcomeRecord,
+    OutcomeStats,
     SubconsciousChunk,
     TaskOpResult,
     TaskRecord,
@@ -328,6 +331,115 @@ class BaseStore(ABC):
     ) -> list[OutcomeRecord]:
         """Asynchronously list outcome records using thread pool."""
         fn = partial(self.list_outcomes, chunk_ids=chunk_ids, consumed=consumed, limit=limit)
+        return await anyio.to_thread.run_sync(fn)
+
+    # ------------------------------------------------------------------
+    # Improvement records (v1.9.7): problems -> attempts, plus outcome stats.
+    # Stored in tables (not chunks) so they are never decayed/consolidated.
+
+    def upsert_improvement_problem(self, problem: ImprovementProblem) -> ImprovementProblem:
+        """Insert the problem if its id is new; return the stored row (follows ``alias_of``)."""
+        raise NotImplementedError("improvement records require the sqlite or pgvector store")
+
+    def get_improvement_problem(self, problem_id: str) -> ImprovementProblem | None:
+        """Fetch a problem by id, following ``alias_of`` to the surviving row."""
+        raise NotImplementedError("improvement records require the sqlite or pgvector store")
+
+    def list_improvement_problems(
+        self,
+        *,
+        pipeline_id: str | None = None,
+        scope: str | None = None,
+        limit: int = 100,
+    ) -> list[ImprovementProblem]:
+        """List non-aliased problems ordered by ``opened_at``."""
+        raise NotImplementedError("improvement records require the sqlite or pgvector store")
+
+    def merge_improvement_problems(self, *, src_problem_id: str, dst_problem_id: str) -> None:
+        """Alias ``src`` to ``dst`` and re-point ``src``'s attempts. Attempts are never deleted."""
+        raise NotImplementedError("improvement records require the sqlite or pgvector store")
+
+    def record_improvement_attempt(self, attempt: ImprovementAttempt) -> ImprovementAttempt:
+        raise NotImplementedError("improvement records require the sqlite or pgvector store")
+
+    def update_improvement_attempt(self, attempt_id: str, **fields: Any) -> ImprovementAttempt:
+        """Update whitelisted fields of an attempt; unknown fields raise ``ValueError``."""
+        raise NotImplementedError("improvement records require the sqlite or pgvector store")
+
+    def list_improvement_attempts(
+        self,
+        *,
+        problem_id: str | None = None,
+        candidate_chunk_id: str | None = None,
+        limit: int = 200,
+    ) -> list[ImprovementAttempt]:
+        """List attempts ordered by ``created_at``."""
+        raise NotImplementedError("improvement records require the sqlite or pgvector store")
+
+    def outcome_stats(self, *, chunk_ids: Sequence[str], model: str | None = None) -> OutcomeStats:
+        """Aggregate every outcome touching ``chunk_ids`` (optionally one ``model``)."""
+        raise NotImplementedError("improvement records require the sqlite or pgvector store")
+
+    def has_success_outcome(
+        self, *, pipeline_id: str | None = None, task: str, slot: str | None = None
+    ) -> bool:
+        """True when a successful outcome exists for the task/slot. Base store: False."""
+        return False
+
+    async def async_upsert_improvement_problem(self, problem: ImprovementProblem) -> ImprovementProblem:
+        return await anyio.to_thread.run_sync(self.upsert_improvement_problem, problem)
+
+    async def async_get_improvement_problem(self, problem_id: str) -> ImprovementProblem | None:
+        return await anyio.to_thread.run_sync(self.get_improvement_problem, problem_id)
+
+    async def async_list_improvement_problems(
+        self, *, pipeline_id: str | None = None, scope: str | None = None, limit: int = 100
+    ) -> list[ImprovementProblem]:
+        fn = partial(self.list_improvement_problems, pipeline_id=pipeline_id, scope=scope, limit=limit)
+        return await anyio.to_thread.run_sync(fn)
+
+    async def async_merge_improvement_problems(
+        self, *, src_problem_id: str, dst_problem_id: str
+    ) -> None:
+        fn = partial(
+            self.merge_improvement_problems, src_problem_id=src_problem_id, dst_problem_id=dst_problem_id
+        )
+        await anyio.to_thread.run_sync(fn)
+
+    async def async_record_improvement_attempt(self, attempt: ImprovementAttempt) -> ImprovementAttempt:
+        return await anyio.to_thread.run_sync(self.record_improvement_attempt, attempt)
+
+    async def async_update_improvement_attempt(
+        self, attempt_id: str, **fields: Any
+    ) -> ImprovementAttempt:
+        fn = partial(self.update_improvement_attempt, attempt_id, **fields)
+        return await anyio.to_thread.run_sync(fn)
+
+    async def async_list_improvement_attempts(
+        self,
+        *,
+        problem_id: str | None = None,
+        candidate_chunk_id: str | None = None,
+        limit: int = 200,
+    ) -> list[ImprovementAttempt]:
+        fn = partial(
+            self.list_improvement_attempts,
+            problem_id=problem_id,
+            candidate_chunk_id=candidate_chunk_id,
+            limit=limit,
+        )
+        return await anyio.to_thread.run_sync(fn)
+
+    async def async_outcome_stats(
+        self, *, chunk_ids: Sequence[str], model: str | None = None
+    ) -> OutcomeStats:
+        fn = partial(self.outcome_stats, chunk_ids=chunk_ids, model=model)
+        return await anyio.to_thread.run_sync(fn)
+
+    async def async_has_success_outcome(
+        self, *, pipeline_id: str | None = None, task: str, slot: str | None = None
+    ) -> bool:
+        fn = partial(self.has_success_outcome, pipeline_id=pipeline_id, task=task, slot=slot)
         return await anyio.to_thread.run_sync(fn)
 
     # ------------------------------------------------------------------

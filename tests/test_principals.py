@@ -321,10 +321,22 @@ class TestPipelineAcl:
         with pytest.raises(AuthorizationError, match="may not access pipeline 'p2'"):
             auth.check_call(limited, "ncp_get_context", {"pipeline_id": "p2"})
 
-    @pytest.mark.parametrize("tool", sorted(PIPELINE_SCOPED_TOOLS - {"ncp_task"}))
+    @pytest.mark.parametrize("tool", sorted(PIPELINE_SCOPED_TOOLS - {"ncp_task", "ncp_record_outcome"}))
     def test_omitted_pipeline_is_rejected(self, store: SQLiteStore, tool: str) -> None:
         with pytest.raises(AuthorizationError, match="pipeline_id is required"):
             ToolAuthorizer(store).check_call(_p(pipelines={"p1"}, caps={"verify"}), tool, {"query": "q"})
+
+    def test_record_outcome_pipeline_is_optional_but_checked_when_given(self, store: SQLiteStore) -> None:
+        # Outcome scope is verified through the chunk ids, so pipeline_id (context
+        # only) stays optional for old clients; a stated one must still be allowed.
+        store.write(SubconsciousChunk(chunk_id="c1", layer="semantic", content="x", src="tool_result",
+                                      pipeline_id="p1", written_by="someone_else"))
+        auth = ToolAuthorizer(store)
+        limited = _p(pipelines={"p1"}, caps={"record_outcome"})
+        auth.check_call(limited, "ncp_record_outcome", {"success": True, "chunk_ids": ["c1"]})
+        auth.check_call(limited, "ncp_record_outcome", {"success": True, "chunk_ids": ["c1"], "pipeline_id": "p1"})
+        with pytest.raises(AuthorizationError, match="may not access pipeline 'p2'"):
+            auth.check_call(limited, "ncp_record_outcome", {"success": True, "chunk_ids": ["c1"], "pipeline_id": "p2"})
 
     def test_unrestricted_principal_may_omit_pipeline(self, store: SQLiteStore) -> None:
         ToolAuthorizer(store).check_call(_p(), "ncp_recall", {"query": "q"})
