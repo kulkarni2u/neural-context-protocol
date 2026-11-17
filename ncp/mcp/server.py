@@ -22,7 +22,7 @@ import urllib.parse
 from uuid import uuid4
 from collections.abc import Callable
 from pathlib import Path, PurePosixPath
-from typing import BinaryIO, Sequence, get_args
+from typing import Any, BinaryIO, Sequence, cast, get_args
 
 from ncp.adaptive_budget import AdaptiveBudgetResult, compute_adaptive_budget
 from ncp.assembler import Assembler, DeltaContext, chunk_content_hash, credited_chunks, stored_evidence_ids
@@ -951,8 +951,9 @@ _SKILLS_CONTEXT_ARG: dict[str, object] = {
 
 
 def _with_skills_context_arg(tool: dict[str, object]) -> dict[str, object]:
-    schema = dict(tool["inputSchema"])  # type: ignore[arg-type]
-    schema["properties"] = {**schema.get("properties", {}), "skills": _SKILLS_CONTEXT_ARG}  # type: ignore[dict-item]
+    schema = dict(cast("dict[str, object]", tool["inputSchema"]))
+    properties = cast("dict[str, object]", schema.get("properties", {}))
+    schema["properties"] = {**properties, "skills": _SKILLS_CONTEXT_ARG}
     return {**tool, "inputSchema": schema}
 
 
@@ -1674,7 +1675,7 @@ def make_handlers(
             as_of=as_of,
             delta=DeltaContext(prior_delivered, skip_recent_agent=conscious.agent_id) if delta_applied else None,
         )
-        response: dict[str, object] = {
+        response: dict[str, Any] = {
             "context": result.context,
             "session_id": session_id,
             "pending_whisper_ids": result.pending_whisper_ids,
@@ -1718,7 +1719,7 @@ def make_handlers(
                 }
             )
         if extra_telemetry and isinstance(response.get("telemetry"), dict):
-            response["telemetry"].update(extra_telemetry)  # type: ignore[union-attr]
+            response["telemetry"].update(extra_telemetry)
         fitted_result = result
         refit_ceiling: int | None = None
         if response_max_tokens is not None:
@@ -2317,11 +2318,12 @@ def make_handlers(
             for key in ("result_summary", "result_full"):
                 if args.get(key) is not None:
                     args[key] = _redact_secrets(str(args[key]))
-            if isinstance(args.get("memory_chunks"), list):
+            raw_memory_chunks = args.get("memory_chunks")
+            if isinstance(raw_memory_chunks, list):
                 args["memory_chunks"] = [
                     {**item, "content": _redact_secrets(str(item["content"]))}
                     if isinstance(item, dict) and item.get("content") is not None else item
-                    for item in args["memory_chunks"]
+                    for item in raw_memory_chunks
                 ]
         conscious = _build_conscious_from_args(store, args)
         assembler = Assembler(store=store, config=config)
@@ -2564,7 +2566,7 @@ def make_handlers(
             if not query_str:
                 raise ValueError("ncp_skill recall requires 'query'")
             try:
-                k = min(4, max(1, int(args.get("k", 2))))
+                k = min(4, max(1, int(cast("int | str", args.get("k", 2)))))
             except (ValueError, TypeError):
                 k = 2
             effective = _claim_fetch_slot(_session_id_from_args(args), pipeline_id)

@@ -52,7 +52,7 @@ import hashlib
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Literal, cast
 
 from ncp.config import NCPConfig, load_config
 from ncp.stores.base import BaseStore
@@ -209,7 +209,7 @@ def _validate_registered_by(registered_by: str | None) -> None:
         raise ValueError(f"invalid registered_by {registered_by!r}: expected 'user' or None")
 
 
-def _target_scope(pipeline_id: str | None, scope_global: bool) -> tuple[str, str | None]:
+def _target_scope(pipeline_id: str | None, scope_global: bool) -> tuple[Literal["pipeline", "global"], str | None]:
     """Return ``(chunk scope, chunk-id salt)`` for a write."""
 
     if pipeline_id and not scope_global:
@@ -531,7 +531,7 @@ def _complete_manifest_rows(
     offset = 0
     for _ in range(_LIST_MAX_PAGES):
         page = store.list_chunks(src="skill_ref", zone="proven", written_by=author, limit=_LIST_PAGE, offset=offset)
-        rows = page.get("chunks", [])
+        rows = cast("list[dict]", page.get("chunks", []))
         for row in rows:
             if row.get("tombstoned") or not str(row["content"]).startswith("skill_ref manifest "):
                 continue
@@ -545,7 +545,7 @@ def _complete_manifest_rows(
             if parsed["content_hash"] and parsed["sections"] is not None:
                 candidates.append((row, parsed))
         offset += _LIST_PAGE
-        if len(rows) < _LIST_PAGE or offset >= int(page.get("total", 0)):
+        if len(rows) < _LIST_PAGE or offset >= int(cast("int | str", page.get("total", 0))):
             break
 
     out: list[SkillInfo] = []

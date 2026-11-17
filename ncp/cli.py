@@ -1662,7 +1662,7 @@ def skill_list_command(pipeline_id: str | None, cwd: Path, as_json: bool) -> Non
 
     config, store = _skill_store(cwd)
     skills = list_skills(store=store, config=config, pipeline_id=pipeline_id)
-    rows = [
+    rows: list[dict[str, Any]] = [
         {
             "skill_id": i.skill_id,
             "content_hash": i.content_hash,
