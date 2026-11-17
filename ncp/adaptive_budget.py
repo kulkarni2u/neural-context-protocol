@@ -71,6 +71,10 @@ one) pulls the scale back down -- up to 50% at a fully exhausted $ ceiling:
                     else min(1.0, max(0.0, dollar_budget_fraction_used))
   conserved_scale = scale * (1.0 - 0.5 * dollar_pressure)
 
+When ``unproven`` is true (slot has no success outcome yet), ``scale`` is
+floored at 1.0 before the $ cut, so an unproven slot is never shrunk by
+task-difficulty signals.
+
 The adjusted token budget is the requested budget scaled and clamped to the
 configured hard range:
 
@@ -116,12 +120,14 @@ class AdaptiveBudgetResult:
     floor_tokens: int
     ceiling_tokens: int
     reason_factors: dict[str, object]
+    unproven_protected: bool = False
 
     def to_dict(self) -> dict[str, object]:
         return {
             "requested": self.requested_tokens,
             "adjusted": self.adjusted_tokens,
             "reason_factors": self.reason_factors,
+            "budget_unproven_protected": self.unproven_protected,
         }
 
 
@@ -135,6 +141,7 @@ def compute_adaptive_budget(
     pressure: str,
     slot_age: int,
     dollar_budget_fraction_used: float | None = None,
+    unproven: bool = False,
 ) -> AdaptiveBudgetResult:
     """Compute the CAP-C6 adjusted token budget. See module docstring for the formula.
 
@@ -143,6 +150,10 @@ def compute_adaptive_budget(
     clamped to ``[floor_tokens, ceiling_tokens]`` regardless of inputs; a
     ``ceiling_tokens`` below ``floor_tokens`` is treated as equal to
     ``floor_tokens`` (the floor always wins) so the range is never inverted.
+
+    ``unproven`` (R7): the slot has no recorded success outcome yet, so the
+    task-difficulty scale is floored at 1.0 (never shrink an unproven slot);
+    the $ conservation cut still applies afterwards.
     """
 
     safe_floor = max(0, int(floor_tokens))
@@ -162,6 +173,9 @@ def compute_adaptive_budget(
     task_signal = min(1.0, max(0.0, task_signal))
 
     scale = _SCALE_BASE + task_signal
+    unproven_protected = bool(unproven) and scale < 1.0
+    if unproven:
+        scale = max(scale, 1.0)
 
     dollar_pressure = (
         0.0
@@ -188,6 +202,7 @@ def compute_adaptive_budget(
             None if dollar_budget_fraction_used is None else round(dollar_pressure, 4)
         ),
         "conserved_scale": round(conserved_scale, 4),
+        "unproven": bool(unproven),
         "floor_tokens": safe_floor,
         "ceiling_tokens": safe_ceiling,
     }
@@ -198,4 +213,5 @@ def compute_adaptive_budget(
         floor_tokens=safe_floor,
         ceiling_tokens=safe_ceiling,
         reason_factors=reason_factors,
+        unproven_protected=unproven_protected,
     )
