@@ -41,10 +41,20 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 from pathlib import Path
-from typing import Sequence
+import time
+from typing import Any, Sequence
 
 from ncp.stores.base import BaseStore
-from ncp.types import ChunkEdge, ChunkSource, OutcomeRecord, SubconsciousChunk
+from ncp.stores.improvement_common import make_problem_id, new_attempt_id
+from ncp.types import (
+    ChunkEdge,
+    ChunkSource,
+    ImprovementAttempt,
+    ImprovementProblem,
+    OutcomeRecord,
+    OutcomeStats,
+    SubconsciousChunk,
+)
 
 PROCEDURE_LAYER = "procedural"
 MAX_CONTENT_CHARS = 2000
@@ -59,6 +69,18 @@ _SRC_DEFAULT_TRUST: dict[str, float] = {
     "agent_inferred": 0.60,
     "subcon_retrieved": 0.55,
 }
+
+
+class RefineError(ValueError):
+    """A refinement request that cannot proceed (subclasses ValueError for CLI compatibility)."""
+
+
+class RefineGateError(RefineError):
+    """A prune candidate failed the apply gate; ``details`` explains why."""
+
+    def __init__(self, message: str, details: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.details = details
 
 
 def _procedure_root_id(*, pipeline_id: str | None, key: str) -> str:
@@ -300,6 +322,11 @@ def propose_refinement(
     min_failed_outcomes: int = 3,
     max_bullets: int = 5,
     dry_run: bool = False,
+    problem_id: str | None = None,
+    problem_name: str | None = None,
+    rationale: str | None = None,
+    predicted: Sequence[str] | None = None,
+    model: str | None = None,
 ) -> RefinementResult:
     """Gather outcome evidence against the current head and propose a next version.
 
@@ -325,9 +352,46 @@ def propose_refinement(
             key=key, head_chunk_id=head.chunk_id, proposal=proposal, new_chunk=None, dry_run=dry_run
         )
 
+    new_chunk = _write_candidate(
+        store,
+        head=head,
+        key=key,
+        pipeline_id=pipeline_id,
+        content=proposal.proposed_content,
+        dup_hint="the rationale may need more distinguishing detail",
+    )
+    summary = "; ".join(proposal.rationale)
+    _record_attempt(
+        store,
+        kind="repair",
+        key=key,
+        pipeline_id=pipeline_id,
+        problem_id=problem_id,
+        problem_name=problem_name,
+        default_name=f"recurring failures in {key}",
+        what=f"repair: {summary}",
+        rationale=rationale,
+        predicted=predicted,
+        model=model,
+        candidate_chunk_id=new_chunk.chunk_id,
+    )
+    return RefinementResult(
+        key=key, head_chunk_id=head.chunk_id, proposal=proposal, new_chunk=new_chunk, dry_run=False
+    )
+
+
+def _write_candidate(
+    store: BaseStore,
+    *,
+    head: SubconsciousChunk,
+    key: str,
+    pipeline_id: str | None,
+    content: str,
+    dup_hint: str,
+) -> SubconsciousChunk:
     new_chunk = SubconsciousChunk(
         layer=PROCEDURE_LAYER,
-        content=proposal.proposed_content,
+        content=content,
         src="synthesis",
         written_by=REFINE_AUTHOR,
         pipeline_id=pipeline_id,
@@ -339,14 +403,231 @@ def propose_refinement(
     if not store.write(new_chunk):
         raise ValueError(
             f"could not write proposal for '{key}': content is too similar to existing memory "
-            "in this pipeline (dedup guard) -- the rationale may need more distinguishing detail"
+            f"in this pipeline (dedup guard) -- {dup_hint}"
         )
     store.add_chunk_edges(
         [ChunkEdge(src_chunk_id=new_chunk.chunk_id, dst_chunk_id=head.chunk_id, edge_type="supersedes", created_by=REFINE_AUTHOR)]
     )
-    return RefinementResult(
-        key=key, head_chunk_id=head.chunk_id, proposal=proposal, new_chunk=new_chunk, dry_run=False
+    return new_chunk
+
+
+def _resolve_problem(
+    store: BaseStore,
+    *,
+    key: str,
+    pipeline_id: str | None,
+    problem_id: str | None,
+    problem_name: str | None,
+    default_name: str,
+) -> ImprovementProblem:
+    if problem_id:
+        found = store.get_improvement_problem(problem_id)
+        if found is None:
+            raise RefineError(f"unknown improvement problem '{problem_id}'")
+        return found
+    name = (problem_name or "").strip() or default_name
+    return store.upsert_improvement_problem(
+        ImprovementProblem(
+            problem_id=make_problem_id(pipeline_id=pipeline_id, scope=key, name=name),
+            pipeline_id=pipeline_id,
+            scope=key,
+            name=name[:300],
+            opened_at=time.time(),
+        )
     )
+
+
+def _record_attempt(
+    store: BaseStore,
+    *,
+    kind: str,
+    key: str,
+    pipeline_id: str | None,
+    problem_id: str | None,
+    problem_name: str | None,
+    default_name: str,
+    what: str,
+    rationale: str | None,
+    predicted: Sequence[str] | None,
+    model: str | None,
+    candidate_chunk_id: str,
+    anchor_rate: float | None = None,
+    anchor_output_tokens: float | None = None,
+) -> ImprovementAttempt | None:
+    """File an attempt under its problem; improvement storage may be unsupported."""
+    try:
+        problem = _resolve_problem(
+            store,
+            key=key,
+            pipeline_id=pipeline_id,
+            problem_id=problem_id,
+            problem_name=problem_name,
+            default_name=default_name,
+        )
+        return store.record_improvement_attempt(
+            ImprovementAttempt(
+                attempt_id=new_attempt_id(),
+                problem_id=problem.problem_id,
+                kind=kind,  # type: ignore[arg-type]
+                what=what[:500],
+                rationale=(rationale[:1000] if rationale else None),
+                candidate_chunk_id=candidate_chunk_id,
+                predicted=list(predicted or []),
+                anchor_rate=anchor_rate,
+                anchor_output_tokens=anchor_output_tokens,
+                model=model,
+                created_at=time.time(),
+            )
+        )
+    except NotImplementedError:
+        return None
+
+
+def _find_attempt(store: BaseStore, chunk_id: str) -> ImprovementAttempt | None:
+    try:
+        attempts = store.list_improvement_attempts(candidate_chunk_id=chunk_id)
+    except NotImplementedError:
+        return None
+    return attempts[-1] if attempts else None
+
+
+def _safe_stats(store: BaseStore, chunk_id: str, model: str | None) -> OutcomeStats | None:
+    try:
+        return store.outcome_stats(chunk_ids=[chunk_id], model=model)
+    except NotImplementedError:
+        return None
+
+
+def propose_prune(
+    store: BaseStore,
+    *,
+    key: str,
+    content: str,
+    pipeline_id: str | None = None,
+    problem_id: str | None = None,
+    problem_name: str | None = None,
+    rationale: str | None = None,
+    predicted: Sequence[str] | None = None,
+    model: str | None = None,
+    min_anchor_outcomes: int = 5,
+    dry_run: bool = False,
+) -> RefinementResult:
+    """Propose a shorter version of the head, only once the head has a working anchor."""
+    head = find_procedure_head(store, key=key, pipeline_id=pipeline_id)
+    if head is None:
+        raise ValueError(f"no procedure ingested for key '{key}'; run `ncp refine ingest` first")
+    content = content.strip()
+    if not content:
+        raise RefineError("prune content must not be empty")
+    if len(content) > MAX_CONTENT_CHARS:
+        raise RefineError(f"prune content is {len(content)} chars; max {MAX_CONTENT_CHARS}")
+    try:
+        anchor = store.outcome_stats(chunk_ids=[head.chunk_id], model=model)
+    except NotImplementedError as exc:
+        raise RefineError(f"cannot prune: {exc}") from exc
+    if anchor.total_weight < min_anchor_outcomes:
+        raise RefineError(
+            f"no anchor: head has {anchor.n} outcomes; collect outcomes or run a repair first"
+        )
+    if len(content) >= len(head.content):
+        raise RefineError(
+            f"prune content ({len(content)} chars) must be strictly shorter than the head "
+            f"({len(head.content)} chars)"
+        )
+    if dry_run:
+        return RefinementResult(
+            key=key, head_chunk_id=head.chunk_id, proposal=None, new_chunk=None, dry_run=True
+        )
+    new_chunk = _write_candidate(
+        store,
+        head=head,
+        key=key,
+        pipeline_id=pipeline_id,
+        content=content,
+        dup_hint="the pruned content is too similar to existing memory",
+    )
+    _record_attempt(
+        store,
+        kind="prune",
+        key=key,
+        pipeline_id=pipeline_id,
+        problem_id=problem_id,
+        problem_name=problem_name,
+        default_name=f"token cost of {key}",
+        what=f"prune: {len(head.content)} -> {len(content)} chars",
+        rationale=rationale,
+        predicted=predicted,
+        model=model,
+        candidate_chunk_id=new_chunk.chunk_id,
+        anchor_rate=anchor.success_rate,
+        anchor_output_tokens=anchor.mean_output_tokens,
+    )
+    return RefinementResult(
+        key=key, head_chunk_id=head.chunk_id, proposal=None, new_chunk=new_chunk, dry_run=False
+    )
+
+
+def _observed_fields(attempt: ImprovementAttempt, stats: OutcomeStats | None) -> dict[str, Any]:
+    if stats is None:
+        return {}
+    succeeded = set(stats.tasks_succeeded)
+    fixed = [t for t in attempt.predicted if t in succeeded]
+    return {
+        "passed": stats.success_weight,
+        "total": stats.total_weight,
+        "mean_output_tokens": stats.mean_output_tokens,
+        "fixed": fixed,
+        "missed": [t for t in attempt.predicted if t not in fixed],
+    }
+
+
+def _check_prune_gate(
+    attempt: ImprovementAttempt,
+    stats: OutcomeStats | None,
+    *,
+    gate_ratio: float,
+    min_trial_outcomes: int,
+) -> None:
+    details: dict[str, Any] = {
+        "anchor_rate": attempt.anchor_rate,
+        "candidate_rate": stats.success_rate if stats else None,
+        "n": stats.n if stats else 0,
+        "total_weight": stats.total_weight if stats else 0.0,
+        "anchor_output_tokens": attempt.anchor_output_tokens,
+        "candidate_output_tokens": stats.mean_output_tokens if stats else None,
+        "required": {
+            "min_trial_outcomes": min_trial_outcomes,
+            "gate_ratio": gate_ratio,
+            "min_rate": (
+                gate_ratio * attempt.anchor_rate if attempt.anchor_rate is not None else None
+            ),
+        },
+    }
+    reasons: list[str] = []
+    if stats is None or stats.total_weight < min_trial_outcomes:
+        reasons.append(
+            f"trial outcomes {details['total_weight']} < required {min_trial_outcomes}"
+        )
+    else:
+        cand_rate = stats.success_rate
+        if attempt.anchor_rate is not None and (
+            cand_rate is None or cand_rate < gate_ratio * attempt.anchor_rate
+        ):
+            reasons.append(
+                f"candidate rate {cand_rate} < {gate_ratio} x anchor rate {attempt.anchor_rate}"
+            )
+        if (
+            attempt.anchor_output_tokens is not None
+            and stats.mean_output_tokens is not None
+            and stats.mean_output_tokens >= attempt.anchor_output_tokens
+        ):
+            reasons.append(
+                f"candidate mean output tokens {stats.mean_output_tokens} >= anchor "
+                f"{attempt.anchor_output_tokens}"
+            )
+    if reasons:
+        details["reasons"] = reasons
+        raise RefineGateError("prune gate failed: " + "; ".join(reasons), details)
 
 
 def apply_refinement(
@@ -355,8 +636,15 @@ def apply_refinement(
     chunk_id: str,
     promote_trust: float = 0.80,
     write_to: Path | None = None,
+    force: bool = False,
+    gate_ratio: float = 0.9,
+    min_trial_outcomes: int = 5,
 ) -> SubconsciousChunk:
     """Adopt a proposed candidate: promote it to head and lift its trust.
+
+    Refuses a stale candidate (its predecessor is no longer the head), even
+    with ``force``. Prune candidates must pass the accuracy/token gate unless
+    ``force`` is set.
 
     Retires the candidate's predecessor via the existing CAP-C5
     ``store.supersede`` machinery (never deletes it) and promotes trust via
@@ -372,6 +660,22 @@ def apply_refinement(
     if not candidate.supersedes:
         raise ValueError(f"chunk '{chunk_id}' is not a refinement proposal (no predecessor)")
 
+    key = candidate.source_refs[0] if candidate.source_refs else None
+    if key is not None:
+        head = find_procedure_head(store, key=key, pipeline_id=candidate.pipeline_id)
+        if head is not None and head.chunk_id != candidate.supersedes:
+            raise RefineError(
+                f"stale candidate '{chunk_id}': it supersedes '{candidate.supersedes}' but the "
+                f"current head of '{key}' is '{head.chunk_id}'; propose again"
+            )
+
+    attempt = _find_attempt(store, candidate.chunk_id)
+    stats = _safe_stats(store, candidate.chunk_id, attempt.model if attempt else None)
+    if attempt is not None and attempt.kind == "prune" and not force:
+        _check_prune_gate(
+            attempt, stats, gate_ratio=gate_ratio, min_trial_outcomes=min_trial_outcomes
+        )
+
     if not store.supersede(candidate.supersedes, candidate.chunk_id):
         raise ValueError(
             f"could not adopt '{chunk_id}': predecessor '{candidate.supersedes}' not found "
@@ -379,10 +683,43 @@ def apply_refinement(
         )
     store.calibrate(chunk_id=candidate.chunk_id, trust=promote_trust)
 
+    if attempt is not None:
+        try:
+            store.update_improvement_attempt(
+                attempt.attempt_id,
+                status="applied",
+                accepted=True,
+                resolved_at=time.time(),
+                **_observed_fields(attempt, stats),
+            )
+        except NotImplementedError:
+            pass
+
     if write_to is not None:
         write_to.write_text(candidate.content + "\n")
 
     return candidate.model_copy(update={"base_trust": promote_trust})
+
+
+def reject_refinement(
+    store: BaseStore, *, chunk_id: str, reason: str | None = None
+) -> ImprovementAttempt:
+    """Mark a candidate's attempt rejected (the candidate chunk stays in place)."""
+    try:
+        attempt = _find_attempt(store, chunk_id)
+        if attempt is None:
+            raise RefineError(f"no improvement attempt found for candidate '{chunk_id}'")
+        if attempt.status != "proposed":
+            raise RefineError(f"attempt '{attempt.attempt_id}' is already {attempt.status}")
+        stats = _safe_stats(store, chunk_id, attempt.model)
+        fields = _observed_fields(attempt, stats)
+        if reason:
+            fields["note"] = reason[:500]
+        return store.update_improvement_attempt(
+            attempt.attempt_id, status="rejected", resolved_at=time.time(), **fields
+        )
+    except NotImplementedError as exc:
+        raise RefineError(str(exc)) from exc
 
 
 def rollback_refinement(
@@ -433,6 +770,15 @@ def rollback_refinement(
     )
     if not store.supersede(head.chunk_id, reverted.chunk_id):
         raise ValueError(f"could not roll back: head '{head.chunk_id}' not found")
+
+    reverted_attempt = _find_attempt(store, head.chunk_id)
+    if reverted_attempt is not None:
+        try:
+            store.update_improvement_attempt(
+                reverted_attempt.attempt_id, status="rolled_back", resolved_at=time.time()
+            )
+        except NotImplementedError:
+            pass
 
     if write_to is not None:
         write_to.write_text(reverted.content + "\n")

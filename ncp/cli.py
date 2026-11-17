@@ -2600,6 +2600,19 @@ def refine_show_command(key: str, cwd: Path | None, pipeline_id: str | None, his
     console.print(head.content)
 
 
+def _refine_problem_options(func: Any) -> Any:
+    """Shared improvement-record flags for ``refine propose`` / ``refine prune``."""
+    for decorator in reversed([
+        click.option("--problem-id", default=None, help="File the attempt under this existing improvement problem."),
+        click.option("--problem", default=None, help="Root-cause hypothesis (problem name) to file the attempt under."),
+        click.option("--rationale", default=None, help="Why this change should help."),
+        click.option("--predict", multiple=True, help="Task id expected to be fixed (repeatable)."),
+        click.option("--model", default=None, help="Model the evidence/evaluation is for."),
+    ]):
+        func = decorator(func)
+    return func
+
+
 @refine_group.command("propose")
 @click.argument("key")
 @click.option("--cwd", default=None, type=click.Path(exists=True, file_okay=False, path_type=Path))
@@ -2607,6 +2620,7 @@ def refine_show_command(key: str, cwd: Path | None, pipeline_id: str | None, his
 @click.option("--min-failed-outcomes", default=None, type=int, help="Override config minimum failure count.")
 @click.option("--max-bullets", default=None, type=int, help="Override config max proposed bullets.")
 @click.option("--dry-run", is_flag=True, default=False, help="Preview the proposal without writing a candidate chunk.")
+@_refine_problem_options
 def refine_propose_command(
     key: str,
     cwd: Path | None,
@@ -2614,6 +2628,11 @@ def refine_propose_command(
     min_failed_outcomes: int | None,
     max_bullets: int | None,
     dry_run: bool,
+    problem_id: str | None,
+    problem: str | None,
+    rationale: str | None,
+    predict: tuple[str, ...],
+    model: str | None,
 ) -> None:
     """Propose a next version of KEY from recorded outcome evidence."""
     from ncp.config import load_config
@@ -2633,6 +2652,11 @@ def refine_propose_command(
             min_failed_outcomes=min_failed_outcomes if min_failed_outcomes is not None else config.refine_min_failed_outcomes,
             max_bullets=max_bullets if max_bullets is not None else config.refine_max_bullets,
             dry_run=dry_run,
+            problem_id=problem_id,
+            problem_name=problem,
+            rationale=rationale,
+            predicted=list(predict),
+            model=model,
         )
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
@@ -2667,15 +2691,21 @@ def refine_propose_command(
 @click.option("--cwd", default=None, type=click.Path(exists=True, file_okay=False, path_type=Path))
 @click.option("--promote-trust", default=None, type=float, help="Trust to promote the candidate to (default from config, 0.80).")
 @click.option("--write-to", default=None, type=click.Path(dir_okay=False, path_type=Path), help="Also write the adopted content to this file.")
+@click.option("--force", is_flag=True, default=False, help="Bypass the prune gate (never bypasses the stale-head check).")
+@click.option("--gate-ratio", default=None, type=float, help="Prune gate: min candidate/anchor success ratio (default from config, 0.9).")
+@click.option("--min-trial-outcomes", default=None, type=int, help="Prune gate: min candidate outcomes (default from config, 5).")
 def refine_apply_command(
     chunk_id: str,
     cwd: Path | None,
     promote_trust: float | None,
     write_to: Path | None,
+    force: bool,
+    gate_ratio: float | None,
+    min_trial_outcomes: int | None,
 ) -> None:
     """Adopt a proposed candidate chunk as the live version of its procedure."""
     from ncp.config import load_config
-    from ncp.refine import apply_refinement
+    from ncp.refine import RefineGateError, apply_refinement
 
     config = load_config(cwd=cwd or Path.cwd())
     try:
@@ -2689,13 +2719,105 @@ def refine_apply_command(
             chunk_id=chunk_id,
             promote_trust=promote_trust if promote_trust is not None else config.refine_promote_trust,
             write_to=write_to,
+            force=force,
+            gate_ratio=gate_ratio if gate_ratio is not None else config.refine_gate_ratio,
+            min_trial_outcomes=(
+                min_trial_outcomes if min_trial_outcomes is not None else config.refine_min_trial_outcomes
+            ),
         )
+    except RefineGateError as exc:
+        click.echo(f"Gate failed: {exc}", err=True)
+        click.echo(json.dumps(exc.details, indent=2, sort_keys=True), err=True)
+        click.echo("Use --force to bypass the gate.", err=True)
+        raise SystemExit(2) from exc
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
 
     console.print(f"[green]Adopted {adopted.chunk_id}[/green] (trust {adopted.base_trust:.2f}).")
     if write_to is not None:
         console.print(f"Wrote content to {write_to}")
+
+
+@refine_group.command("prune")
+@click.argument("key")
+@click.option("--file", "file_path", required=True, type=click.Path(exists=True, dir_okay=False, path_type=Path), help="File holding the shorter procedure text.")
+@click.option("--cwd", default=None, type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("--pipeline-id", default=None, help="Pipeline scope for this procedure.")
+@click.option("--min-anchor-outcomes", default=None, type=int, help="Override config minimum head outcomes.")
+@click.option("--dry-run", is_flag=True, default=False, help="Validate without writing a candidate chunk.")
+@_refine_problem_options
+def refine_prune_command(
+    key: str,
+    file_path: Path,
+    cwd: Path | None,
+    pipeline_id: str | None,
+    min_anchor_outcomes: int | None,
+    dry_run: bool,
+    problem_id: str | None,
+    problem: str | None,
+    rationale: str | None,
+    predict: tuple[str, ...],
+    model: str | None,
+) -> None:
+    """Propose a shorter version of KEY (needs an anchor: outcomes on the current head)."""
+    from ncp.config import load_config
+    from ncp.refine import propose_prune
+
+    config = load_config(cwd=cwd or Path.cwd())
+    try:
+        store = create_store(config)
+    except NCPStoreUnavailableError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    try:
+        result = propose_prune(
+            store,
+            key=key,
+            content=file_path.read_text(),
+            pipeline_id=pipeline_id,
+            problem_id=problem_id,
+            problem_name=problem,
+            rationale=rationale,
+            predicted=list(predict),
+            model=model,
+            min_anchor_outcomes=(
+                min_anchor_outcomes if min_anchor_outcomes is not None else config.refine_min_anchor_outcomes
+            ),
+            dry_run=dry_run,
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    if dry_run or result.new_chunk is None:
+        console.print(f"[yellow]Dry run: prune for '{key}' is valid; no candidate chunk written.[/yellow]")
+        return
+    console.print(
+        f"[green]Proposed prune candidate {result.new_chunk.chunk_id}[/green] "
+        f"(generation {result.new_chunk.generation}). Collect trial outcomes, then "
+        f"run `ncp refine apply {result.new_chunk.chunk_id}`."
+    )
+
+
+@refine_group.command("reject")
+@click.argument("chunk_id")
+@click.option("--cwd", default=None, type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("--reason", default=None, help="Why the candidate was rejected.")
+def refine_reject_command(chunk_id: str, cwd: Path | None, reason: str | None) -> None:
+    """Reject a proposed candidate (its improvement attempt is kept as history)."""
+    from ncp.config import load_config
+    from ncp.refine import reject_refinement
+
+    config = load_config(cwd=cwd or Path.cwd())
+    try:
+        store = create_store(config)
+    except NCPStoreUnavailableError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    try:
+        attempt = reject_refinement(store, chunk_id=chunk_id, reason=reason)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    console.print(f"[green]Rejected {chunk_id}[/green] (attempt {attempt.attempt_id}).")
 
 
 @refine_group.command("rollback")
@@ -2727,6 +2849,60 @@ def refine_rollback_command(
     console.print(f"[green]Rolled back '{key}' to {reverted.chunk_id}[/green] (generation {reverted.generation}).")
     if write_to is not None:
         console.print(f"Wrote content to {write_to}")
+
+
+@main.group("improvements")
+def improvements_group() -> None:
+    """Improvement history: problems and the attempts filed under them."""
+
+
+@improvements_group.command("show")
+@click.option("--cwd", default=None, type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("--scope", default=None, help="Only problems in this scope (procedure key or task slug).")
+@click.option("--pipeline-id", default=None)
+@click.option("--model", default=None, help="Current model; attempts for another model are flagged !model.")
+def improvements_show_command(cwd: Path | None, scope: str | None, pipeline_id: str | None, model: str | None) -> None:
+    """Print the [NCP:IMPROVEMENT] block (never truncated)."""
+    from ncp.config import load_config
+    from ncp.improvement import build_improvement_view, render_improvement_block
+
+    config = load_config(cwd=cwd or Path.cwd())
+    try:
+        store = create_store(config)
+    except NCPStoreUnavailableError as exc:
+        raise click.ClickException(str(exc)) from exc
+    try:
+        view = build_improvement_view(store, pipeline_id=pipeline_id, scope=scope)
+    except NotImplementedError as exc:
+        raise click.ClickException(str(exc)) from exc
+    block, telemetry = render_improvement_block(
+        view, scope=scope, current_model=model, warn_chars=config.improvement_warn_chars
+    )
+    click.echo(block)
+    if telemetry["oversize"]:
+        click.echo(
+            f"warning: block is {telemetry['chars']} chars (over [improvement].warn_chars)", err=True
+        )
+
+
+@improvements_group.command("merge")
+@click.argument("src")
+@click.argument("dst")
+@click.option("--cwd", default=None, type=click.Path(exists=True, file_okay=False, path_type=Path))
+def improvements_merge_command(src: str, dst: str, cwd: Path | None) -> None:
+    """Merge problem SRC into DST (SRC becomes an alias; attempts move, nothing is deleted)."""
+    from ncp.config import load_config
+
+    config = load_config(cwd=cwd or Path.cwd())
+    try:
+        store = create_store(config)
+    except NCPStoreUnavailableError as exc:
+        raise click.ClickException(str(exc)) from exc
+    try:
+        store.merge_improvement_problems(src_problem_id=src, dst_problem_id=dst)
+    except (ValueError, NotImplementedError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    console.print(f"[green]Merged {src} into {dst}.[/green]")
 
 
 @main.group("identity")

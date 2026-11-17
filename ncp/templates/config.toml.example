@@ -46,6 +46,9 @@ adaptive_budget_enabled = true
 # By default adaptation may only shrink: the adjusted budget never exceeds
 # context_token_budget. Set true to allow scaling up (to the ceiling above).
 # adaptive_allow_expand = false
+# R7: a task/slot with no recorded success outcome is never shrunk by adaptation
+# (scale floored at 1.0x before the $ cut). Set false for the old behavior.
+# protect_unproven_slots = true
 
 # Token estimate margin when the unit is chars_div4 (default 1.0, no reserve;
 # 0.9 reserves 10% but lowered recall at tight budgets in benchmarks/hotpotqa_style).
@@ -125,6 +128,19 @@ confidence_k = 20
 # self_report_weight = 1.0        # [0,1] scale for outcomes with eval_source="self_report"
 # auto_on_outcome = true          # run feedback calibrate after ncp_record_outcome
 # auto_min_interval_seconds = 60  # debounce per pipeline
+
+# [refine]
+# `ncp refine` tuning. Prune candidates apply only when their success rate is
+# >= gate_ratio x the anchor rate over >= min_trial_outcomes outcomes.
+# min_failed_outcomes = 3
+# max_bullets = 5
+# promote_trust = 0.80
+# gate_ratio = 0.9
+# min_trial_outcomes = 5
+# min_anchor_outcomes = 5         # outcomes the head needs before a prune
+
+# [improvement]
+# warn_chars = 8000               # [NCP:IMPROVEMENT] is never truncated; over this it reports oversize
 
 # [skill_cache]
 # Library-mode skill/reference caching (ncp.skill_cache; CAP-C9).

@@ -68,6 +68,9 @@ DEFAULT_CONFIG = {
         # adjusted value never exceeds context_token_budget. true restores
         # the 0.5x-1.5x scaling up to adaptive_budget_ceiling_tokens.
         "adaptive_allow_expand": False,
+        # R7: never shrink the adaptive budget for a task/slot that has no
+        # recorded success outcome yet (floor scale at 1.0x).
+        "protect_unproven_slots": True,
     },
     "encoder": {
         # Print ``score:`` in each chunk header. Off by default: the score
@@ -356,6 +359,17 @@ DEFAULT_CONFIG = {
         "min_failed_outcomes": 3,
         "max_bullets": 5,
         "promote_trust": 0.80,
+        # v1.9.7 prune gate: a prune candidate is applied only when its success
+        # rate >= gate_ratio x the anchor rate over >= min_trial_outcomes, and a
+        # prune needs >= min_anchor_outcomes on the current head.
+        "gate_ratio": 0.9,
+        "min_trial_outcomes": 5,
+        "min_anchor_outcomes": 5,
+    },
+    "improvement": {
+        # [NCP:IMPROVEMENT] blocks are never truncated; over this many chars the
+        # telemetry reports oversize=true.
+        "warn_chars": 8000,
     },
     "providers": {
         # ``cache_write`` (Anthropic-only): the premium for tokens written
@@ -660,6 +674,11 @@ class NCPConfig:
         return int(self.values.get("budget", {}).get("adaptive_budget_ceiling_tokens", 2000))
 
     @property
+    def protect_unproven_slots(self) -> bool:
+        """R7: adaptive budget never shrinks slots without a success outcome."""
+        return bool(self.values.get("budget", {}).get("protect_unproven_slots", True))
+
+    @property
     def adaptive_allow_expand(self) -> bool:
         """Whether adaptive budget may exceed ``context_token_budget``."""
         return bool(self.values.get("budget", {}).get("adaptive_allow_expand", False))
@@ -956,6 +975,22 @@ class NCPConfig:
     @property
     def refine_promote_trust(self) -> float:
         return float(self.values.get("refine", {}).get("promote_trust", 0.80))
+
+    @property
+    def refine_gate_ratio(self) -> float:
+        return float(self.values.get("refine", {}).get("gate_ratio", 0.9))
+
+    @property
+    def refine_min_trial_outcomes(self) -> int:
+        return max(1, int(self.values.get("refine", {}).get("min_trial_outcomes", 5)))
+
+    @property
+    def refine_min_anchor_outcomes(self) -> int:
+        return max(1, int(self.values.get("refine", {}).get("min_anchor_outcomes", 5)))
+
+    @property
+    def improvement_warn_chars(self) -> int:
+        return max(1, int(self.values.get("improvement", {}).get("warn_chars", 8000)))
 
 
 def load_config(

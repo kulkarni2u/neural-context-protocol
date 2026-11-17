@@ -481,6 +481,42 @@ MCP_TOOLS: list[dict[str, object]] = [
         },
     },
     {
+        "name": "ncp_improvement_log",
+        "description": (
+            "Improvement history (problems -> attempts): get block, list_problems, "
+            "record_attempt (cite problem_id or problem_name), resolve_attempt, merge."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["get", "list_problems", "record_attempt", "resolve_attempt", "merge"]},
+                "scope": {"type": "string"},
+                "pipeline_id": {"type": "string"},
+                "agent_id": {"type": "string"},
+                "model": {"type": "string"},
+                "problem_id": {"type": "string"},
+                "problem_name": {"type": "string"},
+                "what": {"type": "string"},
+                "rationale": {"type": "string"},
+                "predicted": {"type": "array", "items": {"type": "string"}},
+                "files": {"type": "array", "items": {"type": "string"}},
+                "benchmark": {"type": "string"},
+                "candidate_chunk_id": {"type": "string"},
+                "attempt_id": {"type": "string"},
+                "status": {"type": "string", "enum": ["proposed", "applied", "rejected", "rolled_back"]},
+                "fixed": {"type": "array", "items": {"type": "string"}},
+                "missed": {"type": "array", "items": {"type": "string"}},
+                "passed": {"type": "number"},
+                "total": {"type": "number"},
+                "mean_output_tokens": {"type": "number"},
+                "note": {"type": "string"},
+                "src_problem_id": {"type": "string"},
+                "dst_problem_id": {"type": "string"},
+            },
+            "required": ["action"],
+        },
+    },
+    {
         "name": "ncp_record_decision",
         "description": (
             "Record a structured decision trace (decision, alternatives, rationale, evidence) as "
@@ -847,6 +883,7 @@ STANDARD_TOOL_NAMES = CORE_TOOL_NAMES | frozenset({
     "ncp_get_decision",
     "ncp_compile_decision_query",
     "ncp_wait_whispers",
+    "ncp_improvement_log",
 })
 MEMO_TOOL_NAMES = frozenset({"ncp_lookup_memo", "ncp_record_memo", "ncp_verify_memo"})
 NOTIFY_TOOL_NAMES = frozenset({"ncp_wait_whispers"})
@@ -1251,6 +1288,7 @@ def make_handlers(
     adaptive_budget_floor_tokens = config.adaptive_budget_floor_tokens if config is not None else 300
     adaptive_budget_ceiling_tokens = config.adaptive_budget_ceiling_tokens if config is not None else 2000
     adaptive_allow_expand = config.adaptive_allow_expand if config is not None else False
+    protect_unproven_slots = config.protect_unproven_slots if config is not None else True
     default_context_token_budget = config.context_token_budget if config is not None else 840
     # CAP-T5: computed drift, opt-in (off by default -- legacy self-reported
     # drift_score is unchanged when disabled).
@@ -1443,12 +1481,14 @@ def make_handlers(
             floor_tokens = adaptive_budget_floor_tokens
             ceiling_tokens = adaptive_budget_ceiling_tokens
             allow_expand = adaptive_allow_expand
+            protect_unproven = protect_unproven_slots
         else:
             enabled = request_config.adaptive_budget_enabled
             requested_tokens = request_config.context_token_budget
             floor_tokens = request_config.adaptive_budget_floor_tokens
             ceiling_tokens = request_config.adaptive_budget_ceiling_tokens
             allow_expand = request_config.adaptive_allow_expand
+            protect_unproven = request_config.protect_unproven_slots
 
         if not enabled:
             return caller_max_tokens, None
@@ -1458,6 +1498,7 @@ def make_handlers(
                 "requested": caller_max_tokens,
                 "adjusted": caller_max_tokens,
                 "reason_factors": {"explicit_override": True},
+                "budget_unproven_protected": False,
             }
 
         if not allow_expand:
@@ -1466,6 +1507,14 @@ def make_handlers(
             floor_tokens = min(floor_tokens, requested_tokens)
             ceiling_tokens = min(ceiling_tokens, requested_tokens)
 
+        unproven = False
+        if protect_unproven:
+            try:
+                unproven = not store.has_success_outcome(
+                    pipeline_id=conscious.pipeline_id, task=conscious.task, slot=conscious.slot
+                )
+            except Exception:
+                unproven = False
         result: AdaptiveBudgetResult = compute_adaptive_budget(
             requested_tokens=requested_tokens,
             floor_tokens=floor_tokens,
@@ -1477,6 +1526,7 @@ def make_handlers(
             dollar_budget_fraction_used=(
                 None if budget_snapshot is None else budget_snapshot.fraction_used
             ),
+            unproven=unproven,
         )
         return result.adjusted_tokens, result.to_dict()
 
@@ -2642,6 +2692,137 @@ def make_handlers(
             text = outline_skill(text)
         return {"result": f"{header}\n{text}"}
 
+    def _handle_improvement_log(args: dict[str, object]) -> object:
+        from ncp.improvement import build_improvement_view, render_improvement_block
+        from ncp.stores.improvement_common import make_problem_id
+        from ncp.types import ImprovementAttempt, ImprovementProblem
+
+        action = str(args.get("action", ""))
+
+        def _str(name: str) -> str | None:
+            value = args.get(name)
+            if value is None:
+                return None
+            if not isinstance(value, str):
+                raise ValueError(f"ncp_improvement_log '{name}' must be a string")
+            return value.strip() or None
+
+        def _str_list(name: str) -> list[str]:
+            value = args.get(name)
+            if value is None:
+                return []
+            if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+                raise ValueError(f"ncp_improvement_log '{name}' must be an array of strings")
+            return [v for v in value]
+
+        def _num(name: str) -> float | None:
+            value = args.get(name)
+            if value is None:
+                return None
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+                raise ValueError(f"ncp_improvement_log '{name}' must be a number >= 0")
+            return float(value)
+
+        pipeline_id = _str("pipeline_id")
+        warn_chars = config.improvement_warn_chars if config is not None else 8000
+        try:
+            if action == "get":
+                scope = _str("scope")
+                view = build_improvement_view(store, pipeline_id=pipeline_id, scope=scope)
+                block, telemetry = render_improvement_block(
+                    view, scope=scope, current_model=_str("model"), warn_chars=warn_chars
+                )
+                return {"block": block, "telemetry": telemetry}
+            if action == "list_problems":
+                problems = store.list_improvement_problems(pipeline_id=pipeline_id, scope=_str("scope"))
+                return {"problems": [p.model_dump() for p in problems]}
+            if action == "record_attempt":
+                problem_id = _str("problem_id")
+                problem_name = _str("problem_name")
+                if not problem_id and not problem_name:
+                    raise ValueError("ncp_improvement_log record_attempt must cite 'problem_id' or 'problem_name'")
+                what = _str("what")
+                if not what:
+                    raise ValueError("ncp_improvement_log record_attempt requires 'what'")
+                if len(what) > 500:
+                    raise ValueError("ncp_improvement_log 'what' must be <= 500 chars")
+                rationale = _str("rationale")
+                if rationale is not None and len(rationale) > 1000:
+                    raise ValueError("ncp_improvement_log 'rationale' must be <= 1000 chars")
+                if problem_id:
+                    problem = store.get_improvement_problem(problem_id)
+                    if problem is None:
+                        raise ValueError(f"unknown improvement problem {problem_id!r}")
+                else:
+                    scope = _str("scope")
+                    if not scope:
+                        raise ValueError("ncp_improvement_log record_attempt with 'problem_name' requires 'scope'")
+                    assert problem_name is not None
+                    if len(problem_name) > 300:
+                        raise ValueError("ncp_improvement_log 'problem_name' must be <= 300 chars")
+                    problem = store.upsert_improvement_problem(
+                        ImprovementProblem(
+                            problem_id=make_problem_id(pipeline_id=pipeline_id, scope=scope, name=problem_name),
+                            pipeline_id=pipeline_id,
+                            scope=scope,
+                            name=problem_name,
+                            opened_at=time.time(),
+                        )
+                    )
+                kind = _str("kind") or "manual"
+                if kind != "manual":
+                    raise ValueError("ncp_improvement_log record_attempt kind must be 'manual'")
+                attempt = store.record_improvement_attempt(
+                    ImprovementAttempt(
+                        attempt_id=f"att_{int(time.time() * 1000)}_{uuid4().hex[:12]}",
+                        problem_id=problem.problem_id,
+                        kind="manual",
+                        what=what,
+                        rationale=rationale,
+                        files=_str_list("files"),
+                        candidate_chunk_id=_str("candidate_chunk_id"),
+                        predicted=_str_list("predicted"),
+                        model=_str("model"),
+                        benchmark=_str("benchmark"),
+                        created_at=time.time(),
+                    )
+                )
+                return {"attempt": attempt.model_dump()}
+            if action == "resolve_attempt":
+                attempt_id = _str("attempt_id")
+                if not attempt_id:
+                    raise ValueError("ncp_improvement_log resolve_attempt requires 'attempt_id'")
+                status = _str("status")
+                if status not in ("proposed", "applied", "rejected", "rolled_back"):
+                    raise ValueError(
+                        "ncp_improvement_log resolve_attempt 'status' must be one of "
+                        "proposed, applied, rejected, rolled_back"
+                    )
+                fields: dict[str, object] = {"status": status, "accepted": status == "applied"}
+                if status != "proposed":
+                    fields["resolved_at"] = time.time()
+                for name in ("fixed", "missed"):
+                    if args.get(name) is not None:
+                        fields[name] = _str_list(name)
+                for name in ("passed", "total", "mean_output_tokens"):
+                    value = _num(name)
+                    if value is not None:
+                        fields[name] = value
+                note = _str("note")
+                if note is not None:
+                    fields["note"] = note
+                return {"attempt": store.update_improvement_attempt(attempt_id, **fields).model_dump()}
+            if action == "merge":
+                src_id = _str("src_problem_id")
+                dst_id = _str("dst_problem_id")
+                if not src_id or not dst_id:
+                    raise ValueError("ncp_improvement_log merge requires 'src_problem_id' and 'dst_problem_id'")
+                store.merge_improvement_problems(src_problem_id=src_id, dst_problem_id=dst_id)
+                return {"merged": True, "src_problem_id": src_id, "dst_problem_id": dst_id}
+        except NotImplementedError as exc:
+            raise ValueError(str(exc)) from exc
+        raise ValueError(f"unknown ncp_improvement_log action {action!r}")
+
     def _typed_decision_args(args: dict[str, object]) -> bool:
         """True when the caller supplied any field from the typed contract."""
         return any(
@@ -3346,6 +3527,7 @@ def make_handlers(
         "ncp_post_turn": _handle_post_turn,
         "ncp_fetch": _handle_fetch,
         "ncp_skill": _handle_skill,
+        "ncp_improvement_log": _handle_improvement_log,
         "ncp_record_decision": _handle_record_decision,
         "ncp_get_decision": _handle_get_decision,
         "ncp_compile_decision_query": _handle_compile_decision_query,

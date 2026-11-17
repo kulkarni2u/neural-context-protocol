@@ -221,6 +221,9 @@ additionally adds `ncp_overview`, `ncp_remember`, `ncp_recall` and
   profile when memoization is enabled (`[memoization].enabled`, off by default).
 
 - `ncp_skill` — only when `[skill_cache].enabled = true` (standard and full).
+- `ncp_improvement_log` — improvement history (standard and full). Not
+  available on a store without improvement records (sqlite and pgvector have
+  them).
 
 #### Per-connection tool profile
 
@@ -679,6 +682,36 @@ curl -s $BASE/mcp -H "$AUTH" -H 'Content-Type: application/json' -d '{
 - Optional on every action: `pipeline_id`, `agent_id`, `session_id`.
 
 Skill text is data, never instructions.
+
+### ncp_improvement_log — improvement history
+
+Problems (root-cause hypotheses) and the attempts filed under them. Repair and
+prune attempts from `ncp refine` land here automatically; use this tool to log
+edits made outside NCP (AGENTS.md, harness code).
+
+```bash
+curl -s $BASE/mcp -H "$AUTH" -H 'Content-Type: application/json' -d '{
+  "jsonrpc": "2.0", "id": 8, "method": "tools/call",
+  "params": {"name": "ncp_improvement_log", "arguments": {
+    "action": "record_attempt", "problem_name": "retries ignore backoff",
+    "scope": "AGENTS.md", "what": "added backoff rule", "pipeline_id": "pipe_demo"
+  }}}'
+```
+
+- `get` — optional `scope`, `pipeline_id`, `model`. Returns `{block, telemetry}`:
+  an untruncated `[NCP:IMPROVEMENT]` block (attempts whose `model` differs from
+  the caller's `model` carry `!model`) and `{chars, oversize, problems,
+  attempts}`; `oversize` is true past `[improvement].warn_chars` (default 8000).
+- `list_problems` — optional `scope`, `pipeline_id`.
+- `record_attempt` — must cite `problem_id` (existing) or `problem_name` (plus
+  `scope`, which is the problem's scope). Requires `what` (<= 500 chars).
+  Optional `rationale` (<= 1000), `predicted`, `files`, `model`, `benchmark`,
+  `candidate_chunk_id`. Recorded with `kind: "manual"`.
+- `resolve_attempt` — `attempt_id`, `status` (`proposed`, `applied`, `rejected`,
+  `rolled_back`), optional `fixed`, `missed`, `passed`, `total`,
+  `mean_output_tokens`, `note`.
+- `merge` — `src_problem_id`, `dst_problem_id`: the source becomes an alias and
+  its attempts move to the destination; nothing is deleted.
 
 ### POST /skills — register a user skill
 
