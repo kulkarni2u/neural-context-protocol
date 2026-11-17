@@ -63,6 +63,13 @@ class AssemblyResult:
     # conscious lists (and, if needed, trailing chunks) were trimmed. Servers
     # surface it as ``telemetry.over_budget``.
     over_budget: bool = False
+    # Token size of the never-evicted part (id/role/task/slot/intent, owns,
+    # must_not, skills, budget header). When it alone exceeds ``max_tokens`` the
+    # block is returned over budget with no chunks or whispers.
+    conscious_tokens: int = 0
+    # True when a cap on recent/tried/failed (item count or length) fired.
+    # owns / must_not are never truncated.
+    conscious_truncated: bool = False
     # chunk_id -> content hash for chunks shown in full or as ``seen:1`` (not
     # distilled ones: the reader holds only the shortened text). A server uses
     # it as the session's delivered-state update for cross-turn delta.
@@ -600,6 +607,8 @@ class Assembler:
 
         context, graph, combined_chunks = encode(hydrated, pool, combined_whispers, graph)
         over_budget = False
+        conscious_truncated = conscious.capped_report()[1]
+        conscious_tokens = self._count(self.encoder.assemble(conscious=hydrated, chunks=[], whispers=[], budget=budget))
         if effective_max is not None and self._count(context) > effective_max:
             # Final guard: the fit above is incremental and can miss (fixed
             # conscious growth, estimator error). Shed the optional conscious
@@ -612,7 +621,15 @@ class Assembler:
                 context, graph, combined_chunks = encode(hydrated, pool, combined_whispers, graph)
                 if self._count(context) <= effective_max:
                     break
-            if graph is None:
+            conscious_tokens = self._count(
+                self.encoder.assemble(conscious=hydrated, chunks=[], whispers=[], budget=budget)
+            )
+            if conscious_tokens > effective_max:
+                # The never-evicted part alone exceeds the budget: ship it
+                # (over budget, flagged) with no chunks, whispers or graph.
+                combined_chunks, combined_whispers, graph = [], [], None
+                context, _, _ = encode(hydrated, [], [], None)
+            elif graph is None:
                 while self._count(context) > effective_max and (combined_chunks or combined_whispers):
                     if combined_chunks:
                         combined_chunks = combined_chunks[:-1]
@@ -641,6 +658,8 @@ class Assembler:
             evidence_sources=evidence_sources,
             graph=graph,
             over_budget=over_budget,
+            conscious_tokens=conscious_tokens,
+            conscious_truncated=conscious_truncated,
             delivered_hashes=delivered_hashes_for(combined_chunks),
         )
 
@@ -795,6 +814,8 @@ class Assembler:
             evidence_sources={cid: src for cid, src in result.evidence_sources.items() if cid in kept_ids},
             graph=graph,
             over_budget=result.over_budget,
+            conscious_tokens=result.conscious_tokens,
+            conscious_truncated=result.conscious_truncated,
             delivered_hashes=delivered_hashes_for(chunks),
         )
 

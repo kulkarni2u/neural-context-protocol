@@ -65,7 +65,7 @@ Bounded retrieval is the entry point, not the whole story. The mechanisms below 
 
 - **Bounded context assembly** — every turn gets a budget-capped slice of context (conscious + retrieved + whispers), never the full history. See [How agents talk over the bus](#how-agents-talk-over-the-bus).
 - **Write-time noise filtering** — strips ANSI codes, dedups repeated lines, and prunes boilerplate and empty fields before anything is stored. **33% aggregate token reduction** on a fixed noisy-payload benchmark. See [Signal filtering at write time](#signal-filtering-at-write-time).
-- **Fan-in reduction** — dedups near-duplicate claims across parallel workers before they reach a synthesis agent. **13% token reduction** against an unbounded raw dump. See [Fan-in reduction](#fan-in-reduction).
+- **Fan-in reduction** — dedups near-duplicate claims across parallel workers before they reach a synthesis agent. **8% token reduction** against an unbounded raw dump. See [Fan-in reduction](#fan-in-reduction).
 - **Consolidation** — merges repeated or near-duplicate memory into fewer, stronger entries instead of leaving competing rows. See [Retrieval and self-improving memory](#retrieval-and-self-improving-memory).
 
 ### Context quality
@@ -459,7 +459,7 @@ Write-time filtering strips boilerplate from one chunk at a time. It doesn't ded
 reduce_fanin_enabled = true
 ```
 
-On a deterministic 40-worker benchmark, 25% of NCP's own bounded top-k retrieval slots are near-duplicates of another slot in the same result with this off; enabling it merges those away and cuts tokens 13% against an unbounded raw dump of all 40 workers. See [the fan-in reduction benchmark doc](./docs/NCP_BENCHMARK_FANIN_REDUCE.md), including an honest account of the contradiction-flagging heuristic's false-positive rate.
+On a deterministic 40-worker benchmark, 19% of NCP's own bounded top-k retrieval slots are near-duplicates of another slot in the same result with this off; enabling it merges those away and cuts tokens 8% against an unbounded raw dump of all 40 workers. See [the fan-in reduction benchmark doc](./docs/NCP_BENCHMARK_FANIN_REDUCE.md), including an honest account of the contradiction-flagging heuristic's false-positive rate.
 
 -----
 
@@ -625,7 +625,7 @@ These are deterministic token-accounting benchmarks. The task-success row measur
 
 A separate, complementary compression benchmark measures ingestion-time noise reduction on a fixed noisy-payload corpus: **33% aggregate token reduction** (537 → 360, `chars_div4`, pass gate aggregate >= 0.20), ranging from **68%** on duplicate-heavy logs down to **2%** on already-dense stack traces (see [the compression benchmark doc](./docs/NCP_BENCHMARK_COMPRESSION.md)).
 
-A third, complementary benchmark targets the many-parallel-workers-to-one-synthesizer fan-in case: with `[retrieval].reduce_fanin_enabled` off (today's default), **25% of NCP's own bounded top-k retrieval slots are near-duplicates of another slot in the same result** on a deterministic 40-worker/4-topic corpus; enabling it merges the near-duplicates, drops malformed candidates, and flags likely contradictions for the reading model, at a **13% token reduction** against an unbounded raw dump of all 40 workers (see [the fan-in reduction benchmark doc](./docs/NCP_BENCHMARK_FANIN_REDUCE.md) for the full methodology and an honest account of the contradiction-flagging heuristic's false-positive rate).
+A third, complementary benchmark targets the many-parallel-workers-to-one-synthesizer fan-in case: with `[retrieval].reduce_fanin_enabled` off (today's default), **19% of NCP's own bounded top-k retrieval slots are near-duplicates of another slot in the same result** on a deterministic 40-worker/4-topic corpus; enabling it merges the near-duplicates, drops malformed candidates, and flags likely contradictions for the reading model, at an **8% token reduction** against an unbounded raw dump of all 40 workers (see [the fan-in reduction benchmark doc](./docs/NCP_BENCHMARK_FANIN_REDUCE.md) for the full methodology and an honest account of the contradiction-flagging heuristic's false-positive rate).
 
 Plain RAG is BM25 top-k over the raw transcript turns packed into the same token budget, with none of NCP's trust weighting, whispers, distillation or consolidation (`ncp.bench.baselines.PlainRagBaseline`). On the context-adequacy benchmarks above it ties NCP, and on the HotpotQA-style set it beats NCP at budgets of 200 tokens or less; those benchmarks do not exercise the features that distinguish NCP from ordinary retrieval. The conflicting-memory benchmark does: when contradicting claims match the query equally well, NCP ranks the true one first in 0.98 of tasks against 0.33 for plain RAG, with the caveats in its row above. Efficacy mock mode (`benchmarks/efficacy`, budgets 200 and 400) shows the same tie: NCP 1.00, plain RAG 1.00, rolling summary 1.00, sliding window 0.00.
 

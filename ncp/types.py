@@ -86,16 +86,25 @@ class NCPModel(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
 
-# Per-list item-count caps and the per-item length cap for the conscious block.
+# Item-count and item-length caps for the free-text history lists of the
+# conscious block. ``owns`` / ``must_not`` are safety constraints and are never
+# truncated, dropped or reordered.
 CONSCIOUS_LIST_CAPS: dict[str, int] = {
-    "owns": 16,
-    "must_not": 16,
     "recent": 8,
     "tried": 8,
     "failed": 8,
 }
 CONSCIOUS_ITEM_MAX_CHARS = 160
-_KEEP_RECENT_LISTS = frozenset({"recent", "tried", "failed"})
+CONSCIOUS_MAX_SKILLS = 8
+TRUNCATION_MARK = "\u2026"
+
+
+def _cap_item(item: str, name: str) -> str:
+    if len(item) <= CONSCIOUS_ITEM_MAX_CHARS:
+        return item
+    if name == "recent":
+        return item[:CONSCIOUS_ITEM_MAX_CHARS]
+    return item[: CONSCIOUS_ITEM_MAX_CHARS - 1] + TRUNCATION_MARK
 
 
 class ConsciousBlock(NCPModel):
@@ -146,23 +155,33 @@ class ConsciousBlock(NCPModel):
         field_name = getattr(info, "field_name", "field")
         return _validate_no_spaces_list(values, field_name)
 
-    def capped(self) -> Self:
-        """Copy with list fields bounded in item count and item length.
+    @field_validator("skills")
+    @classmethod
+    def _bounded_skills(cls, values: list[str]) -> list[str]:
+        if len(values) > CONSCIOUS_MAX_SKILLS:
+            raise ValueError(f"skills must have at most {CONSCIOUS_MAX_SKILLS} entries (got {len(values)})")
+        return values
 
-        The conscious block is never evicted, so unbounded ``owns`` /
-        ``must_not`` / ``recent`` / ``tried`` / ``failed`` lists would eat the
-        context budget. ``recent``, ``tried`` and ``failed`` keep their most
-        recent (last) entries; ``owns`` / ``must_not`` keep their first.
+    def capped_report(self) -> tuple[Self, bool]:
+        """Copy with ``recent`` / ``tried`` / ``failed`` bounded, plus a flag.
+
+        Keeps the most recent (last) entries up to the item cap and cuts long
+        items (``tried`` / ``failed`` items end with an ellipsis). ``owns`` and
+        ``must_not`` are never touched. The flag is True when any cap fired.
         """
 
         updates: dict[str, list[str]] = {}
         for name, limit in CONSCIOUS_LIST_CAPS.items():
             values: list[str] = getattr(self, name)
-            keep = values[-limit:] if name in _KEEP_RECENT_LISTS else values[:limit]
-            trimmed = [item[:CONSCIOUS_ITEM_MAX_CHARS] for item in keep]
+            trimmed = [_cap_item(item, name) for item in values[-limit:]]
             if trimmed != values:
                 updates[name] = trimmed
-        return self.model_copy(update=updates) if updates else self
+        if not updates:
+            return self, False
+        return self.model_copy(update=updates), True
+
+    def capped(self) -> Self:
+        return self.capped_report()[0]
 
     @field_validator("ncp_v")
     @classmethod

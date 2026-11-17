@@ -78,7 +78,7 @@ def _is_symbol_dense(text: str) -> bool:
 
     if not text:
         return False
-    symbols = sum(1 for ch in text if not (ch.isalpha() or ch.isspace()))
+    symbols = sum(1 for ch in text if not (ch.isalnum() or ch.isspace()))
     return symbols / len(text) >= _DENSE_SYMBOL_FRACTION
 
 
@@ -97,5 +97,9 @@ def estimate_budget_tokens(text: str, *, margin: float = DEFAULT_ESTIMATE_MARGIN
     if _resolve_encoder() is not None:
         return estimate_tokens(stripped)
     margin = min(1.0, max(0.1, margin))
-    per_token = _DENSE_CHARS_PER_TOKEN if _is_symbol_dense(stripped) else 4.0
-    return max(1, math.ceil(len(stripped) / (per_token * margin)))
+    # Non-ASCII text (CJK etc.) tokenizes near 1 token/char, so count it at 1.
+    wide = sum(1 for ch in stripped if ord(ch) > 127)
+    rest = stripped if not wide else "".join(ch for ch in stripped if ord(ch) <= 127)
+    per_token = _DENSE_CHARS_PER_TOKEN if _is_symbol_dense(rest) else 4.0
+    ascii_tokens = math.ceil(len(rest) / (per_token * margin)) if rest else 0
+    return max(1, ascii_tokens + wide)

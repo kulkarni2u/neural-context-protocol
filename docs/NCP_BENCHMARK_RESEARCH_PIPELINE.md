@@ -29,22 +29,22 @@ python3 benchmarks/research_pipeline/run.py --turns 36
 
 ## Current result
 
-Observed on June 9, 2026:
+Observed on November 17, 2026:
 
 - peak NCP input tokens: `388`
 - peak raw replay input tokens: `3277`
 - peak sliding-window input tokens: `412`
 - peak rolling-summary input tokens: `1912`
-- final NCP input tokens: `267`
+- final NCP input tokens: `259`
 - final raw replay input tokens: `3277`
 - final sliding-window input tokens: `409`
 - final rolling-summary input tokens: `1912`
-- reduction factor vs raw replay at the final turn: `12.27x`
-- reduction factor vs sliding window at the final turn: `1.53x`
-- reduction factor vs rolling summary at the final turn: `7.16x`
-- final-turn savings vs raw replay: `3010`
+- reduction factor vs raw replay at the final turn: `12.65x`
+- reduction factor vs sliding window at the final turn: `1.58x`
+- reduction factor vs rolling summary at the final turn: `7.38x`
+- final-turn savings vs raw replay: `3018`
 - estimated assembly overhead token-equivalent (total across all turns): `480.0`
-- net total token-equivalent savings vs raw replay: `48236.0`
+- net total token-equivalent savings vs raw replay: `47720.0`
 
 ## Interpretation
 

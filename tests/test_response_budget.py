@@ -116,7 +116,7 @@ def _store(tmp_path: Path) -> SQLiteStore:
     for i in range(6):
         store.write(SubconsciousChunk(
             chunk_id=f"rb_{i}",
-            content=f"payment retry budget marker{i} " + " ".join(f"tok{chr(97 + i)}{chr(97 + j % 26)}{chr(97 + j // 26)}" for j in range(40)),
+            content=f"payment retry budget marker{i} " + " ".join(f"tok{i}_{j}" for j in range(40)),
             layer="semantic",
             src="tool_result",
             pipeline_id=PIPELINE,
