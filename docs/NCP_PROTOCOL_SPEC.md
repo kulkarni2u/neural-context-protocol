@@ -33,6 +33,7 @@ chunk:{id} layer:{layer} [score:{0.0}] src:{src} trust:{0.0} verified:1  # score
   {content — 2-space indent, max 200 tok}
 chunk:{id} layer:{layer} [score:{0.0}] src:{src} trust:{0.0}
   {content}
+chunk:{id} seen:1               # delta mode only: held unchanged by this session, text omitted
 
 [NCP:WHISPERS]
 wsp from:{agent} to:{target} t:{type} c:{0.0} age:{<1m|Nm|Nh|Nd}
@@ -53,6 +54,15 @@ Skill block (returned by `ncp_skill get`, not part of the assembled context):
 recency, so printing it makes the cacheable prefix change between calls.
 Parsers MUST NOT require it. `steps:` is present only when the total is known;
 it is never written as `steps:n/?`.
+
+`chunk:{id} seen:1` appears only when the caller passed `delta: true` on
+`ncp_get_context` with an explicit `session_id`. It stands for a chunk the same
+session already received and whose content has not changed, so the reader must
+already hold the earlier text. The feature is opt-in and is never applied to the
+shared default session; a `delta: false` call resets the session's delivered
+state, and a worker that starts with a fresh context must not set it. Distilled
+chunks are always sent in full. Parsers MUST treat the line as a reference to a
+chunk delivered earlier, not as an empty chunk.
 
 `[NCP:SKILL]` blocks are returned by `ncp_skill get` and injected verbatim by `ncp handoff --skill` /
 `ncp run-turn --skill`. A skill is registered by a user (CLI or `POST /skills`),

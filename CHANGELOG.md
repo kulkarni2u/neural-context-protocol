@@ -14,8 +14,6 @@ skill cache wired into MCP/CLI/handoff, tighter budget accounting, retrieval
 defaults tuned against the benchmark gates, one lifecycle hook script,
 `ncp run-turn`, and a single source for the generated turn loop.
 
-<!-- TODO delta: cross-turn delta (`delta: true` on `ncp_get_context`) is in progress; add its entry here once it ships. -->
-
 ### Upgrade notes (behavior changes)
 
 - `ncp handoff` prints a bounded summary by default (`--return summary`, at most
@@ -58,6 +56,21 @@ defaults tuned against the benchmark gates, one lifecycle hook script,
   `ncp_get_context` takes `echo_ids` (default true) to omit them from the
   response. Never applied to the shared `__default__` session; held in process
   memory only, so it is not shared across server processes.
+- Cross-turn delta (opt-in): `ncp_get_context` takes `delta` (default false).
+  With an explicit `session_id`, chunks the session already received unchanged
+  render as `chunk:<id> seen:1` headers, held chunks come first in delivery
+  order, and the agent's own `recent` refs are skipped. Never applied to the
+  shared `__default__` session; `delta: false` resets the state; the state is
+  in process memory, capped at 256 chunks and expires with the session entry.
+  Changed and distilled chunks are re-sent in full. A worker with a fresh
+  context must not set it. Telemetry reports `delta`; `over_budget` appears
+  only when true. On a static 6-chunk store over 10 turns it resends about 87%
+  fewer chunk characters than `delta: false` (see the benchmark below).
+- `benchmarks/harness_overhead/` (CI gate; `docs/NCP_BENCHMARK_HARNESS_OVERHEAD.md`):
+  deterministic structural character counts for tool catalogs per profile,
+  protocol-call characters per turn, handoff returns, delta resends, prefix
+  stability, budget accuracy and skill dispatch. Each "before" is the new code
+  with the old behavior switched on. Not provider tokens or dollars.
 - Per-connection tool profile: `?profile=` query or `X-NCP-Tool-Profile` header
   on the MCP endpoint, and `ncp serve --profile`. A connection can only narrow
   the configured `[tools].profile`. New `minimal` profile

@@ -229,3 +229,19 @@ def test_delta_must_be_boolean(tmp_path: Path) -> None:
         handlers, tools=MCP_TOOLS,
     )
     assert "delta" in json.loads(raw)["error"]["message"]
+
+
+def test_over_budget_telemetry_follows_the_final_context(tmp_path: Path) -> None:
+    handlers = make_handlers(_store(tmp_path))
+    # The never-evicted conscious block alone exceeds a tiny max_tokens.
+    tiny = _call(handlers, _args(max_tokens=20, response_max_tokens=5000))
+    assert tiny["telemetry"]["over_budget"] is True
+    assert tiny["telemetry"]["conscious_tokens"] > 20
+    roomy = _call(handlers, _args(max_tokens=2000, response_max_tokens=5000))
+    assert "over_budget" not in roomy["telemetry"]
+    # After a response_max_tokens refit the flag is recomputed, never stale.
+    for ceiling in (700, 600, 520):
+        fitted = _call(handlers, _args(max_tokens=2000, response_max_tokens=ceiling))
+        telemetry = fitted.get("telemetry")
+        if telemetry is not None and "context_max_tokens" in fitted.get("truncated", {}):
+            assert "over_budget" not in telemetry

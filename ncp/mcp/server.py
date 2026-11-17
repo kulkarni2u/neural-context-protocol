@@ -1085,10 +1085,10 @@ class FetchSession:
     fetch_count: int = 0
     pipeline_id: str | None = None
     last_access: float = field(default_factory=time.monotonic)
-    # Ids from this session's last ncp_get_context; ncp_post_turn defaults to
-    # them when it omits the matching fields (never for the shared default key).
-    pending_whisper_ids: list[str] | None = None
-    retrieved_chunk_ids: list[str] | None = None
+    # Ids from this session's last ncp_get_context per pipeline ("" = none);
+    # ncp_post_turn defaults to them when it omits the matching fields (never
+    # for the shared default key). Value: (pending_whisper_ids, retrieved_chunk_ids).
+    held_ids: dict[str, tuple[list[str], list[str]]] = field(default_factory=dict)
     # Skill content hashes already returned by ncp_skill get in this session.
     skill_hashes: set[str] = field(default_factory=set)
     # Cross-turn delta: chunk_id -> content hash already delivered to this
@@ -1105,6 +1105,7 @@ _RESULT_RAW_MAX_WINDOWS = 20
 _FETCH_SESSION_MAX = 1024
 _FETCH_SESSION_TTL_SECONDS = 3600.0
 _DELIVERED_MAX = 256
+_HELD_SLOTS_MAX = 8
 
 
 @dataclass
@@ -1175,8 +1176,12 @@ def _reject_skill_poisoning(
         raise ValueError(f"{where} rejected: a cached skill chunk cannot be superseded by an agent")
     if isinstance(edges, list):
         for edge in edges:
-            if isinstance(edge, dict) and is_reserved_skill_identity(chunk_id=str(edge.get("dst", ""))):
-                raise ValueError(f"{where} rejected: an agent cannot create an edge onto a cached skill chunk")
+            if (
+                isinstance(edge, dict)
+                and edge.get("type") in ("supersedes", "contradicts")
+                and is_reserved_skill_identity(chunk_id=str(edge.get("dst", "")))
+            ):
+                raise ValueError(f"{where} rejected: a cached skill chunk cannot be superseded or contradicted by an agent")
     if src == "skill_ref":
         claims_user = isinstance(conditions, list) and any(str(c) == "registered_by:user" for c in conditions)
         if claims_user or zone == "proven":
@@ -1543,6 +1548,15 @@ def make_handlers(
                 existing = sessions.get(session_id)
                 if existing is not None:
                     preserved_delivered = dict(existing.delivered)
+        prior_held: dict[str, tuple[list[str], list[str]]] = {}
+        if session_id != DEFAULT_FETCH_SESSION_ID:
+            with sessions_lock:
+                prior_session = sessions.get(session_id)
+                if (
+                    prior_session is not None
+                    and time.monotonic() - prior_session.last_access <= _FETCH_SESSION_TTL_SECONDS
+                ):
+                    prior_held = dict(prior_session.held_ids)
         if delta_applied:
             # Carry delivered state across the per-call session reset below,
             # unless the entry expired (TTL) or never existed (new session_id).
@@ -1734,8 +1748,15 @@ def make_handlers(
             # Server-held ids for ncp_post_turn; never kept for the shared key.
             with sessions_lock:
                 held = sessions.setdefault(session_id, FetchSession())
-                held.pending_whisper_ids = list(fitted_result.pending_whisper_ids)
-                held.retrieved_chunk_ids = _retrieved_chunk_ids(fitted_result)
+                slots = dict(prior_held)
+                slots.pop(normalized_pipeline_id or "", None)  # re-insert as most recent
+                slots[normalized_pipeline_id or ""] = (
+                    list(fitted_result.pending_whisper_ids),
+                    _retrieved_chunk_ids(fitted_result),
+                )
+                while len(slots) > _HELD_SLOTS_MAX:
+                    del slots[next(iter(slots))]
+                held.held_ids = slots
                 # delta:false (or a reset session) starts from an empty set.
                 delivered = dict(prior_delivered) if delta_applied else dict(preserved_delivered or {})
                 delivered.update(fitted_result.delivered_hashes)
@@ -2335,6 +2356,8 @@ def make_handlers(
         defaulted: set[str] = set()
         held_whispers: list[str] = []
         held_chunks: list[str] = []
+        held_slot_key: str | None = None
+        held_ambiguous = False
         if args.get("ack_whisper_ids") is None or args.get("retrieved_chunk_ids") is None:
             if post_session_id == DEFAULT_FETCH_SESSION_ID:
                 raise ValueError(
@@ -2344,8 +2367,16 @@ def make_handlers(
             with sessions_lock:
                 held = sessions.get(post_session_id)
                 if held is not None:
-                    held_whispers = list(held.pending_whisper_ids or [])
-                    held_chunks = list(held.retrieved_chunk_ids or [])
+                    post_pipeline = None if args.get("pipeline_id") is None else str(args["pipeline_id"])
+                    if post_pipeline is not None:
+                        # Exact pipeline slot; else a slot get_context stored without one.
+                        held_slot_key = next((k for k in (post_pipeline, "") if k in held.held_ids), None)
+                    elif len(held.held_ids) == 1:
+                        held_slot_key = next(iter(held.held_ids))
+                    elif held.held_ids:
+                        held_ambiguous = True
+                    if held_slot_key is not None:
+                        held_whispers, held_chunks = (list(v) for v in held.held_ids[held_slot_key])
         if args.get("ack_whisper_ids") is None:
             args = {**args, "ack_whisper_ids": held_whispers}
             if held_whispers:
@@ -2413,14 +2444,21 @@ def make_handlers(
         if defaulted:
             with sessions_lock:
                 held = sessions.get(post_session_id)
-                if held is not None:
+                if held is not None and held_slot_key in held.held_ids:
+                    whispers_left, chunks_left = held.held_ids[held_slot_key]
                     if "pending_whisper_ids" in defaulted:
-                        held.pending_whisper_ids = None
+                        whispers_left = []
                     if "retrieved_chunk_ids" in defaulted:
-                        held.retrieved_chunk_ids = None
+                        chunks_left = []
+                    if whispers_left or chunks_left:
+                        held.held_ids[held_slot_key] = (whispers_left, chunks_left)
+                    else:
+                        del held.held_ids[held_slot_key]
         result: dict[str, object] = {"posted": True, "turn_id": record.turn_id, "acknowledged_whisper_ids": ack_ids}
         if result_truncated:
             result["result_truncated"] = True
+        if held_ambiguous:
+            result["held_ids"] = "ambiguous"
         if raw_ref_ids:
             result["raw_ref"] = raw_ref_ids[0]
             if len(raw_ref_ids) > 1:

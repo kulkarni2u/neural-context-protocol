@@ -142,3 +142,41 @@ def test_held_ids_are_consumed_after_use(tmp_path: Path) -> None:
     _call(handlers, "ncp_post_turn", _args("alice", result_summary="one"))
     second = _call(handlers, "ncp_post_turn", _args("alice", result_summary="two"))
     assert second["acknowledged_whisper_ids"] == []
+
+
+def _two_pipeline_setup(tmp_path: Path):
+    store = SQLiteStore(tmp_path / "s.db")
+    for pipe in ("pipe_a", "pipe_b"):
+        store.emit_whisper(Whisper(
+            whisper_id=f"wsp_{pipe}", from_agent="planner", target="alice", whisper_type="share",
+            payload='{"ask":"x"}', confidence=0.9, pipeline_id=pipe,
+        ))
+    return store, make_handlers(store)
+
+
+def test_get_context_for_other_pipeline_does_not_overwrite_held_ids(tmp_path: Path) -> None:
+    _store, handlers = _two_pipeline_setup(tmp_path)
+    _call(handlers, "ncp_get_context", _args("alice", pipeline_id="pipe_a", session_id="s1"))
+    _call(handlers, "ncp_get_context", _args("alice", pipeline_id="pipe_b", session_id="s1"))
+    posted = _call(handlers, "ncp_post_turn", _args(
+        "alice", pipeline_id="pipe_a", session_id="s1", result_summary="done"))
+    assert posted["acknowledged_whisper_ids"] == ["wsp_pipe_a"]
+
+
+def test_omitted_pipeline_uses_the_single_slot(tmp_path: Path) -> None:
+    _store, handlers = _two_pipeline_setup(tmp_path)
+    _call(handlers, "ncp_get_context", _args("alice", pipeline_id="pipe_a", session_id="s1"))
+    args = {k: v for k, v in _args("alice", session_id="s1", result_summary="done").items() if k != "pipeline_id"}
+    posted = _call(handlers, "ncp_post_turn", args)
+    assert posted["acknowledged_whisper_ids"] == ["wsp_pipe_a"]
+    assert "held_ids" not in posted
+
+
+def test_omitted_pipeline_with_several_slots_is_ambiguous(tmp_path: Path) -> None:
+    _store, handlers = _two_pipeline_setup(tmp_path)
+    _call(handlers, "ncp_get_context", _args("alice", pipeline_id="pipe_a", session_id="s1"))
+    _call(handlers, "ncp_get_context", _args("alice", pipeline_id="pipe_b", session_id="s1"))
+    args = {k: v for k, v in _args("alice", session_id="s1", result_summary="done").items() if k != "pipeline_id"}
+    posted = _call(handlers, "ncp_post_turn", args)
+    assert posted["acknowledged_whisper_ids"] == []
+    assert posted["held_ids"] == "ambiguous"

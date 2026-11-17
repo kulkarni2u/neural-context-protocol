@@ -214,6 +214,14 @@ class TestPoisoningGuard:
         resp = env.raw("ncp_record_decision", {"decision": "d", "rationale": "r", "agent_id": reserved})
         assert "reserved skill-cache namespace" in resp["error"]["message"]
 
+    def test_edges_onto_skill_chunks_rejected(self, env: _Env) -> None:
+        for edge_type in ("supersedes", "contradicts"):
+            resp = env.raw("ncp_write_memory", {
+                **self.WRITE, "written_by": "a",
+                "edges": [{"dst": "skl_deadbeef0001", "type": edge_type}],
+            })
+            assert "cannot be superseded or contradicted" in resp["error"]["message"]
+
     def test_skill_ref_claiming_registered_by_user_rejected(self, env: _Env) -> None:
         bad = {**self.WRITE, "src": "skill_ref", "written_by": "a", "conditions": ["registered_by:user"]}
         assert "registered_by:user" in env.raw("ncp_write_memory", bad)["error"]["message"]

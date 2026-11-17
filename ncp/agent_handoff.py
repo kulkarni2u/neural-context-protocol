@@ -758,6 +758,7 @@ def complete_handoff(
     runner: str,
     response: str,
     run_unique: bool = False,
+    pipeline_id: str | None = None,
 ) -> HandoffCompletion:
     """Persist a bounded completion record, then acknowledge source handoffs.
 
@@ -766,7 +767,8 @@ def complete_handoff(
     """
 
     source_ids = [whisper.whisper_id for whisper in run.handoffs]
-    pipeline_id = run.handoffs[0].pipeline_id if run.handoffs else None
+    if pipeline_id is None:
+        pipeline_id = run.handoffs[0].pipeline_id if run.handoffs else None
     # Chunk content is capped at 2000 chars, so the untruncated output is stored
     # as a chain of raw parts; each part's raw_ref points at the next part.
     redacted = _redact_secrets(response)
@@ -965,7 +967,9 @@ def run_turn(
         context=assembled.context,
         workspace=workspace,
     )
-    completion = complete_handoff(prepared, runner=host, response=response, run_unique=True)
+    completion = complete_handoff(
+        prepared, runner=host, response=response, run_unique=True, pipeline_id=pipeline_id
+    )
     Assembler(store=store, config=config).post_turn(
         conscious=assembled.conscious,
         response=NCPResponse(

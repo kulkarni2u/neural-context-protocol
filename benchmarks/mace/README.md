@@ -40,8 +40,8 @@ python benchmarks/mace/run.py --turns 40
 
 Observed NCP result on the current codebase:
 
-- Composite MACE score: `0.8915`
-- D1 Token Efficiency: `0.6384`
+- Composite MACE score: `0.8964`
+- D1 Token Efficiency: `0.6547`
 - D2 Handoff Quality: `1.0000`
 - D3 Dead-end Prevention: `1.0000`
 - D4 Goal Coherence: `1.0000`
@@ -49,9 +49,9 @@ Observed NCP result on the current codebase:
 D1 primary checkpoint at turn 40:
 
 - baseline tokens: `3426`
-- NCP tokens: `261`
-- reduction ratio: `13.13x`
-- reduction percentage: `92.4%`
+- NCP tokens: `255`
+- reduction ratio: `13.44x`
+- reduction percentage: `92.6%`
 
 ## Scoring
 

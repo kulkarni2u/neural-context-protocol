@@ -80,3 +80,45 @@ def test_empty_instruction_is_rejected(tmp_path: Path) -> None:
     _init(tmp_path)
     result = _run(tmp_path, "--prompt", "  ")
     assert result.exit_code != 0
+
+
+def test_completion_and_raw_chunks_carry_the_turn_pipeline(tmp_path: Path) -> None:
+    import re
+
+    store = _init(tmp_path)
+    result = _run(tmp_path, "--prompt", "implement the thing")
+    assert result.exit_code == 0, result.output
+    match = re.search(r"full_output_chunk_id\W+(raw_[0-9a-f]+)", result.output)
+    assert match, result.output
+    raw_id = match.group(1)
+    raw = store.get_chunks_by_ids([raw_id])
+    assert raw and raw[0].pipeline_id == PIPE
+    completion_id = re.search(r"completion_chunk_id\W+(\w+)", result.output)
+    assert completion_id, result.output
+    completion = store.get_chunks_by_ids([completion_id.group(1)])
+    assert completion and completion[0].pipeline_id == PIPE
+
+    # ncp_post_turn result_ref accepts the printed id for this pipeline.
+    from ncp.mcp.server import MCP_TOOLS, _handle_request, make_handlers
+
+    raw_resp = _handle_request(
+        {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "ncp_post_turn", "arguments": {
+            "agent_id": "worker", "role": "pravaha", "task": "do_thing", "slot": "build", "intent": "i",
+            "pipeline_id": PIPE, "result_summary": "s", "result_ref": raw_id}}},
+        make_handlers(store), tools=MCP_TOOLS,
+    )
+    import json
+
+    assert "error" not in json.loads(raw_resp)
+
+
+def test_handoff_completion_pipeline_behavior_unchanged(tmp_path: Path) -> None:
+    from ncp.agent_handoff import PreparedHandoff, complete_handoff
+    from ncp.config import load_config
+
+    store = _init(tmp_path)
+    prepared = PreparedHandoff(
+        agent_id="a", config=load_config(cwd=tmp_path), store=store, handoffs=[], context="", workspace=tmp_path,
+    )
+    done = complete_handoff(prepared, runner="claude", response="out")
+    assert store.get_chunks_by_ids([done.raw_chunk_id])[0].pipeline_id is None

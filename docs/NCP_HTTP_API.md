@@ -300,11 +300,33 @@ Optional arguments:
 - `echo_ids` (boolean, default `true`) — `false` omits `pending_whisper_ids` and
   `retrieved_chunk_ids` from the response. `ncp_post_turn` then uses the ids the
   server holds for this session.
+- `delta` (boolean, default `false`) — cross-turn delta, for a session that
+  keeps its context between turns. Chunks this session already received and
+  that are unchanged render as a bare `chunk:<id> seen:1` header instead of the
+  full text; held chunks come first in the order they were first delivered, new
+  ones follow, and the agent's own `recent` refs are skipped. Pass an explicit
+  `session_id`: without one, and for the shared `__default__` session, the flag
+  is ignored (`telemetry.delta` says `applied:false`, reason `session_id_required` or `default_session`). `false`
+  resets the session's delivered state, and the state also resets on a new
+  `session_id` or after the one-hour session TTL. It is bounded at 256 chunks
+  and held in process memory only. Chunk content that changed since delivery is
+  sent in full, and distilled chunks are always sent in full. `retrieved_chunk_ids`
+  still lists seen chunks, so `ncp_post_turn` credits them. Do not set it for a
+  worker that starts with a fresh context: it would see headers for text it does
+  not have.
 - `skills` (array of skill ids, max 8, needs `[skill_cache].enabled`) — resolves
   user-registered skills by reference. The context gets a `skills:` line in the
   conscious block with `<skill_id>@<hash12>` entries; the skill text is not
   returned. Unknown ids are listed in `skills_missing`. Fetch the text with
   `ncp_skill`.
+
+`ncp_post_turn` accepts `redact` (boolean, default `false`): `true` redacts
+secrets from `result_summary`, `result_full` and `memory_chunks` content with the
+same redactor as persisted handoff output. The Claude lifecycle hooks always send it.
+
+With `delta` on, `telemetry.delta` is `{"applied": true, "seen": n}`.
+`telemetry.over_budget` appears (as `true`) only when the block still exceeds
+the budget after the over-budget guard.
 
 Chunk headers in `context` omit `score:` unless `[encoder].show_score = true`,
 and `[NCP:BUDGET]` omits `steps:` when the total is unknown.

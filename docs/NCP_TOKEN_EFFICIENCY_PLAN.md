@@ -45,7 +45,7 @@ blocked on the provider-evaluator redesign noted in
 | 6 | Stable prompt-cache prefix | Shipped | `show_score` off by default. Anthropic split is offset-based. `steps:` omitted when the total is unknown. |
 | 7 | Budget accuracy, conscious caps | Shipped | `chunking.max_chunk_tokens` removed rather than wired. The tiktoken property test skips when tiktoken's encoding data is unavailable offline. |
 | 8 | Packing, fan-in, diversity defaults | Shipped | `diversity_lambda` 0.7, auto fan-in at 3+ writers, fit swap on. The swap picks its victim by relevance, because a lower-ranked victim can never make room. pgvector parity was not run locally. |
-| 5 | Cross-turn delta | In progress | <!-- TODO delta --> |
+| 5 | Cross-turn delta | Shipped | Opt-in `delta: true` on `ncp_get_context` with an explicit `session_id`; held chunks render as `chunk:<id> seen:1`. Never for the shared `__default__` session; `delta: false` resets it; state is in process memory, capped at 256 chunks, expires with the session entry. Distilled and changed chunks are re-sent. Not for fresh-context workers. |
 | 11 | Lifecycle hooks and `ncp run-turn` | Shipped | One script, `ncp-lifecycle-hook.sh`, for all four events. `run-turn` hosts: claude, codex, opencode, mock. |
 | 10 | One source for lifecycle instructions | Partly shipped | Generated `CLAUDE.md` and root `AGENTS.md` use `ncp/templates/turn_loop.md.example`. Provider templates are drift-checked only, not generated. |
 
