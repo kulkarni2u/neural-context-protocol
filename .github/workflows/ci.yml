@@ -155,3 +155,4 @@ jobs:
           tests/test_store_lifecycle_postgres.py
           tests/test_store_forget_postgres.py
           tests/test_ontology_parity.py
+          tests/test_improvement_pgvector.py
