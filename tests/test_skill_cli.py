@@ -35,14 +35,30 @@ def _cache(tmp_path: Path, path: Path, *extra: str):
 
 
 def _register(tmp_path: Path, skill_id: str, text: str, *extra: str) -> dict:
+    if "--pipeline" not in extra and "--global" not in extra:
+        extra = (*extra, "--global")
     result = _cache(tmp_path, _file(tmp_path, "s.md", text), "--id", skill_id, "--json", *extra)
     assert result.exit_code == 0, result.output
     return json.loads(result.stdout)
 
 
-def test_cache_default_scope_is_global_and_reported(tmp_path: Path) -> None:
+def test_cache_requires_explicit_scope(tmp_path: Path) -> None:
     _init(tmp_path)
     result = _cache(tmp_path, _file(tmp_path, "a.md", CHECKLIST), "--id", "team/review")
+    assert result.exit_code == 2
+    assert "--pipeline <id> or --global" in result.output
+
+
+def test_cache_global_and_pipeline_are_exclusive(tmp_path: Path) -> None:
+    _init(tmp_path)
+    result = _cache(tmp_path, _file(tmp_path, "a.md", CHECKLIST), "--id", "team/review", "--pipeline", PIPE, "--global")
+    assert result.exit_code == 2
+    assert "mutually exclusive" in result.output
+
+
+def test_cache_global_scope_reported(tmp_path: Path) -> None:
+    _init(tmp_path)
+    result = _cache(tmp_path, _file(tmp_path, "a.md", CHECKLIST), "--id", "team/review", "--global")
     assert result.exit_code == 0, result.output
     assert "scope: global" in result.output
     assert "cache_hit: False" in result.output
@@ -63,7 +79,7 @@ def test_pipeline_scope_and_global_flag(tmp_path: Path) -> None:
     _init(tmp_path)
     scoped = _register(tmp_path, "team/scoped", CHECKLIST, "--pipeline", PIPE)
     assert scoped["scope"] == "pipeline" and scoped["pipeline_id"] == PIPE
-    forced = _register(tmp_path, "team/forced", CHECKLIST, "--pipeline", PIPE, "--global")
+    forced = _register(tmp_path, "team/forced", CHECKLIST, "--global")
     assert forced["scope"] == "global"
 
     def ids(*args: str) -> set[str]:
@@ -78,20 +94,20 @@ def test_pipeline_scope_and_global_flag(tmp_path: Path) -> None:
 
 def test_invalid_skill_id_rejected(tmp_path: Path) -> None:
     _init(tmp_path)
-    result = _cache(tmp_path, _file(tmp_path, "a.md", CHECKLIST), "--id", "no-namespace")
+    result = _cache(tmp_path, _file(tmp_path, "a.md", CHECKLIST), "--id", "no-namespace", "--global")
     assert result.exit_code != 0
     assert "skill_id" in result.output
 
 
 def test_invalid_kind_rejected(tmp_path: Path) -> None:
     _init(tmp_path)
-    result = _cache(tmp_path, _file(tmp_path, "a.md", CHECKLIST), "--id", "t/x", "--kind", "bogus")
+    result = _cache(tmp_path, _file(tmp_path, "a.md", CHECKLIST), "--id", "t/x", "--kind", "bogus", "--global")
     assert result.exit_code != 0
 
 
 def test_hint_when_skill_cache_disabled(tmp_path: Path) -> None:
     _init(tmp_path)
-    result = _cache(tmp_path, _file(tmp_path, "a.md", CHECKLIST), "--id", "t/x")
+    result = _cache(tmp_path, _file(tmp_path, "a.md", CHECKLIST), "--id", "t/x", "--global")
     assert "skill_cache" in result.output and "enabled" in result.output
 
 
@@ -174,6 +190,31 @@ def test_handoff_rejects_unregistered_skill_before_provider(
     missing = _handoff(tmp_path, "team/missing")
     assert missing.exit_code != 0 and "not cached" in missing.output
     assert prompts == []
+
+
+def test_handoff_uses_registered_version_when_newer_is_unregistered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _init(tmp_path)
+    info = _register(tmp_path, "team/review", CHECKLIST, "--pipeline", PIPE)
+    store = SQLiteStore(tmp_path / ".ncp" / "store.db")
+    cache_skill("newer unregistered text", skill_id="team/review", store=store, pipeline_id=PIPE)
+    _emit_whisper(tmp_path)
+    prompts = _capture_subprocess(monkeypatch, "done")
+    result = _handoff(tmp_path, "team/review")
+    assert result.exit_code == 0, result.output
+    assert f"skill:team/review@{info['content_hash'][:12]}" in prompts[0]
+    assert "newer unregistered text" not in prompts[0]
+
+
+def test_handoff_resolves_global_registered_skill(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _init(tmp_path)
+    info = _register(tmp_path, "team/review", CHECKLIST)
+    _emit_whisper(tmp_path)
+    prompts = _capture_subprocess(monkeypatch, "done")
+    result = _handoff(tmp_path, "team/review")
+    assert result.exit_code == 0, result.output
+    assert f"skill:team/review@{info['content_hash'][:12]}" in prompts[0]
 
 
 def test_skill_size_limit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

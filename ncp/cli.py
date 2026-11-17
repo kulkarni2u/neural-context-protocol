@@ -1603,9 +1603,12 @@ def skill_cache_command(
         content = path.read_text()
     except (OSError, UnicodeDecodeError) as exc:
         raise click.ClickException(f"cannot read {path}: {exc}") from exc
+    if scope_global and pipeline_id:
+        raise click.UsageError("--global and --pipeline are mutually exclusive; pass only one.")
+    if not scope_global and not pipeline_id:
+        raise click.UsageError("pass --pipeline <id> or --global")
     config, store = _skill_store(cwd)
-    # Library default: pipeline scope when a pipeline is given, otherwise global.
-    scope = "pipeline" if pipeline_id and not scope_global else "global"
+    scope = "global" if scope_global else "pipeline"
     try:
         result = ensure_cached(
             content,
@@ -1640,8 +1643,6 @@ def skill_cache_command(
     else:
         for key in ("skill_id", "content_hash", "kind", "sections", "cache_hit", "scope"):
             click.echo(f"{key}: {payload[key]}")
-        if not pipeline_id and not scope_global:
-            click.echo("scope: global (no --pipeline given; pass --pipeline <id> to scope it)")
     if not config.skill_cache_enabled:
         click.echo(
             "hint: [skill_cache].enabled is false; the CLI and --skill dispatch work, "

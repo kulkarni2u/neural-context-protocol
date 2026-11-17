@@ -63,6 +63,10 @@ class AssemblyResult:
     # conscious lists (and, if needed, trailing chunks) were trimmed. Servers
     # surface it as ``telemetry.over_budget``.
     over_budget: bool = False
+    # chunk_id -> content hash for chunks shown in full or as ``seen:1`` (not
+    # distilled ones: the reader holds only the shortened text). A server uses
+    # it as the session's delivered-state update for cross-turn delta.
+    delivered_hashes: dict[str, str] = field(default_factory=dict)
 
     @property
     def ontology(self) -> dict[str, object] | None:
@@ -80,6 +84,27 @@ class AssemblyResult:
         them and their content reached the turn as that fact.
         """
         return stored_evidence_ids(credited_chunks(self), self.evidence_sources)
+
+
+def chunk_content_hash(chunk: SubconsciousChunk) -> str:
+    return sha256(chunk.content.encode("utf-8")).hexdigest()[:16]
+
+
+def delivered_hashes_for(chunks: list[SubconsciousChunk]) -> dict[str, str]:
+    return {chunk.chunk_id: chunk_content_hash(chunk) for chunk in chunks if not chunk.distilled}
+
+
+@dataclass(frozen=True, slots=True)
+class DeltaContext:
+    """What a session already holds, for an opt-in ``delta`` assembly.
+
+    ``delivered`` maps chunk_id -> content hash in first-delivery order.
+    ``skip_recent_agent`` drops recent refs of turns that agent wrote itself
+    (already in its transcript).
+    """
+
+    delivered: dict[str, str]
+    skip_recent_agent: str | None = None
 
 
 def credited_chunks(result: object) -> list[SubconsciousChunk]:
@@ -193,6 +218,7 @@ class Assembler:
         diversity_limit: int | None = None,
         max_tokens: int | None = None,
         as_of: float | None = None,
+        delta: DeltaContext | None = None,
     ) -> tuple[
         ConsciousBlock,
         BudgetContext,
@@ -216,7 +242,11 @@ class Assembler:
         hydrated = hydrated.capped()
         chunk_cap, whisper_cap = self._assembly_caps(budget=budget, k=k)
         search_text = query_text or f"{hydrated.task} {hydrated.slot}"
-        recent_chunks = self._resolve_recent_refs(hydrated, query_text=search_text)
+        recent_chunks = self._resolve_recent_refs(
+            hydrated,
+            query_text=search_text,
+            skip_agent=None if delta is None else delta.skip_recent_agent,
+        )
         fallback_count_before = self._retrieval_fallback_count()
         subconscious = self._retrieve_chunks(
             hydrated,
@@ -291,6 +321,19 @@ class Assembler:
                 retrieved_chunks=subconscious,
                 chunk_cap=chunk_cap,
                 budget=budget,
+            )
+        self.encoder.seen_ids = frozenset()
+        if delta is not None and delta.delivered:
+            # Ranking already chose the set; keep what the session holds in its
+            # earlier relative order (first) and append the newly selected.
+            position = {chunk_id: index for index, chunk_id in enumerate(delta.delivered)}
+            held = sorted(
+                (chunk for chunk in combined_chunks if chunk.chunk_id in position),
+                key=lambda chunk: position[chunk.chunk_id],
+            )
+            combined_chunks = [*held, *(chunk for chunk in combined_chunks if chunk.chunk_id not in position)]
+            self.encoder.seen_ids = frozenset(
+                chunk.chunk_id for chunk in held if delta.delivered[chunk.chunk_id] == chunk_content_hash(chunk)
             )
         combined_ids = {chunk.chunk_id for chunk in combined_chunks}
         evicted_high_relevance = [
@@ -497,6 +540,7 @@ class Assembler:
         diversity_limit: int | None = None,
         max_tokens: int | None = None,
         as_of: float | None = None,
+        delta: DeltaContext | None = None,
     ) -> AssemblyResult:
         (
             hydrated,
@@ -522,6 +566,7 @@ class Assembler:
             diversity_limit=diversity_limit,
             max_tokens=max_tokens,
             as_of=as_of,
+            delta=delta,
         )
         effective_max = max_tokens if max_tokens is not None else self._context_token_budget
         pool = combined_chunks if graph is None else graph.memory_pool(combined_chunks)
@@ -596,6 +641,7 @@ class Assembler:
             evidence_sources=evidence_sources,
             graph=graph,
             over_budget=over_budget,
+            delivered_hashes=delivered_hashes_for(combined_chunks),
         )
 
     def assemble_incremental(
@@ -609,6 +655,7 @@ class Assembler:
         k: int | None = None,
         diversity_limit: int | None = None,
         as_of: float | None = None,
+        delta: DeltaContext | None = None,
     ) -> Iterator[tuple[str, str]]:
         """Yield (label, section_text) in priority order, enforcing max_tokens.
 
@@ -630,6 +677,7 @@ class Assembler:
             diversity_limit=diversity_limit,
             max_tokens=max_tokens,
             as_of=as_of,
+            delta=delta,
         )
         hydrated, budget, combined_chunks, combined_whispers = prepared[:4]
         graph = prepared[-1]
@@ -746,6 +794,8 @@ class Assembler:
             fanin_dropped_malformed_count=result.fanin_dropped_malformed_count,
             evidence_sources={cid: src for cid, src in result.evidence_sources.items() if cid in kept_ids},
             graph=graph,
+            over_budget=result.over_budget,
+            delivered_hashes=delivered_hashes_for(chunks),
         )
 
     def apply_post_middleware(self, text: str) -> str:
@@ -875,11 +925,19 @@ class Assembler:
     # Step 2: resolve recent refs
     # ------------------------------------------------------------------
 
-    def _resolve_recent_refs(self, conscious: ConsciousBlock, *, query_text: str | None = None) -> list[SubconsciousChunk]:
+    def _resolve_recent_refs(
+        self,
+        conscious: ConsciousBlock,
+        *,
+        query_text: str | None = None,
+        skip_agent: str | None = None,
+    ) -> list[SubconsciousChunk]:
         records: list[TurnRecord] = []
         for ref in conscious.recent:
             record = self.store.resolve_recent_ref(ref)
             if record is None:
+                continue
+            if skip_agent is not None and record.agent_id == skip_agent:
                 continue
             records.append(record)
         if not records:

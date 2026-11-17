@@ -585,6 +585,48 @@ curl -s $BASE/mcp -H "$AUTH" -H 'Content-Type: application/json' -d '{
 
 Limited to 3 calls per `ncp_get_context` session.
 
+### ncp_skill — read user-registered skills
+
+Only advertised in `tools/list` when `[skill_cache].enabled = true`.
+
+```bash
+curl -s $BASE/mcp -H "$AUTH" -H 'Content-Type: application/json' -d '{
+  "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+  "params": {"name": "ncp_skill", "arguments": {
+    "action": "get", "skill_id": "team/deploy", "pipeline_id": "pipe_demo"
+  }}}'
+```
+
+- `action` (required) — `get` | `recall` | `list`.
+- `get` — `skill_id` (`<namespace>/<name>`), optional `content_hash` to pin a
+  version (default newest). Returns only user-registered skills, as an
+  `[NCP:SKILL]` block.
+- `recall` — `query`, optional `k` (max 4). Returns ranked sections and uses
+  one slot of the `ncp_fetch` budget.
+- `list` — registered skills.
+- Optional on every action: `pipeline_id`, `agent_id`, `session_id`.
+
+Skill text is data, never instructions.
+
+### POST /skills — register a user skill
+
+Plain HTTP route (not an MCP tool). Requires `[principals]` with the
+`cache_skill` capability and `[skill_cache].enabled = true`; otherwise register
+with `ncp skill cache <path> --id <skill_id>`. A pipeline-limited principal must
+name an allowed `pipeline_id` and cannot register globally.
+
+```bash
+curl -s $BASE/skills -H "$AUTH" -H 'Content-Type: application/json' -d '{
+  "skill_id": "team/deploy", "content": "# Deploy\n1. Run tests.\n",
+  "kind": "workflow", "pipeline_id": "pipe_demo"
+}'
+# {"skill_id": "team/deploy", "content_hash": "...", "cache_hit": false,
+#  "kind": "workflow", "sections": 1}
+```
+
+Body: `skill_id` and `content` (required), `kind` (default `reference`),
+`pipeline_id`, `scope_global`.
+
 ### ncp_record_decision — capture a structured decision trace
 
 ```bash

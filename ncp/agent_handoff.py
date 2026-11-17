@@ -315,19 +315,22 @@ def resolve_skill_prefix(
 
     if not skill_ids:
         return ""
-    from ncp.skill_cache import fetch_skill, is_registered_skill, latest_skill
+    from ncp.skill_cache import fetch_skill, latest_registered_skill, latest_skill, registered_skill_info
 
     config = configure(cwd=cwd)
     store = create_store(config)
     blocks: list[str] = []
     total = 0
     for skill_id in skill_ids:
-        info = latest_skill(skill_id, store=store, config=config, pipeline_id=pipeline_id)
+        # Newest user-registered version; pipeline scope is searched together with global.
+        info = latest_registered_skill(skill_id, store=store, config=config, pipeline_id=pipeline_id)
+        if info is not None:
+            info = registered_skill_info(
+                skill_id, info.content_hash, store=store, config=config, pipeline_id=pipeline_id
+            )
         if info is None:
-            raise ValueError(f"Skill {skill_id!r} is not cached; register it with `ncp skill cache`.")
-        if not is_registered_skill(
-            skill_id, info.content_hash, store=store, config=config, pipeline_id=pipeline_id
-        ):
+            if latest_skill(skill_id, store=store, config=config, pipeline_id=pipeline_id) is None:
+                raise ValueError(f"Skill {skill_id!r} is not cached; register it with `ncp skill cache`.")
             raise ValueError(
                 f"Skill {skill_id!r} is not user-registered; only skills added with "
                 "`ncp skill cache` can be dispatched."

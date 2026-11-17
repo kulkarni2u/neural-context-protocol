@@ -97,6 +97,9 @@ class PidginEncoder:
 
     def __init__(self, *, show_score: bool = False) -> None:
         self.show_score = show_score
+        # Cross-turn delta: ids the receiving session already holds unchanged
+        # render as a bare ``chunk:<id> seen:1`` header (set by the Assembler).
+        self.seen_ids: frozenset[str] = frozenset()
 
     def assemble(
         self,
@@ -220,6 +223,8 @@ class PidginEncoder:
         )
 
     def _encode_chunk_entry(self, chunk: SubconsciousChunk) -> str:
+        if chunk.chunk_id in self.seen_ids:
+            return f"chunk:{chunk.chunk_id} seen:1"
         parts = [
             f"chunk:{chunk.chunk_id}",
             f"layer:{chunk.layer}",
