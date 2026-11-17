@@ -731,9 +731,9 @@ def test_cli_handoff_claude_consumes_and_emits_follow_up(
         *,
         runner: str,
         response: str,
-    ) -> None:
+    ) -> agent_handoff.HandoffCompletion:
         events.append("complete")
-        real_complete(run, runner=runner, response=response)
+        return real_complete(run, runner=runner, response=response)
 
     monkeypatch.setattr(
         "ncp.agent_handoff.run_claude_partner",
@@ -758,6 +758,7 @@ def test_cli_handoff_claude_consumes_and_emits_follow_up(
 
     assert result.exit_code == 0
     assert "claude finished the slice and handed it off" in result.output
+    assert "full_output_chunk_id" in result.output
     assert events == ["provider", "complete", "follow_up"]
     assert provider_args["cwd"] == tmp_path
     assert "[NCP:CONSCIOUS]" in str(provider_args["context"])
@@ -768,9 +769,10 @@ def test_cli_handoff_claude_consumes_and_emits_follow_up(
         pipeline_id="pipe_handoff_cli",
         layer="episodic",
     )
-    assert len(completion) == 1
-    assert '"runner":"claude"' in completion[0].content
-    assert source.whisper_id in completion[0].content
+    assert len(completion) == 2
+    summary_chunk = next(c for c in completion if c.raw_ref)
+    assert '"runner":"claude"' in summary_chunk.content
+    assert source.whisper_id in summary_chunk.content
 
 
 def test_cli_handoff_persistence_failure_emits_no_follow_up(

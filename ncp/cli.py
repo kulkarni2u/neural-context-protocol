@@ -278,12 +278,15 @@ def _run_handoff_command(
     max_payload_chars: int,
     timeout_seconds: float,
     runner: str,
+    return_mode: str = "summary",
+    max_return_chars: int = 2000,
 ) -> str:
     from ncp.agent_handoff import (
         complete_handoff,
         emit_follow_up_whisper,
         parse_json_review,
         prepare_handoff,
+        render_handoff_summary,
         run_claude_partner,
         run_opencode_reviewer,
         truncate_whisper_payload,
@@ -325,7 +328,7 @@ def _run_handoff_command(
         raise click.ClickException(str(exc)) from exc
 
     try:
-        complete_handoff(prepared, runner=runner, response=response)
+        completion = complete_handoff(prepared, runner=runner, response=response)
     except (RuntimeError, OSError) as exc:
         raise click.ClickException(str(exc)) from exc
     if emit_to:
@@ -338,7 +341,22 @@ def _run_handoff_command(
             whisper_type=emit_type,
             confidence=emit_confidence,
         )
-    return response
+    if return_mode == "full":
+        return response
+    return render_handoff_summary(
+        prepared,
+        completion,
+        runner=runner,
+        response=response,
+        max_chars=max_return_chars,
+    )
+
+
+def _print_handoff_output(response: str, *, return_mode: str) -> None:
+    if return_mode == "full":
+        console.print(response)
+    else:
+        click.echo(response)
 
 
 def _format_ts(value: float | None) -> str:
@@ -1324,6 +1342,21 @@ def handoff_group() -> None:
 @click.option("--emit-confidence", default=0.90, show_default=True, type=float)
 @click.option("--max-payload-chars", default=600, show_default=True, type=click.IntRange(1, 600))
 @click.option("--timeout-seconds", default=90.0, show_default=True, type=float)
+@click.option(
+    "--return",
+    "return_mode",
+    default="summary",
+    show_default=True,
+    type=click.Choice(["summary", "full"]),
+    help="Print a bounded completion summary (plus full-output chunk id) or the full provider output.",
+)
+@click.option(
+    "--max-return-chars",
+    default=2000,
+    show_default=True,
+    type=click.IntRange(1, 2000),
+    help="Maximum characters printed in summary mode.",
+)
 def handoff_claude_command(
     cwd: Path,
     pipeline_id: str | None,
@@ -1335,6 +1368,8 @@ def handoff_claude_command(
     emit_confidence: float,
     max_payload_chars: int,
     timeout_seconds: float,
+    return_mode: str,
+    max_return_chars: int,
 ) -> None:
     """Consume pending whispers for Claude and optionally emit a follow-up whisper."""
 
@@ -1351,8 +1386,10 @@ def handoff_claude_command(
         max_payload_chars=max_payload_chars,
         timeout_seconds=timeout_seconds,
         runner="claude",
+        return_mode=return_mode,
+        max_return_chars=max_return_chars,
     )
-    console.print(response)
+    _print_handoff_output(response, return_mode=return_mode)
 
 
 @handoff_group.command("opencode")
@@ -1366,6 +1403,21 @@ def handoff_claude_command(
 @click.option("--emit-confidence", default=0.90, show_default=True, type=float)
 @click.option("--max-payload-chars", default=600, show_default=True, type=click.IntRange(1, 600))
 @click.option("--timeout-seconds", default=45.0, show_default=True, type=float)
+@click.option(
+    "--return",
+    "return_mode",
+    default="summary",
+    show_default=True,
+    type=click.Choice(["summary", "full"]),
+    help="Print a bounded completion summary (plus full-output chunk id) or the full provider output.",
+)
+@click.option(
+    "--max-return-chars",
+    default=2000,
+    show_default=True,
+    type=click.IntRange(1, 2000),
+    help="Maximum characters printed in summary mode.",
+)
 def handoff_opencode_command(
     cwd: Path,
     pipeline_id: str | None,
@@ -1377,6 +1429,8 @@ def handoff_opencode_command(
     emit_confidence: float,
     max_payload_chars: int,
     timeout_seconds: float,
+    return_mode: str,
+    max_return_chars: int,
 ) -> None:
     """Consume pending whispers for OpenCode and require a JSON review payload."""
 
@@ -1393,8 +1447,10 @@ def handoff_opencode_command(
         max_payload_chars=max_payload_chars,
         timeout_seconds=timeout_seconds,
         runner="opencode",
+        return_mode=return_mode,
+        max_return_chars=max_return_chars,
     )
-    console.print(response)
+    _print_handoff_output(response, return_mode=return_mode)
 
 
 @main.group("memory")

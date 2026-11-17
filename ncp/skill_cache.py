@@ -49,8 +49,10 @@ heterogeneous fleet of subagents, not just "whatever's on disk right now."
 from __future__ import annotations
 
 import hashlib
+import re
 import time
 from dataclasses import dataclass, field
+from typing import Literal
 
 from ncp.config import NCPConfig, load_config
 from ncp.stores.base import BaseStore
@@ -66,13 +68,53 @@ _HARD_CONTENT_CEILING = 2000
 _MANIFEST_SECTION_INDEX = -1
 
 
+# Reserved identity namespace. Every chunk this module writes uses a
+# ``written_by`` starting with ``SKILL_AUTHOR_PREFIX`` and a chunk id starting
+# with ``SKILL_CHUNK_ID_PREFIX``. Agent-facing write paths (the MCP
+# ``ncp_write_memory``) should refuse writes that use either, via
+# ``is_reserved_skill_identity()``, so an agent cannot forge a registered
+# (user-verified) skill version or overwrite a cached one.
+SKILL_AUTHOR_PREFIX = "ncp:skill_cache:"
+SKILL_CHUNK_ID_PREFIX = "skl_"
+
+SkillKind = Literal["workflow", "reference"]
+_KINDS = ("workflow", "reference")
+_REGISTERED_BY_USER = "user"
+_USER_REGISTERED_TRUST = 0.95  # same level as src="user_verified" elsewhere
+
+_SKILL_ID_RE = re.compile(r"^[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+$")
+_LIST_PAGE = 200
+_LIST_MAX_PAGES = 50
+
+
+def is_reserved_skill_identity(*, written_by: str | None = None, chunk_id: str | None = None) -> bool:
+    """True if ``written_by`` or ``chunk_id`` lies in this module's reserved namespace."""
+
+    if written_by and written_by.startswith(SKILL_AUTHOR_PREFIX):
+        return True
+    return bool(chunk_id and chunk_id.startswith(SKILL_CHUNK_ID_PREFIX))
+
+
+def _validate_skill_id(skill_id: str) -> None:
+    if not isinstance(skill_id, str) or not _SKILL_ID_RE.match(skill_id):
+        raise ValueError(
+            f"invalid skill_id {skill_id!r}: expected '<namespace>/<name>' "
+            "(letters, digits, '_', '-', '.' in each part)"
+        )
+
+
 def _content_hash(content: str) -> str:
     return hashlib.sha256(content.strip().encode("utf-8")).hexdigest()
 
 
-def _section_chunk_id(skill_id: str, content_hash: str, index: int) -> str:
+def _section_chunk_id(skill_id: str, content_hash: str, index: int, *, pipeline_id: str | None = None) -> str:
+    # ``pipeline_id`` salts the id for pipeline-scoped caches so a pipeline's
+    # private copy never collides with (or overwrites) the global one. Global
+    # ids (pipeline_id=None) are unchanged from earlier versions.
     raw = f"{skill_id}|{content_hash}|{index}"
-    return f"skl_{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:12]}"
+    if pipeline_id:
+        raw += f"|{pipeline_id}"
+    return f"{SKILL_CHUNK_ID_PREFIX}{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:12]}"
 
 
 def _split_verbatim(content: str, *, limit: int) -> list[str]:
@@ -129,6 +171,9 @@ class SkillCacheResult:
     section_count: int
     chunk_ids: list[str] = field(default_factory=list)
     written: int = 0  # chunks actually inserted/updated (vs. skipped as near-duplicates)
+    kind: str = "reference"
+    registered_by: str | None = None
+    scope: str = "global"
 
 
 def _skill_author(skill_id: str) -> str:
@@ -147,7 +192,25 @@ def _skill_author(skill_id: str) -> str:
     ``ncp/refine.py`` already uses for machine-authored bus content.
     """
 
-    return f"ncp:skill_cache:{skill_id}"
+    return f"{SKILL_AUTHOR_PREFIX}{skill_id}"
+
+
+def _validate_kind(kind: str) -> None:
+    if kind not in _KINDS:
+        raise ValueError(f"invalid kind {kind!r}: expected one of {_KINDS}")
+
+
+def _validate_registered_by(registered_by: str | None) -> None:
+    if registered_by not in (None, _REGISTERED_BY_USER):
+        raise ValueError(f"invalid registered_by {registered_by!r}: expected 'user' or None")
+
+
+def _target_scope(pipeline_id: str | None, scope_global: bool) -> tuple[str, str | None]:
+    """Return ``(chunk scope, chunk-id salt)`` for a write."""
+
+    if pipeline_id and not scope_global:
+        return "pipeline", pipeline_id
+    return "global", None
 
 
 def cache_skill(
@@ -160,12 +223,28 @@ def cache_skill(
     layer: ChunkLayer = "procedural",
     base_trust: float | None = None,
     source_ref: str | None = None,
+    kind: SkillKind = "reference",
+    registered_by: str | None = None,
+    scope_global: bool = False,
 ) -> SkillCacheResult:
     """Cache third-party skill/reference content as content-addressed chunks.
 
-    ``skill_id`` should be namespaced by the caller (e.g. ``"acme/deploy-api"``,
-    not just ``"deploy-api"``) to avoid two unrelated skills colliding on the
-    same cache key -- NCP has no skill registry and does not enforce this.
+    ``skill_id`` must be ``<namespace>/<name>`` (e.g. ``"acme/deploy-api"``;
+    letters, digits, ``_``, ``-``, ``.`` in each part); ``ValueError``
+    otherwise.
+
+    ``kind`` is ``"workflow"`` (fetched verbatim via ``fetch_skill()``,
+    never surfaced by ``recall_skills()``) or ``"reference"`` (default;
+    relevance-recallable). ``registered_by="user"`` marks the version as
+    user-registered: base_trust seeds at 0.95 (user_verified level) unless an
+    explicit ``base_trust`` is passed, and the manifest records
+    ``registered_by:user`` (see ``is_registered_skill()``). ``None`` keeps the
+    configured ``[skill_cache].default_trust``.
+
+    Scope: when ``pipeline_id`` is given and ``scope_global`` is False
+    (default), chunks are cached with ``scope="pipeline"`` for that pipeline
+    only. ``scope_global=True`` caches globally. When no ``pipeline_id`` is
+    given the chunks are global, as in earlier versions.
 
     Every write for a given ``skill_id`` uses the same synthetic author (see
     ``_skill_author``) regardless of which subagent/process calls this
@@ -181,9 +260,18 @@ def cache_skill(
     different ids until the old ones age out via ``expiry``.
     """
 
+    _validate_skill_id(skill_id)
+    _validate_kind(kind)
+    _validate_registered_by(registered_by)
     resolved_config = config or load_config()
     resolved_store = store or create_store(resolved_config)
-    trust = base_trust if base_trust is not None else resolved_config.skill_cache_default_trust
+    if base_trust is not None:
+        trust = base_trust
+    elif registered_by == _REGISTERED_BY_USER:
+        trust = _USER_REGISTERED_TRUST
+    else:
+        trust = resolved_config.skill_cache_default_trust
+    chunk_scope, salt = _target_scope(pipeline_id, scope_global)
     window_chars = resolved_config.skill_cache_window_chars
     expiry = time.time() + resolved_config.skill_cache_default_expiry_days * 86400
     written_by = _skill_author(skill_id)
@@ -197,7 +285,7 @@ def cache_skill(
     chunk_ids: list[str] = []
 
     for index, section_text in enumerate(sections):
-        chunk_id = _section_chunk_id(skill_id, content_hash, index)
+        chunk_id = _section_chunk_id(skill_id, content_hash, index, pipeline_id=salt)
         chunk_ids.append(chunk_id)
         chunk = SubconsciousChunk(
             chunk_id=chunk_id,
@@ -206,10 +294,16 @@ def cache_skill(
             src="skill_ref",
             written_by=written_by,
             base_trust=trust,
-            conditions=["skill_ref", f"skill:{skill_id}", f"hash:{content_hash[:16]}", f"section:{index}"],
+            conditions=[
+                "skill_ref",
+                f"skill:{skill_id}",
+                f"hash:{content_hash[:16]}",
+                f"section:{index}",
+                f"kind:{kind}",
+            ],
             source_refs=source_refs,
             pipeline_id=pipeline_id,
-            scope="global",
+            scope=chunk_scope,
             zone="proven",
             expiry=expiry,
         )
@@ -224,21 +318,27 @@ def cache_skill(
         if resolved_store.write(chunk, allow_duplicate=True):
             written += 1
 
-    manifest_id = _section_chunk_id(skill_id, content_hash, _MANIFEST_SECTION_INDEX)
+    manifest_id = _section_chunk_id(skill_id, content_hash, _MANIFEST_SECTION_INDEX, pipeline_id=salt)
+    manifest_conditions = ["skill_ref", f"skill:{skill_id}", f"hash:{content_hash[:16]}", "manifest", f"kind:{kind}"]
+    if registered_by == _REGISTERED_BY_USER:
+        manifest_conditions.append(f"registered_by:{_REGISTERED_BY_USER}")
     manifest = SubconsciousChunk(
         chunk_id=manifest_id,
         layer=layer,
         # A manifest exists purely so fetch_skill() can discover section_count
         # from the store without a bespoke tag-query store method -- see the
         # module docstring. Not intended to be independently retrieved.
-        content=f"skill_ref manifest skill:{skill_id} hash:{content_hash[:16]} sections:{len(sections)}",
+        content=(
+            f"skill_ref manifest skill:{skill_id} hash:{content_hash[:16]} sections:{len(sections)} "
+            f"kind:{kind} registered_by:{registered_by or 'none'} chash:{content_hash}"
+        ),
         src="skill_ref",
         written_by=written_by,
         base_trust=trust,
-        conditions=["skill_ref", f"skill:{skill_id}", f"hash:{content_hash[:16]}", "manifest"],
+        conditions=manifest_conditions,
         source_refs=source_refs,
         pipeline_id=pipeline_id,
-        scope="global",
+        scope=chunk_scope,
         zone="proven",
         expiry=expiry,
     )
@@ -251,6 +351,9 @@ def cache_skill(
         section_count=len(sections),
         chunk_ids=chunk_ids,
         written=written,
+        kind=kind,
+        registered_by=registered_by,
+        scope=chunk_scope,
     )
 
 

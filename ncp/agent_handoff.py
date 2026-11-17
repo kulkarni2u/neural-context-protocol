@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import subprocess
 from typing import Literal, Protocol, Sequence
+from uuid import uuid4
 
 from ncp import api
 from ncp.api import configure, emit
@@ -605,14 +606,18 @@ def _bounded_completion_content(
     runner: str,
     handoffs: Sequence[Whisper],
     response: str,
+    max_chars: int = 2000,
+    extra: dict[str, str] | None = None,
 ) -> str:
     summary = _redact_secrets(" ".join(response.strip().split()))
     source_ids = [whisper.whisper_id for whisper in handoffs]
-    envelope = {
+    envelope: dict[str, object] = {
         "result_summary": "",
         "runner": runner,
         "source_whisper_ids": source_ids,
     }
+    if extra:
+        envelope.update(extra)
 
     def _serialize(candidate: str) -> str:
         envelope["result_summary"] = candidate
@@ -624,24 +629,79 @@ def _bounded_completion_content(
         )
 
     serialized = _serialize(summary)
-    if len(serialized) <= 2000:
+    if len(serialized) <= max_chars:
         return serialized
     low, high = 0, len(summary)
     while low < high:
         midpoint = (low + high + 1) // 2
         candidate = summary[:midpoint].rstrip() + "…"
-        if len(_serialize(candidate)) <= 2000:
+        if len(_serialize(candidate)) <= max_chars:
             low = midpoint
         else:
             high = midpoint - 1
     return _serialize(summary[:low].rstrip() + "…")
 
 
-def complete_handoff(run: PreparedHandoff, *, runner: str, response: str) -> None:
-    """Persist a bounded completion record, then acknowledge source handoffs."""
+@dataclass(frozen=True)
+class HandoffCompletion:
+    """Ids of the chunks persisted by :func:`complete_handoff`."""
+
+    chunk_id: str
+    raw_chunk_id: str
+
+
+def render_handoff_summary(
+    run: PreparedHandoff,
+    completion: HandoffCompletion,
+    *,
+    runner: str,
+    response: str,
+    max_chars: int,
+) -> str:
+    """Bounded completion envelope plus the fetchable full-output chunk id."""
+
+    extra = {
+        "completion_chunk_id": completion.chunk_id,
+        "full_output_chunk_id": completion.raw_chunk_id,
+    }
+    text = _bounded_completion_content(
+        runner=runner,
+        handoffs=run.handoffs,
+        response=response,
+        max_chars=max_chars,
+        extra=extra,
+    )
+    if len(text) <= max_chars:
+        return text
+    return f"full_output_chunk_id:{completion.raw_chunk_id}"[:max_chars]
+
+
+def complete_handoff(
+    run: PreparedHandoff,
+    *,
+    runner: str,
+    response: str,
+) -> HandoffCompletion:
+    """Persist a bounded completion record, then acknowledge source handoffs.
+
+    The untruncated (secret-redacted) output is stored first as a low-trust
+    ``raw_ref`` chunk that the completion chunk links to.
+    """
 
     source_ids = [whisper.whisper_id for whisper in run.handoffs]
     pipeline_id = run.handoffs[0].pipeline_id if run.handoffs else None
+    raw_chunk = SubconsciousChunk(
+        chunk_id=f"raw_{uuid4().hex[:12]}",
+        layer="episodic",
+        content=_redact_secrets(response),
+        src="tool_result",
+        written_by=runner,
+        pipeline_id=pipeline_id,
+        base_trust=0.1,
+        source_refs=source_ids,
+    )
+    if not api.write_memory(raw_chunk, store=run.store, config=run.config):
+        raise RuntimeError("Failed to persist NCP handoff completion memory.")
     chunk = SubconsciousChunk(
         layer="episodic",
         content=_bounded_completion_content(
@@ -653,6 +713,7 @@ def complete_handoff(run: PreparedHandoff, *, runner: str, response: str) -> Non
         written_by=runner,
         pipeline_id=pipeline_id,
         source_refs=source_ids,
+        raw_ref=raw_chunk.chunk_id,
     )
     persisted = api.write_memory(chunk, store=run.store, config=run.config)
     if not persisted:
@@ -662,6 +723,7 @@ def complete_handoff(run: PreparedHandoff, *, runner: str, response: str) -> Non
         run.handoffs,
         agent_id=run.agent_id,
     )
+    return HandoffCompletion(chunk_id=chunk.chunk_id, raw_chunk_id=raw_chunk.chunk_id)
 
 
 def parse_json_review(text: str) -> dict[str, object]:

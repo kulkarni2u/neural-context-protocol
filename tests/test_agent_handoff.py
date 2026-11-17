@@ -1084,9 +1084,11 @@ def test_complete_handoff_persists_bounded_memory_before_acknowledgement(
         response=response,
     )
 
-    assert events == ["write", "ack"]
-    assert len(written) == 1
-    chunk = written[0]
+    assert events == ["write", "write", "ack"]
+    assert len(written) == 2
+    raw, chunk = written
+    assert raw.chunk_id == chunk.raw_ref
+    assert "sk-live-supersecret" not in raw.content
     assert chunk.layer == "episodic"
     assert chunk.src == "tool_result"
     assert chunk.pipeline_id == "pipe_lifecycle"

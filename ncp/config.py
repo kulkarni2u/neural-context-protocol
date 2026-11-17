@@ -221,6 +221,12 @@ DEFAULT_CONFIG = {
         "profile": "standard",
         "compact_default": True,
     },
+    "turns": {
+        # Cap (characters) on the result_full stored on a turn record by
+        # ncp_post_turn. Longer input is truncated for the record and the
+        # original kept as a raw_ref chunk.
+        "result_full_max_chars": 8000,
+    },
     "decisions": {
         # Typed decision contract (spec 4h). `enabled` gates the typed path:
         # ncp_compile_decision_query and the typed fields on
@@ -817,7 +823,15 @@ class NCPConfig:
     @property
     def tool_profile(self) -> str:
         profile = str(self.values.get("tools", {}).get("profile", "standard")).lower()
-        return profile if profile in {"core", "standard", "full"} else "standard"
+        return profile if profile in {"minimal", "core", "standard", "full"} else "standard"
+
+    @property
+    def turn_result_full_max_chars(self) -> int:
+        """``[turns].result_full_max_chars``: cap on a stored turn's result_full."""
+        value = self.values.get("turns", {}).get("result_full_max_chars", 8000)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError("[turns].result_full_max_chars must be a positive integer")
+        return value
 
     @property
     def tool_compact_default(self) -> bool:

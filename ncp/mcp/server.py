@@ -782,6 +782,7 @@ ONTOLOGY_MCP_TOOLS: list[dict[str, object]] = [
     },
 ]
 
+MINIMAL_TOOL_NAMES = frozenset({"ncp_get_context", "ncp_write_memory"})
 CORE_TOOL_NAMES = frozenset({
     "ncp_get_context",
     "ncp_write_memory",
@@ -807,7 +808,9 @@ def tools_for_config(config: NCPConfig | None) -> list[dict[str, object]]:
     if config is None:
         return [tool for tool in MCP_TOOLS if str(tool["name"]) in CORE_TOOL_NAMES]
 
-    if config.tool_profile == "core":
+    if config.tool_profile == "minimal":
+        enabled_names = set(MINIMAL_TOOL_NAMES)
+    elif config.tool_profile == "core":
         enabled_names = set(CORE_TOOL_NAMES)
     elif config.tool_profile == "standard":
         enabled_names = set(STANDARD_TOOL_NAMES)
@@ -822,7 +825,7 @@ def tools_for_config(config: NCPConfig | None) -> list[dict[str, object]]:
     tools = [tool for tool in MCP_TOOLS if str(tool["name"]) in enabled_names]
     # Ontology tools: standard/full profile and [ontology] enabled only. Disabled (the
     # default) leaves the list exactly as above.
-    if config.tool_profile != "core" and config.ontology.enabled:
+    if config.tool_profile not in ("minimal", "core") and config.ontology.enabled:
         tools += ONTOLOGY_MCP_TOOLS
     if config.ontology.enabled and config.ontology.provider != "disabled":
         # Advertise the optional per-request ontology extension (design §6.1)
@@ -830,6 +833,41 @@ def tools_for_config(config: NCPConfig | None) -> list[dict[str, object]]:
         # the argument is ignored) keeps the legacy schema.
         tools = [_with_ontology_context_arg(tool) if tool["name"] == "ncp_get_context" else tool
                  for tool in tools]
+    return tools
+
+
+TOOL_PROFILES = ("minimal", "core", "standard", "full")
+TOOL_PROFILE_HEADER = "X-NCP-Tool-Profile"
+
+
+def narrow_tools(
+    server_tools: Sequence[dict[str, object]],
+    *,
+    profile: str | None = None,
+    allowed_names: frozenset[str] | None = None,
+) -> list[dict[str, object]]:
+    """Narrow the server's advertised tools for one connection.
+
+    The result is always a subset of ``server_tools``: a requested profile is
+    intersected with them, so a connection can never widen the configured
+    profile (asking for ``full`` on a ``standard`` server yields ``standard``).
+    An unknown or empty profile name leaves the server set as is.
+    ``allowed_names`` is a per-principal allowlist, intersected the same way.
+    """
+    wanted = (profile or "").strip().lower()
+    names: frozenset[str] | None = None
+    if wanted == "minimal":
+        names = MINIMAL_TOOL_NAMES
+    elif wanted == "core":
+        names = CORE_TOOL_NAMES
+    elif wanted == "standard":
+        names = STANDARD_TOOL_NAMES | ONTOLOGY_TOOL_NAMES
+    # "full" (and unknown names) add no restriction beyond the server set.
+    tools = list(server_tools)
+    if names is not None:
+        tools = [tool for tool in tools if str(tool["name"]) in names]
+    if allowed_names is not None:
+        tools = [tool for tool in tools if str(tool["name"]) in allowed_names]
     return tools
 
 
@@ -2738,7 +2776,7 @@ def make_handlers(
         # still fails at startup; under the core profile the ontology tools
         # are unlisted and it is built lazily, so no ontology tables are
         # created unless an ontology tool actually runs.
-        if config.tool_profile != "core":
+        if config.tool_profile not in ("minimal", "core"):
             ontology_facade()
         handlers.update(make_ontology_tool_handlers(ontology_facade, current_principal))
     return handlers
