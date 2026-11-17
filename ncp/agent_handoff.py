@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import time
 from typing import Literal, Protocol, Sequence
 from uuid import uuid4
 
@@ -18,7 +19,7 @@ from ncp.config import NCPConfig
 from ncp.dogfood import _extract_opencode_text
 from ncp.stores.base import BaseStore
 from ncp.stores.factory import create_store
-from ncp.types import SubconsciousChunk, Whisper
+from ncp.types import BudgetContext, NCPResponse, SubconsciousChunk, Whisper
 
 DEFAULT_CLAUDE_PARTNER_INSTRUCTION = (
     "Use the NCP handoff below as your primary context. Work only inside the bound repo, "
@@ -682,6 +683,7 @@ def complete_handoff(
     *,
     runner: str,
     response: str,
+    run_unique: bool = False,
 ) -> HandoffCompletion:
     """Persist a bounded completion record, then acknowledge source handoffs.
 
@@ -694,13 +696,18 @@ def complete_handoff(
     # Chunk content is capped at 2000 chars, so the untruncated output is stored
     # as a chain of raw parts; each part's raw_ref points at the next part.
     redacted = _redact_secrets(response)
+    run_tag = f"r{uuid4().hex[:6]}" if run_unique else ""
+    part_chars = _RAW_PART_CHARS - (len(run_tag) + 1 if run_tag else 0)
     pieces = [
-        redacted[start : start + _RAW_PART_CHARS]
-        for start in range(0, len(redacted), _RAW_PART_CHARS)
+        redacted[start : start + part_chars]
+        for start in range(0, len(redacted), part_chars)
     ] or [""]
-    if len(pieces) > 1:
+    if len(pieces) > 1 or run_unique:
         # The marker also keeps repeated output from tripping store dedup.
-        pieces = [f"[part {i}/{len(pieces)}] {piece}" for i, piece in enumerate(pieces, 1)]
+        pieces = [
+            f"[part {i}/{len(pieces)}{(' ' + run_tag) if run_tag else ''}] {piece}"
+            for i, piece in enumerate(pieces, 1)
+        ]
     next_id: str | None = None
     for piece in reversed(pieces):
         raw_chunk = SubconsciousChunk(
@@ -723,6 +730,7 @@ def complete_handoff(
             runner=runner,
             handoffs=run.handoffs,
             response=response,
+            extra={"run": run_tag} if run_tag else None,
         ),
         src="tool_result",
         written_by=runner,
@@ -739,6 +747,178 @@ def complete_handoff(
         agent_id=run.agent_id,
     )
     return HandoffCompletion(chunk_id=chunk.chunk_id, raw_chunk_id=raw_chunk.chunk_id)
+
+
+RUN_TURN_HOSTS = ("claude", "codex", "opencode", "mock")
+_RUN_TURN_SUMMARY_CHARS = 600
+
+
+@dataclass(frozen=True)
+class RunTurnResult:
+    """Outcome of one :func:`run_turn` execution."""
+
+    turn_id: str
+    response: str
+    acked_whisper_ids: list[str]
+    output: str
+
+
+def build_run_turn_prompt(*, context: str, instruction: str) -> str:
+    """The whole prompt of a run-turn: bounded context (as data) plus the instruction."""
+
+    return "\n\n".join(
+        ["Bounded NCP context:", _format_context_for_prompt(context), instruction.strip()]
+    )
+
+
+def run_provider_turn(
+    *,
+    host: str,
+    prompt: str,
+    workspace: Path,
+    timeout_seconds: float,
+) -> str:
+    """Run one headless provider turn and return its text output."""
+
+    if host == "mock":
+        # Deterministic, no external binary: echoes the instruction (the prompt tail).
+        return "mock turn result: " + prompt.rsplit("\n\n", 1)[-1]
+    if host == "claude":
+        command = [
+            "claude", "-p", "--model", "sonnet",
+            "--allowedTools", ",".join(_CLAUDE_PARTNER_DEFAULT_TOOLS),
+            "--add-dir", str(workspace), "--", prompt,
+        ]
+        runner_name, env = "Claude", None
+    elif host == "codex":
+        command = ["codex", "exec", "--skip-git-repo-check", "-C", str(workspace), prompt]
+        runner_name, env = "Codex", None
+    elif host == "opencode":
+        command = [
+            "opencode", "--pure", "run", "--format", "json",
+            "--dir", str(workspace), prompt,
+        ]
+        runner_name, env = "OpenCode", None
+    else:
+        raise ValueError(f"Unsupported run-turn host: {host}")
+    completed = _run_handoff_subprocess(
+        runner_name=runner_name,
+        command=command,
+        cwd=workspace,
+        prompt=prompt,
+        timeout_seconds=timeout_seconds,
+        env=env,
+    )
+    if completed.returncode != 0:
+        diagnostic = completed.stderr.strip() or completed.stdout.strip()
+        raise RuntimeError(
+            _sanitize_provider_diagnostic(diagnostic, prompt=prompt)
+            or f"{runner_name} run failed"
+        )
+    if host == "opencode":
+        return _extract_opencode_text(completed.stdout)
+    return completed.stdout.strip()
+
+
+def run_turn(
+    *,
+    cwd: Path,
+    agent_id: str,
+    pipeline_id: str,
+    host: str,
+    task: str,
+    slot: str,
+    instruction: str,
+    intent: str = "advance",
+    role: str = "pravaha",
+    max_tokens: int | None = None,
+    timeout_seconds: float = 120.0,
+    return_mode: str = "summary",
+    max_return_chars: int = 2000,
+) -> RunTurnResult:
+    """Assemble context, run ONE provider turn, post it and ack delivered whispers."""
+
+    from ncp.assembler import Assembler
+
+    if not instruction.strip():
+        raise ValueError("run-turn needs a non-empty instruction (--prompt or stdin).")
+    config = configure(cwd=cwd)
+    store = create_store(config)
+    workspace = resolve_handoff_workspace(cwd, config)
+    conscious = api.agent(
+        id=agent_id,
+        role=role,
+        task=task,
+        slot=slot,
+        intent=intent,
+        pipeline_id=pipeline_id,
+    )
+    assembled = Assembler(store=store, config=config).assemble(
+        conscious=conscious,
+        budget=BudgetContext(),
+        query_text=f"{task} {slot}",
+        max_tokens=min(max_tokens or config.context_token_budget, config.context_token_budget),
+    )
+    prompt = build_run_turn_prompt(context=assembled.context, instruction=instruction)
+    started = time.monotonic()
+    response = run_provider_turn(
+        host=host, prompt=prompt, workspace=workspace, timeout_seconds=timeout_seconds
+    )
+    latency_ms = int((time.monotonic() - started) * 1000)
+
+    redacted = _redact_secrets(response)
+    summary = " ".join(redacted.split())
+    if len(summary) > _RUN_TURN_SUMMARY_CHARS:
+        summary = summary[: _RUN_TURN_SUMMARY_CHARS - 1].rstrip() + "…"
+    result_full = redacted[: config.turn_result_full_max_chars]
+    ack_ids = list(assembled.pending_whisper_ids)
+    delivered = [w for w in assembled.whispers if w.whisper_id in set(ack_ids)]
+    turn_id = f"turn_{int(time.time() * 1000)}_{uuid4().hex[:12]}"
+
+    # Full output as redacted raw part chunks (summary mode links to them).
+    prepared = PreparedHandoff(
+        agent_id=agent_id,
+        config=config,
+        store=store,
+        handoffs=[],
+        context=assembled.context,
+        workspace=workspace,
+    )
+    completion = complete_handoff(prepared, runner=host, response=response, run_unique=True)
+    Assembler(store=store, config=config).post_turn(
+        conscious=assembled.conscious,
+        response=NCPResponse(
+            content=result_full,
+            turn_id=turn_id,
+            pipeline_id=pipeline_id,
+            model=host,
+            input_tokens=0,
+            output_tokens=0,
+            cost_usd=0.0,
+            latency_ms=latency_ms,
+        ),
+        result_summary=summary,
+        result_full=result_full,
+        ack_whisper_ids=ack_ids,
+        retrieved_chunk_ids=None,
+    )
+    if return_mode == "full":
+        output = redacted
+    else:
+        output = render_handoff_summary(
+            prepared,
+            completion,
+            runner=host,
+            response=response,
+            max_chars=max_return_chars,
+        )
+        output = output[:max_return_chars]
+    return RunTurnResult(
+        turn_id=turn_id,
+        response=redacted,
+        acked_whisper_ids=[w.whisper_id for w in delivered],
+        output=output,
+    )
 
 
 def parse_json_review(text: str) -> dict[str, object]:

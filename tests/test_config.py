@@ -69,7 +69,7 @@ def test_tool_profile_invalid_value_falls_back_to_standard(tmp_path: Path) -> No
     project = tmp_path / "repo"
     (project / ".git").mkdir(parents=True)
     (project / ".ncp").mkdir()
-    (project / ".ncp" / "config.toml").write_text('[tools]\nprofile = "minimal"\n')
+    (project / ".ncp" / "config.toml").write_text('[tools]\nprofile = "bogus"\n')
 
     assert load_config(cwd=project).tool_profile == "standard"
 

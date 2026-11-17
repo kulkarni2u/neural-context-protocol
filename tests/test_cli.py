@@ -1,5 +1,6 @@
 from pathlib import Path
 import json
+import os
 import re
 
 from click.testing import CliRunner
@@ -48,6 +49,9 @@ def test_cli_init_prompts_for_detected_provider_hooks(
     assert "OpenCode detected" in result.output
     assert (tmp_path / ".claude" / "settings.json").exists()
     assert (tmp_path / ".claude" / "hooks" / "ncp-session-start.sh").exists()
+    lifecycle = tmp_path / ".claude" / "hooks" / "ncp-lifecycle-hook.sh"
+    assert lifecycle.exists()
+    assert os.access(lifecycle, os.X_OK)
     assert (tmp_path / ".claude" / "skills" / "ncp" / "SKILL.md").exists()
     assert (tmp_path / ".mcp.json").exists()
     assert (tmp_path / ".codex" / "hooks.json").exists()

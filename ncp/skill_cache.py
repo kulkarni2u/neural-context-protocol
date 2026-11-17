@@ -96,7 +96,11 @@ def is_reserved_skill_identity(*, written_by: str | None = None, chunk_id: str |
 
 
 def _validate_skill_id(skill_id: str) -> None:
-    if not isinstance(skill_id, str) or not _SKILL_ID_RE.match(skill_id):
+    if (
+        not isinstance(skill_id, str)
+        or not _SKILL_ID_RE.match(skill_id)
+        or any(set(part) == {"."} for part in skill_id.split("/"))
+    ):
         raise ValueError(
             f"invalid skill_id {skill_id!r}: expected '<namespace>/<name>' "
             "(letters, digits, '_', '-', '.' in each part)"
