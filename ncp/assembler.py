@@ -157,7 +157,7 @@ class Assembler:
         self._edge_expansion_decay = config.edge_expansion_decay if config else 0.7
         self._edge_max_hops = config.edge_max_hops if config else 1
         self._edge_expansion_types = config.edge_expansion_types if config else ["caused_by"]
-        self._diversity_lambda = config.diversity_lambda if config else 1.0
+        self._diversity_lambda = config.diversity_lambda if config else 0.7
         self._distillation_enabled = config.distillation_enabled if config else False
         self._distillation_min_chunk_tokens = config.distillation_min_chunk_tokens if config else 120
         self._fallback_to_trust_recency_enabled = (
@@ -170,8 +170,8 @@ class Assembler:
         )
         self._reduce_fanin_contradict_floor = config.reduce_fanin_contradict_floor if config else 0.35
         self._reduce_fanin_overfetch = config.reduce_fanin_overfetch if config else 8
-        self._reduce_fanin_auto_min_writers = config.reduce_fanin_auto_min_writers if config else 0
-        self._fit_swap_enabled = config.fit_swap_enabled if config else False
+        self._reduce_fanin_auto_min_writers = config.reduce_fanin_auto_min_writers if config else 3
+        self._fit_swap_enabled = config.fit_swap_enabled if config else True
 
     def _count(self, text: str) -> int:
         """Budget-enforcement token count (margin-adjusted for chars_div4)."""

@@ -124,7 +124,7 @@ DEFAULT_CONFIG = {
         "propagation_max_hops": 1,
         "trust_propagation_factor": 0.5,
         "dissent_weight": 0.2,
-        "diversity_lambda": 1.0,
+        "diversity_lambda": 0.7,
         "usage_prior_weight": 1.0,
         "reputation_weight": 0.0,
         "fallback_to_trust_recency_enabled": True,
@@ -153,10 +153,10 @@ DEFAULT_CONFIG = {
         "reduce_fanin_overfetch": 8,
         # Auto fan-in: when reduce_fanin_enabled is false, still reduce if the
         # candidates come from at least this many distinct writers (0 = never).
-        "reduce_fanin_auto_min_writers": 0,
+        "reduce_fanin_auto_min_writers": 3,
         # Second fitting pass: swap a dropped chunk with relevance >= 0.5 in
         # for a lower-ranked admitted one when that fits the budget.
-        "fit_swap_enabled": False,
+        "fit_swap_enabled": True,
     },
     "reputation": {
         "gain": 4.0,
@@ -513,15 +513,15 @@ class NCPConfig:
 
     @property
     def reduce_fanin_auto_min_writers(self) -> int:
-        return max(0, int(self.values.get("retrieval", {}).get("reduce_fanin_auto_min_writers", 0)))
+        return max(0, int(self.values.get("retrieval", {}).get("reduce_fanin_auto_min_writers", 3)))
 
     @property
     def fit_swap_enabled(self) -> bool:
-        return bool(self.values.get("retrieval", {}).get("fit_swap_enabled", False))
+        return bool(self.values.get("retrieval", {}).get("fit_swap_enabled", True))
 
     @property
     def diversity_lambda(self) -> float:
-        return float(self.values.get("retrieval", {}).get("diversity_lambda", 1.0))
+        return float(self.values.get("retrieval", {}).get("diversity_lambda", 0.7))
 
     @property
     def usage_prior_weight(self) -> float:
