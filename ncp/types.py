@@ -131,13 +131,16 @@ class ConsciousBlock(NCPModel):
     calibration_id: str | None = None
     pipeline_id: str | None = None
 
+    # "<skill_id>@<hash12>" references resolved by ncp_get_context; never text.
+    skills: list[str] = Field(default_factory=list)
+
     @field_validator("agent_id", "role", "task", "slot", "intent", "ncp_v")
     @classmethod
     def _no_spaces(cls, value: str, info: object) -> str:
         field_name = getattr(info, "field_name", "field")
         return _validate_no_spaces(value, field_name)
 
-    @field_validator("owns", "must_not", "recent", "tried", "failed")
+    @field_validator("owns", "must_not", "recent", "tried", "failed", "skills")
     @classmethod
     def _no_spaces_in_lists(cls, values: list[str], info: object) -> list[str]:
         field_name = getattr(info, "field_name", "field")

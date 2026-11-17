@@ -193,6 +193,8 @@ class PidginEncoder:
             lines.append(f"owns:{_fmt_compact_list(conscious.owns)}")
         if conscious.must_not:
             lines.append(f"must-not:{_fmt_compact_list(conscious.must_not)}")
+        if conscious.skills:
+            lines.append("skills:" + " ".join(conscious.skills))
         slot_bits = []
         if conscious.slot_age:
             slot_bits.append(f"slot_age:{conscious.slot_age}")

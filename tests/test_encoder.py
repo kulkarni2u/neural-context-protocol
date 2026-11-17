@@ -271,3 +271,21 @@ def test_pidgin_encoder_drops_contradiction_notes_when_no_chunks() -> None:
 
     assert "[NCP:SUBCONSCIOUS]" not in rendered
     assert "note:contradicts" not in rendered
+
+
+def test_show_score_opt_in_and_section_offsets() -> None:
+    chunk = SubconsciousChunk(
+        chunk_id="c1", layer="semantic", content="[NCP:WHISPERS] inline", src="tool_result", base_trust=0.9
+    )
+    conscious = ConsciousBlock(
+        agent_id="a", role="r", owns=[], must_not=[], task="t", slot="s", intent="i"
+    )
+    args = {"conscious": conscious, "chunks": [chunk], "whispers": [], "budget": BudgetContext()}
+    assert "score:" not in PidginEncoder().assemble(**args)
+    assert "score:" in PidginEncoder(show_score=True).assemble(**args)
+
+    context = PidginEncoder().assemble(**args)
+    assert context.startswith("[NCP:CONSCIOUS]", context.offsets["conscious"])
+    assert context.startswith("[NCP:SUBCONSCIOUS]", context.offsets["subconscious"])
+    assert context.startswith("[NCP:BUDGET]", context.offsets["budget"])
+    assert context.volatile_offset == context.offsets["budget"]

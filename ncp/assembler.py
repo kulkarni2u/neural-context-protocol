@@ -705,6 +705,7 @@ class Assembler:
         )
         kept_ids = {chunk.chunk_id for chunk in chunks}
         contradictions = [(a, b) for a, b in result.fanin_contradictions if a in kept_ids and b in kept_ids]
+        context: str
         if graph is None:
             context = self.encoder.assemble(
                 conscious=result.conscious,
@@ -1281,38 +1282,38 @@ class Assembler:
     ) -> list[tuple[int, SubconsciousChunk, str]]:
         """Second fitting pass: let a dropped relevant chunk displace a worse one.
 
-        Greedy skip-and-continue can admit a low-ranked small chunk after
-        dropping a higher-ranked large one. For each dropped chunk with
-        relevance >= 0.5, try replacing the lowest-ranked admitted chunk that
-        both ranks below it and is less relevant; keep the swap only if the
-        block then fits.
+        For each dropped chunk with relevance >= 0.5, try replacing an admitted
+        chunk whose relevance is strictly lower (least relevant first); keep the
+        swap only if the block then fits. The victim is chosen by relevance,
+        not by rank: a lower-*ranked* chunk was admitted after the dropped
+        one failed to fit, so removing it alone can never make room (the
+        block is then exactly the one the dropped chunk already failed
+        against); only an equal-or-better-ranked but less relevant chunk can.
         """
 
         for rank in dropped:
             wanted = chunks[rank]
             if float(wanted.relevance) < 0.5:
                 continue
-            victims = [
-                item
-                for item in admitted
-                if item[0] > rank and float(item[1].relevance) < float(wanted.relevance)
-            ]
-            if not victims:
-                continue
-            victim = max(victims, key=lambda item: item[0])
+            victims = sorted(
+                (item for item in admitted if float(item[1].relevance) < float(wanted.relevance)),
+                key=lambda item: (float(item[1].relevance), -item[0]),
+            )
             entry = self.encoder._encode_chunk_entry(wanted)
-            trial = sorted(
-                [item for item in admitted if item is not victim] + [(rank, wanted, entry)],
-                key=lambda item: item[0],
-            )
-            candidate = self.encoder.assemble_from_parts(
-                conscious_text=conscious_text,
-                chunk_entries=[item[2] for item in trial],
-                whispers_text=whispers_text,
-                budget_text=budget_text,
-            )
-            if self._count(candidate) <= max_tokens:
-                admitted = trial
+            for victim in victims:
+                trial = sorted(
+                    [item for item in admitted if item is not victim] + [(rank, wanted, entry)],
+                    key=lambda item: item[0],
+                )
+                candidate = self.encoder.assemble_from_parts(
+                    conscious_text=conscious_text,
+                    chunk_entries=[item[2] for item in trial],
+                    whispers_text=whispers_text,
+                    budget_text=budget_text,
+                )
+                if self._count(candidate) <= max_tokens:
+                    admitted = trial
+                    break
         return admitted
 
     def _distill_for_budget(

@@ -669,20 +669,10 @@ def registered_skill_info(
     resolved_store = store or create_store(config or load_config())
     if not is_registered_skill(skill_id, content_hash, store=resolved_store, pipeline_id=pipeline_id):
         return None
-    found = _find_manifest(skill_id, content_hash, resolved_store, _lookup_salts(pipeline_id))
-    if found is None:
-        return None
-    manifest, parsed, salt = found
-    return SkillInfo(
-        skill_id=skill_id,
-        content_hash=content_hash,
-        kind=parsed["kind"],
-        section_count=int(parsed["sections"] or 0),
-        registered_by=parsed["registered_by"],
-        created_at=float(manifest.created_at),
-        scope="pipeline" if salt else "global",
-        pipeline_id=salt,
-    )
+    for info in _complete_manifest_rows(skill_id, resolved_store, pipeline_id, registered_only=True):
+        if info.content_hash == content_hash:
+            return info
+    return None
 
 
 def fetch_skill(

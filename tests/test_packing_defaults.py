@@ -36,71 +36,52 @@ def test_new_defaults(tmp_path: Path) -> None:
     assert config.reduce_fanin_enabled is False  # explicit opt-in unchanged
 
 
-def test_swap_pass_admits_relevant_dropped_chunk_over_lower_ranked(tmp_path: Path) -> None:
+def test_swap_pass_displaces_less_relevant_admitted_chunk(tmp_path: Path) -> None:
     assembler = Assembler(store=SQLiteStore(tmp_path / "ncp.db"))
-    big = _chunk("big", "alpha " * 60, relevance=0.9)
-    small_a = _chunk("small_a", "alpha one", relevance=0.2)
-    small_b = _chunk("small_b", "alpha two", relevance=0.1)
     conscious, budget = _conscious(), BudgetContext()
-    with_big = assembler.encoder.assemble(conscious=conscious, chunks=[big], whispers=[], budget=budget)
-    base = estimate_budget_tokens(
-        assembler.encoder.assemble(conscious=conscious, chunks=[small_a, small_b], whispers=[], budget=budget)
+    first = _chunk("c_first", "gamma " * 30, relevance=0.2)  # ranked first, barely relevant
+    wanted = _chunk("c_want", "alpha " * 30, relevance=0.9)
+    last = _chunk("c_last", "delta " * 3, relevance=0.1)
+    # first + last fit; wanted does not fit alongside first, but fits instead of it.
+    limit = estimate_budget_tokens(
+        assembler.encoder.assemble(conscious=conscious, chunks=[first, last], whispers=[], budget=budget)
     )
-    # Room for the two small chunks (admitted greedily after the big one is
-    # skipped) or the big one alone, never both.
-    limit = max(base, estimate_budget_tokens(with_big) - 1) + 1
-    limit = base + 2 if limit < base else limit
-
-    def fit(swap: bool) -> list[str]:
-        assembler._fit_swap_enabled = swap
-        # Order is ranking: big first, but a stricter limit forces it out.
-        kept, _ = assembler._fit_token_budget(
-            conscious=conscious, budget=budget, chunks=[big, small_a, small_b], whispers=[],
-            max_tokens=estimate_budget_tokens(with_big) - 1, query_text="alpha",
-        )
-        return [c.chunk_id for c in kept]
-
-    off, on = fit(False), fit(True)
-    assert "big" not in off and off == ["small_a", "small_b"]
-    assert on == off  # big alone cannot fit either: swap must never overflow
-    assert limit  # silence unused
-
-
-def test_swap_pass_swaps_when_the_relevant_chunk_fits_in_place_of_victim(tmp_path: Path) -> None:
-    assembler = Assembler(store=SQLiteStore(tmp_path / "ncp.db"))
-    conscious, budget = _conscious(), BudgetContext()
-    medium = _chunk("medium", "alpha " * 30, relevance=0.9)
-    pad = _chunk("pad", "beta " * 30, relevance=0.95)
-    tail = _chunk("tail", "gamma " * 30, relevance=0.1)
-    # pad + tail fit together; medium (ranked between them) does not fit as a
-    # third chunk, but fits when it replaces the lower-ranked tail.
-    two = assembler.encoder.assemble(conscious=conscious, chunks=[pad, tail], whispers=[], budget=budget)
-    limit = estimate_budget_tokens(two)
 
     def fit(swap: bool) -> list[str]:
         assembler._fit_swap_enabled = swap
         kept, _ = assembler._fit_token_budget(
-            conscious=conscious, budget=budget, chunks=[pad, medium, tail], whispers=[],
+            conscious=conscious, budget=budget, chunks=[first, wanted, last], whispers=[],
             max_tokens=limit, query_text="alpha",
         )
         return [c.chunk_id for c in kept]
 
-    assert fit(False) == ["pad", "tail"]
-    swapped = fit(True)
-    assert swapped == ["pad", "medium"]
+    assert fit(False) == ["c_first", "c_last"]
+    assert fit(True) == ["c_want", "c_last"]
 
 
-def test_auto_fanin_reduces_only_with_enough_distinct_writers(tmp_path: Path) -> None:
-    def build(writers: list[str]) -> list[str]:
-        store = SQLiteStore(tmp_path / f"{len(set(writers))}.db")
-        for i, writer in enumerate(writers):
-            store.write(_chunk(f"d{i}", "payment retry backoff must use jitter always", writer=writer))
-        assembler = Assembler(store=store)
-        result = assembler.assemble(
-            conscious=_conscious(), budget=BudgetContext(), query_text="payment retry backoff jitter", k=8,
-        )
-        return [c.chunk_id for c in result.chunks]
+def test_swap_pass_never_overflows_or_swaps_below_half_relevance(tmp_path: Path) -> None:
+    assembler = Assembler(store=SQLiteStore(tmp_path / "ncp.db"))
+    conscious, budget = _conscious(), BudgetContext()
+    first = _chunk("first", "beta " * 30, relevance=0.1)
+    wanted = _chunk("wanted", "alpha " * 30, relevance=0.4)
+    limit = estimate_budget_tokens(
+        assembler.encoder.assemble(conscious=conscious, chunks=[first], whispers=[], budget=budget)
+    )
+    assembler._fit_swap_enabled = True
+    kept, _ = assembler._fit_token_budget(
+        conscious=conscious, budget=budget, chunks=[first, wanted], whispers=[],
+        max_tokens=limit, query_text="alpha",
+    )
+    assert [c.chunk_id for c in kept] == ["first"]
 
-    many = build(["w1", "w2", "w3", "w1", "w2", "w3"])
-    few = build(["w1", "w1", "w2", "w1", "w2", "w1"])
-    assert len(many) < len(few)
+
+def test_auto_fanin_trigger_needs_enough_distinct_writers(tmp_path: Path) -> None:
+    assembler = Assembler(store=SQLiteStore(tmp_path / "ncp.db"))
+    many = [_chunk(f"m{i}", "x", writer=f"w{i % 3}") for i in range(6)]
+    few = [_chunk(f"f{i}", "x", writer=f"w{i % 2}") for i in range(6)]
+    assert assembler._should_reduce_fanin(many) is True
+    assert assembler._should_reduce_fanin(few) is False
+    assembler._reduce_fanin_auto_min_writers = 0
+    assert assembler._should_reduce_fanin(many) is False
+    assembler._reduce_fanin_enabled = True
+    assert assembler._should_reduce_fanin(few) is True

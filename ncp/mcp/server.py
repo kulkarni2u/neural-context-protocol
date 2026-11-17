@@ -1536,6 +1536,25 @@ def make_handlers(
         # self-reported drift_score *before* budget/tiering/assembly consume
         # it. No-op (drift_block stays None) when the feature is disabled.
         conscious, drift_block = _apply_computed_drift(conscious, args)
+        resolved_skills: list[dict[str, object]] = []
+        missing_skills: list[str] = []
+        for skill_id in skill_ids or []:
+            try:
+                found = latest_registered_skill(
+                    skill_id, store=store, config=config, pipeline_id=normalized_pipeline_id
+                )
+            except ValueError:
+                found = None
+            if found is None:
+                missing_skills.append(skill_id)
+            else:
+                resolved_skills.append(
+                    {"skill_id": found.skill_id, "content_hash": found.content_hash, "kind": found.kind}
+                )
+        if resolved_skills:
+            conscious = conscious.model_copy(update={
+                "skills": [f"{item['skill_id']}@{str(item['content_hash'])[:12]}" for item in resolved_skills]
+            })
         budget = _budget_from_args(args, conscious=conscious)
 
         # CAP-E2: pre-flight budget check. In "block" mode an already-exceeded
@@ -1623,23 +1642,8 @@ def make_handlers(
         if budget_tokens_block is not None:
             response["budget_tokens"] = budget_tokens_block
         if skill_ids is not None:
-            resolved: list[dict[str, object]] = []
-            missing: list[str] = []
-            for skill_id in skill_ids:
-                try:
-                    found = latest_registered_skill(
-                        skill_id, store=store, config=config, pipeline_id=normalized_pipeline_id
-                    )
-                except ValueError:
-                    found = None
-                if found is None:
-                    missing.append(skill_id)
-                else:
-                    resolved.append(
-                        {"skill_id": found.skill_id, "content_hash": found.content_hash, "kind": found.kind}
-                    )
-            response["skills"] = resolved
-            response["skills_missing"] = missing
+            response["skills"] = resolved_skills
+            response["skills_missing"] = missing_skills
         if drift_block is not None:
             response["drift"] = drift_block
         if as_of is not None:
