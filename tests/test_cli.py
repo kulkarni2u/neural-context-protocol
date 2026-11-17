@@ -403,6 +403,7 @@ def test_cli_serve_passes_explicit_cwd(monkeypatch: object, tmp_path: Path) -> N
         cwd: Path | None = None,
         auth_token: str | None = None,
         cors_allowed_origins: list[str] | None = None,
+        profile: str | None = None,
     ) -> None:
         called["host"] = host
         called["port"] = port
@@ -434,6 +435,7 @@ def test_cli_serve_passes_network_options(monkeypatch: object, tmp_path: Path) -
         cwd: Path | None = None,
         auth_token: str | None = None,
         cors_allowed_origins: list[str] | None = None,
+        profile: str | None = None,
     ) -> None:
         called["host"] = host
         called["port"] = port
@@ -478,6 +480,7 @@ def test_cli_serve_passes_cors_origins(monkeypatch: object, tmp_path: Path) -> N
         cwd: Path | None = None,
         auth_token: str | None = None,
         cors_allowed_origins: list[str] | None = None,
+        profile: str | None = None,
     ) -> None:
         called["auth_token"] = auth_token
         called["cors_allowed_origins"] = cors_allowed_origins
@@ -512,6 +515,7 @@ def test_cli_serve_auth_token_resolution_order(monkeypatch: object, tmp_path: Pa
         cwd: Path | None = None,
         auth_token: str | None = None,
         cors_allowed_origins: list[str] | None = None,
+        profile: str | None = None,
     ) -> None:
         called["auth_token"] = auth_token
 
@@ -549,7 +553,9 @@ def test_cli_serve_auth_token_resolution_order(monkeypatch: object, tmp_path: Pa
 def test_cli_serve_stdio_hidden_command(monkeypatch: object, tmp_path: Path) -> None:
     called: dict[str, object] = {}
 
-    def fake_serve(*, store_path: Path | None = None, cwd: Path | None = None) -> None:
+    def fake_serve(
+        *, store_path: Path | None = None, cwd: Path | None = None, profile: str | None = None
+    ) -> None:
         called["store_path"] = store_path
         called["cwd"] = cwd
 

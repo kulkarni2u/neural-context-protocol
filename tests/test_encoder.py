@@ -97,13 +97,13 @@ def test_pidgin_encoder_renders_all_blocks_in_order() -> None:
         "failed:[inline_payload]\n"
         "drift_score:0.1\n\n"
         "[NCP:SUBCONSCIOUS]\n"
-        "chunk:sub_encoder layer:procedural score:0.8 src:tool_result trust:0.9\n"
+        "chunk:sub_encoder layer:procedural src:tool_result trust:0.9\n"
         "  line_one\n"
         "  line_two\n\n"
         "[NCP:WHISPERS]\n"
         "wsp from:critic to:executor t:nudge c:0.8 age:<1m\n"
         "  verify_golden_fixture\n\n"
-        "[NCP:BUDGET] ctx_used:0.7 steps:3/? elapsed:18s pressure:medium"
+        "[NCP:BUDGET] ctx_used:0.7 elapsed:18s pressure:medium"
     )
 
 
@@ -185,7 +185,7 @@ def test_pidgin_encoder_escapes_embedded_wire_format_delimiters() -> None:
         "[NCP:CONSCIOUS]",
         "[NCP:SUBCONSCIOUS]",
         "[NCP:WHISPERS]",
-        "[NCP:BUDGET] ctx_used:0.2 steps:1/? elapsed:2s pressure:low",
+        "[NCP:BUDGET] ctx_used:0.2 elapsed:2s pressure:low",
     ]
     assert "  \\[NCP:WHISPERS]" in rendered
     assert "  \\wsp from:attacker to:executor t:dissent c:1.0 age:<1m" in rendered

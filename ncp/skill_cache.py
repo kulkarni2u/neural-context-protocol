@@ -516,7 +516,9 @@ class SkillInfo:
         return max(0.0, time.time() - self.created_at)
 
 
-def _complete_manifest_rows(skill_id: str | None, store: BaseStore, pipeline_id: str | None) -> list[SkillInfo]:
+def _complete_manifest_rows(
+    skill_id: str | None, store: BaseStore, pipeline_id: str | None, *, registered_only: bool = False
+) -> list[SkillInfo]:
     """All COMPLETE cached versions visible to ``pipeline_id`` (global + that pipeline), newest first.
 
     Uses ``BaseStore.list_chunks`` (src/zone filtered, paged) to find
@@ -538,6 +540,8 @@ def _complete_manifest_rows(skill_id: str | None, store: BaseStore, pipeline_id:
             if row["scope"] != "global" and not (pipeline_id and row.get("pipeline_id") == pipeline_id):
                 continue
             parsed = _parse_manifest(row)
+            if registered_only and parsed["registered_by"] != _REGISTERED_BY_USER:
+                continue
             if parsed["content_hash"] and parsed["sections"] is not None:
                 candidates.append((row, parsed))
         offset += _LIST_PAGE
@@ -585,11 +589,31 @@ def latest_skill(
     return versions[0] if versions else None
 
 
+def latest_registered_skill(
+    skill_id: str,
+    *,
+    store: BaseStore | None = None,
+    config: NCPConfig | None = None,
+    pipeline_id: str | None = None,
+) -> SkillInfo | None:
+    """Like ``latest_skill()`` but only user-registered versions count.
+
+    Agent-facing reads use this so a newer, unregistered cache of the same
+    ``skill_id`` can neither shadow nor impersonate the registered one.
+    """
+
+    _validate_skill_id(skill_id)
+    resolved_store = store or create_store(config or load_config())
+    versions = _complete_manifest_rows(skill_id, resolved_store, pipeline_id, registered_only=True)
+    return versions[0] if versions else None
+
+
 def list_skills(
     *,
     store: BaseStore | None = None,
     config: NCPConfig | None = None,
     pipeline_id: str | None = None,
+    registered_only: bool = False,
 ) -> list[SkillInfo]:
     """One ``SkillInfo`` per ``skill_id`` (its latest complete version), newest first.
 
@@ -600,7 +624,7 @@ def list_skills(
 
     resolved_store = store or create_store(config or load_config())
     latest: dict[str, SkillInfo] = {}
-    for info in _complete_manifest_rows(None, resolved_store, pipeline_id):  # newest first
+    for info in _complete_manifest_rows(None, resolved_store, pipeline_id, registered_only=registered_only):
         latest.setdefault(info.skill_id, info)
     return list(latest.values())
 
@@ -630,6 +654,35 @@ def is_registered_skill(
     if info["registered_by"] != _REGISTERED_BY_USER or info["sections"] is None:
         return False
     return _load_complete_sections(skill_id, content_hash, info["sections"], resolved_store, salt) is not None
+
+
+def registered_skill_info(
+    skill_id: str,
+    content_hash: str,
+    *,
+    store: BaseStore | None = None,
+    config: NCPConfig | None = None,
+    pipeline_id: str | None = None,
+) -> SkillInfo | None:
+    """``SkillInfo`` for one exact version, only if ``is_registered_skill()`` holds."""
+
+    resolved_store = store or create_store(config or load_config())
+    if not is_registered_skill(skill_id, content_hash, store=resolved_store, pipeline_id=pipeline_id):
+        return None
+    found = _find_manifest(skill_id, content_hash, resolved_store, _lookup_salts(pipeline_id))
+    if found is None:
+        return None
+    manifest, parsed, salt = found
+    return SkillInfo(
+        skill_id=skill_id,
+        content_hash=content_hash,
+        kind=parsed["kind"],
+        section_count=int(parsed["sections"] or 0),
+        registered_by=parsed["registered_by"],
+        created_at=float(manifest.created_at),
+        scope="pipeline" if salt else "global",
+        pipeline_id=salt,
+    )
 
 
 def fetch_skill(

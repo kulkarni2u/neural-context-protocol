@@ -14,7 +14,6 @@ warn_at_ratio = 0.70
 critical_at_ratio = 0.85
 
 [chunking]
-max_chunk_tokens = 200
 default_type = "auto"
 
 [whispers]

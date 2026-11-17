@@ -48,7 +48,6 @@ adaptive_budget_enabled = true
 # adaptive_allow_expand = false
 
 [chunking]
-max_chunk_tokens = 200
 default_type = "auto"
 
 [whispers]

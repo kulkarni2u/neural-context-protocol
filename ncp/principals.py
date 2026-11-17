@@ -31,7 +31,9 @@ from typing import Any
 CAP_ADMIN = "admin"
 CAP_VERIFY = "verify"
 CAP_RECORD_OUTCOME = "record_outcome"
-CAPABILITIES = frozenset({CAP_ADMIN, CAP_VERIFY, CAP_RECORD_OUTCOME})
+# Register (cache) a user skill over HTTP POST /skills; never an MCP tool.
+CAP_CACHE_SKILL = "cache_skill"
+CAPABILITIES = frozenset({CAP_ADMIN, CAP_VERIFY, CAP_RECORD_OUTCOME, CAP_CACHE_SKILL})
 
 # Name of the implicit principal the legacy [server].auth_token maps to when
 # principals are also configured.
@@ -53,6 +55,7 @@ IDENTITY_ARGS: dict[str, tuple[tuple[str, bool], ...]] = {
     "ncp_task": (("agent_id", True),),
     "ncp_overview": (("agent_id", True),),
     "ncp_fetch": (("agent_id", True),),
+    "ncp_skill": (("agent_id", True),),
     "ncp_record_decision": (("agent_id", True),),
     "ncp_compile_decision_query": (("agent_id", True),),
     "ncp_remember": (("written_by", True),),
@@ -68,6 +71,7 @@ PIPELINE_SCOPED_TOOLS = frozenset({
     "ncp_wait_whispers",
     "ncp_task",
     "ncp_fetch",
+    "ncp_skill",
     "ncp_record_decision",
     "ncp_compile_decision_query",
     "ncp_lookup_memo",
@@ -376,7 +380,7 @@ class ToolAuthorizer:
         if tool in PIPELINE_SCOPED_TOOLS:
             self._check_pipeline_scope(principal, tool, args)
 
-        if tool in ("ncp_get_context", "ncp_fetch", "ncp_post_turn"):
+        if tool in ("ncp_get_context", "ncp_fetch", "ncp_post_turn", "ncp_skill"):
             # The per-turn ncp_fetch budget (and the ids ncp_post_turn defaults
             # to from ncp_get_context) is keyed by principal, never by a
             # caller-chosen session_id. Admin acts for many agents, so its

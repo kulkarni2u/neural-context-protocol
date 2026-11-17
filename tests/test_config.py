@@ -234,10 +234,10 @@ def test_retrieval_diversity_lambda_defaults_and_overrides(tmp_path) -> None:
     (project / ".git").mkdir(parents=True)
     (project / ".ncp").mkdir()
 
-    assert load_config(cwd=project).diversity_lambda == 1.0
-
-    (project / ".ncp" / "config.toml").write_text("[retrieval]\ndiversity_lambda = 0.7\n")
     assert load_config(cwd=project).diversity_lambda == pytest.approx(0.7)
+
+    (project / ".ncp" / "config.toml").write_text("[retrieval]\ndiversity_lambda = 1.0\n")
+    assert load_config(cwd=project).diversity_lambda == pytest.approx(1.0)
 
     config = load_config(cwd=project, env={"NCP_DIVERSITY_LAMBDA": "0.8"})
     assert config.diversity_lambda == pytest.approx(0.8)

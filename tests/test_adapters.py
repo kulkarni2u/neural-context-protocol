@@ -59,7 +59,7 @@ def _mock_anthropic_usage(
 # WHISPERS, then BUDGET last).
 NCP_CTX_WITH_BUDGET = (
     "[NCP:CONSCIOUS]\nid:agent-1 role:worker ncp_v:1\n\n"
-    "[NCP:BUDGET] ctx_used:0.1 steps:1/? elapsed:2s pressure:low"
+    "[NCP:BUDGET] ctx_used:0.1 elapsed:2s pressure:low"
 )
 
 
