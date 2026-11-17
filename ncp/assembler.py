@@ -22,7 +22,7 @@ from ncp.middleware.base import MiddlewarePipeline
 from ncp.stores.base import BaseStore
 from ncp.stores.consolidation import reduce_candidates
 from ncp.stores.retrieval import DEFAULT_RETRIEVAL_POLICY, apply_mmr_selection, build_lexical_candidates, normalize_query_terms
-from ncp.tokens import estimate_tokens
+from ncp.tokens import estimate_budget_tokens, estimate_tokens
 from ncp.types import BudgetContext, ConsciousBlock, NCPResponse, SubconsciousChunk, TurnRecord, Whisper
 
 if TYPE_CHECKING:
@@ -59,6 +59,10 @@ class AssemblyResult:
     # statements cite evidence chunk ids but are not stored chunks, so they
     # never enter ``chunks`` / ``stored_evidence_ids`` (no false outcome credit).
     graph: GraphContext | None = None
+    # True when the first-built block exceeded ``max_tokens`` and the optional
+    # conscious lists (and, if needed, trailing chunks) were trimmed. Servers
+    # surface it as ``telemetry.over_budget``.
+    over_budget: bool = False
 
     @property
     def ontology(self) -> dict[str, object] | None:
@@ -137,7 +141,8 @@ class Assembler:
         # ontology is disabled or resolves to off) keeps every step below
         # exactly the legacy path.
         self._ontology = ontology
-        self.encoder = encoder or PidginEncoder()
+        self.encoder = encoder or PidginEncoder(show_score=config.encoder_show_score if config else False)
+        self._estimate_margin = config.estimate_margin if config else 0.9
         self.coherence = CoherenceChecker(store=store)
         self.middleware = middleware or MiddlewarePipeline()
         self._chunk_cap_default = config.chunk_cap_default if config else 4
@@ -165,6 +170,13 @@ class Assembler:
         )
         self._reduce_fanin_contradict_floor = config.reduce_fanin_contradict_floor if config else 0.35
         self._reduce_fanin_overfetch = config.reduce_fanin_overfetch if config else 8
+        self._reduce_fanin_auto_min_writers = config.reduce_fanin_auto_min_writers if config else 0
+        self._fit_swap_enabled = config.fit_swap_enabled if config else False
+
+    def _count(self, text: str) -> int:
+        """Budget-enforcement token count (margin-adjusted for chars_div4)."""
+
+        return estimate_budget_tokens(text, margin=self._estimate_margin)
 
     # ------------------------------------------------------------------
     # Step 0-5: assemble
@@ -201,6 +213,7 @@ class Assembler:
         coherence_report = self.coherence.check(conscious)
         coherence_alerts = coherence_report.alerts
         hydrated = conscious if ctx_window is None else conscious.model_copy(update={"ctx_window": ctx_window})
+        hydrated = hydrated.capped()
         chunk_cap, whisper_cap = self._assembly_caps(budget=budget, k=k)
         search_text = query_text or f"{hydrated.task} {hydrated.slot}"
         recent_chunks = self._resolve_recent_refs(hydrated, query_text=search_text)
@@ -247,7 +260,7 @@ class Assembler:
         fanin_merged_count = 0
         fanin_contradictions: list[tuple[str, str]] = []
         fanin_dropped_malformed_count = 0
-        if self._reduce_fanin_enabled and subconscious:
+        if subconscious and self._should_reduce_fanin(subconscious):
             reduced = reduce_candidates(
                 subconscious,
                 similarity_threshold=self._reduce_fanin_similarity_threshold,
@@ -396,7 +409,7 @@ class Assembler:
         assert self._ontology is not None
         token_limit: int | None = None
         if max_tokens is not None:
-            fixed = estimate_tokens(
+            fixed = self._count(
                 self.encoder.assemble_from_parts(
                     conscious_text=self.encoder._encode_conscious(conscious),
                     chunk_entries=[],
@@ -449,7 +462,7 @@ class Assembler:
             )
             if (
                 graph is not None and graph.text is None and unfitted and max_tokens is not None
-                and estimate_tokens(context) > max_tokens
+                and self._count(context) > max_tokens
             ):
                 chunks = [chunk for chunk in chunks if chunk.chunk_id not in unfitted]
                 unfitted = frozenset()
@@ -458,7 +471,7 @@ class Assembler:
                 graph is None
                 or graph.text is None
                 or max_tokens is None
-                or estimate_tokens(context) <= max_tokens
+                or self._count(context) <= max_tokens
             ):
                 if graph is not None:
                     graph = graph.with_substituted(
@@ -505,25 +518,57 @@ class Assembler:
             max_tokens=max_tokens,
             as_of=as_of,
         )
-        if graph is None:
-            context = self.encoder.assemble(
-                conscious=hydrated,
-                chunks=combined_chunks,
-                whispers=combined_whispers,
+        effective_max = max_tokens if max_tokens is not None else self._context_token_budget
+        pool = combined_chunks if graph is None else graph.memory_pool(combined_chunks)
+        unfitted = frozenset() if graph is None else frozenset(graph.substituted_ids)
+
+        def encode(
+            conscious_block: ConsciousBlock,
+            chunks: list[SubconsciousChunk],
+            whispers: list[Whisper],
+            current_graph: GraphContext | None,
+        ) -> tuple[str, GraphContext | None, list[SubconsciousChunk]]:
+            if current_graph is None:
+                text = self.encoder.assemble(
+                    conscious=conscious_block,
+                    chunks=chunks,
+                    whispers=whispers,
+                    budget=budget,
+                    contradiction_notes=fanin_contradictions or None,
+                )
+                return text, None, chunks
+            return self._encode_with_graph(
+                conscious=conscious_block,
+                chunks=chunks,
+                whispers=whispers,
                 budget=budget,
                 contradiction_notes=fanin_contradictions or None,
+                graph=current_graph,
+                max_tokens=effective_max,
+                unfitted=unfitted,
             )
-        else:
-            context, graph, combined_chunks = self._encode_with_graph(
-                conscious=hydrated,
-                chunks=graph.memory_pool(combined_chunks),
-                whispers=combined_whispers,
-                budget=budget,
-                contradiction_notes=fanin_contradictions or None,
-                graph=graph,
-                max_tokens=max_tokens if max_tokens is not None else self._context_token_budget,
-                unfitted=frozenset(graph.substituted_ids),
-            )
+
+        context, graph, combined_chunks = encode(hydrated, pool, combined_whispers, graph)
+        over_budget = False
+        if effective_max is not None and self._count(context) > effective_max:
+            # Final guard: the fit above is incremental and can miss (fixed
+            # conscious growth, estimator error). Shed the optional conscious
+            # lists first, then trailing chunks and whispers.
+            over_budget = True
+            for name in ("recent", "tried", "failed"):
+                if not getattr(hydrated, name):
+                    continue
+                hydrated = hydrated.model_copy(update={name: []})
+                context, graph, combined_chunks = encode(hydrated, pool, combined_whispers, graph)
+                if self._count(context) <= effective_max:
+                    break
+            if graph is None:
+                while self._count(context) > effective_max and (combined_chunks or combined_whispers):
+                    if combined_chunks:
+                        combined_chunks = combined_chunks[:-1]
+                    else:
+                        combined_whispers = combined_whispers[:-1]
+                    context, _, _ = encode(hydrated, combined_chunks, combined_whispers, None)
         context = self.middleware.post_assemble(context)
         return AssemblyResult(
             context=context,
@@ -545,6 +590,7 @@ class Assembler:
             fanin_dropped_malformed_count=fanin_dropped_malformed_count,
             evidence_sources=evidence_sources,
             graph=graph,
+            over_budget=over_budget,
         )
 
     def assemble_incremental(
@@ -884,7 +930,7 @@ class Assembler:
         store_k = k
         if diversity_lambda is not None and diversity_lambda < 1.0:
             store_k = max(store_k, k * 3)
-        if self._reduce_fanin_enabled:
+        if self._reduce_fanin_enabled or self._reduce_fanin_auto_min_writers > 0:
             store_k = max(store_k, k * self._reduce_fanin_overfetch)
         search_text = query_text or f"{conscious.task} {conscious.slot}"
         extra: dict = {}
@@ -900,6 +946,12 @@ class Assembler:
             fallback_to_trust_recency=self._fallback_to_trust_recency_enabled,
             **extra,
         )
+
+    def _should_reduce_fanin(self, candidates: list[SubconsciousChunk]) -> bool:
+        if self._reduce_fanin_enabled:
+            return True
+        threshold = self._reduce_fanin_auto_min_writers
+        return threshold > 0 and len({chunk.written_by for chunk in candidates}) >= threshold
 
     def _retrieval_fallback_count(self) -> int:
         """Best-effort read of the store's trust/recency-fallback counter.
@@ -1175,9 +1227,12 @@ class Assembler:
         budget_text = self.encoder._encode_budget(budget)
         whispers_text = self.encoder._encode_whispers(fitted_whispers, now=None) if fitted_whispers else None
 
-        fitted_chunks: list[SubconsciousChunk] = []
-        fitted_entries: list[str] = []
-        for chunk in chunks:
+        # (rank, chunk, entry) for every admitted chunk; rank is the position in
+        # the ranked input so a second pass can tell who outranks whom.
+        admitted: list[tuple[int, SubconsciousChunk, str]] = []
+        dropped: list[int] = []
+        for rank, chunk in enumerate(chunks):
+            fitted_entries = [entry for _, _, entry in admitted]
             entry = self.encoder._encode_chunk_entry(chunk)
             candidate = self.encoder.assemble_from_parts(
                 conscious_text=conscious_text,
@@ -1185,9 +1240,8 @@ class Assembler:
                 whispers_text=whispers_text,
                 budget_text=budget_text,
             )
-            if estimate_tokens(candidate) <= max_tokens:
-                fitted_chunks.append(chunk)
-                fitted_entries.append(entry)
+            if self._count(candidate) <= max_tokens:
+                admitted.append((rank, chunk, entry))
                 continue
             distilled = self._distill_for_budget(
                 conscious_text=conscious_text,
@@ -1199,9 +1253,67 @@ class Assembler:
                 query_text=query_text,
             )
             if distilled is not None:
-                fitted_chunks.append(distilled)
-                fitted_entries.append(self.encoder._encode_chunk_entry(distilled))
-        return fitted_chunks, fitted_whispers
+                admitted.append((rank, distilled, self.encoder._encode_chunk_entry(distilled)))
+            else:
+                dropped.append(rank)
+        if self._fit_swap_enabled and dropped:
+            admitted = self._swap_pass(
+                chunks=chunks,
+                admitted=admitted,
+                dropped=dropped,
+                conscious_text=conscious_text,
+                budget_text=budget_text,
+                whispers_text=whispers_text,
+                max_tokens=max_tokens,
+            )
+        return [chunk for _, chunk, _ in admitted], fitted_whispers
+
+    def _swap_pass(
+        self,
+        *,
+        chunks: list[SubconsciousChunk],
+        admitted: list[tuple[int, SubconsciousChunk, str]],
+        dropped: list[int],
+        conscious_text: str,
+        budget_text: str,
+        whispers_text: str | None,
+        max_tokens: int,
+    ) -> list[tuple[int, SubconsciousChunk, str]]:
+        """Second fitting pass: let a dropped relevant chunk displace a worse one.
+
+        Greedy skip-and-continue can admit a low-ranked small chunk after
+        dropping a higher-ranked large one. For each dropped chunk with
+        relevance >= 0.5, try replacing the lowest-ranked admitted chunk that
+        both ranks below it and is less relevant; keep the swap only if the
+        block then fits.
+        """
+
+        for rank in dropped:
+            wanted = chunks[rank]
+            if float(wanted.relevance) < 0.5:
+                continue
+            victims = [
+                item
+                for item in admitted
+                if item[0] > rank and float(item[1].relevance) < float(wanted.relevance)
+            ]
+            if not victims:
+                continue
+            victim = max(victims, key=lambda item: item[0])
+            entry = self.encoder._encode_chunk_entry(wanted)
+            trial = sorted(
+                [item for item in admitted if item is not victim] + [(rank, wanted, entry)],
+                key=lambda item: item[0],
+            )
+            candidate = self.encoder.assemble_from_parts(
+                conscious_text=conscious_text,
+                chunk_entries=[item[2] for item in trial],
+                whispers_text=whispers_text,
+                budget_text=budget_text,
+            )
+            if self._count(candidate) <= max_tokens:
+                admitted = trial
+        return admitted
 
     def _distill_for_budget(
         self,
@@ -1224,7 +1336,7 @@ class Assembler:
             whispers_text=whispers_text,
             budget_text=budget_text,
         )
-        remaining = max_tokens - estimate_tokens(base_context)
+        remaining = max_tokens - self._count(base_context)
         if remaining <= 0:
             return None
         distilled_content = distill_chunk(
@@ -1241,7 +1353,7 @@ class Assembler:
             whispers_text=whispers_text,
             budget_text=budget_text,
         )
-        if estimate_tokens(candidate) <= max_tokens:
+        if self._count(candidate) <= max_tokens:
             return distilled
         return None
 
@@ -1271,7 +1383,7 @@ class Assembler:
                 whispers_text=whisper_text,
                 budget_text=budget_text,
             )
-            if estimate_tokens(whisper_text) <= reserve and estimate_tokens(full_context) <= max_tokens:
+            if self._count(whisper_text) <= reserve and self._count(full_context) <= max_tokens:
                 fitted.append(whisper)
                 fitted_entries.append(entry)
         return fitted

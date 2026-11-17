@@ -86,6 +86,18 @@ class NCPModel(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
 
+# Per-list item-count caps and the per-item length cap for the conscious block.
+CONSCIOUS_LIST_CAPS: dict[str, int] = {
+    "owns": 16,
+    "must_not": 16,
+    "recent": 8,
+    "tried": 8,
+    "failed": 8,
+}
+CONSCIOUS_ITEM_MAX_CHARS = 160
+_KEEP_RECENT_LISTS = frozenset({"recent", "tried", "failed"})
+
+
 class ConsciousBlock(NCPModel):
     """Per-turn conscious state injected into the working context."""
 
@@ -130,6 +142,24 @@ class ConsciousBlock(NCPModel):
     def _no_spaces_in_lists(cls, values: list[str], info: object) -> list[str]:
         field_name = getattr(info, "field_name", "field")
         return _validate_no_spaces_list(values, field_name)
+
+    def capped(self) -> Self:
+        """Copy with list fields bounded in item count and item length.
+
+        The conscious block is never evicted, so unbounded ``owns`` /
+        ``must_not`` / ``recent`` / ``tried`` / ``failed`` lists would eat the
+        context budget. ``recent``, ``tried`` and ``failed`` keep their most
+        recent (last) entries; ``owns`` / ``must_not`` keep their first.
+        """
+
+        updates: dict[str, list[str]] = {}
+        for name, limit in CONSCIOUS_LIST_CAPS.items():
+            values: list[str] = getattr(self, name)
+            keep = values[-limit:] if name in _KEEP_RECENT_LISTS else values[:limit]
+            trimmed = [item[:CONSCIOUS_ITEM_MAX_CHARS] for item in keep]
+            if trimmed != values:
+                updates[name] = trimmed
+        return self.model_copy(update=updates) if updates else self
 
     @field_validator("ncp_v")
     @classmethod

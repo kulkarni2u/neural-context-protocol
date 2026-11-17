@@ -31,6 +31,7 @@ DEFAULT_OPENCODE_REVIEW_INSTRUCTION = (
 )
 
 _TIMEOUT_ERROR_MAX_CHARS = 320
+_RAW_PART_CHARS = 1980  # leaves room for the "[part i/n] " marker
 
 
 def _render_timeout_error(
@@ -690,18 +691,32 @@ def complete_handoff(
 
     source_ids = [whisper.whisper_id for whisper in run.handoffs]
     pipeline_id = run.handoffs[0].pipeline_id if run.handoffs else None
-    raw_chunk = SubconsciousChunk(
-        chunk_id=f"raw_{uuid4().hex[:12]}",
-        layer="episodic",
-        content=_redact_secrets(response),
-        src="tool_result",
-        written_by=runner,
-        pipeline_id=pipeline_id,
-        base_trust=0.1,
-        source_refs=source_ids,
-    )
-    if not api.write_memory(raw_chunk, store=run.store, config=run.config):
-        raise RuntimeError("Failed to persist NCP handoff completion memory.")
+    # Chunk content is capped at 2000 chars, so the untruncated output is stored
+    # as a chain of raw parts; each part's raw_ref points at the next part.
+    redacted = _redact_secrets(response)
+    pieces = [
+        redacted[start : start + _RAW_PART_CHARS]
+        for start in range(0, len(redacted), _RAW_PART_CHARS)
+    ] or [""]
+    if len(pieces) > 1:
+        # The marker also keeps repeated output from tripping store dedup.
+        pieces = [f"[part {i}/{len(pieces)}] {piece}" for i, piece in enumerate(pieces, 1)]
+    next_id: str | None = None
+    for piece in reversed(pieces):
+        raw_chunk = SubconsciousChunk(
+            chunk_id=f"raw_{uuid4().hex[:12]}",
+            layer="episodic",
+            content=piece,
+            src="tool_result",
+            written_by=runner,
+            pipeline_id=pipeline_id,
+            base_trust=0.1,
+            source_refs=source_ids,
+            raw_ref=next_id,
+        )
+        if not api.write_memory(raw_chunk, store=run.store, config=run.config):
+            raise RuntimeError("Failed to persist NCP handoff completion memory.")
+        next_id = raw_chunk.chunk_id
     chunk = SubconsciousChunk(
         layer="episodic",
         content=_bounded_completion_content(

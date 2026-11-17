@@ -47,6 +47,9 @@ DEFAULT_CONFIG = {
         "whisper_cap_default": 3,
         "whisper_cap_high": 2,
         "whisper_cap_critical": 1,
+        # Budget enforcement counts chars/4 tokens divided by this margin
+        # (0.9 reserves 10%) when the unit is chars_div4; ignored for tiktoken.
+        "estimate_margin": 0.9,
         # CAP-E2: per-pipeline $ budget governance over real (CAP-E1) cost
         # accounting. None (default) disables the governor entirely.
         "pipeline_budget_usd": None,
@@ -64,8 +67,12 @@ DEFAULT_CONFIG = {
         # the 0.5x-1.5x scaling up to adaptive_budget_ceiling_tokens.
         "adaptive_allow_expand": False,
     },
+    "encoder": {
+        # Print ``score:`` in each chunk header. Off by default: the score
+        # includes wall-clock recency, so it makes the cacheable prefix drift.
+        "show_score": False,
+    },
     "chunking": {
-        "max_chunk_tokens": 200,
         "default_type": "auto",
     },
     "whispers": {
@@ -144,6 +151,12 @@ DEFAULT_CONFIG = {
         # that wider pool and the existing chunk_cap/MMR/budget-fit steps
         # still trim the *reduced* result down to budget, same as always.
         "reduce_fanin_overfetch": 8,
+        # Auto fan-in: when reduce_fanin_enabled is false, still reduce if the
+        # candidates come from at least this many distinct writers (0 = never).
+        "reduce_fanin_auto_min_writers": 0,
+        # Second fitting pass: swap a dropped chunk with relevance >= 0.5 in
+        # for a lower-ranked admitted one when that fits the budget.
+        "fit_swap_enabled": False,
     },
     "reputation": {
         "gain": 4.0,
@@ -216,6 +229,9 @@ DEFAULT_CONFIG = {
         # Character budget per window before ncp.skill_cache splits skill
         # content -- headroom under SubconsciousChunk's 2000-char cap.
         "window_chars": 1800,
+        # Gates the agent-facing surfaces (MCP/CLI) only; the library
+        # functions in ncp.skill_cache work regardless.
+        "enabled": False,
     },
     "tools": {
         "profile": "standard",
@@ -486,6 +502,22 @@ class NCPConfig:
     @property
     def dissent_weight(self) -> float:
         return float(self.values.get("retrieval", {}).get("dissent_weight", 0.2))
+
+    @property
+    def encoder_show_score(self) -> bool:
+        return bool(self.values.get("encoder", {}).get("show_score", False))
+
+    @property
+    def estimate_margin(self) -> float:
+        return min(1.0, max(0.1, float(self.values.get("budget", {}).get("estimate_margin", 0.9))))
+
+    @property
+    def reduce_fanin_auto_min_writers(self) -> int:
+        return max(0, int(self.values.get("retrieval", {}).get("reduce_fanin_auto_min_writers", 0)))
+
+    @property
+    def fit_swap_enabled(self) -> bool:
+        return bool(self.values.get("retrieval", {}).get("fit_swap_enabled", False))
 
     @property
     def diversity_lambda(self) -> float:
@@ -819,6 +851,10 @@ class NCPConfig:
     @property
     def skill_cache_window_chars(self) -> int:
         return int(self.values.get("skill_cache", {}).get("window_chars", 1800))
+
+    @property
+    def skill_cache_enabled(self) -> bool:
+        return bool(self.values.get("skill_cache", {}).get("enabled", False))
 
     @property
     def tool_profile(self) -> str:

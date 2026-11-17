@@ -906,6 +906,8 @@ def test_cli_handoff_opencode_requires_json_and_emits_follow_up(
             "pipe_handoff_cli",
             "--emit-to",
             "claude",
+            "--return",
+            "full",
         ],
     )
 
@@ -919,9 +921,10 @@ def test_cli_handoff_opencode_requires_json_and_emits_follow_up(
         pipeline_id="pipe_handoff_cli",
         layer="episodic",
     )
-    assert len(completion) == 1
-    assert '"runner":"opencode"' in completion[0].content
-    assert source.whisper_id in completion[0].content
+    assert len(completion) == 2  # raw_ref output chunk + completion envelope
+    summary_chunk = next(c for c in completion if c.raw_ref)
+    assert '"runner":"opencode"' in summary_chunk.content
+    assert source.whisper_id in summary_chunk.content
 
 
 def test_cli_handoff_reports_missing_queue_cleanly(tmp_path: Path) -> None:

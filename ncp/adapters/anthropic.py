@@ -78,6 +78,29 @@ class AnthropicAdapter(BaseAdapter):
         return self._split_stable_prefix(ncp_context)
 
     @staticmethod
+    def _volatile_index(ncp_context: str) -> int:
+        """Where the per-turn tail starts, or -1 when it cannot be found.
+
+        Prefers the section offsets the encoder recorded (an
+        ``EncodedContext``); chunk text containing a marker cannot move them.
+        If the string was rewritten after encoding (offset no longer lands on
+        a section marker) or never came from the encoder, fall back to a
+        line-start marker search. Chunk and whisper lines are always indented
+        or escaped, so a real marker is the only thing at column 0.
+        """
+
+        offset = getattr(ncp_context, "volatile_offset", None)
+        if isinstance(offset, int) and ncp_context.startswith("[NCP:", offset):
+            return offset
+        for marker in (_WHISPERS_MARKER, _BUDGET_MARKER):
+            if ncp_context.startswith(marker):
+                return 0
+            idx = ncp_context.find("\n" + marker)
+            if idx != -1:
+                return idx + 1
+        return -1
+
+    @staticmethod
     def _split_stable_prefix(ncp_context: str) -> list[dict[str, object]]:
         """Split into a cached stable-prefix block and an uncached volatile block.
 
@@ -103,9 +126,7 @@ class AnthropicAdapter(BaseAdapter):
         caching that block.
         """
 
-        idx = ncp_context.find(_WHISPERS_MARKER)
-        if idx == -1:
-            idx = ncp_context.find(_BUDGET_MARKER)
+        idx = AnthropicAdapter._volatile_index(ncp_context)
         if idx == -1:
             return [{"type": "text", "text": ncp_context, "cache_control": {"type": "ephemeral"}}]
 

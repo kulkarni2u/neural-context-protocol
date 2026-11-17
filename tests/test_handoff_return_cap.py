@@ -49,10 +49,14 @@ def test_summary_is_bounded_and_links_full_output(
     out = result.output.rstrip("\n")
     assert len(out) <= 2000
     chunks = store.get_working_zone(pipeline_id=PIPE, layer="episodic")
-    summary = next(c for c in chunks if c.raw_ref)
+    summary = next(c for c in chunks if c.chunk_id in out and c.written_by == "claude" and c.content.startswith("{"))
     assert summary.raw_ref in out
-    raw = next(c for c in chunks if c.chunk_id == summary.raw_ref)
-    assert raw.content == BIG
+    by_id = {c.chunk_id: c for c in chunks}
+    parts, cursor = [], summary.raw_ref
+    while cursor:
+        parts.append(by_id[cursor].content.split("] ", 1)[1])
+        cursor = by_id[cursor].raw_ref
+    assert "".join(parts) == BIG
 
 
 def test_max_return_chars_respected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

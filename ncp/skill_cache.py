@@ -376,6 +376,9 @@ def ensure_cached(
     layer: ChunkLayer = "procedural",
     base_trust: float | None = None,
     source_ref: str | None = None,
+    kind: SkillKind = "reference",
+    registered_by: str | None = None,
+    scope_global: bool = False,
 ) -> EnsureCachedResult:
     """Fetch-or-cache in one call -- the common case at every skill-load site.
 
@@ -384,10 +387,11 @@ def ensure_cached(
     way ``fetch_skill()`` returns content to a caller who doesn't have it.
     What this saves is the section-by-section re-chunk-and-write work on
     every call where nothing changed: it checks whether ``skill_id`` is
-    already completely cached at this exact content hash (one manifest
-    lookup, one section-completeness check -- the same check ``fetch_skill()``
-    does, not a full ``cache_skill()`` write) and only calls ``cache_skill()``
-    on an actual miss (first-ever call, or the content changed).
+    already completely cached at this exact content hash *in the target
+    scope* (see ``cache_skill()``), with the same ``kind`` and at least the
+    requested provenance, and only calls ``cache_skill()`` on an actual miss
+    (first-ever call, content changed, or a user registration of content
+    previously cached without it).
 
     Typical call site: the main/orchestrator session's classification step,
     once per workflow skill or selected reference file, before any subagent
@@ -398,14 +402,24 @@ def ensure_cached(
     process each subagent runs in.
     """
 
+    _validate_skill_id(skill_id)
+    _validate_kind(kind)
+    _validate_registered_by(registered_by)
     resolved_config = config or load_config()
     resolved_store = store or create_store(resolved_config)
     content_hash = _content_hash(content)
+    _, salt = _target_scope(pipeline_id, scope_global)
 
-    section_count = _load_manifest_section_count(skill_id, content_hash, resolved_store)
-    if section_count is not None:
-        complete = _load_complete_sections(skill_id, content_hash, section_count, resolved_store)
-        if complete is not None:
+    found = _find_manifest(skill_id, content_hash, resolved_store, [salt])
+    if found is not None:
+        info = found[1]
+        provenance_ok = registered_by != _REGISTERED_BY_USER or info["registered_by"] == _REGISTERED_BY_USER
+        if (
+            info["kind"] == kind
+            and provenance_ok
+            and info["sections"] is not None
+            and _load_complete_sections(skill_id, content_hash, info["sections"], resolved_store, salt) is not None
+        ):
             return EnsureCachedResult(skill_id=skill_id, content_hash=content_hash, cache_hit=True)
 
     cache_skill(
@@ -417,22 +431,55 @@ def ensure_cached(
         layer=layer,
         base_trust=base_trust,
         source_ref=source_ref,
+        kind=kind,
+        registered_by=registered_by,
+        scope_global=scope_global,
     )
     return EnsureCachedResult(skill_id=skill_id, content_hash=content_hash, cache_hit=False)
 
 
-def _load_manifest_section_count(skill_id: str, content_hash: str, store: BaseStore) -> int | None:
-    manifest_id = _section_chunk_id(skill_id, content_hash, _MANIFEST_SECTION_INDEX)
-    manifest_rows = store.get_chunks_by_ids([manifest_id])
-    if not manifest_rows:
-        return None
-    return _parse_section_count(manifest_rows[0].content)
+def _parse_manifest(chunk_or_content: SubconsciousChunk | dict) -> dict:
+    """Parse the ``key:value`` tokens of a manifest chunk's content."""
+
+    content = chunk_or_content["content"] if isinstance(chunk_or_content, dict) else chunk_or_content.content
+    tokens: dict[str, str] = {}
+    for token in content.split():
+        key, sep, value = token.partition(":")
+        if sep:
+            tokens[key] = value
+    sections = tokens.get("sections")
+    registered = tokens.get("registered_by")
+    kind = tokens.get("kind")
+    return {
+        "sections": int(sections) if sections and sections.isdigit() else None,
+        "kind": kind if kind in _KINDS else "reference",
+        "registered_by": registered if registered == _REGISTERED_BY_USER else None,
+        "content_hash": tokens.get("chash"),
+    }
+
+
+def _find_manifest(
+    skill_id: str, content_hash: str, store: BaseStore, salts: list[str | None]
+) -> tuple[SubconsciousChunk, dict, str | None] | None:
+    """Return ``(manifest, parsed, salt)`` for the first salt whose manifest exists."""
+
+    for salt in salts:
+        manifest_id = _section_chunk_id(skill_id, content_hash, _MANIFEST_SECTION_INDEX, pipeline_id=salt)
+        rows = store.get_chunks_by_ids([manifest_id])
+        if rows:
+            return rows[0], _parse_manifest(rows[0]), salt
+    return None
+
+
+def _lookup_salts(pipeline_id: str | None) -> list[str | None]:
+    # Pipeline-scoped copy first, then the global one.
+    return [pipeline_id, None] if pipeline_id else [None]
 
 
 def _load_complete_sections(
-    skill_id: str, content_hash: str, section_count: int, store: BaseStore
+    skill_id: str, content_hash: str, section_count: int, store: BaseStore, salt: str | None = None
 ) -> list[SubconsciousChunk] | None:
-    section_ids = [_section_chunk_id(skill_id, content_hash, i) for i in range(section_count)]
+    section_ids = [_section_chunk_id(skill_id, content_hash, i, pipeline_id=salt) for i in range(section_count)]
     rows_by_id = {chunk.chunk_id: chunk for chunk in store.get_chunks_by_ids(section_ids)}
     ordered = [rows_by_id[cid] for cid in section_ids if cid in rows_by_id]
     if len(ordered) != section_count:
@@ -442,14 +489,158 @@ def _load_complete_sections(
     return ordered
 
 
+@dataclass(slots=True)
+class SkillInfo:
+    """Manifest-level facts about one cached skill version."""
+
+    skill_id: str
+    content_hash: str
+    kind: str
+    section_count: int
+    registered_by: str | None
+    created_at: float
+    scope: str = "global"
+    pipeline_id: str | None = None
+
+    @property
+    def sections(self) -> int:
+        return self.section_count
+
+    @property
+    def age(self) -> float:
+        """Seconds since the manifest was written."""
+        return max(0.0, time.time() - self.created_at)
+
+
+def _complete_manifest_rows(skill_id: str | None, store: BaseStore, pipeline_id: str | None) -> list[SkillInfo]:
+    """All COMPLETE cached versions visible to ``pipeline_id`` (global + that pipeline), newest first.
+
+    Uses ``BaseStore.list_chunks`` (src/zone filtered, paged) to find
+    manifests, then verifies section completeness through
+    ``get_chunks_by_ids``. Backends without ``list_chunks`` yield nothing.
+    """
+
+    author = _skill_author(skill_id) if skill_id else None
+    candidates: list[tuple[dict, dict]] = []
+    offset = 0
+    for _ in range(_LIST_MAX_PAGES):
+        page = store.list_chunks(src="skill_ref", zone="proven", written_by=author, limit=_LIST_PAGE, offset=offset)
+        rows = page.get("chunks", [])
+        for row in rows:
+            if row.get("tombstoned") or not str(row["content"]).startswith("skill_ref manifest "):
+                continue
+            if not str(row["written_by"]).startswith(SKILL_AUTHOR_PREFIX):
+                continue
+            if row["scope"] != "global" and not (pipeline_id and row.get("pipeline_id") == pipeline_id):
+                continue
+            parsed = _parse_manifest(row)
+            if parsed["content_hash"] and parsed["sections"] is not None:
+                candidates.append((row, parsed))
+        offset += _LIST_PAGE
+        if len(rows) < _LIST_PAGE or offset >= int(page.get("total", 0)):
+            break
+
+    out: list[SkillInfo] = []
+    for row, parsed in candidates:
+        sid = str(row["written_by"])[len(SKILL_AUTHOR_PREFIX) :]
+        salt = row.get("pipeline_id") if row["scope"] == "pipeline" else None
+        if _load_complete_sections(sid, parsed["content_hash"], parsed["sections"], store, salt) is None:
+            continue
+        out.append(
+            SkillInfo(
+                skill_id=sid,
+                content_hash=parsed["content_hash"],
+                kind=parsed["kind"],
+                section_count=parsed["sections"],
+                registered_by=parsed["registered_by"],
+                created_at=float(row["created_at"]),
+                scope=str(row["scope"]),
+                pipeline_id=row.get("pipeline_id"),
+            )
+        )
+    out.sort(key=lambda info: info.created_at, reverse=True)
+    return out
+
+
+def latest_skill(
+    skill_id: str,
+    *,
+    store: BaseStore | None = None,
+    config: NCPConfig | None = None,
+    pipeline_id: str | None = None,
+) -> SkillInfo | None:
+    """Manifest info for the newest COMPLETE cached version of ``skill_id``, or ``None``.
+
+    Considers global caches plus, if ``pipeline_id`` is given, that
+    pipeline's own caches. Versions with a missing/expired section are skipped.
+    """
+
+    _validate_skill_id(skill_id)
+    resolved_store = store or create_store(config or load_config())
+    versions = _complete_manifest_rows(skill_id, resolved_store, pipeline_id)
+    return versions[0] if versions else None
+
+
+def list_skills(
+    *,
+    store: BaseStore | None = None,
+    config: NCPConfig | None = None,
+    pipeline_id: str | None = None,
+) -> list[SkillInfo]:
+    """One ``SkillInfo`` per ``skill_id`` (its latest complete version), newest first.
+
+    ``SkillInfo`` exposes ``skill_id``, ``content_hash``, ``kind``,
+    ``sections`` (alias of ``section_count``), ``registered_by`` and ``age``
+    (seconds).
+    """
+
+    resolved_store = store or create_store(config or load_config())
+    latest: dict[str, SkillInfo] = {}
+    for info in _complete_manifest_rows(None, resolved_store, pipeline_id):  # newest first
+        latest.setdefault(info.skill_id, info)
+    return list(latest.values())
+
+
+def is_registered_skill(
+    skill_id: str,
+    content_hash: str,
+    *,
+    store: BaseStore | None = None,
+    config: NCPConfig | None = None,
+    pipeline_id: str | None = None,
+) -> bool:
+    """True only if this exact version is complete AND was user-registered.
+
+    Checks the manifest is ``src="skill_ref"`` from the reserved author
+    namespace (so a forged chunk from another author never counts), records
+    ``registered_by:user``, and that every section is still present.
+    """
+
+    resolved_store = store or create_store(config or load_config())
+    found = _find_manifest(skill_id, content_hash, resolved_store, _lookup_salts(pipeline_id))
+    if found is None:
+        return False
+    manifest, info, salt = found
+    if manifest.src != "skill_ref" or manifest.written_by != _skill_author(skill_id):
+        return False
+    if info["registered_by"] != _REGISTERED_BY_USER or info["sections"] is None:
+        return False
+    return _load_complete_sections(skill_id, content_hash, info["sections"], resolved_store, salt) is not None
+
+
 def fetch_skill(
     skill_id: str,
     *,
-    content_hash: str,
+    content_hash: str | None = None,
     store: BaseStore | None = None,
     config: NCPConfig | None = None,
+    pipeline_id: str | None = None,
 ) -> str | None:
     """Return the full cached content for ``skill_id`` at ``content_hash``, verbatim, in order.
+
+    ``content_hash=None`` means the latest complete cached version (see
+    ``latest_skill()``). ``pipeline_id`` additionally makes that pipeline's
+    own scoped caches visible (looked up before global ones).
 
     For workflow/protocol skills where every subagent must see the identical
     content -- not a relevance-ranked slice of it. Returns ``None`` if the
@@ -467,11 +658,22 @@ def fetch_skill(
     resolved_config = config or load_config()
     resolved_store = store or create_store(resolved_config)
 
-    section_count = _load_manifest_section_count(skill_id, content_hash, resolved_store)
-    if section_count is None:
-        return None
+    if content_hash is None:
+        _validate_skill_id(skill_id)
+        versions = _complete_manifest_rows(skill_id, resolved_store, pipeline_id)
+        if not versions:
+            return None
+        content_hash = versions[0].content_hash
+        salts = [versions[0].pipeline_id if versions[0].scope == "pipeline" else None]
+    else:
+        salts = _lookup_salts(pipeline_id)
 
-    ordered = _load_complete_sections(skill_id, content_hash, section_count, resolved_store)
+    found = _find_manifest(skill_id, content_hash, resolved_store, salts)
+    if found is None or found[1]["sections"] is None:
+        return None
+    _, info, salt = found
+
+    ordered = _load_complete_sections(skill_id, content_hash, info["sections"], resolved_store, salt)
     if ordered is None:
         # Report a miss rather than silently returning a truncated protocol.
         return None
@@ -490,35 +692,32 @@ def recall_skills(
     k: int = 4,
     store: BaseStore | None = None,
     config: NCPConfig | None = None,
+    pipeline_id: str | None = None,
 ) -> list[SubconsciousChunk]:
-    """Relevance-ranked retrieval over cached skill/reference content.
+    """Relevance-ranked retrieval over cached *reference* skill content.
 
     For review/checklist skills, where a subagent only needs the section
     relevant to what it's looking at -- call this alongside your normal
-    ``ncp.get_context()`` call and fold the results into the subagent's
-    prompt. Not automatic inside ``get_context()`` itself; see the module
-    docstring for why (``zone="proven"`` vs. the assembler's
-    ``zone="working"`` retrieval).
+    ``ncp.get_context()`` call and fold the results in. Not automatic inside
+    ``get_context()`` itself; see the module docstring for why
+    (``zone="proven"`` vs. the assembler's ``zone="working"`` retrieval).
 
-    Queries ``zone="proven"``/``scope="global"`` (where ``cache_skill()``
-    writes) and filters to ``src="skill_ref"`` client-side, since
-    ``BaseStore.query()`` has no ``src`` filter parameter. This can also
-    surface manifest chunks incidentally if their content happens to score
-    -- callers that need to exclude them can check
-    ``"manifest" in chunk.conditions``.
+    Workflow skills (``kind="workflow"``) are excluded: they must be fetched
+    whole via ``fetch_skill()``, never as a relevance slice. Queries
+    ``zone="proven"``/``scope="global"`` (plus, if ``pipeline_id`` is given,
+    that pipeline's ``scope="pipeline"`` caches) and filters to
+    ``src="skill_ref"`` client-side, since ``BaseStore.query()`` has no
+    ``src`` filter parameter. This can also surface manifest chunks
+    incidentally if their content happens to score -- callers that need to
+    exclude them can check ``"manifest" in chunk.conditions``.
     """
 
     resolved_config = config or load_config()
     resolved_store = store or create_store(resolved_config)
-    hits = resolved_store.query(query, k=k, scope="global", zone="proven")
-    return [chunk for chunk in hits if chunk.src == "skill_ref"]
-
-
-def _parse_section_count(manifest_content: str) -> int | None:
-    marker = "sections:"
-    idx = manifest_content.rfind(marker)
-    if idx == -1:
-        return None
-    tail = manifest_content[idx + len(marker) :].strip()
-    digits = "".join(ch for ch in tail if ch.isdigit())
-    return int(digits) if digits else None
+    hits = list(resolved_store.query(query, k=k, scope="global", zone="proven"))
+    if pipeline_id:
+        seen = {chunk.chunk_id for chunk in hits}
+        for chunk in resolved_store.query(query, k=k, scope="pipeline", pipeline_id=pipeline_id, zone="proven"):
+            if chunk.chunk_id not in seen:
+                hits.append(chunk)
+    return [chunk for chunk in hits if chunk.src == "skill_ref" and "kind:workflow" not in chunk.conditions][:k]

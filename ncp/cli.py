@@ -1176,6 +1176,8 @@ def demo_command(
                    "[server].auth_token from config.toml. Required when binding to a non-loopback host.")
 @click.option("--cors-origin", "cors_origins", multiple=True,
               help="Allowed CORS origin for HTTP requests. May be passed multiple times.")
+@click.option("--profile", type=click.Choice(["minimal", "core", "standard", "full"]), default=None,
+              help="Narrow the advertised tool set below the configured [tools].profile (never widens it).")
 def serve_command(
     cwd: Path | None,
     store_path: Path | None,
@@ -1183,6 +1185,7 @@ def serve_command(
     port: int,
     auth_token: str | None,
     cors_origins: tuple[str, ...],
+    profile: str | None,
 ) -> None:
     """Start the MCP server over HTTP POST plus SSE discovery."""
 
@@ -1201,18 +1204,21 @@ def serve_command(
         cwd=cwd,
         auth_token=auth_token,
         cors_allowed_origins=list(cors_origins) or None,
+        profile=profile,
     )
 
 
 @main.command("serve-stdio", hidden=True)
 @click.option("--cwd", type=click.Path(path_type=Path), default=None)
 @click.option("--store-path", type=click.Path(path_type=Path), default=None)
-def serve_stdio_command(cwd: Path | None, store_path: Path | None) -> None:
+@click.option("--profile", type=click.Choice(["minimal", "core", "standard", "full"]), default=None,
+              help="Narrow the advertised tool set below the configured [tools].profile.")
+def serve_stdio_command(cwd: Path | None, store_path: Path | None, profile: str | None) -> None:
     """Internal compatibility transport used by tests and dogfood."""
 
     from ncp.mcp.server import serve as mcp_serve
 
-    mcp_serve(store_path=store_path, cwd=cwd)
+    mcp_serve(store_path=store_path, cwd=cwd, profile=profile)
 
 
 @main.command("dogfood")

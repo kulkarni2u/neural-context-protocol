@@ -8,6 +8,7 @@ in to cl100k_base counting when tiktoken and its encoding data are available.
 
 from __future__ import annotations
 
+import math
 import os
 from typing import cast
 
@@ -61,3 +62,40 @@ def token_unit() -> str:
     """Return the token-counting unit used by estimate_tokens()."""
 
     return "tiktoken/cl100k_base" if _resolve_encoder() is not None else "chars_div4"
+
+
+# Budget-enforcement counting (assembly only). ``estimate_tokens`` stays the raw,
+# margin-free estimate that benchmarks and reports use; the assembler counts
+# with ``estimate_budget_tokens`` so a block that "fits" is unlikely to overflow
+# a real tokenizer.
+DEFAULT_ESTIMATE_MARGIN = 0.9
+_DENSE_CHARS_PER_TOKEN = 2.5
+_DENSE_SYMBOL_FRACTION = 0.2
+
+
+def _is_symbol_dense(text: str) -> bool:
+    """True for mostly-code/JSON text, which tokenizes at far fewer chars/token."""
+
+    if not text:
+        return False
+    symbols = sum(1 for ch in text if not (ch.isalpha() or ch.isspace()))
+    return symbols / len(text) >= _DENSE_SYMBOL_FRACTION
+
+
+def estimate_budget_tokens(text: str, *, margin: float = DEFAULT_ESTIMATE_MARGIN) -> int:
+    """Conservative token estimate for budget enforcement.
+
+    With the ``chars_div4`` unit the plain chars/4 estimate is divided by
+    ``margin`` (0 < margin <= 1; 0.9 reserves 10%), and symbol-dense text
+    (code, JSON) uses a denser chars-per-token ratio. A real tokenizer
+    (``NCP_TOKEN_UNIT=tiktoken``) is already exact, so no margin is applied.
+    """
+
+    stripped = text.strip()
+    if not stripped:
+        return 0
+    if _resolve_encoder() is not None:
+        return estimate_tokens(stripped)
+    margin = min(1.0, max(0.1, margin))
+    per_token = _DENSE_CHARS_PER_TOKEN if _is_symbol_dense(stripped) else 4.0
+    return max(1, math.ceil(len(stripped) / (per_token * margin)))

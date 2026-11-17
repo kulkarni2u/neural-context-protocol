@@ -145,6 +145,7 @@ MCP_TOOLS: list[dict[str, object]] = [
                 "diversity_limit": {"type": "integer", "description": "Max chunks per author (default 2)."},
                 "max_tokens": {"type": "integer", "description": "Estimated token ceiling for the context block. Omit to let the adaptive budget decide (see response budget_tokens)."},
                 "compact": {"type": "boolean", "description": "Compact telemetry (default); false requests full diagnostics."},
+                "echo_ids": {"type": "boolean", "description": "Default true. false omits pending_whisper_ids and retrieved_chunk_ids; ncp_post_turn then uses the ids the server holds for this session."},
                 "response_max_tokens": {"type": "integer", "minimum": 1, "description": "Estimated token ceiling for the whole serialized response; diagnostics are dropped first, then context is re-fitted before streaming."},
                 "context_policy": {"type": "string", "description": "Name of a [context_policies.<name>] entry applied to this request only. Unknown or invalid names are rejected."},
                 "recent": {"type": "array", "items": {"type": "string"}},
@@ -325,9 +326,11 @@ MCP_TOOLS: list[dict[str, object]] = [
         "name": "ncp_post_turn",
         "description": (
             "Record the completed turn, update conscious state, log cost and acknowledge "
-            "whispers. Pass the pending_whisper_ids as ack_whisper_ids and the "
-            "retrieved_chunk_ids from ncp_get_context. Writes suppressed by dedup are listed "
-            "in suppressed_chunk_ids."
+            "whispers. Omit ack_whisper_ids and retrieved_chunk_ids to use the ids from this "
+            "session's last ncp_get_context (needs agent_id or session_id). result_full is "
+            "optional and for harnesses that already have the text; do not retype your answer "
+            "(omit it, or pass result_ref, a chunk id). Longer than [turns].result_full_max_chars "
+            "is truncated. Dedup-suppressed writes are listed in suppressed_chunk_ids."
         ),
         "inputSchema": {
             "type": "object",
@@ -341,6 +344,8 @@ MCP_TOOLS: list[dict[str, object]] = [
                 "turn_id": {"type": "string"},
                 "result_summary": {"type": "string"},
                 "result_full": {"type": "string"},
+                "result_ref": {"type": "string", "description": "Id of a chunk already written this turn, used as the full result."},
+                "session_id": {"type": "string", "description": "Optional; selects the session whose ncp_get_context ids are used."},
                 "model": {"type": "string"},
                 "input_tokens": {"type": "integer"},
                 "output_tokens": {"type": "integer"},
@@ -372,7 +377,7 @@ MCP_TOOLS: list[dict[str, object]] = [
                     },
                 },
             },
-            "required": ["agent_id", "role", "task", "slot", "intent", "result_summary", "result_full"],
+            "required": ["agent_id", "role", "task", "slot", "intent", "result_summary"],
         },
     },
     {
@@ -1027,7 +1032,13 @@ class FetchSession:
     fetch_count: int = 0
     pipeline_id: str | None = None
     last_access: float = field(default_factory=time.monotonic)
+    # Ids from this session's last ncp_get_context; ncp_post_turn defaults to
+    # them when it omits the matching fields (never for the shared default key).
+    pending_whisper_ids: list[str] | None = None
+    retrieved_chunk_ids: list[str] | None = None
 
+
+_RESULT_RAW_MAX_WINDOWS = 20
 
 # Bound the in-memory fetch-session table so a client rotating session_ids
 # cannot grow it without limit. Entries older than the TTL are dropped; if the
@@ -1397,6 +1408,9 @@ def make_handlers(
         compact = args.get("compact", config.tool_compact_default if config is not None else False)
         if not isinstance(compact, bool):
             raise ValueError("ncp_get_context 'compact' must be a boolean")
+        echo_ids = args.get("echo_ids", True)
+        if not isinstance(echo_ids, bool):
+            raise ValueError("ncp_get_context 'echo_ids' must be a boolean")
         response_max_tokens: int | None = None
         if args.get("response_max_tokens") is not None:
             response_max_tokens = _int_arg(args, "response_max_tokens", 0)
@@ -1530,6 +1544,16 @@ def make_handlers(
                 return refit_fields
 
             response = fit_response(response, response_max_tokens, reassemble=_refit)
+        if session_id != DEFAULT_FETCH_SESSION_ID:
+            # Server-held ids for ncp_post_turn; never kept for the shared key.
+            with sessions_lock:
+                held = sessions.setdefault(session_id, FetchSession())
+                held.pending_whisper_ids = list(fitted_result.pending_whisper_ids)
+                held.retrieved_chunk_ids = _retrieved_chunk_ids(fitted_result)
+                held.last_access = time.monotonic()
+        if not echo_ids:
+            response.pop("pending_whisper_ids", None)
+            response.pop("retrieved_chunk_ids", None)
         if stream:
             sections = assembler.sections_from_result(result=fitted_result, budget=budget)
             # post_assemble middleware (applied to the whole context, also by
@@ -2055,8 +2079,56 @@ def make_handlers(
     def _handle_post_turn(args: dict[str, object]) -> object:
         conscious = _build_conscious_from_args(store, args)
         assembler = Assembler(store=store, config=config)
+        result_summary = str(args["result_summary"])
+        raw_ref_ids: list[str] = []
+        config_result_cap = config.turn_result_full_max_chars if config is not None else 8000
+        result_full: str
+        if args.get("result_full") is not None:
+            result_full = str(args["result_full"])
+        elif args.get("result_ref") is not None:
+            ref_id = str(args["result_ref"])
+            found = store.get_chunks_by_ids([ref_id])
+            if not found:
+                raise ValueError(f"ncp_post_turn: result_ref {ref_id!r} is not a stored chunk")
+            ref_chunk = found[0]
+            if getattr(ref_chunk, "scope", "pipeline") != "global" and ref_chunk.pipeline_id != conscious.pipeline_id:
+                raise ValueError(f"ncp_post_turn: result_ref {ref_id!r} is outside this turn's pipeline")
+            result_full = ref_chunk.content
+            # An over-cap result_ref needs no copy: the chunk is its own original.
+            raw_ref_ids = [ref_id] if len(result_full) > config_result_cap else []
+        else:
+            result_full = result_summary
+        result_truncated = len(result_full) > config_result_cap
+        original_full = result_full
+        if result_truncated:
+            result_full = result_full[:config_result_cap]
+        # Server-held ids: an omitted field defaults to what this session's last
+        # ncp_get_context returned; an explicit array (even empty) is used as is.
+        post_session_id = _session_id_from_args(args)
+        defaulted: set[str] = set()
+        held_whispers: list[str] = []
+        held_chunks: list[str] = []
+        if args.get("ack_whisper_ids") is None or args.get("retrieved_chunk_ids") is None:
+            if post_session_id == DEFAULT_FETCH_SESSION_ID:
+                raise ValueError(
+                    "ncp_post_turn: ack_whisper_ids/retrieved_chunk_ids were omitted but the session is the "
+                    "shared default; pass agent_id or session_id (or send the ids explicitly)"
+                )
+            with sessions_lock:
+                held = sessions.get(post_session_id)
+                if held is not None:
+                    held_whispers = list(held.pending_whisper_ids or [])
+                    held_chunks = list(held.retrieved_chunk_ids or [])
+        if args.get("ack_whisper_ids") is None:
+            args = {**args, "ack_whisper_ids": held_whispers}
+            if held_whispers:
+                defaulted.add("pending_whisper_ids")
+        if args.get("retrieved_chunk_ids") is None:
+            args = {**args, "retrieved_chunk_ids": held_chunks}
+            if held_chunks:
+                defaulted.add("retrieved_chunk_ids")
         response = NCPResponse(
-            content=str(args["result_full"]),
+            content=result_full,
             turn_id=str(args.get("turn_id") or f"turn_{int(time.time() * 1000)}_{uuid4().hex[:12]}"),
             pipeline_id=conscious.pipeline_id,
             model=str(args.get("model", "unknown")),
@@ -2083,16 +2155,49 @@ def make_handlers(
             memory_chunks.append(chunk)
             if demoted:
                 demoted_chunk_ids.append(chunk.chunk_id)
+        if result_truncated and not raw_ref_ids:
+            # Chunk content is capped at 2000 chars, so the untruncated original
+            # is kept as consecutive raw chunks (bounded) the turn can point at.
+            window = 2000
+            for index, start in enumerate(range(0, len(original_full), window)):
+                if index >= _RESULT_RAW_MAX_WINDOWS:
+                    break
+                raw_chunk = SubconsciousChunk(
+                    chunk_id=f"raw_turn_{int(time.time() * 1000)}_{uuid4().hex[:12]}",
+                    layer="episodic",
+                    content=original_full[start:start + window],
+                    src="tool_result",
+                    written_by=conscious.agent_id,
+                    pipeline_id=conscious.pipeline_id,
+                    base_trust=0.1,
+                    zone="working",
+                )
+                if store.write(raw_chunk):
+                    raw_ref_ids.append(raw_chunk.chunk_id)
         record = assembler.post_turn(
             conscious=conscious,
             response=response,
-            result_summary=str(args["result_summary"]),
-            result_full=str(args["result_full"]),
+            result_summary=result_summary,
+            result_full=result_full,
             memory_chunks=memory_chunks or None,
             ack_whisper_ids=ack_ids,
             retrieved_chunk_ids=retrieved_ids or None,
         )
+        if defaulted:
+            with sessions_lock:
+                held = sessions.get(post_session_id)
+                if held is not None:
+                    if "pending_whisper_ids" in defaulted:
+                        held.pending_whisper_ids = None
+                    if "retrieved_chunk_ids" in defaulted:
+                        held.retrieved_chunk_ids = None
         result: dict[str, object] = {"posted": True, "turn_id": record.turn_id, "acknowledged_whisper_ids": ack_ids}
+        if result_truncated:
+            result["result_truncated"] = True
+        if raw_ref_ids:
+            result["raw_ref"] = raw_ref_ids[0]
+            if len(raw_ref_ids) > 1:
+                result["raw_ref_chunk_ids"] = raw_ref_ids
         # WI-007(a): surface dedup-suppressed memory writes to the host.
         if record.suppressed_chunk_ids:
             result["suppressed_chunk_ids"] = record.suppressed_chunk_ids
@@ -3214,8 +3319,11 @@ def _create_handlers_with_store(
     *,
     store_path: str | Path | None = None,
     cwd: Path | None = None,
+    profile: str | None = None,
 ) -> tuple[dict[str, ToolHandler], BaseStore, list[dict[str, object]]]:
-    handlers, store, tools, _notifier, _config = _create_server_parts(store_path=store_path, cwd=cwd)
+    handlers, store, tools, _notifier, _config = _create_server_parts(
+        store_path=store_path, cwd=cwd, profile=profile
+    )
     return handlers, store, tools
 
 
@@ -3231,11 +3339,13 @@ def _create_server_parts(
     *,
     store_path: str | Path | None = None,
     cwd: Path | None = None,
+    profile: str | None = None,
 ) -> tuple[dict[str, ToolHandler], BaseStore, list[dict[str, object]], Notifier | None, NCPConfig]:
     """Build handlers plus the ONE notifier the handlers and HTTP /events share."""
     config = _load_server_config(store_path=store_path, cwd=cwd)
     store = create_store(config)
-    tools = tools_for_config(config)
+    # ``profile`` (``ncp serve --profile``) can only narrow the configured set.
+    tools = narrow_tools(tools_for_config(config), profile=profile)
     notifier = get_process_notifier(config, store=store)
     handlers = handlers_for_tools(make_handlers(store, config=config, notifier=notifier), tools)
     return handlers, store, tools, notifier, config
@@ -3247,10 +3357,11 @@ def serve_streams(
     *,
     store_path: str | Path | None = None,
     cwd: Path | None = None,
+    profile: str | None = None,
 ) -> None:
     """Run the MCP server against arbitrary binary streams."""
     try:
-        handlers, _store, tools = _create_handlers_with_store(store_path=store_path, cwd=cwd)
+        handlers, _store, tools = _create_handlers_with_store(store_path=store_path, cwd=cwd, profile=profile)
     except Exception as exc:
         _err(f"NCP server failed to start: {exc}\n{traceback.format_exc()}")
         sys.exit(1)
@@ -3301,9 +3412,14 @@ def serve_streams(
             _write_message(output_stream, response)
 
 
-def serve(store_path: str | Path | None = None, *, cwd: Path | None = None) -> None:
+def serve(
+    store_path: str | Path | None = None,
+    *,
+    cwd: Path | None = None,
+    profile: str | None = None,
+) -> None:
     """Run the MCP stdio server loop."""
-    serve_streams(sys.stdin.buffer, sys.stdout.buffer, store_path=store_path, cwd=cwd)
+    serve_streams(sys.stdin.buffer, sys.stdout.buffer, store_path=store_path, cwd=cwd, profile=profile)
 
 
 # ----------------------------------------------------------------------
@@ -3694,6 +3810,21 @@ class _MCPHTTPHandler(BaseHTTPRequestHandler):
         principal = registry.resolve_authorization(self.headers.get("Authorization"))
         return principal is not None, principal
 
+    def _requested_profile(self) -> str | None:
+        """Tool profile asked for by ``?profile=`` (first) or ``X-NCP-Tool-Profile``."""
+        query = _query_params(urllib.parse.urlsplit(self.path).query)
+        value = query.get("profile") or self.headers.get(TOOL_PROFILE_HEADER)
+        value = (value or "").strip()
+        return value or None
+
+    def _connection_tools(self, principal: Principal | None) -> list[dict[str, object]]:
+        """The tools this connection may list and call: server set, narrowed only."""
+        return narrow_tools(
+            self.server.tools,
+            profile=self._requested_profile(),
+            allowed_names=None if principal is None else principal.tools,
+        )
+
     def _send_forbidden(self, exc: AuthorizationError) -> None:
         self._send_json(HTTPStatus.FORBIDDEN, {"error": "forbidden", "detail": str(exc)})
 
@@ -3800,13 +3931,19 @@ class _MCPHTTPHandler(BaseHTTPRequestHandler):
                 {"ok": True, "transport": "http_sse", "rpc_path": self.server.rpc_path, "sse_path": self.server.sse_path},
             )
             return
-        if self.path == self.server.sse_path:
+        if urllib.parse.urlsplit(self.path).path == self.server.sse_path:
             if not self._origin_allowed():
                 self._send_json(HTTPStatus.FORBIDDEN, {"error": "forbidden_origin"})
                 return
             if not self._authenticate()[0]:
                 self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
                 return
+            # Carry the requested tool profile to the POST endpoint the client
+            # is told to use, so a legacy SSE client keeps its narrow set.
+            requested_profile = self._requested_profile()
+            endpoint = self.server.rpc_path
+            if requested_profile:
+                endpoint += "?" + urllib.parse.urlencode({"profile": requested_profile})
 
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "text/event-stream")
@@ -3815,7 +3952,7 @@ class _MCPHTTPHandler(BaseHTTPRequestHandler):
             self._send_cors_headers()
             self.end_headers()
             try:
-                endpoint_event = f"event: endpoint\ndata: {self.server.rpc_path}\n\n".encode("utf-8")
+                endpoint_event = f"event: endpoint\ndata: {endpoint}\n\n".encode("utf-8")
                 self.wfile.write(endpoint_event)
                 self.wfile.flush()
                 while not self.server._shutdown_event.is_set():
@@ -4033,7 +4170,7 @@ class _MCPHTTPHandler(BaseHTTPRequestHandler):
         self.rfile.read(content_length)
 
     def do_POST(self) -> None:
-        if self.path not in (self.server.rpc_path, "/message"):
+        if urllib.parse.urlsplit(self.path).path not in (self.server.rpc_path, "/message"):
             self._drain_request_body()
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
             return
@@ -4078,7 +4215,7 @@ class _MCPHTTPHandler(BaseHTTPRequestHandler):
         response = _handle_request(
             payload,
             self.server.handlers,
-            tools=self.server.tools,
+            tools=self._connection_tools(principal),
             principal=principal,
             authorizer=self.server.authorizer,
         )
@@ -4111,8 +4248,11 @@ def create_http_server(
     max_body_bytes: int = 10_485_760,
     max_subscribers: int | None = None,
     socket_timeout_seconds: float | None = _HTTP_SOCKET_TIMEOUT_SECONDS,
+    profile: str | None = None,
 ) -> _MCPHTTPServer:
-    handlers, store, tools, notifier, config = _create_server_parts(store_path=store_path, cwd=cwd)
+    handlers, store, tools, notifier, config = _create_server_parts(
+        store_path=store_path, cwd=cwd, profile=profile
+    )
     # Raises PrincipalConfigError on an invalid [principals] table: fail closed.
     principals = load_principals(config.principals_config, legacy_token=auth_token or None)
     return _MCPHTTPServer(
@@ -4146,6 +4286,7 @@ def serve_http(
     auth_token: str | None = None,
     cors_allowed_origins: list[str] | None = None,
     max_body_bytes: int = 10_485_760,
+    profile: str | None = None,
 ) -> None:
     """Run the MCP server over HTTP POST plus an SSE discovery stream.
 
@@ -4177,6 +4318,7 @@ def serve_http(
             auth_token=auth_token,
             cors_allowed_origins=cors_allowed_origins,
             max_body_bytes=max_body_bytes,
+            profile=profile,
         )
     except Exception as exc:
         _err(f"NCP HTTP server failed to start: {exc}\n{traceback.format_exc()}")
