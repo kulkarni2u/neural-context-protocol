@@ -1556,6 +1556,8 @@ class SQLiteStore(BaseStore):
             src_id, dst_id = str(src["problem_id"]), str(dst["problem_id"])
             if src_id == dst_id:
                 return
+            if src["pipeline_id"] != dst["pipeline_id"]:
+                raise ValueError("cannot merge improvement problems across pipelines")
             connection.execute(
                 "UPDATE improvement_problems SET alias_of = ? WHERE problem_id = ?", (dst_id, src_id)
             )

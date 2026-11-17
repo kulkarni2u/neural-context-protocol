@@ -157,3 +157,15 @@ Once the task is validated (tests pass, review approved), call
 `ncp_record_outcome` with the chunk/turn IDs that informed it. This is what
 closes the loop — without it, a subagent's contribution never earns or
 loses trust, and `ncp calibrate --feedback` has nothing to work from.
+
+## Improvement records
+
+When a turn changes a procedure, skill or harness file, record the attempt with
+`ncp_improvement_log` (`record_attempt`), citing a problem by `problem_id` or
+`problem_name` (the root-cause hypothesis), with `what`, `rationale`,
+`predicted` task ids and the `model`/`benchmark` it was evaluated on. Check
+`ncp_improvement_log` (`get`) for prior attempts before starting.
+When you record the result with `ncp_record_outcome`, pass `model`, `task` and
+`eval_source` (`verifier` or `human` when something other than you checked it;
+`self_report` is the default and can be down-weighted by the operator). Do not prune a procedure before it has
+a working anchor. Follow the usage rules in `docs/NCP_SELF_IMPROVEMENT.md`.

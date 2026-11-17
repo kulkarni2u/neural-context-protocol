@@ -713,6 +713,28 @@ curl -s $BASE/mcp -H "$AUTH" -H 'Content-Type: application/json' -d '{
 - `merge` — `src_problem_id`, `dst_problem_id`: the source becomes an alias and
   its attempts move to the destination; nothing is deleted.
 
+### ncp_record_outcome — outcome with evaluation context
+
+Records whether the chunks that informed a task worked. Give `success` and
+either `chunk_ids` or `turn_id`. v1.9.7 adds optional context fields, all
+backward compatible:
+
+- `pipeline_id`, `task`, `slot` — where the outcome applies. When omitted, a
+  caller that identifies itself (`agent_id`, or a `session_id`) gets the values
+  from its last `ncp_get_context`; the shared default session never borrows.
+- `model`, `benchmark` — what the evaluation ran against.
+- `eval_source` — `self_report` (default), `verifier` or `human`. Self-reports
+  are weighted by `[calibration].self_report_weight` during calibration.
+- `output_tokens`, `input_tokens`, `turns` — non-negative integers; the prune
+  gate compares mean output tokens.
+- `agent_id` — the caller; under `[principals]` it must match the principal.
+
+The response is `{recorded, outcome_id, calibrated}` (plus `decision_linked`
+when a `decision_id` resolves). `calibrated` is true when this call ran
+feedback calibration: it runs automatically after a recorded outcome, at most
+once per `[calibration].auto_min_interval_seconds` (default 60) per pipeline,
+and can be turned off with `[calibration].auto_on_outcome = false`.
+
 ### POST /skills — register a user skill
 
 Plain HTTP route (not an MCP tool). Requires `[principals]` with the

@@ -1783,6 +1783,8 @@ class PgvectorStore(BaseStore):
                     raise ValueError(f"unknown improvement problem {dst_problem_id!r}")
                 src_id, dst_id = str(src["problem_id"]), str(dst["problem_id"])
                 if src_id != dst_id:
+                    if src["pipeline_id"] != dst["pipeline_id"]:
+                        raise ValueError("cannot merge improvement problems across pipelines")
                     cursor.execute(
                         self._sql(
                             "UPDATE {schema}.{prefix}improvement_problems SET alias_of = %s WHERE problem_id = %s"
