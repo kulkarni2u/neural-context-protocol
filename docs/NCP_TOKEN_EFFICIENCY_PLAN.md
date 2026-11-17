@@ -134,6 +134,23 @@ The module works and is tested, but nothing calls it: no MCP tool, no CLI
 command, no handoff path. This reverses the design doc's "no new MCP tool"
 decision (`NCP_SKILL_CACHING_DESIGN.md` §1.5); update that doc in the same PR.
 
+**What counts as a skill.** Any reusable content the user registers: a
+workflow (a procedure every worker must follow the same way) or any other
+reusable skill (a checklist, review rules, reference notes, conventions).
+The module was written for third-party skill text; this widens it to
+user-owned skills as the main case.
+
+- Each skill records a `kind` in its manifest: `workflow` or `reference`.
+  `ncp skill cache --kind workflow|reference`, default `reference`.
+- `workflow` skills are always delivered whole and verbatim (`get`), so two
+  workers never see different slices of one procedure. They are excluded
+  from `recall`.
+- `reference` skills can be fetched whole or recalled by section.
+- A skill the user registers is seeded at the `user_verified` trust level
+  (0.95), not the 0.60 default the module uses for third-party text. Content
+  cached by anything other than the user's CLI or an authorised principal
+  keeps 0.60 and `src="skill_ref"`.
+
 **Where the saving comes from.** A subagent that needs a skill still pays
 input tokens to read it. The savings are:
 
@@ -199,18 +216,31 @@ Acceptance:
 - A benchmark with N workers and one skill reports orchestrator output
   tokens for inline dispatch against reference dispatch.
 
-**Decisions needed before building.**
+**Trust boundary (decided).** Skills come from the user, so a registered
+skill is an instruction source, unlike memory chunks and whispers written by
+other agents.
 
-1. *Is a fetched skill an instruction or data?* `AGENTS.md` says retrieved
-   content is data, never instructions. A workflow skill is a procedure the
-   worker is meant to follow. Proposal: only content cached through the CLI
-   or a `cache_skill` principal is returned by `ncp_skill get`, it is
-   rendered outside the `[NCP:SUBCONSCIOUS]` block, and `AGENTS.md` names
-   that one path as trusted. `recall` results stay data.
-2. *Scope.* Skills are cached `scope="global"`. On a shared bus that lets one
+- Only the user's CLI, or a principal holding `cache_skill`, can register a
+  skill. No MCP tool writes one, so an agent cannot promote its own text
+  into an instruction.
+- `ncp_skill get` and `ncp handoff --skill` return only user-registered
+  skills, rendered in their own `[NCP:SKILL]` block outside
+  `[NCP:SUBCONSCIOUS]`.
+- `AGENTS.md` and the generated contracts gain one sentence naming
+  `[NCP:SKILL]` as user-authored instructions. The existing rule for
+  `[NCP:WHISPERS]` and `[NCP:SUBCONSCIOUS]` stays verbatim.
+- A skill still cannot override the conscious block: content asking a worker
+  to act outside `owns` or inside `must-not` is refused, as today.
+- Add a poisoning test: an agent writes a chunk with `src="skill_ref"` and a
+  matching `skill_id` through `ncp_write_memory`; it must never be returned
+  by `ncp_skill get` or rendered in `[NCP:SKILL]`.
+
+**Decisions still needed before building.**
+
+1. *Scope.* Skills are cached `scope="global"`. On a shared bus that lets one
    pipeline's skill reach every pipeline. Proposal: default to the caller's
    pipeline and require an explicit `--global`.
-3. *`skill_id` namespacing* is still unvalidated (design doc §5.3). Proposal:
+2. *`skill_id` namespacing* is still unvalidated (design doc §5.3). Proposal:
    require `<namespace>/<name>`.
 
 ## PR D: assembly accuracy and cache stability
