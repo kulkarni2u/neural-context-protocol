@@ -357,6 +357,7 @@ MCP_TOOLS: list[dict[str, object]] = [
                 "result_summary": {"type": "string"},
                 "result_full": {"type": "string"},
                 "result_ref": {"type": "string", "description": "Id of a chunk already written this turn, used as the full result."},
+                "redact": {"type": "boolean", "description": "Default false. true redacts secrets from result_summary, result_full and memory_chunks content before storing."},
                 "session_id": {"type": "string", "description": "Optional; selects the session whose ncp_get_context ids are used."},
                 "model": {"type": "string"},
                 "input_tokens": {"type": "integer"},
@@ -1153,6 +1154,7 @@ def _reject_skill_poisoning(
     conditions: object = None,
     zone: object = None,
     supersedes: object = None,
+    edges: object = None,
 ) -> None:
     """Refuse agent writes that forge or touch the reserved skill-cache namespace.
 
@@ -1171,6 +1173,10 @@ def _reject_skill_poisoning(
         )
     if supersedes is not None and is_reserved_skill_identity(chunk_id=str(supersedes)):
         raise ValueError(f"{where} rejected: a cached skill chunk cannot be superseded by an agent")
+    if isinstance(edges, list):
+        for edge in edges:
+            if isinstance(edge, dict) and is_reserved_skill_identity(chunk_id=str(edge.get("dst", ""))):
+                raise ValueError(f"{where} rejected: an agent cannot create an edge onto a cached skill chunk")
     if src == "skill_ref":
         claims_user = isinstance(conditions, list) and any(str(c) == "registered_by:user" for c in conditions)
         if claims_user or zone == "proven":
@@ -1684,6 +1690,10 @@ def make_handlers(
         extra_telemetry: dict[str, object] = {}
         if result.over_budget:
             extra_telemetry["over_budget"] = True
+        if getattr(result, "conscious_truncated", False):
+            extra_telemetry["conscious_truncated"] = True
+        if getattr(result, "conscious_tokens", 0):
+            extra_telemetry["conscious_tokens"] = getattr(result, "conscious_tokens")
         if delta:
             extra_telemetry["delta"] = (
                 {"applied": True, "seen": len(_seen_ids(result, prior_delivered))}
@@ -1696,11 +1706,13 @@ def make_handlers(
         if extra_telemetry and isinstance(response.get("telemetry"), dict):
             response["telemetry"].update(extra_telemetry)  # type: ignore[union-attr]
         fitted_result = result
+        refit_ceiling: int | None = None
         if response_max_tokens is not None:
             def _refit(ceiling: int) -> dict[str, object]:
-                nonlocal fitted_result
+                nonlocal fitted_result, refit_ceiling
                 refitted = assembler.refit(result, budget=budget, max_tokens=ceiling, query_text=search_text)
                 fitted_result = refitted
+                refit_ceiling = ceiling
                 refit_fields: dict[str, object] = {
                     "context": refitted.context,
                     "pending_whisper_ids": refitted.pending_whisper_ids,
@@ -1711,6 +1723,13 @@ def make_handlers(
                 return refit_fields
 
             response = fit_response(response, response_max_tokens, reassemble=_refit)
+            if refit_ceiling is not None and isinstance(response.get("telemetry"), dict):
+                # The refit changed the context: judge the final text against the
+                # ceiling it was refitted to, not the first assembly's flag.
+                if assembler._count(fitted_result.context) > refit_ceiling:
+                    response["telemetry"]["over_budget"] = True
+                else:
+                    response["telemetry"].pop("over_budget", None)
         if session_id != DEFAULT_FETCH_SESSION_ID:
             # Server-held ids for ncp_post_turn; never kept for the shared key.
             with sessions_lock:
@@ -1757,7 +1776,7 @@ def make_handlers(
         _reject_skill_poisoning(
             where="ncp_write_memory", written_by=written_by, chunk_id=args.get("chunk_id"),
             src=args.get("src"), conditions=args.get("conditions"), zone=args.get("zone"),
-            supersedes=args.get("supersedes"),
+            supersedes=args.get("supersedes"), edges=args.get("edges"),
         )
         pipeline_id = args.get("pipeline_id")
         latest = store.load_latest_conscious(
@@ -2266,6 +2285,23 @@ def make_handlers(
         return SubconsciousChunk(**chunk_kwargs), demoted
 
     def _handle_post_turn(args: dict[str, object]) -> object:
+        redact = args.get("redact", False)
+        if not isinstance(redact, bool):
+            raise ValueError("ncp_post_turn 'redact' must be a boolean")
+        if redact:
+            # Same redactor as persisted handoff output (lazy: heavy import).
+            from ncp.agent_handoff import _redact_secrets
+
+            args = dict(args)
+            for key in ("result_summary", "result_full"):
+                if args.get(key) is not None:
+                    args[key] = _redact_secrets(str(args[key]))
+            if isinstance(args.get("memory_chunks"), list):
+                args["memory_chunks"] = [
+                    {**item, "content": _redact_secrets(str(item["content"]))}
+                    if isinstance(item, dict) and item.get("content") is not None else item
+                    for item in args["memory_chunks"]
+                ]
         conscious = _build_conscious_from_args(store, args)
         assembler = Assembler(store=store, config=config)
         result_summary = str(args["result_summary"])
@@ -2280,6 +2316,8 @@ def make_handlers(
             if not found:
                 raise ValueError(f"ncp_post_turn: result_ref {ref_id!r} is not a stored chunk")
             ref_chunk = found[0]
+            if is_reserved_skill_identity(chunk_id=ref_id):
+                raise ValueError(f"ncp_post_turn: result_ref {ref_id!r} is in the reserved skill-cache namespace")
             if getattr(ref_chunk, "scope", "pipeline") != "global" and ref_chunk.pipeline_id != conscious.pipeline_id:
                 raise ValueError(f"ncp_post_turn: result_ref {ref_id!r} is outside this turn's pipeline")
             result_full = ref_chunk.content
