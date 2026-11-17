@@ -783,6 +783,7 @@ def test_reduce_fanin_disabled_by_default_leaves_worker_burst_unreduced(tmp_path
         store.write(_fanin_worker_chunk(f"worker_{index}", claim, base_trust=0.4 + index * 0.1))
 
     assembler = Assembler(store=store)
+    assembler._reduce_fanin_auto_min_writers = 0  # auto fan-in (3+ writers) is a separate default
     result = assembler.assemble(
         conscious=_make_conscious(pipeline_id="pipe_fanin"),
         budget=BudgetContext(ctx_used=0.2, steps_completed=1, steps_total=3, elapsed_seconds=10),

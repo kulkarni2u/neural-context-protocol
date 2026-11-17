@@ -69,7 +69,7 @@ def test_tool_profile_invalid_value_falls_back_to_standard(tmp_path: Path) -> No
     project = tmp_path / "repo"
     (project / ".git").mkdir(parents=True)
     (project / ".ncp").mkdir()
-    (project / ".ncp" / "config.toml").write_text('[tools]\nprofile = "minimal"\n')
+    (project / ".ncp" / "config.toml").write_text('[tools]\nprofile = "bogus"\n')
 
     assert load_config(cwd=project).tool_profile == "standard"
 
@@ -234,7 +234,7 @@ def test_retrieval_diversity_lambda_defaults_and_overrides(tmp_path) -> None:
     (project / ".git").mkdir(parents=True)
     (project / ".ncp").mkdir()
 
-    assert load_config(cwd=project).diversity_lambda == 1.0
+    assert load_config(cwd=project).diversity_lambda == pytest.approx(1.0)
 
     (project / ".ncp" / "config.toml").write_text("[retrieval]\ndiversity_lambda = 0.7\n")
     assert load_config(cwd=project).diversity_lambda == pytest.approx(0.7)

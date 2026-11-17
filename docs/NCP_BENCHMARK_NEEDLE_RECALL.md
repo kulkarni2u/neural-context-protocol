@@ -19,23 +19,18 @@ python3 benchmarks/needle/run.py --turns 24 --needles 6 --budget 4
 
 ## Current result
 
-Observed on June 1, 2026:
+Observed on November 17, 2026:
 
 - token unit: `word_split`
 - budget mode: `chunk_budget`
 - budget: `4` chunks
-- final NCP recall: `0.50`
+- final NCP recall: `1.00`
 - final sliding-window recall: `0.00`
 - reported deficit: `false`
 
 First needle eviction turns (NCP retrieval — first turn where NCP failed to retrieve the needle):
 
-- `needle_01`: retained through the final turn
-- `needle_02`: retained through the final turn
-- `needle_03`: retained through the final turn
-- `needle_04`: evicted at turn `6`
-- `needle_05`: evicted at turn `6`
-- `needle_06`: evicted at turn `6`
+- `needle_01` to `needle_06`: retained through the final turn (no evictions)
 
 ### Plain RAG arm (added v1.8.x)
 
@@ -62,8 +57,7 @@ Every needle query shares a unique slug (`constraint_1`, ...) with exactly one
 chunk, and the fillers share none, so any lexical retriever solves it. It
 shows that NCP's retrieval is not worse than BM25 and beats recency; it does
 not exercise trust weighting, contradiction handling, or distinguishing
-near-duplicate candidates. (The `0.50` figures above were measured on an older
-revision; the current code reproduces `1.00` for NCP.) New summary keys:
+near-duplicate candidates. New summary keys:
 `recall_at_final.plain_rag`, `ncp_beats_plain_rag`,
 `ncp_ties_or_beats_plain_rag`; per-turn `plain_rag_recall`,
 `plain_rag_hits`, `plain_rag_budget_tokens`. No CI gate asserts NCP beats plain

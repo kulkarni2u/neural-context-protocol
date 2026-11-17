@@ -699,3 +699,32 @@ reasonable for a single trusted harness's own skills, less so if this ever
 runs on a multi-tenant bus with arbitrary third-party MCP hosts), and
 `skill_id` namespacing enforcement (§5.3 — documented as the caller's
 responsibility, not validated).
+
+## 7. Update, 2026-11-17: `ncp_skill` added (the "no new MCP tool" decision is reversed)
+
+The decision in §1.5 to add no MCP tool is reversed in v1.9.6. Reason: the
+token-efficiency work (`NCP_TOKEN_EFFICIENCY_PLAN.md`, item 9) wants
+subagents to receive a skill by reference and read it on demand. Pushing the
+text through `ncp_fetch` or the orchestrator's own prompt costs tokens on
+every dispatch, and `ncp_fetch` reads only the working zone, so cached skills
+needed their own route.
+
+What shipped:
+
+- MCP tool `ncp_skill` with `get`, `recall` and `list`, advertised only when
+  `[skill_cache].enabled = true`. `ncp_get_context` takes `skills` (ids in, a
+  `skills:` conscious line out, no text). `ncp handoff` and `ncp run-turn` take
+  `--skill`.
+- `ncp skill cache|list|show` and `POST /skills`. A skill has a `kind`
+  (`workflow` or `reference`) and exactly one scope: a pipeline or global.
+  Ids are `<namespace>/<name>`.
+
+Trust rule: only skills registered by a user (CLI, or `POST /skills` by a
+principal with the `cache_skill` capability) are served by `ncp_skill get`
+and `--skill`. A `[NCP:SKILL]` block is therefore user-authored instruction,
+still bounded by `owns` and `must-not`. Agent write paths (`ncp_write_memory`,
+`ncp_post_turn` memory chunks, `ncp_record_decision`, ...) reject writes that
+create or alter skill chunks, so an agent cannot plant a skill. Skills that a
+library-mode harness caches with `cache_skill()` are not user-registered and
+are never returned as `[NCP:SKILL]`. The §5.1 global-scope concern still
+applies; `--global` is an explicit choice, not a default.

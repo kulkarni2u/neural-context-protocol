@@ -1084,9 +1084,13 @@ def test_complete_handoff_persists_bounded_memory_before_acknowledgement(
         response=response,
     )
 
-    assert events == ["write", "ack"]
-    assert len(written) == 1
-    chunk = written[0]
+    assert events == ["write"] * len(written) + ["ack"]
+    assert len(written) > 2  # long response: several raw parts, then the completion
+    *raw_parts, chunk = written
+    assert raw_parts[-1].chunk_id == chunk.raw_ref  # head part is written last
+    assert all(part.raw_ref for part in raw_parts[1:])
+    assert all("sk-live-supersecret" not in part.content for part in raw_parts)
+    assert all(len(part.content) <= 2000 for part in raw_parts)
     assert chunk.layer == "episodic"
     assert chunk.src == "tool_result"
     assert chunk.pipeline_id == "pipe_lifecycle"
@@ -1253,6 +1257,6 @@ def test_complete_handoff_redacts_common_oauth_aws_and_quoted_credentials(
         pipeline_id="pipe_redaction",
         layer="episodic",
     )
-    assert len(chunks) == 1
-    assert secret_value not in chunks[0].content
-    assert "[REDACTED]" in chunks[0].content
+    assert len(chunks) == 2
+    assert all(secret_value not in chunk.content for chunk in chunks)
+    assert any("[REDACTED]" in chunk.content for chunk in chunks)

@@ -1,5 +1,6 @@
 from pathlib import Path
 import json
+import os
 import re
 
 from click.testing import CliRunner
@@ -48,6 +49,9 @@ def test_cli_init_prompts_for_detected_provider_hooks(
     assert "OpenCode detected" in result.output
     assert (tmp_path / ".claude" / "settings.json").exists()
     assert (tmp_path / ".claude" / "hooks" / "ncp-session-start.sh").exists()
+    lifecycle = tmp_path / ".claude" / "hooks" / "ncp-lifecycle-hook.sh"
+    assert lifecycle.exists()
+    assert os.access(lifecycle, os.X_OK)
     assert (tmp_path / ".claude" / "skills" / "ncp" / "SKILL.md").exists()
     assert (tmp_path / ".mcp.json").exists()
     assert (tmp_path / ".codex" / "hooks.json").exists()
@@ -399,6 +403,7 @@ def test_cli_serve_passes_explicit_cwd(monkeypatch: object, tmp_path: Path) -> N
         cwd: Path | None = None,
         auth_token: str | None = None,
         cors_allowed_origins: list[str] | None = None,
+        profile: str | None = None,
     ) -> None:
         called["host"] = host
         called["port"] = port
@@ -430,6 +435,7 @@ def test_cli_serve_passes_network_options(monkeypatch: object, tmp_path: Path) -
         cwd: Path | None = None,
         auth_token: str | None = None,
         cors_allowed_origins: list[str] | None = None,
+        profile: str | None = None,
     ) -> None:
         called["host"] = host
         called["port"] = port
@@ -474,6 +480,7 @@ def test_cli_serve_passes_cors_origins(monkeypatch: object, tmp_path: Path) -> N
         cwd: Path | None = None,
         auth_token: str | None = None,
         cors_allowed_origins: list[str] | None = None,
+        profile: str | None = None,
     ) -> None:
         called["auth_token"] = auth_token
         called["cors_allowed_origins"] = cors_allowed_origins
@@ -508,6 +515,7 @@ def test_cli_serve_auth_token_resolution_order(monkeypatch: object, tmp_path: Pa
         cwd: Path | None = None,
         auth_token: str | None = None,
         cors_allowed_origins: list[str] | None = None,
+        profile: str | None = None,
     ) -> None:
         called["auth_token"] = auth_token
 
@@ -545,7 +553,9 @@ def test_cli_serve_auth_token_resolution_order(monkeypatch: object, tmp_path: Pa
 def test_cli_serve_stdio_hidden_command(monkeypatch: object, tmp_path: Path) -> None:
     called: dict[str, object] = {}
 
-    def fake_serve(*, store_path: Path | None = None, cwd: Path | None = None) -> None:
+    def fake_serve(
+        *, store_path: Path | None = None, cwd: Path | None = None, profile: str | None = None
+    ) -> None:
         called["store_path"] = store_path
         called["cwd"] = cwd
 
@@ -731,9 +741,9 @@ def test_cli_handoff_claude_consumes_and_emits_follow_up(
         *,
         runner: str,
         response: str,
-    ) -> None:
+    ) -> agent_handoff.HandoffCompletion:
         events.append("complete")
-        real_complete(run, runner=runner, response=response)
+        return real_complete(run, runner=runner, response=response)
 
     monkeypatch.setattr(
         "ncp.agent_handoff.run_claude_partner",
@@ -758,6 +768,7 @@ def test_cli_handoff_claude_consumes_and_emits_follow_up(
 
     assert result.exit_code == 0
     assert "claude finished the slice and handed it off" in result.output
+    assert "full_output_chunk_id" in result.output
     assert events == ["provider", "complete", "follow_up"]
     assert provider_args["cwd"] == tmp_path
     assert "[NCP:CONSCIOUS]" in str(provider_args["context"])
@@ -768,9 +779,10 @@ def test_cli_handoff_claude_consumes_and_emits_follow_up(
         pipeline_id="pipe_handoff_cli",
         layer="episodic",
     )
-    assert len(completion) == 1
-    assert '"runner":"claude"' in completion[0].content
-    assert source.whisper_id in completion[0].content
+    assert len(completion) == 2
+    summary_chunk = next(c for c in completion if c.raw_ref)
+    assert '"runner":"claude"' in summary_chunk.content
+    assert source.whisper_id in summary_chunk.content
 
 
 def test_cli_handoff_persistence_failure_emits_no_follow_up(
@@ -904,6 +916,8 @@ def test_cli_handoff_opencode_requires_json_and_emits_follow_up(
             "pipe_handoff_cli",
             "--emit-to",
             "claude",
+            "--return",
+            "full",
         ],
     )
 
@@ -917,9 +931,10 @@ def test_cli_handoff_opencode_requires_json_and_emits_follow_up(
         pipeline_id="pipe_handoff_cli",
         layer="episodic",
     )
-    assert len(completion) == 1
-    assert '"runner":"opencode"' in completion[0].content
-    assert source.whisper_id in completion[0].content
+    assert len(completion) == 2  # raw_ref output chunk + completion envelope
+    summary_chunk = next(c for c in completion if c.raw_ref)
+    assert '"runner":"opencode"' in summary_chunk.content
+    assert source.whisper_id in summary_chunk.content
 
 
 def test_cli_handoff_reports_missing_queue_cleanly(tmp_path: Path) -> None:

@@ -197,12 +197,12 @@ PRE_CHANGE_CONTEXT = (
     "intent:why_is_payroll_lagging\n"
     "\n"
     "[NCP:SUBCONSCIOUS]\n"
-    "chunk:fixed-2 layer:semantic score:0.9 src:tool_result trust:0.7\n"
+    "chunk:fixed-2 layer:semantic src:tool_result trust:0.7\n"
     "  ledger database is read by payroll\n"
-    "chunk:fixed-1 layer:semantic score:0.9 src:tool_result trust:0.7\n"
+    "chunk:fixed-1 layer:semantic src:tool_result trust:0.7\n"
     "  payroll-events topic has 12 partitions\n"
     "\n"
-    "[NCP:BUDGET] ctx_used:0.0 steps:0/? elapsed:0s pressure:low"
+    "[NCP:BUDGET] ctx_used:0.0 elapsed:0s pressure:low"
 )
 
 

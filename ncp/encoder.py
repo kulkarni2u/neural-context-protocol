@@ -61,8 +61,45 @@ def _fmt_payload_value(value: object) -> str:
     return _escape_payload_value(str(value))
 
 
+class EncodedContext(str):
+    """The assembled context string plus the offsets of its sections.
+
+    ``offsets`` maps a section label (``conscious``, ``subconscious``,
+    ``ontology``, ``whispers``, ``budget``) to its start index in the string.
+    ``volatile_offset`` is where the turn-varying tail begins (whispers when
+    present, else the budget block), so a provider adapter can place a cache
+    breakpoint without searching for marker text that chunk content could
+    also contain.
+    """
+
+    offsets: dict[str, int]
+
+    def __new__(cls, text: str, offsets: dict[str, int] | None = None) -> EncodedContext:
+        obj = super().__new__(cls, text)
+        obj.offsets = dict(offsets or {})
+        return obj
+
+    @property
+    def volatile_offset(self) -> int | None:
+        for label in ("whispers", "budget"):
+            if label in self.offsets:
+                return self.offsets[label]
+        return None
+
+
 class PidginEncoder:
-    """Encode assembled context into the V1 NCP pidgin wire format."""
+    """Encode assembled context into the V1 NCP pidgin wire format.
+
+    ``show_score`` (default off) prints ``score:`` in each chunk header. The
+    score folds in wall-clock recency, so printing it makes the cacheable
+    prefix change between turns.
+    """
+
+    def __init__(self, *, show_score: bool = False) -> None:
+        self.show_score = show_score
+        # Cross-turn delta: ids the receiving session already holds unchanged
+        # render as a bare ``chunk:<id> seen:1`` header (set by the Assembler).
+        self.seen_ids: frozenset[str] = frozenset()
 
     def assemble(
         self,
@@ -74,7 +111,7 @@ class PidginEncoder:
         now: float | None = None,
         contradiction_notes: Sequence[tuple[str, str]] | None = None,
         graph_text: str | None = None,
-    ) -> str:
+    ) -> EncodedContext:
         """Assemble the wire-format block ordering for one provider turn."""
 
         return self.assemble_from_parts(
@@ -95,7 +132,7 @@ class PidginEncoder:
         budget_text: str,
         contradiction_notes: Sequence[tuple[str, str]] | None = None,
         graph_text: str | None = None,
-    ) -> str:
+    ) -> EncodedContext:
         """Assemble from already-encoded blocks/entries.
 
         Lets callers that re-check token budgets across many candidate
@@ -115,24 +152,34 @@ class PidginEncoder:
         default) leaves the legacy layout untouched.
         """
 
-        blocks = [conscious_text]
+        blocks: list[tuple[str, str]] = [("conscious", conscious_text)]
         if chunk_entries:
             note_lines = [f"note:contradicts {a}<->{b}" for a, b in contradiction_notes or []]
-            blocks.append("\n".join(["[NCP:SUBCONSCIOUS]", *chunk_entries, *note_lines]))
+            blocks.append(("subconscious", "\n".join(["[NCP:SUBCONSCIOUS]", *chunk_entries, *note_lines])))
         if graph_text is not None:
-            blocks.append(graph_text)
+            blocks.append(("ontology", graph_text))
         if whispers_text is not None:
-            blocks.append(whispers_text)
-        blocks.append(budget_text)
-        return "\n\n".join(blocks)
+            blocks.append(("whispers", whispers_text))
+        blocks.append(("budget", budget_text))
+        offsets: dict[str, int] = {}
+        position = 0
+        for label, text in blocks:
+            offsets[label] = position
+            position += len(text) + 2
+        return EncodedContext("\n\n".join(text for _, text in blocks), offsets)
 
     def _encode_budget(self, budget: BudgetContext) -> str:
-        steps_total = "?" if budget.steps_total is None else str(budget.steps_total)
         elapsed_seconds = int(round(budget.elapsed_seconds))
+        # ``steps:N/?`` carries no information when the total is unknown.
+        steps = (
+            f"steps:{budget.steps_completed}/{budget.steps_total} "
+            if budget.steps_total is not None
+            else ""
+        )
         return (
             "[NCP:BUDGET] "
             f"ctx_used:{_fmt_float(budget.ctx_used)} "
-            f"steps:{budget.steps_completed}/{steps_total} "
+            f"{steps}"
             f"elapsed:{elapsed_seconds}s "
             f"pressure:{budget.pressure}"
         )
@@ -149,6 +196,8 @@ class PidginEncoder:
             lines.append(f"owns:{_fmt_compact_list(conscious.owns)}")
         if conscious.must_not:
             lines.append(f"must-not:{_fmt_compact_list(conscious.must_not)}")
+        if conscious.skills:
+            lines.append("skills:" + " ".join(conscious.skills))
         slot_bits = []
         if conscious.slot_age:
             slot_bits.append(f"slot_age:{conscious.slot_age}")
@@ -174,10 +223,12 @@ class PidginEncoder:
         )
 
     def _encode_chunk_entry(self, chunk: SubconsciousChunk) -> str:
+        if chunk.chunk_id in self.seen_ids:
+            return f"chunk:{chunk.chunk_id} seen:1"
         parts = [
             f"chunk:{chunk.chunk_id}",
             f"layer:{chunk.layer}",
-            f"score:{_fmt_float(chunk.effective_score)}",
+            *([f"score:{_fmt_float(chunk.effective_score)}"] if self.show_score else []),
             f"src:{chunk.src}",
             f"trust:{_fmt_float(chunk.base_trust)}",
         ]

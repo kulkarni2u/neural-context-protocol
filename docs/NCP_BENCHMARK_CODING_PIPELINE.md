@@ -31,24 +31,24 @@ python3 benchmarks/coding_pipeline/run.py --turns 40
 
 ## Current result
 
-Observed on June 9, 2026:
+Observed on November 17, 2026:
 
 - token unit: `chars_div4`
 - context token budget: `340`
-- peak NCP input tokens: `370`
+- peak NCP input tokens: `368`
 - peak raw replay input tokens: `3426`
 - peak sliding-window input tokens: `383`
 - peak rolling-summary input tokens: `2096`
-- final NCP input tokens: `261`
+- final NCP input tokens: `255`
 - final raw replay input tokens: `3426`
 - final sliding-window input tokens: `377`
 - final rolling-summary input tokens: `2096`
-- reduction factor vs raw replay at the final turn: `13.13x`
-- reduction factor vs sliding window at the final turn: `1.44x`
-- reduction factor vs rolling summary at the final turn: `8.03x`
-- final-turn savings vs raw replay: `3165`
+- reduction factor vs raw replay at the final turn: `13.44x`
+- reduction factor vs sliding window at the final turn: `1.48x`
+- reduction factor vs rolling summary at the final turn: `8.22x`
+- final-turn savings vs raw replay: `3171`
 - estimated assembly overhead token-equivalent (total across all turns): `533.33`
-- net total token-equivalent savings vs raw replay: `56230.67`
+- net total token-equivalent savings vs raw replay: `56770.67`
 - benchmark pass gate: `true`
 
 ### Plain RAG arm (token accounting only)
@@ -60,19 +60,19 @@ Measured with `python3 benchmarks/coding_pipeline/run.py --turns 40`:
 
 | Arm | Peak input tokens | Final input tokens | Final vs NCP |
 |---|---:|---:|---:|
-| ncp | 371 | 260 | 1.00x |
-| plain_rag | 377 | 358 | 1.38x |
-| sliding_window | 383 | 377 | 1.45x |
-| rolling_summary | 2096 | 2096 | 8.06x |
-| raw_replay | 3426 | 3426 | 13.18x |
+| ncp | 368 | 255 | 1.00x |
+| plain_rag | 377 | 358 | 1.40x |
+| sliding_window | 383 | 377 | 1.48x |
+| rolling_summary | 2096 | 2096 | 8.22x |
+| raw_replay | 3426 | 3426 | 13.44x |
 
 This is a token-count comparison only and says nothing about whether plain
 RAG's context is adequate or worse. Because both arms are capped at the same
 ceiling, plain RAG necessarily lands close to NCP; NCP's lower final-turn count
 reflects it not filling the ceiling, not retrieval quality. The existing pass
 gate is unchanged and does not involve plain RAG. The research pipeline
-benchmark gets the same arm (40 turns: ncp peak 404 / final 272, plain_rag
-peak 406 / final 258, so plain RAG is slightly smaller at the final turn there).
+benchmark gets the same arm (40 turns: ncp peak 394 / final 267, plain_rag
+peak 397 / final 258, so plain RAG is slightly smaller at the final turn there).
 
 ## Interpretation
 

@@ -96,7 +96,9 @@ def test_mmr_uses_embedding_similarity_when_available() -> None:
     assert [chunk.chunk_id for chunk in selected] == ["near_a", "far"]
 
 
-def test_assembler_default_lambda_keeps_duplicate_top_behavior(tmp_path: Path) -> None:
+def test_assembler_default_lambda_preserves_relevance_order(tmp_path: Path) -> None:
+    """MMR is opt-in: the 0.7 default dropped needed chunks in hotpotqa_style."""
+
     store = SQLiteStore(tmp_path / "default.db")
     store.query = lambda *args, **kwargs: _pool()  # type: ignore[method-assign]
 
@@ -109,8 +111,8 @@ def test_assembler_default_lambda_keeps_duplicate_top_behavior(tmp_path: Path) -
     assert [chunk.chunk_id for chunk in result.chunks] == ["dup_a", "dup_b", "dup_c"]
 
 
-def test_assembler_configured_lambda_selects_diverse_set(tmp_path: Path) -> None:
-    store = SQLiteStore(tmp_path / "configured.db")
+def test_assembler_opt_in_lambda_is_diverse(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "opt_in.db")
     store.query = lambda *args, **kwargs: _pool()  # type: ignore[method-assign]
 
     result = Assembler(store=store, config=_config(tmp_path, 0.7)).assemble(
@@ -119,22 +121,4 @@ def test_assembler_configured_lambda_selects_diverse_set(tmp_path: Path) -> None
         k=3,
     )
 
-    assert [chunk.chunk_id for chunk in result.chunks] == [
-        "dup_a",
-        "distinct_rate",
-        "distinct_schema",
-    ]
-    assert len(result.chunks) == 3
-
-
-def test_assembler_mmr_does_not_widen_explicit_k(tmp_path: Path) -> None:
-    store = SQLiteStore(tmp_path / "bounded.db")
-    store.query = lambda *args, **kwargs: _pool()  # type: ignore[method-assign]
-
-    result = Assembler(store=store, config=_config(tmp_path, 0.7)).assemble(
-        conscious=_make_conscious(),
-        budget=BudgetContext(),
-        k=2,
-    )
-
-    assert len(result.chunks) == 2
+    assert [chunk.chunk_id for chunk in result.chunks] == ["dup_a", "distinct_rate", "distinct_schema"]

@@ -279,6 +279,7 @@ class TestToolsList:
             "ncp_recall",
             "ncp_improve",
             "ncp_fetch",
+            "ncp_skill",
             "ncp_record_decision",
             "ncp_get_decision",
             "ncp_compile_decision_query",
@@ -417,7 +418,10 @@ class TestToolsList:
 
         response = _read_message(io.BytesIO(output_stream.getvalue()))
         assert response is not None
-        assert [tool["name"] for tool in response["result"]["tools"]] == [tool["name"] for tool in MCP_TOOLS]
+        # ncp_skill stays hidden until [skill_cache].enabled = true.
+        assert [tool["name"] for tool in response["result"]["tools"]] == [
+            tool["name"] for tool in MCP_TOOLS if tool["name"] != "ncp_skill"
+        ]
 
     def test_disabled_memo_tools_are_not_callable(self, tmp_path: Path) -> None:
         project = tmp_path / "repo"

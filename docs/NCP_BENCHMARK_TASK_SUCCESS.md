@@ -139,11 +139,11 @@ The artifact is printed to stdout as JSON with:
 
 ## Current result
 
-Observed on June 10, 2026 (mock provider, default budget 400, all 12 tasks):
+Observed on November 17, 2026 (mock provider, default budget 400, all 12 tasks):
 
 - token unit: `chars_div4`
 - budget: `400`
-- `ncp` success rate: `1.0` (12/12), median context tokens `295`
+- `ncp` success rate: `1.0` (12/12), median context tokens `341.5`
 - `sliding_window` success rate: `0.0` (0/12), median context tokens `399`
 - `raw_replay` success rate: `1.0` (12/12, unbounded), median context tokens `806`
 - pass gate (`ncp >= sliding_window` and `ncp >= 0.75`): `true`
@@ -158,19 +158,20 @@ tasks). Measured success rate (median context tokens):
 
 | Budget | ncp | plain_rag | sliding_window | raw_replay (unbounded) |
 |---:|---:|---:|---:|---:|
-| 150 | 1.00 (115) | 1.00 (132) | 0.00 (114) | 1.00 (806) |
-| 200 | 1.00 (192) | 1.00 (175) | 0.00 (171) | 1.00 (806) |
-| 300 | 1.00 (259) | 1.00 (271.5) | 0.00 (286) | 1.00 (806) |
-| 400 | 1.00 (360) | 1.00 (376) | 0.00 (399) | 1.00 (806) |
-| 800 | 1.00 (567.5) | 1.00 (783) | 0.58 (790.5) | 1.00 (806) |
+| 150 | 1.00 (140) | 1.00 (132) | 0.00 (114) | 1.00 (806) |
+| 200 | 1.00 (187) | 1.00 (175) | 0.00 (171) | 1.00 (806) |
+| 300 | 1.00 (266.5) | 1.00 (271.5) | 0.00 (286) | 1.00 (806) |
+| 400 | 1.00 (341.5) | 1.00 (376) | 0.00 (399) | 1.00 (806) |
+| 800 | 1.00 (536) | 1.00 (783) | 0.58 (790.5) | 1.00 (806) |
 
 **Plain RAG ties NCP at every budget tried.** Mock mode only checks whether
 the approved-path slug is present in the context, and the question's query
 shares vocabulary with the turn carrying it, so ordinary lexical retrieval is
 sufficient. This benchmark therefore shows NCP beats recency, not that NCP
 beats retrieval; it does not exercise trust weighting or negation handling
-(mock scoring ignores the rejected paths). At larger budgets NCP used fewer
-tokens than plain RAG for the same success (567 vs 783 at budget 800). No gate
+(mock scoring ignores the rejected paths). At budgets of 300 and above NCP used fewer
+tokens than plain RAG for the same success (536 vs 783 at budget 800); at 150 and 200 it fills
+more of the budget than plain RAG (140 vs 132, 187 vs 175). No gate
 on plain RAG is asserted.
 
 ## Interpretation

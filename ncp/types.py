@@ -86,6 +86,27 @@ class NCPModel(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
 
+# Item-count and item-length caps for the free-text history lists of the
+# conscious block. ``owns`` / ``must_not`` are safety constraints and are never
+# truncated, dropped or reordered.
+CONSCIOUS_LIST_CAPS: dict[str, int] = {
+    "recent": 8,
+    "tried": 8,
+    "failed": 8,
+}
+CONSCIOUS_ITEM_MAX_CHARS = 160
+CONSCIOUS_MAX_SKILLS = 8
+TRUNCATION_MARK = "\u2026"
+
+
+def _cap_item(item: str, name: str) -> str:
+    if len(item) <= CONSCIOUS_ITEM_MAX_CHARS:
+        return item
+    if name == "recent":
+        return item[:CONSCIOUS_ITEM_MAX_CHARS]
+    return item[: CONSCIOUS_ITEM_MAX_CHARS - 1] + TRUNCATION_MARK
+
+
 class ConsciousBlock(NCPModel):
     """Per-turn conscious state injected into the working context."""
 
@@ -119,17 +140,48 @@ class ConsciousBlock(NCPModel):
     calibration_id: str | None = None
     pipeline_id: str | None = None
 
+    # "<skill_id>@<hash12>" references resolved by ncp_get_context; never text.
+    skills: list[str] = Field(default_factory=list)
+
     @field_validator("agent_id", "role", "task", "slot", "intent", "ncp_v")
     @classmethod
     def _no_spaces(cls, value: str, info: object) -> str:
         field_name = getattr(info, "field_name", "field")
         return _validate_no_spaces(value, field_name)
 
-    @field_validator("owns", "must_not", "recent", "tried", "failed")
+    @field_validator("owns", "must_not", "recent", "tried", "failed", "skills")
     @classmethod
     def _no_spaces_in_lists(cls, values: list[str], info: object) -> list[str]:
         field_name = getattr(info, "field_name", "field")
         return _validate_no_spaces_list(values, field_name)
+
+    @field_validator("skills")
+    @classmethod
+    def _bounded_skills(cls, values: list[str]) -> list[str]:
+        if len(values) > CONSCIOUS_MAX_SKILLS:
+            raise ValueError(f"skills must have at most {CONSCIOUS_MAX_SKILLS} entries (got {len(values)})")
+        return values
+
+    def capped_report(self) -> tuple[Self, bool]:
+        """Copy with ``recent`` / ``tried`` / ``failed`` bounded, plus a flag.
+
+        Keeps the most recent (last) entries up to the item cap and cuts long
+        items (``tried`` / ``failed`` items end with an ellipsis). ``owns`` and
+        ``must_not`` are never touched. The flag is True when any cap fired.
+        """
+
+        updates: dict[str, list[str]] = {}
+        for name, limit in CONSCIOUS_LIST_CAPS.items():
+            values: list[str] = getattr(self, name)
+            trimmed = [_cap_item(item, name) for item in values[-limit:]]
+            if trimmed != values:
+                updates[name] = trimmed
+        if not updates:
+            return self, False
+        return self.model_copy(update=updates), True
+
+    def capped(self) -> Self:
+        return self.capped_report()[0]
 
     @field_validator("ncp_v")
     @classmethod

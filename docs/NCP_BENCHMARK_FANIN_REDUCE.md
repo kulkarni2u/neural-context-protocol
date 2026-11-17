@@ -16,7 +16,7 @@ similarity-clustering "keep the highest-trust version" merge primitive in
 `ncp/stores/consolidation.py`, and a `contradicts` edge type in the chunk
 graph schema. What was missing was wiring those into the one read path where
 a many-to-one fan-in actually happens: `ncp_get_context` for a synthesis
-turn. `[retrieval].reduce_fanin_enabled` (off by default) closes that gap --
+turn. `[retrieval].reduce_fanin_enabled` (off by default; a capped-set pass also runs automatically at 3+ distinct writers, see `reduce_fanin_auto_min_writers`) closes that gap --
 see `ncp/stores/consolidation.py::reduce_candidates` and its call site in
 `Assembler._prepare_assembly`. This benchmark measures it.
 
@@ -71,15 +71,15 @@ Observed with 40 workers, `k=16`, `chars_div4` tokens:
 | Scenario | Input tokens | Cost (`claude-sonnet-4`, 200 fixed output tokens) | Chunks |
 | --- | ---: | ---: | ---: |
 | `raw_dump` (no bound at all) | 1079 | $0.006237 | 40 |
-| `ncp_default` (bounded top-k, reducer off) | 807 | $0.005421 | 16 |
-| `ncp_reduced` (overfetched + reduced, then same cap) | 936 | $0.005808 | 16 |
+| `ncp_default` (bounded top-k, reducer off) | 780 | $0.005340 | 16 |
+| `ncp_reduced` (overfetched + reduced, then same cap) | 959 | $0.005877 | 16 |
 
-- token reduction vs `raw_dump`: **13.25%**
-- **4 of `ncp_default`'s own 16 returned chunks (25%) are near-duplicates of
+- token reduction vs `raw_dump`: **11.12%**
+- **3 of `ncp_default`'s own 16 returned chunks (19%) are near-duplicates of
   another chunk in that same result** -- context budget spent twice on one
   claim instead of once each on two different ones
 - the reducer merges **7** near-duplicates out of the wider overfetched pool
-  and flags **11** contradiction pairs, of which **7 (64%)** are genuinely
+  and flags **16** contradiction pairs, of which **11 (69%)** are genuinely
   about the same topic per the corpus's ground-truth labels
 
 ## Interpretation
@@ -92,15 +92,15 @@ contradiction notes. Comparing token totals at a fixed cap mostly measures
 
 The number that actually isolates the reducer's effect is
 **`wasted_duplicate_slots_in_default`**: running the same reducer as a
-read-only diagnostic over `ncp_default`'s own already-capped output. A
-quarter of the context budget NCP spends today on this corpus, with the
+read-only diagnostic over `ncp_default`'s own already-capped output. About
+a fifth of the context budget NCP spends today on this corpus, with the
 reducer off, goes to a chunk that says the same thing another chunk in the
 same context already said. That's the direct analogue of the pattern the
 tweet described, scoped honestly to NCP's bounded-retrieval architecture
 rather than to an unbounded raw dump NCP would never actually produce.
 
 The `raw_dump` comparison is the closest match to the tweet's own framing,
-and it's real but modest here (13%) because this corpus's simulated worker
+and it's real but modest here (11%) because this corpus's simulated worker
 outputs are short one-line claims. The tweet's reported 41,200 raw tokens
 across 40 workers implies roughly 1,000 tokens per worker -- a much more
 verbose payload (paragraphs, not one-liners) where duplication is a larger
@@ -123,7 +123,7 @@ harmless paraphrases). Gating on a small set of reversal cue phrases
 still fully deterministic, still no-model-call signal, but it is a keyword
 heuristic: it will miss a contradiction phrased without one of those cues,
 and it will still occasionally flag a same-similarity-band pair from a
-*different* topic that happens to clear the floor together (4 of the 11
+*different* topic that happens to clear the floor together (5 of the 16
 flagged pairs above). This is disclosed, not hidden, in the artifact's
 `contradiction_same_topic_fraction` field -- computed only because this
 benchmark's corpus has ground-truth topic labels; production data has no

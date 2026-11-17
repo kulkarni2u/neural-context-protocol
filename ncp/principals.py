@@ -31,13 +31,15 @@ from typing import Any
 CAP_ADMIN = "admin"
 CAP_VERIFY = "verify"
 CAP_RECORD_OUTCOME = "record_outcome"
-CAPABILITIES = frozenset({CAP_ADMIN, CAP_VERIFY, CAP_RECORD_OUTCOME})
+# Register (cache) a user skill over HTTP POST /skills; never an MCP tool.
+CAP_CACHE_SKILL = "cache_skill"
+CAPABILITIES = frozenset({CAP_ADMIN, CAP_VERIFY, CAP_RECORD_OUTCOME, CAP_CACHE_SKILL})
 
 # Name of the implicit principal the legacy [server].auth_token maps to when
 # principals are also configured.
 LEGACY_PRINCIPAL_NAME = "legacy_auth_token"
 
-_PRINCIPAL_KEYS = frozenset({"agent_id", "token_sha256", "token_env", "pipelines", "capabilities"})
+_PRINCIPAL_KEYS = frozenset({"agent_id", "token_sha256", "token_env", "pipelines", "capabilities", "tools"})
 _SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 
 # Tool -> top-level arguments that name the acting agent. Each one must equal
@@ -53,6 +55,7 @@ IDENTITY_ARGS: dict[str, tuple[tuple[str, bool], ...]] = {
     "ncp_task": (("agent_id", True),),
     "ncp_overview": (("agent_id", True),),
     "ncp_fetch": (("agent_id", True),),
+    "ncp_skill": (("agent_id", True),),
     "ncp_record_decision": (("agent_id", True),),
     "ncp_compile_decision_query": (("agent_id", True),),
     "ncp_remember": (("written_by", True),),
@@ -68,6 +71,7 @@ PIPELINE_SCOPED_TOOLS = frozenset({
     "ncp_wait_whispers",
     "ncp_task",
     "ncp_fetch",
+    "ncp_skill",
     "ncp_record_decision",
     "ncp_compile_decision_query",
     "ncp_lookup_memo",
@@ -121,6 +125,9 @@ class Principal:
     agent_id: str | None
     pipelines: frozenset[str] | None
     capabilities: frozenset[str]
+    # Optional tool allowlist, intersected with the connection's tool profile.
+    # None means "no per-principal restriction".
+    tools: frozenset[str] | None = None
 
     @property
     def is_admin(self) -> bool:
@@ -201,7 +208,17 @@ def _parse_one(name: str, raw: object, env: Mapping[str, str]) -> tuple[Principa
         raise PrincipalConfigError(
             f"[principals.{name}].capabilities has unknown values {bad}; expected a subset of {sorted(CAPABILITIES)}"
         )
-    return Principal(name=name, agent_id=agent_id.strip(), pipelines=pipelines, capabilities=capabilities), digest
+    tools: frozenset[str] | None = None
+    if "tools" in raw:
+        listed_tools = _string_list(name, "tools", raw["tools"])
+        if not listed_tools:
+            raise PrincipalConfigError(
+                f"[principals.{name}].tools is empty; omit it to allow every tool in the profile"
+            )
+        tools = frozenset(listed_tools)
+    return Principal(
+        name=name, agent_id=agent_id.strip(), pipelines=pipelines, capabilities=capabilities, tools=tools
+    ), digest
 
 
 class PrincipalRegistry:
@@ -363,8 +380,9 @@ class ToolAuthorizer:
         if tool in PIPELINE_SCOPED_TOOLS:
             self._check_pipeline_scope(principal, tool, args)
 
-        if tool in ("ncp_get_context", "ncp_fetch"):
-            # The per-turn ncp_fetch budget is keyed by principal, never by a
+        if tool in ("ncp_get_context", "ncp_fetch", "ncp_post_turn", "ncp_skill"):
+            # The per-turn ncp_fetch budget (and the ids ncp_post_turn defaults
+            # to from ncp_get_context) is keyed by principal, never by a
             # caller-chosen session_id. Admin acts for many agents, so its
             # budget is per acting agent.
             key = principal.fetch_session_key

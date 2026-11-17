@@ -6,7 +6,7 @@
 ![PyPI](https://img.shields.io/pypi/v/neural-context-protocol)
 
 **Bounded, trust-weighted memory for multi-agent systems.**
-MCP-native. Agents share context without replaying full transcripts. Fewer tokens than replaying history: about 1.44x fewer than a sliding window and about 13x fewer than raw replay in the 4-agent coding benchmark. The raw-replay figure is a worst-case floor that grows with turn count — see [Benchmarks](#benchmarks).
+MCP-native. Agents share context without replaying full transcripts. Fewer tokens than replaying history: about 1.48x fewer than a sliding window and about 13x fewer than raw replay in the 4-agent coding benchmark. The raw-replay figure is a worst-case floor that grows with turn count — see [Benchmarks](#benchmarks).
 
 -----
 
@@ -65,8 +65,34 @@ Bounded retrieval is the entry point, not the whole story. The mechanisms below 
 
 - **Bounded context assembly** — every turn gets a budget-capped slice of context (conscious + retrieved + whispers), never the full history. See [How agents talk over the bus](#how-agents-talk-over-the-bus).
 - **Write-time noise filtering** — strips ANSI codes, dedups repeated lines, and prunes boilerplate and empty fields before anything is stored. **33% aggregate token reduction** on a fixed noisy-payload benchmark. See [Signal filtering at write time](#signal-filtering-at-write-time).
-- **Fan-in reduction** — dedups near-duplicate claims across parallel workers before they reach a synthesis agent. **13% token reduction** against an unbounded raw dump. See [Fan-in reduction](#fan-in-reduction).
+- **Fan-in reduction** — dedups near-duplicate claims across parallel workers before they reach a synthesis agent. **11% token reduction** against an unbounded raw dump. See [Fan-in reduction](#fan-in-reduction).
 - **Consolidation** — merges repeated or near-duplicate memory into fewer, stronger entries instead of leaving competing rows. See [Retrieval and self-improving memory](#retrieval-and-self-improving-memory).
+
+### Harness and subagent overhead (v1.9.6)
+
+The protocol calls around a turn cost characters too. v1.9.6 trims them, and each piece is opt-out or opt-in as noted:
+
+- **Capped handoff returns** — `ncp handoff` and `ncp run-turn` print a bounded summary plus the chunk id of the full output (`--return full` restores the old output).
+- **Smaller turn posts** — `ncp_post_turn` takes an optional `result_full` and defaults its whisper and chunk ids to those of the session's last `ncp_get_context` (in process memory, never for the shared default session).
+- **Per-connection tool profiles** — `?profile=minimal` (just `ncp_get_context` and `ncp_write_memory`), `X-NCP-Tool-Profile` or `ncp serve --profile`; a connection can only narrow the configured profile.
+- **Skills by reference** (opt-in, `[skill_cache].enabled`) — register a workflow once with `ncp skill cache`, then dispatch it by id (`--skill`, `ncp_skill`, `skills` on `ncp_get_context`). The worker's prompt gets a `[NCP:SKILL]` block of user-authored instructions; the orchestrator emits an id, not the text.
+- **Cross-turn delta** (opt-in) — `ncp_get_context` with `delta: true` and an explicit `session_id` sends `chunk:<id> seen:1` for chunks the session already holds unchanged. Not for the shared default session, reset by a `delta: false` call, and wrong for a worker that starts with a fresh context; distilled chunks are always re-sent.
+- **Lifecycle hooks** — one `ncp-lifecycle-hook.sh` covers SessionStart(compact|clear), SubagentStart, SubagentStop and Stop (`NCP_HOOKS_DISABLE=1` turns it off), and `ncp run-turn --host claude|codex|opencode|mock` runs one fresh-context turn.
+
+Chunk headers also drop the wall-clock `score:` by default (`[encoder].show_score` restores it), which keeps the cacheable prefix stable.
+
+A deterministic benchmark (`benchmarks/harness_overhead/`, in CI) measures these as structural character counts, with each "before" being the new code with the old behavior switched on:
+
+| Measure | Before | After |
+|---|---:|---:|
+| Handoff return, 20 KB provider response | 20,677 | 1,999 |
+| Model-emitted characters per `ncp_post_turn` | 1,909 | 257 |
+| Tool catalog, `standard` against `minimal` | 15,874 | 5,062 |
+| Chunk characters resent over 10 turns (delta) | 20,620 | 2,656 |
+| Prefix-stable fraction of the block across turns | 0.19 | 0.89 |
+| Orchestrator characters, one 6,000-character skill to 8 workers | 48,480 | 504 |
+
+These are `chars_div4` counts with a mock provider on small fixed workloads, not provider tokens or dollars, and the savings scale with the sizes chosen. See [the benchmark doc](./docs/NCP_BENCHMARK_HARNESS_OVERHEAD.md) and [the token-efficiency plan](./docs/NCP_TOKEN_EFFICIENCY_PLAN.md).
 
 ### Context quality
 
@@ -452,14 +478,14 @@ This is deterministic signal filtering, not a model-quality change. See [the com
 
 Write-time filtering strips boilerplate from one chunk at a time. It doesn't dedup *across* chunks — and a high-fanout burst (many parallel workers writing overlapping findings into one pipeline) is exactly the case where that matters: without dedup, a synthesis agent's bounded context can end up with several near-duplicate restatements of the same claim instead of that many distinct ones.
 
-`[retrieval].reduce_fanin_enabled` (off by default) adds a deterministic reduction pass to context assembly for this case. When enabled, retrieval overfetches beyond the normal chunk cap, then — within any high-fanout cluster — merges near-duplicate claims down to the highest-trust version (reusing the same clustering `ncp consolidate` uses), drops malformed (empty) candidates, and flags surviving same-topic claims that diverge as contradictions. Contradictions are surfaced as a `note:contradicts` line in the assembled context for the reading agent to reason about; NCP groups and drops duplicates deterministically, but it never resolves a contradiction itself.
+A reduced version of this runs by default: `[retrieval].reduce_fanin_auto_min_writers = 3` applies the reduction to the already-capped candidate set whenever it comes from at least 3 distinct writers (set it to `0` to turn that off). `[retrieval].reduce_fanin_enabled` (off by default) is the full mode and adds a deterministic reduction pass to context assembly for this case. When enabled, retrieval overfetches beyond the normal chunk cap, then — within any high-fanout cluster — merges near-duplicate claims down to the highest-trust version (reusing the same clustering `ncp consolidate` uses), drops malformed (empty) candidates, and flags surviving same-topic claims that diverge as contradictions. Contradictions are surfaced as a `note:contradicts` line in the assembled context for the reading agent to reason about; NCP groups and drops duplicates deterministically, but it never resolves a contradiction itself.
 
 ```toml
 [retrieval]
 reduce_fanin_enabled = true
 ```
 
-On a deterministic 40-worker benchmark, 25% of NCP's own bounded top-k retrieval slots are near-duplicates of another slot in the same result with this off; enabling it merges those away and cuts tokens 13% against an unbounded raw dump of all 40 workers. See [the fan-in reduction benchmark doc](./docs/NCP_BENCHMARK_FANIN_REDUCE.md), including an honest account of the contradiction-flagging heuristic's false-positive rate.
+On a deterministic 40-worker benchmark, 19% of NCP's own bounded top-k retrieval slots are near-duplicates of another slot in the same result with `reduce_fanin_enabled` off (the default auto pass only sees the capped set); enabling it merges those away and cuts tokens 11% against an unbounded raw dump of all 40 workers. See [the fan-in reduction benchmark doc](./docs/NCP_BENCHMARK_FANIN_REDUCE.md), including an honest account of the contradiction-flagging heuristic's false-positive rate.
 
 -----
 
@@ -604,30 +630,30 @@ NCP adds bounded retrieval, provenance, optional authenticated authorship, disse
 
 | Scenario                               | Baseline       | Baseline tokens | NCP tokens | Result     | Caveat |
 |----------------------------------------|----------------|----------------:|-----------:|-----------:|--------|
-| 4-agent coding pipeline (40 turns)     | sliding window | 377             | 261        | **1.44x**  | Closest accounting comparison for a bounded recent-context baseline. |
-| 4-agent coding pipeline (40 turns)     | plain RAG (BM25) | 358           | 260        | **1.38x**  | Token accounting only, at the same 340-token ceiling; says nothing about context quality. |
-| 4-agent coding pipeline (40 turns)     | raw replay     | 3,426           | 261        | **13.13x** | Worst-case floor; the ratio scales with turn count. |
-| 4-agent coding pipeline (40 turns)     | rolling summary| 2,096           | 261        | **8.03x**  | Token accounting only; does not score summary quality. |
-| 6-role research pipeline (36 turns)    | raw replay     | 3,277           | 267        | **12.27x** | Worst-case floor for a deterministic synthetic research trace. |
+| 4-agent coding pipeline (40 turns)     | sliding window | 377             | 255        | **1.48x**  | Closest accounting comparison for a bounded recent-context baseline. |
+| 4-agent coding pipeline (40 turns)     | plain RAG (BM25) | 358           | 255        | **1.40x**  | Token accounting only, at the same 340-token ceiling; says nothing about context quality. |
+| 4-agent coding pipeline (40 turns)     | raw replay     | 3,426           | 255        | **13.44x** | Worst-case floor; the ratio scales with turn count. |
+| 4-agent coding pipeline (40 turns)     | rolling summary| 2,096           | 255        | **8.22x**  | Token accounting only; does not score summary quality. |
+| 6-role research pipeline (36 turns)    | raw replay     | 3,277           | 259        | **12.65x** | Worst-case floor for a deterministic synthetic research trace. |
 | Cross-host handoff (Claude -> OpenCode)| window baseline| 0.0 success     | 0.8 success| **+0.8**   | Local harness with a noise-only control, not a distributed-host reliability study. |
 | Needle recall at budget 4              | sliding window | 0.00            | 1.00       | **+1.00**  | Synthetic budget-stress recall check. |
 | Needle recall at budget 4              | plain RAG (BM25) | 1.00          | 1.00       | **tie**    | Lexical task: any BM25 retriever solves it; shows NCP is not worse than ordinary retrieval, not that it is better. |
 | Task success at matched budget 400 (12 tasks, mock) | sliding window | 0.00 | 1.00 | **+1.00** | Context adequacy with a deterministic mock provider, not live model success. |
-| Task success at matched budget 400 (12 tasks, mock) | plain RAG (BM25) | 1.00 | 1.00 | **tie** | Ties at every budget tried (150-800); mock scoring only checks the fact is present. NCP used fewer tokens at budget 800 (568 vs 783 median). |
+| Task success at matched budget 400 (12 tasks, mock) | plain RAG (BM25) | 1.00 | 1.00 | **tie** | Ties at every budget tried (150-800); mock scoring only checks the fact is present. NCP used fewer tokens at budget 800 (536 vs 783 median). |
 | HotpotQA-style multi-hop QA at matched budget 300 (15 tasks) | sliding window | 0.00 | 1.00 | **+1.00** | Synthetic, HotpotQA-shaped context-adequacy check — not the official HotpotQA dataset or PlugMem's own eval harness (see [the benchmark's README](./benchmarks/hotpotqa_style/README.md)). |
-| HotpotQA-style multi-hop QA at matched budget 300 (15 tasks) | plain RAG (BM25) | 1.00 | 1.00 | **tie** | Plain RAG **beats** NCP at tighter budgets: 1.00 vs 0.60 at budget 150 and 1.00 vs 0.87 at 200. |
+| HotpotQA-style multi-hop QA at matched budget 300 (15 tasks) | plain RAG (BM25) | 1.00 | 1.00 | **tie** | Plain RAG **beats** NCP at small budgets (1.00 vs 0.67 at budget 150, 0.93 at 200) and ties it from 300 up. |
 | Conflicting / low-trust memory, true claim ranked first at k=1 (60 tasks) | plain RAG (BM25) | 0.33 | 0.98 | **+0.65** | Claims differ only by value, so BM25 ties; NCP uses trust, supersedes, outcomes and dissent. NCP's one miss per seed is a retrieval ranking issue (a common word outweighs the topical terms), and it loses when the wrong claim is the trusted one (0.00 vs 0.58). Seed 7; NCP is 0.98 on all five seeds tried. See `docs/NCP_BENCHMARK_CONFLICT_TRUST.md`. |
 
-MACE multi-agent coordination score (40 turns): **0.8915**
+MACE multi-agent coordination score (40 turns): **0.8964**
 
 Coding benchmark token unit: `chars_div4`; context budget: `340`; pass gate: `true`.
 These are deterministic token-accounting benchmarks. The task-success row measures context adequacy at a matched token budget with a deterministic mock provider — whether the needed fact survives into a budget-bounded context (see [the benchmark doc](./docs/NCP_BENCHMARK_TASK_SUCCESS.md)); run it with a live provider to measure real model task success. Provider-real quality-at-matched-budget evaluation lives in `benchmarks/efficacy/` and compares NCP with sliding-window and rolling-summary controls (see [the efficacy benchmark doc](./docs/NCP_BENCHMARK_EFFICACY_LIVE.md)). The matched-budget construction and negation-aware scoring these benchmarks use are also available as a public API — `ncp.eval` — so you can build the same kind of eval against your own scenarios without vendoring `benchmarks/`.
 
 A separate, complementary compression benchmark measures ingestion-time noise reduction on a fixed noisy-payload corpus: **33% aggregate token reduction** (537 → 360, `chars_div4`, pass gate aggregate >= 0.20), ranging from **68%** on duplicate-heavy logs down to **2%** on already-dense stack traces (see [the compression benchmark doc](./docs/NCP_BENCHMARK_COMPRESSION.md)).
 
-A third, complementary benchmark targets the many-parallel-workers-to-one-synthesizer fan-in case: with `[retrieval].reduce_fanin_enabled` off (today's default), **25% of NCP's own bounded top-k retrieval slots are near-duplicates of another slot in the same result** on a deterministic 40-worker/4-topic corpus; enabling it merges the near-duplicates, drops malformed candidates, and flags likely contradictions for the reading model, at a **13% token reduction** against an unbounded raw dump of all 40 workers (see [the fan-in reduction benchmark doc](./docs/NCP_BENCHMARK_FANIN_REDUCE.md) for the full methodology and an honest account of the contradiction-flagging heuristic's false-positive rate).
+A third, complementary benchmark targets the many-parallel-workers-to-one-synthesizer fan-in case: with `[retrieval].reduce_fanin_enabled` off (today's default), **19% of NCP's own bounded top-k retrieval slots are near-duplicates of another slot in the same result** on a deterministic 40-worker/4-topic corpus; enabling it merges the near-duplicates, drops malformed candidates, and flags likely contradictions for the reading model, at an **11% token reduction** against an unbounded raw dump of all 40 workers (see [the fan-in reduction benchmark doc](./docs/NCP_BENCHMARK_FANIN_REDUCE.md) for the full methodology and an honest account of the contradiction-flagging heuristic's false-positive rate).
 
-Plain RAG is BM25 top-k over the raw transcript turns packed into the same token budget, with none of NCP's trust weighting, whispers, distillation or consolidation (`ncp.bench.baselines.PlainRagBaseline`). On the context-adequacy benchmarks above it ties NCP, and on the HotpotQA-style set it beats NCP at budgets of 200 tokens or less; those benchmarks do not exercise the features that distinguish NCP from ordinary retrieval. The conflicting-memory benchmark does: when contradicting claims match the query equally well, NCP ranks the true one first in 0.98 of tasks against 0.33 for plain RAG, with the caveats in its row above. Efficacy mock mode (`benchmarks/efficacy`, budgets 200 and 400) shows the same tie: NCP 1.00, plain RAG 1.00, rolling summary 1.00, sliding window 0.00.
+Plain RAG is BM25 top-k over the raw transcript turns packed into the same token budget, with none of NCP's trust weighting, whispers, distillation or consolidation (`ncp.bench.baselines.PlainRagBaseline`). On the context-adequacy benchmarks above it ties NCP, and on the HotpotQA-style set it beats NCP at budgets of 200 tokens or less and ties it from 300 up; those benchmarks do not exercise the features that distinguish NCP from ordinary retrieval. The conflicting-memory benchmark does: when contradicting claims match the query equally well, NCP ranks the true one first in 0.98 of tasks against 0.33 for plain RAG, with the caveats in its row above. Efficacy mock mode (`benchmarks/efficacy`, budgets 200 and 400) shows the same tie: NCP 1.00, plain RAG 1.00, rolling summary 1.00, sliding window 0.00.
 
 Benchmarks are reproducible:
 
@@ -639,6 +665,7 @@ python3 benchmarks/task_success/run.py --provider anthropic   # live task succes
 python3 benchmarks/efficacy/run.py --provider mock --seeds 2  # context adequacy at matched budget
 python3 benchmarks/compression/run.py             # ingestion-time compression
 python3 benchmarks/fanin_reduce/run.py            # many-workers-to-one-synthesizer fan-in reduction
+python3 benchmarks/harness_overhead/run.py        # handoff, turn-post, catalog, delta and skill-dispatch overhead
 python3 benchmarks/hotpotqa_style/run.py          # synthetic HotpotQA-shaped multi-hop QA
 ```
 
@@ -664,12 +691,13 @@ ncp_record_outcome   — attach outcome feedback to chunks, turns, or a decision
 ncp_lookup_memo      — check for reusable completed work by signature
 ncp_record_memo      — store reusable completed work by signature
 ncp_wait_whispers    — block until a whisper is queued for this agent (peeks, never drains)
+ncp_skill            — opt-in (`[skill_cache].enabled`): read a user-registered skill by id (get / recall / list)
 ncp_task             — opt-in task ledger: create / claim / heartbeat / release / complete / cancel / get / list
 ncp_overview         — ranked, token-bounded summary across active pipelines (read-only)
 ncp_ontology_*       — opt-in domain graph: capabilities / query / explain / assert / revoke / evidence
 ```
 
-The `[tools] profile` setting picks the advertised surface: `core` (5 per-turn lifecycle tools), `standard` (the default: core plus `ncp_record_outcome`, the decision tools and `ncp_wait_whispers`) or `full` (everything). `ncp_overview`, `ncp_remember`, `ncp_recall`, `ncp_improve`, `ncp_task` and the memo tools require `profile = "full"` (`ncp_task` also needs `[tasks].enabled = true`); the six `ncp_ontology_*` tools need `[ontology].enabled = true` and a non-`core` profile. See [the ontology guide](./docs/NCP_ONTOLOGY.md).
+The `[tools] profile` setting picks the advertised surface: `minimal` (`ncp_get_context` and `ncp_write_memory` only; also available per connection with `?profile=minimal`), `core` (5 per-turn lifecycle tools), `standard` (the default: core plus `ncp_record_outcome`, the decision tools and `ncp_wait_whispers`) or `full` (everything). `ncp_overview`, `ncp_remember`, `ncp_recall`, `ncp_improve`, `ncp_task` and the memo tools require `profile = "full"` (`ncp_task` also needs `[tasks].enabled = true`); the six `ncp_ontology_*` tools need `[ontology].enabled = true` and a non-`core` profile. See [the ontology guide](./docs/NCP_ONTOLOGY.md).
 
 The core agent-to-agent protocol is still: read context, publish memory, signal peers, and record outcomes. The memory facade (`ncp_remember` / `ncp_recall` / `ncp_improve`) is an ergonomic layer over the same trust-aware chunks and graph edges.
 
@@ -760,7 +788,9 @@ ncp ontology eval # score a scan against a golden manifest (precision / recall /
 ncp ontology seed # load/sync the opt-in ontology from one or more manifests (--dry-run, --prune)
 ncp calibrate   # recalibrate trust (add --feedback for the self-improvement pass)
 ncp refine      # evidence-backed procedural self-refinement: ingest/show/propose/apply/rollback
-ncp handoff     # cross-agent handoff coordination
+ncp handoff     # cross-agent handoff coordination (bounded summary return; --skill, --return full)
+ncp run-turn    # run one fresh-context turn on a host: claude, codex, opencode or mock
+ncp skill       # cache | list | show user-registered skills (opt-in, [skill_cache])
 ncp batch       # process a JSONL file of NCP operations
 ncp identity    # create / list / revoke Ed25519 agent identities
 ncp reputation  # per-identity reputation: score, confidence, observation count
@@ -817,6 +847,8 @@ ncp handoff claude --cwd /path/to/project --pipeline-id pipe_demo --emit-to open
 ncp handoff opencode --cwd /path/to/project --pipeline-id pipe_demo --emit-to claude
 ```
 
+`ncp handoff` prints a bounded summary plus the chunk id of the full output; `--return full` prints it all, `--skill <id>` places a registered skill at the start of the prompt.  See [Harness and subagent overhead](#harness-and-subagent-overhead-v196).
+
 -----
 
 ## Verify setup
@@ -842,16 +874,20 @@ ncp explain --cwd /path/to/project
 
 | Block            | Controls                                                                                  |
 |------------------|-------------------------------------------------------------------------------------------|
-| `[budget]`       | Context token budget and per-pressure chunk/whisper caps (default → high → critical)       |
+| `[budget]`       | Context token budget, per-pressure chunk/whisper caps (default → high → critical) and `estimate_margin` (1.0; 0.9 reserves 10%, opt-in) |
 | `[pipeline]`     | Working-set size and GC (`max_working_chunks`, `gc_threshold`, default TTL); eviction is lowest trust/recency first and never removes `user_verified` chunks |
 | `[whispers]`     | Whisper TTL, max per drain, and `min_confidence` to deliver                                |
-| `[retrieval]`    | Signal weights, `generation_penalty_base`, `edge_expansion`, rerank, trust propagation, `reduce_fanin_enabled` |
+| `[retrieval]`    | Signal weights, `generation_penalty_base`, `edge_expansion`, rerank, trust propagation, `diversity_lambda` (1.0; MMR is opt-in), `reduce_fanin_enabled` and `reduce_fanin_auto_min_writers` (3), `fit_swap_enabled` |
 | `[embedding]`    | Semantic vector retrieval — on by default (local, no API key); provider, model, graceful lexical-only fallback if `fastembed` is absent |
 | `[reputation]`   | Beta-reputation `gain`, `forget`, `confidence_k`                                           |
 | `[consolidation]`| Similarity threshold, trust floor, and optional LLM model for memory compaction            |
 | `[retention]`    | Hard cap on working chunks per pipeline (`user_verified` chunks are never evicted)         |
 | `[providers]`    | Per-model pricing used by `ncp cost` (configurable)                                        |
 | `[server]`       | `auth_token` for non-loopback binds                                                        |
+| `[tools]`        | `profile`: `minimal`, `core`, `standard` (default) or `full`; a connection can narrow it                 |
+| `[turns]`        | `result_full_max_chars` (8000): cap on the result stored by `ncp_post_turn`                |
+| `[encoder]`      | `show_score` (false): print `score:` in chunk headers (off keeps the cacheable prefix stable) |
+| `[skill_cache]`  | `enabled` (false) gates `ncp_skill`, `ncp skill` and `--skill`; `default_trust`, `default_expiry_days`, `window_chars` |
 | `[notify]`       | Push delivery: `enabled`, `backend` (auto/memory/redis), `max_subscribers`, `max_wait_seconds`, `poll_interval_seconds` |
 | `[tasks]`        | Task ledger (off by default): `enabled`, lease defaults and limits, `default_max_attempts`, `stale_open_seconds` |
 | `[principals.<name>]` | Opt-in authenticated principals: a bearer token (`token_sha256` or `token_env`) bound to an `agent_id`, a `pipelines` allowlist and `admin`/`verify`/`record_outcome` capabilities. See "Principals" in [the HTTP API](./docs/NCP_HTTP_API.md) |
@@ -959,6 +995,7 @@ When Sarathi orchestrates, it dispatches the same roles. Every worker starts wit
 - [Benchmark: research pipeline](./docs/NCP_BENCHMARK_RESEARCH_PIPELINE.md)
 - [Benchmark: ingestion-time compression](./docs/NCP_BENCHMARK_COMPRESSION.md)
 - [Benchmark: fan-in reduction](./docs/NCP_BENCHMARK_FANIN_REDUCE.md)
+- [Benchmark: harness and subagent overhead](./docs/NCP_BENCHMARK_HARNESS_OVERHEAD.md)
 - [Benchmark: ontology](./docs/NCP_BENCHMARK_ONTOLOGY.md)
 - [MACE multi-agent eval](./benchmarks/mace/README.md)
 - [North-star capability roadmap](./docs/NCP_NORTH_STAR_CAPABILITY_ROADMAP.md)
