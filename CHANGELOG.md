@@ -4,15 +4,15 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [Unreleased]
 
+## [1.9.6] - 2026-11-17
+
 ### Release scope
 
 Token-efficiency work from `docs/NCP_TOKEN_EFFICIENCY_PLAN.md`: smaller handoff
 returns and turn posts, server-held ids, per-connection tool profiles, a user
 skill cache wired into MCP/CLI/handoff, tighter budget accounting, retrieval
 defaults tuned against the benchmark gates, one lifecycle hook script,
-`ncp run-turn`, and a single source for the generated turn loop. Feature PRs
-do not bump the version in this repository; the version stays 1.9.5 until a
-`chore(release)` commit.
+`ncp run-turn`, and a single source for the generated turn loop.
 
 <!-- TODO delta: cross-turn delta (`delta: true` on `ncp_get_context`) is in progress; add its entry here once it ships. -->
 

@@ -134,3 +134,28 @@ def test_marker_chunk_prefix_stable_across_multi_hour_gap(tmp_path: Path, hours:
 
 def _prefix_by_offset(context: str) -> str:
     return context[: context.volatile_offset]  # type: ignore[attr-defined]
+
+
+def test_delta_mode_prefix_is_stable_across_wall_time(tmp_path: Path) -> None:
+    from ncp.assembler import DeltaContext, chunk_content_hash
+
+    assembler = Assembler(store=_store(tmp_path, whisper=True))
+    with patch("time.time", _REAL_TIME):
+        result = assembler.assemble(
+            conscious=_conscious(), budget=BudgetContext(steps_completed=0), query_text="payment retry",
+        )
+    first = result.context
+    delivered = {c.chunk_id: chunk_content_hash(c) for c in result.chunks}
+    assert delivered == result.delivered_hashes and len(delivered) >= 2
+
+    def at(offset: float, steps: int) -> str:
+        with patch("time.time", lambda: _REAL_TIME() + offset):
+            return assembler.assemble(
+                conscious=_conscious(), budget=BudgetContext(steps_completed=steps),
+                query_text="payment retry", delta=DeltaContext(delivered),
+            ).context
+
+    contexts = [at(offset, steps) for offset, steps in ((0, 1), (3000, 2), (30 * 3600, 3))]
+    assert all("seen:1" in c for c in contexts)
+    assert len({_prefix(c) for c in contexts}) == 1
+    assert _prefix(first) != _prefix(contexts[0])  # header lines replace the full chunks

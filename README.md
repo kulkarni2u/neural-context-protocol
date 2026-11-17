@@ -807,6 +807,8 @@ resets the per-chunk retrieval/dissent counters it consumes, `ncp trust-drift`'s
 totals.
 
 -----
+- **Smaller harness overhead** — `ncp handoff` returns a bounded summary by default (`--return full` for everything); `ncp_post_turn` takes an optional `result_full` and defaults its ids from the last `ncp_get_context`; a connection can ask for a narrower tool set (`?profile=minimal`). See [the token-efficiency plan](./docs/NCP_TOKEN_EFFICIENCY_PLAN.md).
+- **Skill cache (opt-in)** — register a workflow or reference skill once (`ncp skill cache <file> --id team/deploy --pipeline <id>`), then pass it by id (`--skill`, `ncp_skill`, `skills` on `ncp_get_context`) instead of pasting it into every prompt. `[NCP:SKILL]` blocks are user-authored instructions. See [the design](./docs/NCP_SKILL_CACHING_DESIGN.md).
 
 ## Cross-agent handoffs
 
@@ -816,6 +818,8 @@ Handoffs are first-class on the bus: one agent hands its task to another host th
 ncp handoff claude --cwd /path/to/project --pipeline-id pipe_demo --emit-to opencode
 ncp handoff opencode --cwd /path/to/project --pipeline-id pipe_demo --emit-to claude
 ```
+
+`ncp handoff` prints a bounded summary plus the chunk id of the full output; `--return full` prints it all, `--skill <id>` places a registered skill at the start of the prompt. `ncp run-turn --host claude|codex|opencode|mock` runs one fresh-context turn. The Claude plugin's `ncp-lifecycle-hook.sh` covers SessionStart(compact|clear), SubagentStart, SubagentStop and Stop (`NCP_HOOKS_DISABLE=1` turns it off).
 
 -----
 
@@ -852,6 +856,9 @@ ncp explain --cwd /path/to/project
 | `[retention]`    | Hard cap on working chunks per pipeline (`user_verified` chunks are never evicted)         |
 | `[providers]`    | Per-model pricing used by `ncp cost` (configurable)                                        |
 | `[server]`       | `auth_token` for non-loopback binds                                                        |
+| `[turns]`        | `result_full_max_chars` (8000): cap on the result stored by `ncp_post_turn`                |
+| `[encoder]`      | `show_score` (false): print `score:` in chunk headers (off keeps the cacheable prefix stable) |
+| `[skill_cache]`  | `enabled` (false) gates `ncp_skill`, `ncp skill` and `--skill`; `default_trust`, `default_expiry_days`, `window_chars` |
 | `[notify]`       | Push delivery: `enabled`, `backend` (auto/memory/redis), `max_subscribers`, `max_wait_seconds`, `poll_interval_seconds` |
 | `[tasks]`        | Task ledger (off by default): `enabled`, lease defaults and limits, `default_max_attempts`, `stale_open_seconds` |
 | `[principals.<name>]` | Opt-in authenticated principals: a bearer token (`token_sha256` or `token_env`) bound to an `agent_id`, a `pipelines` allowlist and `admin`/`verify`/`record_outcome` capabilities. See "Principals" in [the HTTP API](./docs/NCP_HTTP_API.md) |

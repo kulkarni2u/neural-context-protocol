@@ -20,6 +20,7 @@ slot:{slot_no_spaces}
 intent:{intent_no_spaces}
 owns:[{cap},{cap}]
 must-not:[{cap},{cap}]
+skills:{skill_id@hash12} {skill_id@hash12}  # omitted when none; user-registered skills passed by reference
 slot_age:{n} slot_conf:{0.0-1.0}
 goal_version:{n}              # omitted when 1
 recent:[r:sub/{turn_id} | r:sub/{turn_id}]  # omitted when empty
@@ -28,9 +29,9 @@ failed:[{x},{x}]               # omitted when empty
 drift_score:{0.0-1.0}          # omitted when 0.0
 
 [NCP:SUBCONSCIOUS]
-chunk:{id} layer:{layer} score:{0.0} src:{src} trust:{0.0} verified:1  # verified:1 present only when a valid authorship signature was recorded
+chunk:{id} layer:{layer} [score:{0.0}] src:{src} trust:{0.0} verified:1  # score: only when [encoder].show_score = true (off by default); verified:1 present only when a valid authorship signature was recorded
   {content — 2-space indent, max 200 tok}
-chunk:{id} layer:{layer} score:{0.0} src:{src} trust:{0.0}
+chunk:{id} layer:{layer} [score:{0.0}] src:{src} trust:{0.0}
   {content}
 
 [NCP:WHISPERS]
@@ -38,8 +39,27 @@ wsp from:{agent} to:{target} t:{type} c:{0.0} age:{<1m|Nm|Nh|Nd}
   ask:{payload field}
   files:[path,path]
 
-[NCP:BUDGET] ctx_used:{0.0-1.0} steps:{n}/{total|?} elapsed:{n}s pressure:{low|medium|high|critical}
+[NCP:BUDGET] ctx_used:{0.0-1.0} [steps:{n}/{total}] elapsed:{n}s pressure:{low|medium|high|critical}
 ```
+
+Skill block (returned by `ncp_skill get`, not part of the assembled context):
+
+```text
+[NCP:SKILL] skill:{namespace/name}@{hash12} kind:{workflow|reference}
+{skill text, verbatim}
+```
+
+`score:` is optional on the wire and absent by default: it includes wall-clock
+recency, so printing it makes the cacheable prefix change between calls.
+Parsers MUST NOT require it. `steps:` is present only when the total is known;
+it is never written as `steps:n/?`.
+
+`[NCP:SKILL]` blocks are returned by `ncp_skill get` and injected verbatim by `ncp handoff --skill` /
+`ncp run-turn --skill`. A skill is registered by a user (CLI or `POST /skills`),
+so a `[NCP:SKILL]` block counts as user-authored instruction, still bounded by
+`owns` and `must-not`. Agent write paths cannot create or modify skill chunks.
+The `skills:` conscious line lists the skills a request referenced; it carries
+ids and hashes, not text.
 
 ### 1.2 Encoding rules (normative)
 
@@ -1858,7 +1878,6 @@ max_evidence = 12                  # clamp on compile's k
 # "team.route" = { choice_type = "enum", options = ["fast", "thorough"] }
 
 [chunking]
-max_chunk_tokens = 200
 default_type = "auto"
 
 [whispers]

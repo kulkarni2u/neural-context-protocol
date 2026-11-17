@@ -13,6 +13,18 @@ max_tokens_per_call = 4000
 warn_at_ratio = 0.70
 critical_at_ratio = 0.85
 
+# Token estimate margin when the unit is chars_div4 (0.9 reserves 10%).
+# estimate_margin = 0.9
+
+[encoder]
+# Print "score:" in chunk headers. Off keeps the cacheable prefix stable.
+# show_score = false
+
+[turns]
+# Cap (characters) on result_full stored by ncp_post_turn; longer input is
+# truncated and the original kept as a raw_ref chunk.
+# result_full_max_chars = 8000
+
 [chunking]
 default_type = "auto"
 

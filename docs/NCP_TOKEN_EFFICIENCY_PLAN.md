@@ -1,6 +1,6 @@
 # NCP Token-Efficiency Plan: Harness and Subagent Overhead
 
-Status: **proposed, nothing implemented.** Baseline: v1.9.5.
+Status: **shipped in v1.9.6, except item 5 (cross-turn delta), which is in progress.** Baseline: v1.9.5. Where the code differs from the text below, the [Status](#status) table says so and the code wins.
 
 NCP already bounds its own context block (840 tokens by default, capped chunk
 and whisper counts, write-side noise filtering). This plan covers the token
@@ -32,6 +32,22 @@ Order: A, B, C first. They affect every worker dispatch and touch no
 retrieval logic. D and E change assembly and need the benchmark gates. G is
 blocked on the provider-evaluator redesign noted in
 `NCP_CONTEXT_ENGINEERING_REVIEW.md`.
+
+## Status
+
+| # | Item | Status | Deviation from the plan |
+|---|------|--------|-------------------------|
+| 1 | Handoff return cap | Shipped | Full output is stored as a chain of `raw_ref` part chunks (each part links to the next), not one chunk. `ncp run-turn` takes the same `--return` / `--max-return-chars`. `--max-return-chars` is limited to 1-2,000. |
+| 2 | Optional `result_full` | Shipped | `result_ref` over the cap needs no copy (the referenced chunk is the original). Response adds `result_truncated` and `raw_ref`. |
+| 4 | Server-held ids | Shipped | In-process only: not shared across server processes. Never used for the shared `__default__` session. `echo_ids` on `ncp_get_context` added. |
+| 3 | Per-connection tool profile | Shipped | Narrow-only. Adds a `minimal` profile and a per-principal `tools` allowlist. |
+| 9 | Skill cache over MCP, handoff, CLI | Shipped | Off by default (`[skill_cache].enabled`). `ncp_skill` is an MCP tool (the design doc's "no new tool" decision was reversed). Scope flag required on `ncp skill cache`. `POST /skills` needs the `cache_skill` capability. |
+| 6 | Stable prompt-cache prefix | Shipped | `show_score` off by default. Anthropic split is offset-based. `steps:` omitted when the total is unknown. |
+| 7 | Budget accuracy, conscious caps | Shipped | `chunking.max_chunk_tokens` removed rather than wired. The tiktoken property test skips when tiktoken's encoding data is unavailable offline. |
+| 8 | Packing, fan-in, diversity defaults | Shipped | `diversity_lambda` 0.7, auto fan-in at 3+ writers, fit swap on. The swap picks its victim by relevance, because a lower-ranked victim can never make room. pgvector parity was not run locally. |
+| 5 | Cross-turn delta | In progress | <!-- TODO delta --> |
+| 11 | Lifecycle hooks and `ncp run-turn` | Shipped | One script, `ncp-lifecycle-hook.sh`, for all four events. `run-turn` hosts: claude, codex, opencode, mock. |
+| 10 | One source for lifecycle instructions | Partly shipped | Generated `CLAUDE.md` and root `AGENTS.md` use `ncp/templates/turn_loop.md.example`. Provider templates are drift-checked only, not generated. |
 
 ## PR A: stop routing bulk text through the model
 

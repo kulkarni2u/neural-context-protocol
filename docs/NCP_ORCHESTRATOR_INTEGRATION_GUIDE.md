@@ -205,6 +205,34 @@ Rules that keep the loop honest:
 | `ncp_record_outcome` | after task completes | Success/failure evidence that feeds reputation calibration (CAP-T3). Pass `decision_id` to close the decision loop. |
 | `ncp_overview` | router, before picking where to work (needs `profile = "full"`) | Read-only, token-bounded ranked view of many pipelines (spec §4k). Peeks your inbox; acknowledges nothing. |
 | `ncp_lookup_memo` / `ncp_record_memo` | around expensive work | Semantic memoization: skip work already done for the same task signature (CAP-C3). |
+| `ncp_skill` | dispatch, mid-turn | Read user-registered skills (`get` / `recall` / `list`). Needs `[skill_cache].enabled`. Pass skill ids by reference (`skills` on `ncp_get_context`, `--skill` on `ncp handoff` / `ncp run-turn`) instead of pasting the text into each prompt. |
+
+Cutting per-turn tokens:
+
+- **Profile per connection.** A subagent that only reads and writes memory can
+  connect with `?profile=minimal` (or `X-NCP-Tool-Profile: minimal`) so the
+  server advertises two tools instead of the full catalog. A connection can
+  only narrow the server's profile. `ncp serve --profile` does the same for a
+  whole server.
+- **Do not retype the result.** `ncp_post_turn` needs only `result_summary`;
+  `result_full` is optional and capped at `[turns].result_full_max_chars`.
+  Omit `ack_whisper_ids` / `retrieved_chunk_ids` and the server uses the ids
+  from the session's last `ncp_get_context` (in-process, not for the shared
+  `__default__` session). `echo_ids: false` on `ncp_get_context` stops the
+  ids being sent to the model at all.
+- **Bounded handoff returns.** `ncp handoff` prints a summary by default
+  (`--return summary`, `--max-return-chars`) and keeps the full output as
+  `raw_ref` chunks you can `ncp_fetch`. `--return full` prints everything.
+- **Fresh-context turns.** `ncp run-turn --host claude|codex|opencode|mock`
+  runs one turn with NCP context assembled for it.
+- **Lifecycle hooks (Claude Code).** `ncp-lifecycle-hook.sh` handles
+  SessionStart(compact|clear), SubagentStart, SubagentStop and Stop: it injects
+  context on restart and posts the finished turn out of band. Disable with
+  `NCP_HOOKS_DISABLE=1` or `NCP_HOOK_<EVENT>_DISABLE=1`; set identity with
+  `NCP_TASK`, `NCP_SLOT`, `NCP_AGENT_ID`.
+- **Config.** `[turns]` (`result_full_max_chars`), `[encoder]` (`show_score`)
+  and `[skill_cache]` (`enabled`, `default_trust`, `default_expiry_days`,
+  `window_chars`).
 
 Normative details for each: [`docs/NCP_PROTOCOL_SPEC.md`](./NCP_PROTOCOL_SPEC.md).
 
@@ -219,7 +247,7 @@ four ordered sections, always ≤ your token ceiling:
 
 ```text
 [NCP:CONSCIOUS]      # who/what/why for this turn, recent-turn refs, tried/failed
-[NCP:SUBCONSCIOUS]   # retrieved chunks: chunk:{id} layer:… score:… src:… trust:…
+[NCP:SUBCONSCIOUS]   # retrieved chunks: chunk:{id} layer:… src:… trust:…  (score:… only with [encoder].show_score)
 [NCP:WHISPERS]       # pending signals from peers, with sender/type/confidence/age
 [NCP:BUDGET]         # ctx_used, steps, elapsed, pressure
 ```

@@ -76,7 +76,8 @@ def test_seen_line_is_header_only_and_frees_budget(tmp_path: Path) -> None:
     shown_first = len(first["retrieved_chunk_ids"])
     second = _call(handlers, _args(delta=True, max_tokens=420, k=6))
     assert len(second["retrieved_chunk_ids"]) > shown_first
-    assert "chunk:c0 seen:1\n" in second["context"] or second["context"].count("seen:1") >= shown_first
+    assert second["context"].count("seen:1") == shown_first
+    assert second["retrieved_chunk_ids"][:shown_first] == first["retrieved_chunk_ids"]
 
 
 def test_changed_content_is_resent_in_full(tmp_path: Path) -> None:
@@ -160,11 +161,9 @@ def test_stable_order_with_new_chunk_appended(tmp_path: Path) -> None:
     assert order_second[: len(order_first)] == order_first
     assert order_second[len(order_first):] == ["c_new"]
     assert "chunk:c_new seen:1" not in second["context"]
-    # Without delta the order is the ranking's, untouched by delivery state.
+    # Without delta the order is the ranking's: the new top-ranked chunk is first.
     plain = _call(handlers, _args(session_id="plain"))
-    assert re.findall(r"^chunk:(\S+)", plain["context"], re.MULTILINE) == re.findall(
-        r"^chunk:(\S+)", _call(handlers, _args(session_id="plain2"))["context"], re.MULTILINE
-    )
+    assert re.findall(r"^chunk:(\S+)", plain["context"], re.MULTILINE)[0] == "c_new"
 
 
 def test_retrieved_ids_complete_and_held_for_post_turn(tmp_path: Path) -> None:
@@ -176,6 +175,9 @@ def test_retrieved_ids_complete_and_held_for_post_turn(tmp_path: Path) -> None:
     # The server-held ids (what ncp_post_turn credits) still include seen chunks.
     held = _call(handlers, _args(delta=True))
     assert sorted(held["retrieved_chunk_ids"]) == sorted(first["retrieved_chunk_ids"])
+    links: list[tuple] = []
+    real = store.link_turn_chunks
+    store.link_turn_chunks = lambda turn_id, ids, *, relation: (links.append((tuple(ids), relation)), real(turn_id, ids, relation=relation))[1]  # type: ignore[method-assign]
     raw = _handle_request(
         {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "ncp_post_turn", "arguments": {
             "agent_id": "alice", "role": "build", "task": "payment_retry", "slot": "retry", "intent": "fix",
@@ -183,8 +185,7 @@ def test_retrieved_ids_complete_and_held_for_post_turn(tmp_path: Path) -> None:
         handlers, tools=MCP_TOOLS,
     )
     assert "error" not in json.loads(raw)
-    linked = store.link_turn_chunks  # presence check: credited via held ids
-    assert linked is not None
+    assert [(sorted(ids), rel) for ids, rel in links] == [(sorted(first["retrieved_chunk_ids"]), "retrieved")]
 
 
 def test_non_delta_calls_unchanged_by_prior_delivery(tmp_path: Path) -> None:

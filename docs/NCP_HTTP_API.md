@@ -85,6 +85,8 @@ capabilities = ["record_outcome"]
 Each principal needs `agent_id` and exactly one of `token_sha256` (the token
 is never stored in plaintext; a `token` key is refused) or `token_env` (the
 secret stays out of the file). `pipelines`, if present, must be non-empty.
+`tools`, if present, is a non-empty list of tool names; the principal's
+`tools/list` and calls are limited to those tools (within the tool profile).
 Capabilities:
 
 | Capability | Grants |
@@ -206,6 +208,7 @@ Returns the enabled tool catalog, each tool with a JSON Schema under
 `inputSchema`. `[tools] profile` selects the surface (`NCP_TOOL_PROFILE`
 overrides it). The `core` profile advertises `ncp_get_context`,
 `ncp_write_memory`, `ncp_emit_whisper`, `ncp_post_turn` and `ncp_fetch`. The
+`minimal` profile advertises only `ncp_get_context` and `ncp_write_memory`. The
 `standard` profile (the default) adds `ncp_record_outcome`,
 `ncp_record_decision`, `ncp_get_decision`, `ncp_compile_decision_query` and
 `ncp_wait_whispers` (unless `[notify].enabled = false`). The `full` profile
@@ -216,6 +219,20 @@ additionally adds `ncp_overview`, `ncp_remember`, `ncp_recall` and
 - `ncp_task` — only in the `full` profile with `[tasks].enabled = true`.
 - `ncp_lookup_memo`, `ncp_record_memo`, `ncp_verify_memo` — only in the `full`
   profile when memoization is enabled (`[memoization].enabled`, off by default).
+
+- `ncp_skill` — only when `[skill_cache].enabled = true` (standard and full).
+
+#### Per-connection tool profile
+
+A client can ask for a smaller tool set than the server's configured
+`[tools].profile`: `POST /mcp?profile=minimal` (the SSE endpoint carries the
+query on to the POST endpoint) or the `X-NCP-Tool-Profile` header. The query
+parameter wins when both are sent. The value is one of `minimal`, `core`,
+`standard`, `full`. A request can only narrow: asking for `full` on a `standard`
+server yields `standard`, and an unknown value leaves the server set unchanged.
+`ncp serve --profile <name>` narrows the whole server the same way. A
+principal's optional `tools` list (see Principals) is intersected with the
+result; an empty list is rejected at startup.
 
 The authoritative list is `MCP_TOOLS` in `ncp/mcp/server.py`;
 `tests/test_docs_tool_catalog.py` fails if a tool is missing from this file.
@@ -276,6 +293,21 @@ The decoded result contains:
 - `context_policy` — only when the request named one: the applied policy's
   `name`, `version`, `sha256` and `max_tokens_cap`, plus
   `max_tokens_capped_from` when an explicit `max_tokens` was lowered to the cap
+- `skills`, `skills_missing` — only when the request sent `skills` (see below)
+
+Optional arguments:
+
+- `echo_ids` (boolean, default `true`) — `false` omits `pending_whisper_ids` and
+  `retrieved_chunk_ids` from the response. `ncp_post_turn` then uses the ids the
+  server holds for this session.
+- `skills` (array of skill ids, max 8, needs `[skill_cache].enabled`) — resolves
+  user-registered skills by reference. The context gets a `skills:` line in the
+  conscious block with `<skill_id>@<hash12>` entries; the skill text is not
+  returned. Unknown ids are listed in `skills_missing`. Fetch the text with
+  `ncp_skill`.
+
+Chunk headers in `context` omit `score:` unless `[encoder].show_score = true`,
+and `[NCP:BUDGET]` omits `steps:` when the total is unknown.
 
 Pass `"context_policy": "<name>"` to assemble this request under a
 `[context_policies.<name>]` entry (see `docs/NCP_CONTEXT_POLICY.md`). Unknown
@@ -302,6 +334,21 @@ curl -s $BASE/mcp -H "$AUTH" -H 'Content-Type: application/json' -d '{
 ```
 
 Returns `{"posted": true, "turn_id": "...", "acknowledged_whisper_ids": [...]}`.
+When the stored result was truncated, the response also has
+`"result_truncated": true` and `raw_ref` (the chunk id holding the original;
+`raw_ref_chunk_ids` when there is more than one).
+
+`result_full` is optional. Omit it and `result_summary` is stored as the turn
+result, or pass `result_ref` (the id of a chunk already written in this
+turn's pipeline) to use that chunk's content. A result longer than
+`[turns].result_full_max_chars` (default 8,000) is truncated on the turn
+record and the original is kept as a `raw_ref` chunk. Do not retype the model's
+answer into `result_full`; it is for harnesses that already hold the text.
+
+When `ack_whisper_ids` or `retrieved_chunk_ids` is omitted, the server uses the
+ids from the last `ncp_get_context` of the same session (give `agent_id` or
+`session_id`). This does not apply to the shared `__default__` session, and the
+held ids live in the server process only. Explicit values always win.
 This is what makes recent-ref continuity, `ncp cost`, and `ncp status` work.
 
 Optional `retrieved_chunk_ids` (array of strings, from `ncp_get_context`) and
@@ -612,7 +659,7 @@ Skill text is data, never instructions.
 
 Plain HTTP route (not an MCP tool). Requires `[principals]` with the
 `cache_skill` capability and `[skill_cache].enabled = true`; otherwise register
-with `ncp skill cache <path> --id <skill_id>`. A pipeline-limited principal must
+with `ncp skill cache <path> --id <skill_id> --pipeline <id>` (or `--global`). A pipeline-limited principal must
 name an allowed `pipeline_id` and cannot register globally.
 
 ```bash

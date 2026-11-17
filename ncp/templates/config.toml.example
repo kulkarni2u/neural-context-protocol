@@ -47,6 +47,18 @@ adaptive_budget_enabled = true
 # context_token_budget. Set true to allow scaling up (to the ceiling above).
 # adaptive_allow_expand = false
 
+# Token estimate margin when the unit is chars_div4 (0.9 reserves 10%).
+# estimate_margin = 0.9
+
+[encoder]
+# Print "score:" in chunk headers. Off keeps the cacheable prefix stable.
+# show_score = false
+
+[turns]
+# Cap (characters) on result_full stored by ncp_post_turn; longer input is
+# truncated and the original kept as a raw_ref chunk.
+# result_full_max_chars = 8000
+
 [chunking]
 default_type = "auto"
 
