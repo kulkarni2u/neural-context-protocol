@@ -25,7 +25,7 @@ from pathlib import Path, PurePosixPath
 from typing import BinaryIO, Sequence, get_args
 
 from ncp.adaptive_budget import AdaptiveBudgetResult, compute_adaptive_budget
-from ncp.assembler import Assembler, credited_chunks, stored_evidence_ids
+from ncp.assembler import Assembler, DeltaContext, chunk_content_hash, credited_chunks, stored_evidence_ids
 from ncp.mcp.response_budget import compact_telemetry, context_sha256, fit_response
 from ncp.budget import BudgetSnapshot, evaluate_budget
 from ncp.chunker import filter_content
@@ -156,6 +156,7 @@ MCP_TOOLS: list[dict[str, object]] = [
                 "diversity_limit": {"type": "integer", "description": "Max chunks per author (default 2)."},
                 "max_tokens": {"type": "integer", "description": "Estimated token ceiling for the context block. Omit to let the adaptive budget decide (see response budget_tokens)."},
                 "compact": {"type": "boolean", "description": "Compact telemetry (default); false requests full diagnostics."},
+                "delta": {"type": "boolean", "description": "Default false. true renders chunks this session already received unchanged as 'chunk:<id> seen:1'; false resets that state. Never for the shared default session."},
                 "echo_ids": {"type": "boolean", "description": "Default true. false omits pending_whisper_ids and retrieved_chunk_ids; ncp_post_turn then uses the ids the server holds for this session."},
                 "response_max_tokens": {"type": "integer", "minimum": 1, "description": "Estimated token ceiling for the whole serialized response; diagnostics are dropped first, then context is re-fitted before streaming."},
                 "context_policy": {"type": "string", "description": "Name of a [context_policies.<name>] entry applied to this request only. Unknown or invalid names are rejected."},
@@ -1089,6 +1090,10 @@ class FetchSession:
     retrieved_chunk_ids: list[str] | None = None
     # Skill content hashes already returned by ncp_skill get in this session.
     skill_hashes: set[str] = field(default_factory=set)
+    # Cross-turn delta: chunk_id -> content hash already delivered to this
+    # session, in first-delivery order. Per-agent state: never kept for the
+    # shared default key. Bounded (oldest dropped); expires with the entry.
+    delivered: dict[str, str] = field(default_factory=dict)
 
 
 _RESULT_RAW_MAX_WINDOWS = 20
@@ -1098,6 +1103,7 @@ _RESULT_RAW_MAX_WINDOWS = 20
 # table still exceeds the cap, the least-recently-accessed entries are evicted.
 _FETCH_SESSION_MAX = 1024
 _FETCH_SESSION_TTL_SECONDS = 3600.0
+_DELIVERED_MAX = 256
 
 
 @dataclass
@@ -1514,9 +1520,21 @@ def make_handlers(
             if not skill_cache_on:
                 raise ValueError("ncp_get_context 'skills' requires [skill_cache].enabled = true")
             skill_ids = list(dict.fromkeys(item.strip() for item in raw_skills if item.strip()))[:8]
+        delta = args.get("delta", False)
+        if not isinstance(delta, bool):
+            raise ValueError("ncp_get_context 'delta' must be a boolean")
         session_id = _session_id_from_args(args)
         pipeline_id = args.get("pipeline_id")
         normalized_pipeline_id = None if pipeline_id is None else str(pipeline_id)
+        delta_applied = delta and session_id != DEFAULT_FETCH_SESSION_ID
+        prior_delivered: dict[str, str] = {}
+        if delta_applied:
+            # Carry delivered state across the per-call session reset below,
+            # unless the entry expired (TTL) or never existed (new session_id).
+            with sessions_lock:
+                prior = sessions.get(session_id)
+                if prior is not None and time.monotonic() - prior.last_access <= _FETCH_SESSION_TTL_SECONDS:
+                    prior_delivered = dict(prior.delivered)
         if coordination is not None and hasattr(coordination, "reset_fetch_session"):
             coordination.reset_fetch_session(session_id, pipeline_id=normalized_pipeline_id)
             if session_id != DEFAULT_FETCH_SESSION_ID:
@@ -1625,6 +1643,7 @@ def make_handlers(
             diversity_limit=caller_diversity_limit,
             max_tokens=effective_max_tokens,
             as_of=as_of,
+            delta=DeltaContext(prior_delivered, skip_recent_agent=conscious.agent_id) if delta_applied else None,
         )
         response: dict[str, object] = {
             "context": result.context,
@@ -1652,6 +1671,18 @@ def make_handlers(
             response["ontology"] = result.ontology
         if compact:
             _compact_response(response)
+        # Added after compaction (which keeps a fixed key set) so they survive it.
+        extra_telemetry: dict[str, object] = {}
+        if result.over_budget:
+            extra_telemetry["over_budget"] = True
+        if delta:
+            extra_telemetry["delta"] = (
+                {"applied": True, "seen": len(_seen_ids(result, prior_delivered))}
+                if delta_applied
+                else {"applied": False, "reason": "default_session"}
+            )
+        if extra_telemetry and isinstance(response.get("telemetry"), dict):
+            response["telemetry"].update(extra_telemetry)  # type: ignore[union-attr]
         fitted_result = result
         if response_max_tokens is not None:
             def _refit(ceiling: int) -> dict[str, object]:
@@ -1674,6 +1705,12 @@ def make_handlers(
                 held = sessions.setdefault(session_id, FetchSession())
                 held.pending_whisper_ids = list(fitted_result.pending_whisper_ids)
                 held.retrieved_chunk_ids = _retrieved_chunk_ids(fitted_result)
+                # delta:false (or a reset session) starts from an empty set.
+                delivered = dict(prior_delivered) if delta_applied else {}
+                delivered.update(fitted_result.delivered_hashes)
+                while len(delivered) > _DELIVERED_MAX:
+                    del delivered[next(iter(delivered))]
+                held.delivered = delivered
                 held.last_access = time.monotonic()
         if not echo_ids:
             response.pop("pending_whisper_ids", None)
@@ -1688,6 +1725,13 @@ def make_handlers(
                 sections = [("context", str(response["context"]))]
             return StreamResponse(sections=sections, handler_result=response)
         return response
+
+    def _seen_ids(result: object, prior: dict[str, str]) -> list[str]:
+        return [
+            chunk.chunk_id
+            for chunk in getattr(result, "chunks", [])
+            if prior.get(chunk.chunk_id) == chunk_content_hash(chunk)
+        ]
 
     def _compact_response(response: dict[str, object]) -> None:
         telemetry = response.get("telemetry")

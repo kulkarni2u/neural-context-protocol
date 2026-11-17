@@ -4,6 +4,92 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [Unreleased]
 
+### Release scope
+
+Token-efficiency work from `docs/NCP_TOKEN_EFFICIENCY_PLAN.md`: smaller handoff
+returns and turn posts, server-held ids, per-connection tool profiles, a user
+skill cache wired into MCP/CLI/handoff, tighter budget accounting, retrieval
+defaults tuned against the benchmark gates, one lifecycle hook script,
+`ncp run-turn`, and a single source for the generated turn loop. Feature PRs
+do not bump the version in this repository; the version stays 1.9.5 until a
+`chore(release)` commit.
+
+<!-- TODO delta: cross-turn delta (`delta: true` on `ncp_get_context`) is in progress; add its entry here once it ships. -->
+
+### Upgrade notes (behavior changes)
+
+- `ncp handoff` prints a bounded summary by default (`--return summary`, at most
+  `--max-return-chars`, default 2,000) plus the chunk id of the full output.
+  `--return full` prints the whole provider output as before.
+- Chunk headers no longer carry `score:` by default. The score includes
+  wall-clock recency and made the cacheable prefix drift. Set
+  `[encoder] show_score = true` to restore it. Parsers that required `score:`
+  must treat it as optional.
+- The budget is stricter. With the `chars_div4` unit, tokens are estimated as
+  chars/4 divided by `[budget].estimate_margin` (0.9), dense text (code, JSON,
+  non-ASCII) is counted at a higher rate, and an over-budget guard drops
+  low-ranked chunks until the block fits. Blocks that used to fit just under
+  `max_tokens` may now lose a chunk.
+- `[NCP:BUDGET]` omits `steps:` when the total is unknown (`steps:0/?` is gone).
+- Retrieval defaults: `[retrieval].diversity_lambda` 1.0 -> 0.7; fan-in
+  reduction now also runs when candidates come from at least
+  `reduce_fanin_auto_min_writers` (3) distinct writers; a fit-swap pass
+  (`fit_swap_enabled`, on) can swap a dropped chunk with relevance >= 0.5 for a
+  lower-ranked admitted one when that fits the budget. Set `diversity_lambda =
+  1.0`, `reduce_fanin_auto_min_writers = 0` and `fit_swap_enabled = false` to
+  restore the old behavior.
+- The `[chunking].max_chunk_tokens` key is removed (it was never read). It is
+  still accepted in existing configs but reported as unknown by `ncp doctor`.
+- `ncp skill cache` requires exactly one of `--pipeline <id>` or `--global`.
+- Conscious-block lists (`recent`, `tried`, `failed`, `owns`, `must-not`) are
+  capped so they cannot crowd out chunks.
+
+### Added
+
+- `ncp_post_turn`: `result_full` is optional (omitted -> `result_summary` is
+  stored); new `result_ref` (a chunk id written this turn); new
+  `[turns].result_full_max_chars` (8,000), with longer input truncated on the
+  turn record and the original kept as `raw_ref` chunks (`result_truncated`,
+  `raw_ref` in the response).
+- `ncp handoff --return summary|full` and `--max-return-chars`; the full output
+  is stored as chained `raw_ref` part chunks.
+- Server-held ids: `ncp_post_turn` defaults omitted `ack_whisper_ids` and
+  `retrieved_chunk_ids` to those of the session's last `ncp_get_context`.
+  `ncp_get_context` takes `echo_ids` (default true) to omit them from the
+  response. Never applied to the shared `__default__` session; held in process
+  memory only, so it is not shared across server processes.
+- Per-connection tool profile: `?profile=` query or `X-NCP-Tool-Profile` header
+  on the MCP endpoint, and `ncp serve --profile`. A connection can only narrow
+  the configured `[tools].profile`. New `minimal` profile
+  (`ncp_get_context`, `ncp_write_memory`). Per-principal `tools` allowlist.
+- Skill cache (opt-in, `[skill_cache].enabled`): `ncp skill cache|list|show`
+  (`--kind workflow|reference`, ids `<namespace>/<name>`); MCP tool `ncp_skill`
+  (`get`, `recall`, `list`); `skills` argument on `ncp_get_context` (returns
+  `skills` / `skills_missing`, a `skills:` conscious line, never the text);
+  `--skill` on `ncp handoff` and `ncp run-turn`; `POST /skills` for principals
+  with the `cache_skill` capability. `[NCP:SKILL]` blocks are user-authored
+  instructions, still bounded by `owns`/`must-not`. Agent write paths reject
+  writes that target skill chunks (poisoning guard).
+- `ncp run-turn --host claude|codex|opencode|mock`: one fresh-context turn.
+- `ncp-lifecycle-hook.sh` (Claude plugin and `ncp setup` hooks):
+  SessionStart(compact|clear), SubagentStart, SubagentStop and Stop. Disable
+  with `NCP_HOOKS_DISABLE=1` or `NCP_HOOK_<EVENT>_DISABLE=1`; `NCP_TASK`,
+  `NCP_SLOT` and `NCP_AGENT_ID` set the identity.
+- `[encoder].show_score`, `[budget].estimate_margin`,
+  `[retrieval].reduce_fanin_auto_min_writers`, `[retrieval].fit_swap_enabled`.
+
+### Changed
+
+- The Anthropic adapter splits the cached prefix by encoded-block offsets
+  instead of re-parsing the text.
+- The generated `CLAUDE.md` and root `AGENTS.md` turn loop comes from
+  `ncp/templates/turn_loop.md.example`; provider templates are only
+  drift-checked against it.
+
+### Removed
+
+- `[chunking].max_chunk_tokens` (see upgrade notes).
+
 ## [1.9.5] - 2026-11-16
 
 ### Release scope
