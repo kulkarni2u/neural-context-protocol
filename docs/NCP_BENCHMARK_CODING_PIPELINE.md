@@ -35,7 +35,7 @@ Observed on November 17, 2026:
 
 - token unit: `chars_div4`
 - context token budget: `340`
-- peak NCP input tokens: `329`
+- peak NCP input tokens: `368`
 - peak raw replay input tokens: `3426`
 - peak sliding-window input tokens: `383`
 - peak rolling-summary input tokens: `2096`
@@ -60,7 +60,7 @@ Measured with `python3 benchmarks/coding_pipeline/run.py --turns 40`:
 
 | Arm | Peak input tokens | Final input tokens | Final vs NCP |
 |---|---:|---:|---:|
-| ncp | 329 | 255 | 1.00x |
+| ncp | 368 | 255 | 1.00x |
 | plain_rag | 377 | 358 | 1.40x |
 | sliding_window | 383 | 377 | 1.48x |
 | rolling_summary | 2096 | 2096 | 8.22x |

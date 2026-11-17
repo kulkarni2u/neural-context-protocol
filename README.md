@@ -65,7 +65,7 @@ Bounded retrieval is the entry point, not the whole story. The mechanisms below 
 
 - **Bounded context assembly** — every turn gets a budget-capped slice of context (conscious + retrieved + whispers), never the full history. See [How agents talk over the bus](#how-agents-talk-over-the-bus).
 - **Write-time noise filtering** — strips ANSI codes, dedups repeated lines, and prunes boilerplate and empty fields before anything is stored. **33% aggregate token reduction** on a fixed noisy-payload benchmark. See [Signal filtering at write time](#signal-filtering-at-write-time).
-- **Fan-in reduction** — dedups near-duplicate claims across parallel workers before they reach a synthesis agent. **8% token reduction** against an unbounded raw dump. See [Fan-in reduction](#fan-in-reduction).
+- **Fan-in reduction** — dedups near-duplicate claims across parallel workers before they reach a synthesis agent. **11% token reduction** against an unbounded raw dump. See [Fan-in reduction](#fan-in-reduction).
 - **Consolidation** — merges repeated or near-duplicate memory into fewer, stronger entries instead of leaving competing rows. See [Retrieval and self-improving memory](#retrieval-and-self-improving-memory).
 
 ### Harness and subagent overhead (v1.9.6)
@@ -478,14 +478,14 @@ This is deterministic signal filtering, not a model-quality change. See [the com
 
 Write-time filtering strips boilerplate from one chunk at a time. It doesn't dedup *across* chunks — and a high-fanout burst (many parallel workers writing overlapping findings into one pipeline) is exactly the case where that matters: without dedup, a synthesis agent's bounded context can end up with several near-duplicate restatements of the same claim instead of that many distinct ones.
 
-`[retrieval].reduce_fanin_enabled` (off by default) adds a deterministic reduction pass to context assembly for this case. When enabled, retrieval overfetches beyond the normal chunk cap, then — within any high-fanout cluster — merges near-duplicate claims down to the highest-trust version (reusing the same clustering `ncp consolidate` uses), drops malformed (empty) candidates, and flags surviving same-topic claims that diverge as contradictions. Contradictions are surfaced as a `note:contradicts` line in the assembled context for the reading agent to reason about; NCP groups and drops duplicates deterministically, but it never resolves a contradiction itself.
+A reduced version of this runs by default: `[retrieval].reduce_fanin_auto_min_writers = 3` applies the reduction to the already-capped candidate set whenever it comes from at least 3 distinct writers (set it to `0` to turn that off). `[retrieval].reduce_fanin_enabled` (off by default) is the full mode and adds a deterministic reduction pass to context assembly for this case. When enabled, retrieval overfetches beyond the normal chunk cap, then — within any high-fanout cluster — merges near-duplicate claims down to the highest-trust version (reusing the same clustering `ncp consolidate` uses), drops malformed (empty) candidates, and flags surviving same-topic claims that diverge as contradictions. Contradictions are surfaced as a `note:contradicts` line in the assembled context for the reading agent to reason about; NCP groups and drops duplicates deterministically, but it never resolves a contradiction itself.
 
 ```toml
 [retrieval]
 reduce_fanin_enabled = true
 ```
 
-On a deterministic 40-worker benchmark, 19% of NCP's own bounded top-k retrieval slots are near-duplicates of another slot in the same result with this off; enabling it merges those away and cuts tokens 8% against an unbounded raw dump of all 40 workers. See [the fan-in reduction benchmark doc](./docs/NCP_BENCHMARK_FANIN_REDUCE.md), including an honest account of the contradiction-flagging heuristic's false-positive rate.
+On a deterministic 40-worker benchmark, 19% of NCP's own bounded top-k retrieval slots are near-duplicates of another slot in the same result with `reduce_fanin_enabled` off (the default auto pass only sees the capped set); enabling it merges those away and cuts tokens 11% against an unbounded raw dump of all 40 workers. See [the fan-in reduction benchmark doc](./docs/NCP_BENCHMARK_FANIN_REDUCE.md), including an honest account of the contradiction-flagging heuristic's false-positive rate.
 
 -----
 
@@ -639,9 +639,9 @@ NCP adds bounded retrieval, provenance, optional authenticated authorship, disse
 | Needle recall at budget 4              | sliding window | 0.00            | 1.00       | **+1.00**  | Synthetic budget-stress recall check. |
 | Needle recall at budget 4              | plain RAG (BM25) | 1.00          | 1.00       | **tie**    | Lexical task: any BM25 retriever solves it; shows NCP is not worse than ordinary retrieval, not that it is better. |
 | Task success at matched budget 400 (12 tasks, mock) | sliding window | 0.00 | 1.00 | **+1.00** | Context adequacy with a deterministic mock provider, not live model success. |
-| Task success at matched budget 400 (12 tasks, mock) | plain RAG (BM25) | 1.00 | 1.00 | **tie** | Ties at every budget tried (150-800); mock scoring only checks the fact is present. NCP used fewer tokens at budget 800 (559 vs 783 median). |
-| HotpotQA-style multi-hop QA at matched budget 300 (15 tasks) | sliding window | 0.00 | 0.87 | **+0.87** | Synthetic, HotpotQA-shaped context-adequacy check — not the official HotpotQA dataset or PlugMem's own eval harness (see [the benchmark's README](./benchmarks/hotpotqa_style/README.md)). |
-| HotpotQA-style multi-hop QA at matched budget 300 (15 tasks) | plain RAG (BM25) | 1.00 | 0.87 | **-0.13** | Plain RAG **beats** NCP at every budget measured: 1.00 vs 0.53 at budget 150, 0.80 at 200, 0.87 at 300 and 0.93 at 400 and 800. |
+| Task success at matched budget 400 (12 tasks, mock) | plain RAG (BM25) | 1.00 | 1.00 | **tie** | Ties at every budget tried (150-800); mock scoring only checks the fact is present. NCP used fewer tokens at budget 800 (536 vs 783 median). |
+| HotpotQA-style multi-hop QA at matched budget 300 (15 tasks) | sliding window | 0.00 | 1.00 | **+1.00** | Synthetic, HotpotQA-shaped context-adequacy check — not the official HotpotQA dataset or PlugMem's own eval harness (see [the benchmark's README](./benchmarks/hotpotqa_style/README.md)). |
+| HotpotQA-style multi-hop QA at matched budget 300 (15 tasks) | plain RAG (BM25) | 1.00 | 1.00 | **tie** | Plain RAG **beats** NCP at small budgets (1.00 vs 0.67 at budget 150, 0.93 at 200) and ties it from 300 up. |
 | Conflicting / low-trust memory, true claim ranked first at k=1 (60 tasks) | plain RAG (BM25) | 0.33 | 0.98 | **+0.65** | Claims differ only by value, so BM25 ties; NCP uses trust, supersedes, outcomes and dissent. NCP's one miss per seed is a retrieval ranking issue (a common word outweighs the topical terms), and it loses when the wrong claim is the trusted one (0.00 vs 0.58). Seed 7; NCP is 0.98 on all five seeds tried. See `docs/NCP_BENCHMARK_CONFLICT_TRUST.md`. |
 
 MACE multi-agent coordination score (40 turns): **0.8964**
@@ -651,9 +651,9 @@ These are deterministic token-accounting benchmarks. The task-success row measur
 
 A separate, complementary compression benchmark measures ingestion-time noise reduction on a fixed noisy-payload corpus: **33% aggregate token reduction** (537 → 360, `chars_div4`, pass gate aggregate >= 0.20), ranging from **68%** on duplicate-heavy logs down to **2%** on already-dense stack traces (see [the compression benchmark doc](./docs/NCP_BENCHMARK_COMPRESSION.md)).
 
-A third, complementary benchmark targets the many-parallel-workers-to-one-synthesizer fan-in case: with `[retrieval].reduce_fanin_enabled` off (today's default), **19% of NCP's own bounded top-k retrieval slots are near-duplicates of another slot in the same result** on a deterministic 40-worker/4-topic corpus; enabling it merges the near-duplicates, drops malformed candidates, and flags likely contradictions for the reading model, at an **8% token reduction** against an unbounded raw dump of all 40 workers (see [the fan-in reduction benchmark doc](./docs/NCP_BENCHMARK_FANIN_REDUCE.md) for the full methodology and an honest account of the contradiction-flagging heuristic's false-positive rate).
+A third, complementary benchmark targets the many-parallel-workers-to-one-synthesizer fan-in case: with `[retrieval].reduce_fanin_enabled` off (today's default), **19% of NCP's own bounded top-k retrieval slots are near-duplicates of another slot in the same result** on a deterministic 40-worker/4-topic corpus; enabling it merges the near-duplicates, drops malformed candidates, and flags likely contradictions for the reading model, at an **11% token reduction** against an unbounded raw dump of all 40 workers (see [the fan-in reduction benchmark doc](./docs/NCP_BENCHMARK_FANIN_REDUCE.md) for the full methodology and an honest account of the contradiction-flagging heuristic's false-positive rate).
 
-Plain RAG is BM25 top-k over the raw transcript turns packed into the same token budget, with none of NCP's trust weighting, whispers, distillation or consolidation (`ncp.bench.baselines.PlainRagBaseline`). On the context-adequacy benchmarks above it ties NCP, and on the HotpotQA-style set it beats NCP at every budget measured (a regression from the tie at 300 tokens and above before the v1.9.6 estimate-margin default); those benchmarks do not exercise the features that distinguish NCP from ordinary retrieval. The conflicting-memory benchmark does: when contradicting claims match the query equally well, NCP ranks the true one first in 0.98 of tasks against 0.33 for plain RAG, with the caveats in its row above. Efficacy mock mode (`benchmarks/efficacy`, budgets 200 and 400) shows the same tie: NCP 1.00, plain RAG 1.00, rolling summary 1.00, sliding window 0.00.
+Plain RAG is BM25 top-k over the raw transcript turns packed into the same token budget, with none of NCP's trust weighting, whispers, distillation or consolidation (`ncp.bench.baselines.PlainRagBaseline`). On the context-adequacy benchmarks above it ties NCP, and on the HotpotQA-style set it beats NCP at budgets of 200 tokens or less and ties it from 300 up; those benchmarks do not exercise the features that distinguish NCP from ordinary retrieval. The conflicting-memory benchmark does: when contradicting claims match the query equally well, NCP ranks the true one first in 0.98 of tasks against 0.33 for plain RAG, with the caveats in its row above. Efficacy mock mode (`benchmarks/efficacy`, budgets 200 and 400) shows the same tie: NCP 1.00, plain RAG 1.00, rolling summary 1.00, sliding window 0.00.
 
 Benchmarks are reproducible:
 
@@ -874,10 +874,10 @@ ncp explain --cwd /path/to/project
 
 | Block            | Controls                                                                                  |
 |------------------|-------------------------------------------------------------------------------------------|
-| `[budget]`       | Context token budget, per-pressure chunk/whisper caps (default → high → critical) and `estimate_margin` (0.9): the conservative counting margin |
+| `[budget]`       | Context token budget, per-pressure chunk/whisper caps (default → high → critical) and `estimate_margin` (1.0; 0.9 reserves 10%, opt-in) |
 | `[pipeline]`     | Working-set size and GC (`max_working_chunks`, `gc_threshold`, default TTL); eviction is lowest trust/recency first and never removes `user_verified` chunks |
 | `[whispers]`     | Whisper TTL, max per drain, and `min_confidence` to deliver                                |
-| `[retrieval]`    | Signal weights, `generation_penalty_base`, `edge_expansion`, rerank, trust propagation, `diversity_lambda` (0.7), `reduce_fanin_enabled` and `reduce_fanin_auto_min_writers` (3), `fit_swap_enabled` |
+| `[retrieval]`    | Signal weights, `generation_penalty_base`, `edge_expansion`, rerank, trust propagation, `diversity_lambda` (1.0; MMR is opt-in), `reduce_fanin_enabled` and `reduce_fanin_auto_min_writers` (3), `fit_swap_enabled` |
 | `[embedding]`    | Semantic vector retrieval — on by default (local, no API key); provider, model, graceful lexical-only fallback if `fastembed` is absent |
 | `[reputation]`   | Beta-reputation `gain`, `forget`, `confidence_k`                                           |
 | `[consolidation]`| Similarity threshold, trust floor, and optional LLM model for memory compaction            |

@@ -30,7 +30,7 @@ def test_new_defaults(tmp_path: Path) -> None:
     project = tmp_path / "repo"
     (project / ".git").mkdir(parents=True)
     config = load_config(cwd=project)
-    assert config.diversity_lambda == pytest.approx(0.7)
+    assert config.diversity_lambda == pytest.approx(1.0)  # MMR is opt-in: 0.7 regressed hotpotqa_style recall
     assert config.reduce_fanin_auto_min_writers == 3
     assert config.fit_swap_enabled is True
     assert config.reduce_fanin_enabled is False  # explicit opt-in unchanged

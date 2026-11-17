@@ -174,7 +174,7 @@ class Assembler:
         # exactly the legacy path.
         self._ontology = ontology
         self.encoder = encoder or PidginEncoder(show_score=config.encoder_show_score if config else False)
-        self._estimate_margin = config.estimate_margin if config else 0.9
+        self._estimate_margin = config.estimate_margin if config else 1.0
         self.coherence = CoherenceChecker(store=store)
         self.middleware = middleware or MiddlewarePipeline()
         self._chunk_cap_default = config.chunk_cap_default if config else 4
@@ -189,7 +189,7 @@ class Assembler:
         self._edge_expansion_decay = config.edge_expansion_decay if config else 0.7
         self._edge_max_hops = config.edge_max_hops if config else 1
         self._edge_expansion_types = config.edge_expansion_types if config else ["caused_by"]
-        self._diversity_lambda = config.diversity_lambda if config else 0.7
+        self._diversity_lambda = config.diversity_lambda if config else 1.0
         self._distillation_enabled = config.distillation_enabled if config else False
         self._distillation_min_chunk_tokens = config.distillation_min_chunk_tokens if config else 120
         self._fallback_to_trust_recency_enabled = (

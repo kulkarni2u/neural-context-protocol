@@ -68,7 +68,7 @@ def token_unit() -> str:
 # margin-free estimate that benchmarks and reports use; the assembler counts
 # with ``estimate_budget_tokens`` so a block that "fits" is unlikely to overflow
 # a real tokenizer.
-DEFAULT_ESTIMATE_MARGIN = 0.9
+DEFAULT_ESTIMATE_MARGIN = 1.0
 _DENSE_CHARS_PER_TOKEN = 2.5
 _DENSE_SYMBOL_FRACTION = 0.2
 
@@ -86,7 +86,7 @@ def estimate_budget_tokens(text: str, *, margin: float = DEFAULT_ESTIMATE_MARGIN
     """Conservative token estimate for budget enforcement.
 
     With the ``chars_div4`` unit the plain chars/4 estimate is divided by
-    ``margin`` (0 < margin <= 1; 0.9 reserves 10%), and symbol-dense text
+    ``margin`` (0 < margin <= 1; e.g. 0.9 reserves 10%; default 1.0), and symbol-dense text
     (code, JSON) uses a denser chars-per-token ratio. A real tokenizer
     (``NCP_TOKEN_UNIT=tiktoken``) is already exact, so no margin is applied.
     """

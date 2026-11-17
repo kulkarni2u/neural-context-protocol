@@ -48,8 +48,10 @@ DEFAULT_CONFIG = {
         "whisper_cap_high": 2,
         "whisper_cap_critical": 1,
         # Budget enforcement counts chars/4 tokens divided by this margin
-        # (0.9 reserves 10%) when the unit is chars_div4; ignored for tiktoken.
-        "estimate_margin": 0.9,
+        # (e.g. 0.9 reserves 10%) when the unit is chars_div4; ignored for
+        # tiktoken. Default 1.0 (no reserve): 0.9 dropped needed chunks at tight
+        # budgets (benchmarks/hotpotqa_style 300: 1.00 -> 0.93), so it is opt-in.
+        "estimate_margin": 1.0,
         # CAP-E2: per-pipeline $ budget governance over real (CAP-E1) cost
         # accounting. None (default) disables the governor entirely.
         "pipeline_budget_usd": None,
@@ -124,7 +126,7 @@ DEFAULT_CONFIG = {
         "propagation_max_hops": 1,
         "trust_propagation_factor": 0.5,
         "dissent_weight": 0.2,
-        "diversity_lambda": 0.7,
+        "diversity_lambda": 1.0,
         "usage_prior_weight": 1.0,
         "reputation_weight": 0.0,
         "fallback_to_trust_recency_enabled": True,
@@ -509,7 +511,7 @@ class NCPConfig:
 
     @property
     def estimate_margin(self) -> float:
-        return min(1.0, max(0.1, float(self.values.get("budget", {}).get("estimate_margin", 0.9))))
+        return min(1.0, max(0.1, float(self.values.get("budget", {}).get("estimate_margin", 1.0))))
 
     @property
     def reduce_fanin_auto_min_writers(self) -> int:
@@ -521,7 +523,7 @@ class NCPConfig:
 
     @property
     def diversity_lambda(self) -> float:
-        return float(self.values.get("retrieval", {}).get("diversity_lambda", 0.7))
+        return float(self.values.get("retrieval", {}).get("diversity_lambda", 1.0))
 
     @property
     def usage_prior_weight(self) -> float:

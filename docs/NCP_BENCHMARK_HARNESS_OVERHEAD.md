@@ -90,15 +90,15 @@ first chunk header, so almost nothing is cacheable.
 ### f. Budget accuracy
 
 A store of 18 mixed prose, code and JSON chunks assembled at four ceilings.
-The conservative counter (`estimate_budget_tokens`, margin 0.9 and a dense-text
+The conservative counter (`estimate_budget_tokens`, default margin 1.0 and a dense-text
 rate) must never exceed `max_tokens`.
 
 | max_tokens | Conservative count | Ratio | Plain chars/4 count |
 |---:|---:|---:|---:|
-| 400 | 368 | 0.92 | 206 |
-| 800 | 644 | 0.81 | 579 |
-| 1600 | 1499 | 0.94 | 842 |
-| 3200 | 3161 | 0.99 | 2844 |
+| 400 | 331 | 0.83 | 206 |
+| 800 | 793 | 0.99 | 792 |
+| 1600 | 1349 | 0.84 | 842 |
+| 3200 | 3033 | 0.95 | 3032 |
 
 Gate: every ratio is at most 1.0. Highest observed: 0.99. There is no "before"
 here: it is a safety bound, not a saving. The plain chars/4 column is for

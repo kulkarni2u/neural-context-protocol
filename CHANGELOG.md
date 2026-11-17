@@ -23,24 +23,29 @@ defaults tuned against the benchmark gates, one lifecycle hook script,
   wall-clock recency and made the cacheable prefix drift. Set
   `[encoder] show_score = true` to restore it. Parsers that required `score:`
   must treat it as optional.
-- The budget is stricter. With the `chars_div4` unit, tokens are estimated as
-  chars/4 divided by `[budget].estimate_margin` (0.9), dense text (code, JSON,
+- The budget is stricter. With the `chars_div4` unit, dense text (code, JSON,
   non-ASCII) is counted at a higher rate, and an over-budget guard drops
   low-ranked chunks until the block fits. Blocks that used to fit just under
-  `max_tokens` may now lose a chunk.
+  `max_tokens` may now lose a chunk. `[budget].estimate_margin` (divides the
+  chars/4 estimate; 0.9 reserves 10%) is opt-in, default 1.0: at 0.9 the
+  HotpotQA-style benchmark lost recall at budget 300 (1.00 -> 0.93).
 - `[NCP:BUDGET]` omits `steps:` when the total is unknown (`steps:0/?` is gone).
-- Retrieval defaults: `[retrieval].diversity_lambda` 1.0 -> 0.7; fan-in
-  reduction now also runs when candidates come from at least
-  `reduce_fanin_auto_min_writers` (3) distinct writers; a fit-swap pass
-  (`fit_swap_enabled`, on) can swap a dropped chunk with relevance >= 0.5 for a
-  lower-ranked admitted one when that fits the budget. Set `diversity_lambda =
-  1.0`, `reduce_fanin_auto_min_writers = 0` and `fit_swap_enabled = false` to
-  restore the old behavior.
+- Retrieval defaults: fan-in reduction now also runs when candidates come from
+  at least `reduce_fanin_auto_min_writers` (3) distinct writers; a fit-swap
+  pass (`fit_swap_enabled`, on) can swap a dropped chunk with relevance >= 0.5
+  for a lower-ranked admitted one when that fits the budget. Set
+  `reduce_fanin_auto_min_writers = 0` and `fit_swap_enabled = false` to restore
+  the old behavior. `[retrieval].diversity_lambda` stays 1.0 (MMR off); 0.7 is
+  opt-in because as a default it dropped needed chunks (HotpotQA-style recall
+  at budget 300 fell to 0.93 with it alone, 0.87 together with the margin).
 - The `[chunking].max_chunk_tokens` key is removed (it was never read). It is
   still accepted in existing configs but reported as unknown by `ncp doctor`.
 - `ncp skill cache` requires exactly one of `--pipeline <id>` or `--global`.
-- Conscious-block lists (`recent`, `tried`, `failed`, `owns`, `must-not`) are
-  capped so they cannot crowd out chunks.
+- Conscious-block lists `recent`, `tried` and `failed` are capped (most recent
+  entries kept, long items cut with a visible ellipsis) so they cannot crowd
+  out chunks. `owns` and `must-not` are never truncated, dropped or reordered;
+  if they alone exceed the budget the block is returned with
+  `telemetry.over_budget` set and no chunks.
 
 ### Added
 

@@ -30,8 +30,8 @@ distillation).
 
 | Budget | ncp | plain_rag | rolling_summary | sliding_window |
 |---:|---:|---:|---:|---:|
-| 400 | 1.00 (437.2) | 1.00 (483.8) | 1.00 (487.4) | 0.00 (501.7) |
-| 200 | 1.00 (255.2) | 1.00 (280.6) | 1.00 (285.0) | 0.00 (277.2) |
+| 400 | 1.00 (449.6) | 1.00 (483.8) | 1.00 (487.4) | 0.00 (501.7) |
+| 200 | 1.00 (293.7) | 1.00 (280.6) | 1.00 (285.0) | 0.00 (277.2) |
 
 **Plain RAG ties NCP** (as does the rolling summary). Mock mode checks only
 that the approved-path slug reached the prompt; it does not measure model

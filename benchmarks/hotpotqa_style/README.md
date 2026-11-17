@@ -51,27 +51,30 @@ At the default budget (300 tokens, `chars_div4` unit), on all 15 tasks:
 
 | Condition | Success rate | Median context tokens |
 |---|---:|---:|
-| `ncp` | **87%** | 254 |
+| `ncp` | **100%** | 281 |
 | `sliding_window` | **0%** | 277 |
 | `raw_replay` (unbounded) | 100% | 778 |
 
-At a matched budget of ~254 tokens, NCP's relevance-based retrieval finds
-both gold paragraphs on 13 of 15 tasks (both `comparison` tasks pass 7/7,
-`bridge` 6/8; a v1.9.6 default change, the conservative estimate margin,
-made this slightly worse than the earlier 15/15); a pure recency window finds neither on
-any task, because both gold paragraphs are deliberately planted early/mid
-transcript, behind filler content, where recency drops them. `raw_replay`
-confirms the facts are answerable at all — it just costs 3.1x the tokens to
-get there. The split holds on both question kinds (`bridge`: 6/8 tasks,
-`comparison`: 7/7 tasks — see `by_kind_and_condition` in the JSON output).
+At a matched budget of ~281 tokens, NCP's relevance-based retrieval finds
+both gold paragraphs on all 15 tasks (`bridge` 8/8, `comparison` 7/7); a pure
+recency window finds neither on any task, because both gold paragraphs are
+deliberately planted early/mid transcript, behind filler content, where
+recency drops them. `raw_replay` confirms the facts are answerable at all --
+it just costs 2.8x the tokens to get there. The split holds on both question
+kinds (see `by_kind_and_condition` in the JSON output).
+
+The v1.9.6 candidate defaults `[budget].estimate_margin = 0.9` and
+`[retrieval].diversity_lambda = 0.7` each cost this benchmark recall (0.87 at
+300, 0.93 at 800 with both on), so both stay opt-in (`1.0`); a regression test
+pins 100% at budgets 300 and 800.
 
 This budget is a knife-edge by construction — every distractor and filler
 paragraph is short, so a slightly larger budget lets `sliding_window` sweep
 in enough of the transcript to accidentally pass. Sweep it yourself:
 
 ```bash
-python3 benchmarks/hotpotqa_style/run.py --budget 150   # ncp 53%, sliding_window 0%
-python3 benchmarks/hotpotqa_style/run.py --budget 350   # ncp 93%, sliding_window 47%
+python3 benchmarks/hotpotqa_style/run.py --budget 150   # ncp 67%, sliding_window 0%
+python3 benchmarks/hotpotqa_style/run.py --budget 350   # ncp 100%, sliding_window 47%
 ```
 
 ## Options
@@ -94,13 +97,13 @@ alongside the others. Measured success rate (15 tasks, `--budget B`):
 
 | Budget | ncp | plain_rag | sliding_window | raw_replay |
 |---:|---:|---:|---:|---:|
-| 150 | 0.53 | 1.00 | 0.00 | 1.00 |
-| 200 | 0.80 | 1.00 | 0.00 | 1.00 |
-| 300 | 0.87 | 1.00 | 0.00 | 1.00 |
-| 400 | 0.93 | 1.00 | 0.53 | 1.00 |
-| 800 | 0.93 | 1.00 | 1.00 | 1.00 |
+| 150 | 0.67 | 1.00 | 0.00 | 1.00 |
+| 200 | 0.93 | 1.00 | 0.00 | 1.00 |
+| 300 | 1.00 | 1.00 | 0.00 | 1.00 |
+| 400 | 1.00 | 1.00 | 0.53 | 1.00 |
+| 800 | 1.00 | 1.00 | 1.00 | 1.00 |
 
-**Plain RAG beats NCP at every budget measured (150 to 800).** In
+**Plain RAG beats NCP at budgets of 200 or less and ties it from 300 up.** In
 this synthetic set both needed paragraphs share vocabulary with the question,
 which favors BM25 over raw paragraphs; NCP's chunk assembly (k-limited,
 trust/relevance weighted, with all paragraphs given identical trust here) has

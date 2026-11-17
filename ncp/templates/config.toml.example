@@ -47,8 +47,9 @@ adaptive_budget_enabled = true
 # context_token_budget. Set true to allow scaling up (to the ceiling above).
 # adaptive_allow_expand = false
 
-# Token estimate margin when the unit is chars_div4 (0.9 reserves 10%).
-# estimate_margin = 0.9
+# Token estimate margin when the unit is chars_div4 (default 1.0, no reserve;
+# 0.9 reserves 10% but lowered recall at tight budgets in benchmarks/hotpotqa_style).
+# estimate_margin = 1.0
 
 [encoder]
 # Print "score:" in chunk headers. Off keeps the cacheable prefix stable.
@@ -88,7 +89,9 @@ confidence_k = 20
 
 # [retrieval]
 # Redundancy-aware MMR selection before context budget fitting.
-# 1.0 preserves pure relevance ordering; 0.7 is a recommended starting point.
+# 1.0 preserves pure relevance ordering; the default. 0.7 trades recall for diversity (it lowered
+# benchmarks/hotpotqa_style recall at budget 300) so enable it only if your pool is
+# full of near-duplicates.
 # diversity_lambda = 1.0
 # Blend each author's reputation confidence into chunk trust at query time
 # (CAP-T4): blended = (1-w)*base_trust + w*confidence. 0.0 (default) disables.

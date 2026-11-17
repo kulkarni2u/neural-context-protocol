@@ -92,6 +92,18 @@ def test_run_hotpotqa_style_matched_budget_beats_sliding_window() -> None:
     assert ncp_rate >= sliding_rate
 
 
+@pytest.mark.parametrize("budget", [300, 800])
+def test_run_hotpotqa_style_ncp_recall_pinned_to_baseline(budget: int) -> None:
+    """A new default must not regress recall: NCP kept both gold facts on 15/15 tasks at a6267e5.
+
+    Regression guard: ``estimate_margin`` 0.9 and ``diversity_lambda`` 0.7 as defaults dropped
+    this to 0.87 at 300 and 0.93 at 800, so both stay opt-in.
+    """
+
+    artifact = run_hotpotqa_style(budget=budget, k=6)
+    assert artifact["summary"]["by_condition"]["ncp"]["success_rate"] == 1.0
+
+
 def test_run_hotpotqa_style_invalid_budget() -> None:
     with pytest.raises(ValueError, match="budget must be >= 1"):
         run_hotpotqa_style(budget=0, n_tasks=2)

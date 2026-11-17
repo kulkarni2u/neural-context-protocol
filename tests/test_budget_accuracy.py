@@ -206,5 +206,5 @@ def test_estimate_margin_config_and_removed_dead_key(tmp_path: Path) -> None:
     project = tmp_path / "repo"
     (project / ".git").mkdir(parents=True)
     config = load_config(cwd=project)
-    assert config.estimate_margin == pytest.approx(0.9)
+    assert config.estimate_margin == pytest.approx(1.0)  # 0.9 is opt-in; it regressed hotpotqa_style recall
     assert "max_chunk_tokens" not in config.values["chunking"]

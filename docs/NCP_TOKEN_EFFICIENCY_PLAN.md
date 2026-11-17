@@ -44,7 +44,7 @@ blocked on the provider-evaluator redesign noted in
 | 9 | Skill cache over MCP, handoff, CLI | Shipped | Off by default (`[skill_cache].enabled`). `ncp_skill` is an MCP tool (the design doc's "no new tool" decision was reversed). Scope flag required on `ncp skill cache`. `POST /skills` needs the `cache_skill` capability. |
 | 6 | Stable prompt-cache prefix | Shipped | `show_score` off by default. Anthropic split is offset-based. `steps:` omitted when the total is unknown. |
 | 7 | Budget accuracy, conscious caps | Shipped | `chunking.max_chunk_tokens` removed rather than wired. The tiktoken property test skips when tiktoken's encoding data is unavailable offline. |
-| 8 | Packing, fan-in, diversity defaults | Shipped | `diversity_lambda` 0.7, auto fan-in at 3+ writers, fit swap on. The swap picks its victim by relevance, because a lower-ranked victim can never make room. pgvector parity was not run locally. |
+| 8 | Packing, fan-in, diversity defaults | Shipped | Auto fan-in at 3+ writers and fit swap on. `diversity_lambda` stays 1.0 and `estimate_margin` stays 1.0 (opt-in): as defaults, 0.7 and 0.9 cut HotpotQA-style recall at budget 300 from 1.00 to 0.87 (0.93 at 800), so they were reverted. The swap picks its victim by relevance, because a lower-ranked victim can never make room. pgvector parity was not run locally. |
 | 5 | Cross-turn delta | Shipped | Opt-in `delta: true` on `ncp_get_context` with an explicit `session_id`; held chunks render as `chunk:<id> seen:1`. Never for the shared `__default__` session; `delta: false` resets it; state is in process memory, capped at 256 chunks, expires with the session entry. Distilled and changed chunks are re-sent. Not for fresh-context workers. |
 | 11 | Lifecycle hooks and `ncp run-turn` | Shipped | One script, `ncp-lifecycle-hook.sh`, for all four events. `run-turn` hosts: claude, codex, opencode, mock. |
 | 10 | One source for lifecycle instructions | Partly shipped | Generated `CLAUDE.md` and root `AGENTS.md` use `ncp/templates/turn_loop.md.example`. Provider templates are drift-checked only, not generated. |
@@ -285,11 +285,13 @@ multi-hour gap and a chunk whose content contains a section marker.
 ### 7. Budget accuracy and conscious-block caps
 
 - Token counting is `chars // 4` with no margin (`ncp/tokens.py`). Add
-  `[budget].estimate_margin` (default 0.9) applied when the unit is
+  `[budget].estimate_margin` (default 1.0; 0.9 was tried and reverted because it dropped needed chunks in `benchmarks/hotpotqa_style`) applied when the unit is
   `chars_div4`, and a denser ratio for content that is mostly code or JSON.
 - `owns`, `must_not`, `recent`, `tried` and `failed` are uncapped and the
   conscious block is never evicted. Cap item count and item length, keeping
   the most recent `tried` and `failed` entries.
+  **As shipped:** only `recent`, `tried` and `failed` are capped. `owns` and
+  `must_not` are safety constraints and are never truncated or dropped.
 - Add a final check: if the assembled block still exceeds `max_tokens`, trim
   the optional conscious lists and set `telemetry.over_budget`.
 - `chunking.max_chunk_tokens` is read by nothing. Wire it to the chunker or
@@ -303,7 +305,8 @@ under tiktoken counting for mixed prose, code and JSON chunks.
 - Fan-in reduction and MMR diversity are off by default. The repo's fan-in
   benchmark found 25% of top-k slots were near-duplicates with it off.
   Propose enabling fan-in reduction when candidates come from three or more
-  distinct writers, and setting `diversity_lambda` to 0.7.
+  distinct writers. (Setting `diversity_lambda` to 0.7 was tried and reverted: it lowered
+  HotpotQA-style recall at budget 300, so it stays opt-in.)
 - Fitting is greedy skip-and-continue with distillation at the skip point.
   Add a second pass: if a chunk with relevance of 0.5 or more was dropped
   while a lower-ranked chunk was admitted, try swapping them.
