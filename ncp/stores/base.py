@@ -399,6 +399,10 @@ class BaseStore(ABC):
         """True when a successful outcome exists for the task/slot. Base store: False."""
         return False
 
+    def has_any_outcome(self, *, pipeline_id: str | None = None) -> bool:
+        """True when any outcome (success or failure) exists for the pipeline. Base store: False."""
+        return False
+
     async def async_upsert_improvement_problem(self, problem: ImprovementProblem) -> ImprovementProblem:
         return await anyio.to_thread.run_sync(self.upsert_improvement_problem, problem)
 
@@ -454,6 +458,9 @@ class BaseStore(ABC):
             self.outcome_stats, chunk_ids=chunk_ids, model=model, exclude_chunk_ids=exclude_chunk_ids
         )
         return await anyio.to_thread.run_sync(fn)
+
+    async def async_has_any_outcome(self, *, pipeline_id: str | None = None) -> bool:
+        return await anyio.to_thread.run_sync(partial(self.has_any_outcome, pipeline_id=pipeline_id))
 
     async def async_has_success_outcome(
         self, *, pipeline_id: str | None = None, task: str, slot: str | None = None
@@ -822,6 +829,7 @@ class BaseStore(ABC):
         propagation_factor: float = 0.5,
         dissent_weight: float = 0.2,
         propagation_max_hops: int = 1,
+        outcome_step: float = 1.0,
     ) -> CalibrationReport:
         """Re-score base_trust on existing chunks.
 

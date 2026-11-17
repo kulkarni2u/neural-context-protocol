@@ -23,19 +23,29 @@ which prunes only after a working anchor exists, under an accuracy gate. See
 - Auto-calibration on outcome is on by default. After `ncp_record_outcome`,
   feedback calibration runs (debounced, at most once per
   `[calibration].auto_min_interval_seconds`, default 60, per pipeline) and
-  `ncp_record_outcome` returns `calibrated`. Set
+  `ncp_record_outcome` returns `calibrated`. Each outcome moves trust by at most
+  weight x `[calibration].auto_outcome_step` (default 0.1); manual
+  `ncp calibrate` is unchanged. Set
   `[calibration].auto_on_outcome = false` to restore operator-only calibration.
   It never runs the batch generation-0 decay.
-- The adaptive budget no longer shrinks task/slots with no successful outcome
-  yet. Set `[budget].protect_unproven_slots = false` to restore the old
-  behavior. The `budget` block gains `budget_unproven_protected`.
+- The adaptive budget no longer shrinks an unproven task/slot, but only when
+  the pipeline has recorded at least one outcome, the task/slot has no
+  successful outcome, and `slot_age` is below `[budget].unproven_max_turns`
+  (default 5). Pipelines that never record outcomes get exactly the 1.9.6
+  budget. Set `[budget].protect_unproven_slots = false` to disable. The
+  `budget` block gains `budget_unproven_protected`.
+- Chunk-header `trust:` is pinned per fetch session (the value at first render
+  in that session; ranking still uses live trust), so outcomes do not rewrite
+  the cached prefix. `[encoder].pin_trust_per_session = true`.
 - User-registered skills are no longer decayed by batch `ncp calibrate`.
 - `ncp refine apply` (and `apply_refinement`) refuses a stale candidate whose
   predecessor is no longer the procedure head, even with `--force`. Propose
   again from the current head.
-- `ncp_record_outcome` accepts `agent_id` and the new context fields. Under
-  `[principals]` it now checks `agent_id` against the principal, and an
-  explicit `pipeline_id` against the principal's pipelines.
+- `ncp_record_outcome` accepts `agent_id` and one `ctx` object (`task`, `slot`,
+  `model`, `benchmark`, `eval_source`, `output_tokens`, `input_tokens`,
+  `turns`). `pipeline_id` is no longer a client argument: it is derived from
+  the session, else from the chunks' common pipeline. Under `[principals]` it
+  checks `agent_id` against the principal.
 - `ncp_improvement_log` is in the `full` tool profile only (not `standard`).
   It enforces pipeline ownership for `record_attempt`, `resolve_attempt` and
   `merge`; a merge needs both problems in the same pipeline, and
@@ -58,16 +68,25 @@ which prunes only after a working anchor exists, under an accuracy gate. See
   `[refine].min_trial_outcomes` outcomes, with lower mean output tokens.
   `--force` bypasses the gate (never the stale-head check).
 
+### Kept from 1.9.6
+
+`benchmarks/harness_overhead` now gates `release_invariants` (ANDed into
+`summary.pass`): chunk header lines are identical across a
+`ncp_get_context` / 3 x `ncp_record_outcome` / `ncp_get_context` sequence; a
+pipeline with no outcomes gets the unprotected adaptive budget; the `standard`
+catalog is at most 16,000 compact-JSON chars; `AGENTS.md` is at most 9,000
+chars.
+
 ### Added
 
 - Improvement records: problems (root-cause hypotheses) and the attempts filed
   under them, in their own tables so they are never decayed or consolidated;
   merging problems leaves aliases. SQLite and pgvector (migration 020);
   `pgvector_async` follows. Redis has none.
-- `ncp_record_outcome` context fields: `pipeline_id`, `task`, `slot`, `model`,
-  `benchmark`, `eval_source` (`self_report`, `verifier`, `human`),
-  `output_tokens`, `input_tokens`, `turns`. Omitted `pipeline_id`/`task`/`slot`
-  default from the caller's last `ncp_get_context`.
+- `ncp_record_outcome` `ctx` object: `task`, `slot`, `model`, `benchmark`,
+  `eval_source` (`self_report`, `verifier`, `human`), `output_tokens`,
+  `input_tokens`, `turns`. Omitted `task`/`slot` default from the caller's last
+  `ncp_get_context`.
 - `[calibration].self_report_weight` scales outcomes whose `eval_source` is
   `self_report` during feedback calibration.
 - `ncp refine propose` / `prune` take `--problem-id`, `--problem`,

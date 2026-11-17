@@ -2127,6 +2127,21 @@ class AsyncPgvectorStore(BaseStore):
                 row = await cur.fetchone()
         return row is not None
 
+    async def async_has_any_outcome(self, *, pipeline_id: str | None = None) -> bool:
+        where = ""
+        params: tuple[Any, ...] = ()
+        if pipeline_id is not None:
+            where = " WHERE pipeline_id = %s"
+            params = (pipeline_id,)
+        async with self._aconnect() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    self._sql(f"SELECT 1 FROM {{schema}}.{{prefix}}outcomes{where} LIMIT 1"),
+                    params,
+                )
+                row = await cur.fetchone()
+        return row is not None
+
     # ── typed decisions (spec 4h) ─────────────────────────────────────────
 
     async def async_record_decision_record(self, decision: DecisionRecord) -> bool:
@@ -3315,6 +3330,7 @@ class AsyncPgvectorStore(BaseStore):
         propagation_factor: float = 0.5,
         dissent_weight: float = 0.2,
         propagation_max_hops: int = 1,
+        outcome_step: float = 1.0,
     ) -> CalibrationReport:
         """Re-score base_trust on live chunks using async DB I/O. Full parity with calibrate()."""
         started = time.monotonic()
@@ -3503,6 +3519,7 @@ class AsyncPgvectorStore(BaseStore):
                         outcome_evidence = compute_outcome_evidence(
                             scoped,
                             self_report_weight=self.config.calibration_self_report_weight if self.config is not None else 1.0,
+                            outcome_step=outcome_step,
                         )
                     applied_now = [
                         (o.outcome_id, cid) for o in scoped for cid in o.chunk_ids

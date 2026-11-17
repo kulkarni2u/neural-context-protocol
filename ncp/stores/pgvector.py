@@ -2005,6 +2005,24 @@ class PgvectorStore(BaseStore):
                 self._close_cursor(cursor)
         return row is not None
 
+    def has_any_outcome(self, *, pipeline_id: str | None = None) -> bool:
+        where = ""
+        params: tuple[Any, ...] = ()
+        if pipeline_id is not None:
+            where = " WHERE pipeline_id = %s"
+            params = (pipeline_id,)
+        with self._connect() as connection:
+            cursor = connection.cursor()
+            try:
+                cursor.execute(
+                    self._sql(f"SELECT 1 FROM {{schema}}.{{prefix}}outcomes{where} LIMIT 1"),
+                    params,
+                )
+                row = cursor.fetchone()
+            finally:
+                self._close_cursor(cursor)
+        return row is not None
+
     # ── typed decisions (spec 4h) ─────────────────────────────────────────
 
     _DECISION_COLUMNS = (
@@ -3306,6 +3324,7 @@ class PgvectorStore(BaseStore):
         propagation_factor: float = 0.5,
         dissent_weight: float = 0.2,
         propagation_max_hops: int = 1,
+        outcome_step: float = 1.0,
     ) -> CalibrationReport:
         """Re-score base_trust on live chunks.
 
@@ -3499,6 +3518,7 @@ class PgvectorStore(BaseStore):
                             outcome_evidence = compute_outcome_evidence(
                                 scoped,
                                 self_report_weight=self.config.calibration_self_report_weight if self.config is not None else 1.0,
+                                outcome_step=outcome_step,
                             )
                         applied_now = [
                             (o.outcome_id, cid) for o in scoped for cid in o.chunk_ids

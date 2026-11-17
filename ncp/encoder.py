@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 from .types import BudgetContext, ConsciousBlock, SubconsciousChunk, Whisper
 
@@ -100,6 +100,10 @@ class PidginEncoder:
         # Cross-turn delta: ids the receiving session already holds unchanged
         # render as a bare ``chunk:<id> seen:1`` header (set by the Assembler).
         self.seen_ids: frozenset[str] = frozenset()
+        # Session-pinned trust display: chunk_id -> trust to print instead of the
+        # live value, so an outcome-driven trust change does not rewrite headers
+        # already sent in this session. Read-only here (the server owns the map).
+        self.trust_pins: Mapping[str, float] = {}
 
     def assemble(
         self,
@@ -230,7 +234,7 @@ class PidginEncoder:
             f"layer:{chunk.layer}",
             *([f"score:{_fmt_float(chunk.effective_score)}"] if self.show_score else []),
             f"src:{chunk.src}",
-            f"trust:{_fmt_float(chunk.base_trust)}",
+            f"trust:{_fmt_float(self.trust_pins.get(chunk.chunk_id, chunk.base_trust))}",
         ]
         if chunk.verified:
             parts.append("verified:1")

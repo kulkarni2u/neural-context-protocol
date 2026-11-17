@@ -1144,6 +1144,8 @@ class FetchSession:
     # session, in first-delivery order. Per-agent state: never kept for the
     # shared default key. Bounded (oldest dropped); expires with the entry.
     delivered: dict[str, str] = field(default_factory=dict)
+    # chunk_id -> trust first rendered in this session (LRU, _TRUST_PINS_MAX).
+    trust_pins: dict[str, float] = field(default_factory=dict)
 
 
 _RESULT_RAW_MAX_WINDOWS = 20
@@ -1155,6 +1157,7 @@ _FETCH_SESSION_MAX = 1024
 _FETCH_SESSION_TTL_SECONDS = 3600.0
 _DELIVERED_MAX = 256
 _HELD_SLOTS_MAX = 8
+_TRUST_PINS_MAX = 512
 
 
 @dataclass
@@ -1284,6 +1287,7 @@ def make_handlers(
     adaptive_budget_ceiling_tokens = config.adaptive_budget_ceiling_tokens if config is not None else 2000
     adaptive_allow_expand = config.adaptive_allow_expand if config is not None else False
     protect_unproven_slots = config.protect_unproven_slots if config is not None else True
+    default_unproven_max_turns = config.unproven_max_turns if config is not None else 5
     default_context_token_budget = config.context_token_budget if config is not None else 840
     # CAP-T5: computed drift, opt-in (off by default -- legacy self-reported
     # drift_score is unchanged when disabled).
@@ -1477,6 +1481,7 @@ def make_handlers(
             ceiling_tokens = adaptive_budget_ceiling_tokens
             allow_expand = adaptive_allow_expand
             protect_unproven = protect_unproven_slots
+            unproven_max_turns = default_unproven_max_turns
         else:
             enabled = request_config.adaptive_budget_enabled
             requested_tokens = request_config.context_token_budget
@@ -1484,6 +1489,7 @@ def make_handlers(
             ceiling_tokens = request_config.adaptive_budget_ceiling_tokens
             allow_expand = request_config.adaptive_allow_expand
             protect_unproven = request_config.protect_unproven_slots
+            unproven_max_turns = request_config.unproven_max_turns
 
         if not enabled:
             return caller_max_tokens, None
@@ -1503,10 +1509,14 @@ def make_handlers(
             ceiling_tokens = min(ceiling_tokens, requested_tokens)
 
         unproven = False
-        if protect_unproven:
+        if protect_unproven and conscious.slot_age < unproven_max_turns:
+            # Only a pipeline that already records outcomes can have an unproven
+            # slot; a pipeline with none keeps the normal adaptive budget.
             try:
-                unproven = not store.has_success_outcome(
-                    pipeline_id=conscious.pipeline_id, task=conscious.task, slot=conscious.slot
+                unproven = store.has_any_outcome(pipeline_id=conscious.pipeline_id) and not (
+                    store.has_success_outcome(
+                        pipeline_id=conscious.pipeline_id, task=conscious.task, slot=conscious.slot
+                    )
                 )
             except Exception:
                 unproven = False
@@ -1615,6 +1625,8 @@ def make_handlers(
                 if existing is not None:
                     preserved_delivered = dict(existing.delivered)
         prior_held: dict[str, tuple[list[str], list[str]]] = {}
+        prior_pins: dict[str, float] = {}
+        pin_trust = config is not None and config.encoder_pin_trust_per_session
         if session_id != DEFAULT_FETCH_SESSION_ID:
             with sessions_lock:
                 prior_session = sessions.get(session_id)
@@ -1623,6 +1635,8 @@ def make_handlers(
                     and time.monotonic() - prior_session.last_access <= _FETCH_SESSION_TTL_SECONDS
                 ):
                     prior_held = dict(prior_session.held_ids)
+                    if pin_trust:
+                        prior_pins = dict(prior_session.trust_pins)
         if delta_applied:
             # Carry delivered state across the per-call session reset below,
             # unless the entry expired (TTL) or never existed (new session_id).
@@ -1699,6 +1713,8 @@ def make_handlers(
                 facade_provider=ontology_facade,
             )
         assembler = Assembler(store=store, config=request_config or config, ontology=enricher)
+        if pin_trust and session_id != DEFAULT_FETCH_SESSION_ID:
+            assembler.encoder.trust_pins = prior_pins
         stream = bool(args.get("stream", False))
         search_text = conscious.task + " " + conscious.slot
         try:
@@ -1830,6 +1846,14 @@ def make_handlers(
                 while len(delivered) > _DELIVERED_MAX:
                     del delivered[next(iter(delivered))]
                 held.delivered = delivered
+                if pin_trust:
+                    pins = prior_pins
+                    for chunk in fitted_result.chunks:
+                        # setdefault keeps the first-rendered value; re-insert to mark recent.
+                        pins[chunk.chunk_id] = pins.pop(chunk.chunk_id, chunk.base_trust)
+                    while len(pins) > _TRUST_PINS_MAX:
+                        del pins[next(iter(pins))]
+                    held.trust_pins = pins
                 held.last_access = time.monotonic()
         if not echo_ids:
             response.pop("pending_whisper_ids", None)
@@ -3346,7 +3370,11 @@ def make_handlers(
                 return False
             auto_calibrate_last[key] = now
         try:
-            calibrate_fn(feedback_mode=True, pipeline_id=pipeline_id)
+            calibrate_fn(
+                feedback_mode=True,
+                pipeline_id=pipeline_id,
+                outcome_step=config.calibration_auto_outcome_step if config is not None else 0.1,
+            )
         except NotImplementedError:
             return False
         except Exception as exc:

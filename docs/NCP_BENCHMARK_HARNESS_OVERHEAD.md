@@ -119,6 +119,16 @@ Every "after" is at most its "before", the prefix fraction does not fall, the
 conservative budget count never exceeds `max_tokens`, `minimal < core < standard
 < full`, and both `ncp_post_turn` shapes are accepted. Current result: `pass: true`.
 
+## Release invariants
+
+`release_invariants` in the artifact is ANDed into `summary.pass`. It guards
+savings that a later release must not undo: chunk header lines are identical
+across `ncp_get_context`, three `ncp_record_outcome` calls and a second
+`ncp_get_context` (common-prefix chars reported as info); a fresh pipeline with
+no outcomes gets `budget_unproven_protected: false` and exactly
+`compute_adaptive_budget(..., unproven=False)`; the `standard` catalog is at
+most 16,000 compact-JSON chars; `AGENTS.md` is at most 9,000 chars.
+
 ## Caveats
 
 - These are structural character counts under `chars_div4`, not provider

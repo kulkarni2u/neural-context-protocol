@@ -716,24 +716,33 @@ curl -s $BASE/mcp -H "$AUTH" -H 'Content-Type: application/json' -d '{
 ### ncp_record_outcome — outcome with evaluation context
 
 Records whether the chunks that informed a task worked. Give `success` and
-either `chunk_ids` or `turn_id`. v1.9.7 adds optional context fields, all
-backward compatible:
+either `chunk_ids` or `turn_id`, plus `agent_id` (the caller; under
+`[principals]` it must match the principal). v1.9.7 adds one optional `ctx`
+object, backward compatible with the v1.9.6 properties:
 
-- `pipeline_id`, `task`, `slot` — where the outcome applies. When omitted, a
-  caller that identifies itself (`agent_id`, or a `session_id`) gets the values
-  from its last `ncp_get_context`; the shared default session never borrows.
-- `model`, `benchmark` — what the evaluation ran against.
-- `eval_source` — `self_report` (default), `verifier` or `human`. Self-reports
-  are weighted by `[calibration].self_report_weight` during calibration.
-- `output_tokens`, `input_tokens`, `turns` — non-negative integers; the prune
-  gate compares mean output tokens.
-- `agent_id` — the caller; under `[principals]` it must match the principal.
+```json
+{"success": true, "chunk_ids": ["c1"], "agent_id": "builder",
+ "ctx": {"task": "deploy", "slot": "migrate", "model": "m1", "benchmark": "b1",
+         "eval_source": "verifier", "output_tokens": 900, "input_tokens": 4000, "turns": 3}}
+```
+
+- `ctx.task`, `ctx.slot` — where the outcome applies. When omitted, a caller
+  that identifies itself (`agent_id`, or a `session_id`) gets the values from
+  its last `ncp_get_context`; the shared default session never borrows.
+- `ctx.model`, `ctx.benchmark` — what the evaluation ran against.
+- `ctx.eval_source` — `self_report` (default), `verifier` or `human`.
+  Self-reports are weighted by `[calibration].self_report_weight`.
+- `ctx.output_tokens`, `ctx.input_tokens`, `ctx.turns` — non-negative integers;
+  the prune gate compares mean output tokens.
+- `pipeline_id` is not a client argument. It is derived from the session, else
+  from the pipeline the chunks have in common.
 
 The response is `{recorded, outcome_id, calibrated}` (plus `decision_linked`
 when a `decision_id` resolves). `calibrated` is true when this call ran
 feedback calibration: it runs automatically after a recorded outcome, at most
 once per `[calibration].auto_min_interval_seconds` (default 60) per pipeline,
-and can be turned off with `[calibration].auto_on_outcome = false`.
+moves trust by at most weight x `[calibration].auto_outcome_step` (default 0.1)
+per outcome, and can be turned off with `[calibration].auto_on_outcome = false`.
 
 ### POST /skills — register a user skill
 

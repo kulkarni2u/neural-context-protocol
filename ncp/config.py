@@ -71,11 +71,18 @@ DEFAULT_CONFIG = {
         # R7: never shrink the adaptive budget for a task/slot that has no
         # recorded success outcome yet (floor scale at 1.0x).
         "protect_unproven_slots": True,
+        # Protection only applies while the slot is younger than this many turns
+        # and its pipeline already has outcomes but none successful for the slot.
+        "unproven_max_turns": 5,
     },
     "encoder": {
         # Print ``score:`` in each chunk header. Off by default: the score
         # includes wall-clock recency, so it makes the cacheable prefix drift.
         "show_score": False,
+        # Print each chunk's trust as first rendered in the fetch session, so
+        # calibration between turns does not change already-sent headers
+        # (ranking still uses live trust).
+        "pin_trust_per_session": True,
     },
     "chunking": {
         "default_type": "auto",
@@ -246,6 +253,9 @@ DEFAULT_CONFIG = {
         # at most once per auto_min_interval_seconds per pipeline.
         "auto_on_outcome": True,
         "auto_min_interval_seconds": 60,
+        # Per-outcome trust step used by the automatic calibration (manual
+        # `ncp calibrate` keeps 1.0). Clamped to (0, 1].
+        "auto_outcome_step": 0.1,
     },
     "tools": {
         "profile": "standard",
@@ -533,6 +543,10 @@ class NCPConfig:
         return bool(self.values.get("encoder", {}).get("show_score", False))
 
     @property
+    def encoder_pin_trust_per_session(self) -> bool:
+        return bool(self.values.get("encoder", {}).get("pin_trust_per_session", True))
+
+    @property
     def estimate_margin(self) -> float:
         return min(1.0, max(0.1, float(self.values.get("budget", {}).get("estimate_margin", 1.0))))
 
@@ -677,6 +691,14 @@ class NCPConfig:
     def protect_unproven_slots(self) -> bool:
         """R7: adaptive budget never shrinks slots without a success outcome."""
         return bool(self.values.get("budget", {}).get("protect_unproven_slots", True))
+
+    @property
+    def unproven_max_turns(self) -> int:
+        """Slot age (turns) after which unproven-slot protection stops applying."""
+        try:
+            return max(0, int(self.values.get("budget", {}).get("unproven_max_turns", 5)))
+        except (TypeError, ValueError):
+            return 5
 
     @property
     def adaptive_allow_expand(self) -> bool:
@@ -881,6 +903,14 @@ class NCPConfig:
     @property
     def calibration_auto_on_outcome(self) -> bool:
         return bool(self.values.get("calibration", {}).get("auto_on_outcome", True))
+
+    @property
+    def calibration_auto_outcome_step(self) -> float:
+        """``[calibration].auto_outcome_step`` clamped to (0, 1]; invalid -> 0.1."""
+        raw = self.values.get("calibration", {}).get("auto_outcome_step", 0.1)
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not raw > 0:
+            return 0.1
+        return min(1.0, float(raw))
 
     @property
     def calibration_auto_min_interval_seconds(self) -> float:

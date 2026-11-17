@@ -1715,6 +1715,16 @@ class SQLiteStore(BaseStore):
             ).fetchone()
         return row is not None
 
+    def has_any_outcome(self, *, pipeline_id: str | None = None) -> bool:
+        sql = "SELECT 1 FROM outcomes"
+        params: list[Any] = []
+        if pipeline_id is not None:
+            sql += " WHERE pipeline_id = ?"
+            params.append(pipeline_id)
+        with self._connect() as connection:
+            row = connection.execute(f"{sql} LIMIT 1", params).fetchone()
+        return row is not None
+
     def record_memo(
         self,
         signature: str,
@@ -2732,6 +2742,7 @@ class SQLiteStore(BaseStore):
         propagation_factor: float = 0.5,
         dissent_weight: float = 0.2,
         propagation_max_hops: int = 1,
+        outcome_step: float = 1.0,
     ) -> CalibrationReport:
         """Re-score base_trust on live chunks.
 
@@ -2891,6 +2902,7 @@ class SQLiteStore(BaseStore):
                             outcome_evidence = compute_outcome_evidence(
                                 scoped,
                                 self_report_weight=self.config.calibration_self_report_weight if self.config is not None else 1.0,
+                                outcome_step=outcome_step,
                             )
                         applied_now = [
                             (o.outcome_id, cid) for o in scoped for cid in o.chunk_ids

@@ -74,14 +74,25 @@ records need the sqlite or pgvector store.
 
 ## Outcome context
 
-`ncp_record_outcome` takes optional context so evidence can be judged later:
+`ncp_record_outcome` takes `agent_id` and one optional `ctx` object so evidence
+can be judged later:
 
-| Field | Meaning |
+```json
+{"success": true, "chunk_ids": ["c1"], "agent_id": "builder",
+ "ctx": {"task": "deploy", "slot": "migrate", "model": "m1", "benchmark": "b1",
+         "eval_source": "verifier", "output_tokens": 900, "input_tokens": 4000, "turns": 3}}
+```
+
+| `ctx` field | Meaning |
 |---|---|
-| `pipeline_id`, `task`, `slot` | What the outcome applies to. Omitted values default from the caller's last `ncp_get_context`. |
+| `task`, `slot` | What the outcome applies to. Omitted values default from the caller's last `ncp_get_context`. |
 | `model`, `benchmark` | What the evaluation ran against. |
 | `eval_source` | `self_report` (default), `verifier` or `human`. |
 | `output_tokens`, `input_tokens`, `turns` | Cost of the run; the prune gate compares mean output tokens. |
+
+`pipeline_id` is not a client argument. It is derived from the caller's
+session (its last `ncp_get_context`) and otherwise from the pipeline the given
+chunks have in common; chunks spanning pipelines are refused.
 
 `eval_source` is an honor-system field: NCP does not verify it, so any client
 allowed to call `ncp_record_outcome` can claim `verifier` or `human`. Grant that
@@ -100,10 +111,28 @@ recorded outcome, NCP runs feedback calibration automatically, at most once per
 `ncp_record_outcome` returns `calibrated: true` when it ran. It never runs the
 batch decay. Turn it off with `[calibration].auto_on_outcome = false`.
 
+Auto-calibration is bounded: each outcome moves a chunk's trust by at most
+weight x `[calibration].auto_outcome_step` (default 0.1), up on success and down
+on failure. Manual `ncp calibrate` is unchanged.
+
+Chunk-header `trust:` is pinned per fetch session: the value shown the first
+time a chunk is rendered in a session is reused for the rest of that session
+(`[encoder].pin_trust_per_session = true`), so outcomes recorded mid-session do
+not rewrite the cached prompt prefix. Ranking still uses live trust.
+
 An agent grading its own work is weak evidence. `[calibration].self_report_weight`
 (0 to 1, default 1.0) scales outcomes whose `eval_source` is `self_report`
 during feedback calibration; lower it to favor `verifier` and `human`
 outcomes.
+
+## Unproven-slot budget protection
+
+The adaptive budget does not shrink a task/slot that has not proven itself, but
+only when all of these hold: the pipeline has recorded at least one outcome,
+the task/slot has no successful outcome, and its `slot_age` is below
+`[budget].unproven_max_turns` (default 5). A pipeline that never records
+outcomes gets exactly the v1.9.6 budget. Turn it off with
+`[budget].protect_unproven_slots = false`.
 
 ## The [NCP:IMPROVEMENT] block
 
@@ -166,7 +195,10 @@ the prune gate only.
 | `[calibration].auto_on_outcome` | true | Calibrate after `ncp_record_outcome`. |
 | `[calibration].auto_min_interval_seconds` | 60 | Debounce per pipeline. |
 | `[calibration].self_report_weight` | 1.0 | Scale for `self_report` outcomes. |
-| `[budget].protect_unproven_slots` | true | Never shrink a task/slot with no success yet. |
+| `[calibration].auto_outcome_step` | 0.1 | Max trust change per auto-calibrated outcome (x weight). |
+| `[encoder].pin_trust_per_session` | true | Pin header `trust:` per fetch session. |
+| `[budget].unproven_max_turns` | 5 | Protection applies only while slot_age is below this. |
+| `[budget].protect_unproven_slots` | true | Protect unproven task/slots (see above). |
 
 ## Rules for using improvement entries
 

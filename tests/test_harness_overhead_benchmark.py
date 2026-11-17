@@ -28,6 +28,24 @@ def test_harness_overhead_benchmark_passes_gate(tmp_path: Path) -> None:
     assert metrics["g_dispatch_chars"]["worker_receives_skill_text"] is True
 
 
+def test_harness_overhead_release_invariants(tmp_path: Path) -> None:
+    artifact = run_harness_overhead_benchmark(workdir=tmp_path)
+    invariants = artifact["release_invariants"]
+    checks = artifact["summary"]["checks"]
+    for name in (
+        "prefix_stable_after_outcomes",
+        "no_outcome_pipeline_budget_unchanged",
+        "standard_catalog_chars_le_limit",
+        "agents_md_chars_le_limit",
+    ):
+        assert invariants["checks"][name] is True, (name, invariants)
+        assert checks[f"release_{name}"] is True
+    assert invariants["standard_catalog_chars"] <= 16_000
+    assert invariants["agents_md_chars"] <= 9_000
+    assert invariants["no_outcome_budget"]["budget_unproven_protected"] is False
+    assert invariants["prefix_after_outcomes"]["headers_changed"] == 0
+
+
 def test_harness_overhead_benchmark_is_deterministic(tmp_path: Path) -> None:
     first = run_harness_overhead_benchmark(workdir=tmp_path / "a", delta_turns=4, workers=3)
     second = run_harness_overhead_benchmark(workdir=tmp_path / "b", delta_turns=4, workers=3)

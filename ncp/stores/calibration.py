@@ -334,20 +334,23 @@ def settled_outcome_ids(
 
 
 def compute_outcome_evidence(
-    outcomes: list[OutcomeRecord], *, self_report_weight: float = 1.0
+    outcomes: list[OutcomeRecord], *, self_report_weight: float = 1.0, outcome_step: float = 1.0
 ) -> dict[str, float]:
     """Aggregate outcome evidence into per-chunk deltas.
 
     Returns ``{chunk_id: net_delta}`` where success outcomes contribute
     ``+weight`` and failures contribute ``-weight``. Outcomes whose
     ``eval_source`` is ``"self_report"`` are scaled by ``self_report_weight``
-    (``[calibration].self_report_weight``; 1.0 leaves behavior unchanged).
+    (``[calibration].self_report_weight``; 1.0 leaves behavior unchanged). Every
+    outcome is further scaled by ``outcome_step`` (1.0 = unchanged; auto-calibration
+    passes ``[calibration].auto_outcome_step``).
     """
     evidence: dict[str, float] = {}
     for out in outcomes:
         weight = out.weight
         if out.eval_source == "self_report":
             weight *= self_report_weight
+        weight *= outcome_step
         delta = weight if out.success else -weight
         for cid in out.chunk_ids:
             evidence[cid] = evidence.get(cid, 0.0) + delta

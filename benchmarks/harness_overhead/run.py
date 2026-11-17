@@ -321,6 +321,99 @@ def _budget(workdir: Path, budgets: tuple[int, ...]) -> dict[str, Any]:
             "never_exceeds": all(r["within_budget"] for r in rows)}
 
 
+# --- h. release invariants (savings that must survive later releases) ------------------
+
+STANDARD_CATALOG_MAX_CHARS = 16_000
+AGENTS_MD_MAX_CHARS = 9_000
+
+
+def _chunk_header_lines(context: str) -> list[str]:
+    return [line for line in context.splitlines() if line.startswith("chunk:")]
+
+
+def _release_invariants(workdir: Path) -> dict[str, Any]:
+    from ncp.adaptive_budget import compute_adaptive_budget
+
+    # prefix_stable_after_outcomes: recording outcomes must not rewrite the cached prefix.
+    store = SQLiteStore(workdir / "invariants_prefix.db")
+    for i in range(8):
+        store.write(SubconsciousChunk(
+            chunk_id=f"c{i}", layer="semantic", src="tool_result", pipeline_id="p", written_by=f"w{i % 3}",
+            base_trust=0.6, content=f"payment retry bug fact number {i} about idempotency keys and retries",
+        ))
+    handlers = make_handlers(store, config=load_config(cwd=workdir, env={}))
+    args = {"agent_id": "a", "role": "build", "task": "fix_payment_bug", "slot": "payment",
+            "intent": "advance", "pipeline_id": "p"}
+    first = _call(handlers, "ncp_get_context", dict(args))
+    ids = first["retrieved_chunk_ids"][:3]
+    for _ in range(3):
+        _call(handlers, "ncp_record_outcome", {
+            "success": True, "chunk_ids": ids, "agent_id": "a",
+            "ctx": {"task": "fix_payment_bug", "slot": "payment", "model": "bench", "benchmark": "invariants",
+                    "eval_source": "verifier", "output_tokens": 100, "input_tokens": 400, "turns": 1},
+        })
+    second = _call(handlers, "ncp_get_context", dict(args))
+    headers_before = _chunk_header_lines(first["context"])
+    headers_after = _chunk_header_lines(second["context"])
+    common = len(os.path.commonprefix([first["context"], second["context"]]))
+    prefix = {
+        "chunk_headers": len(headers_before),
+        "headers_identical": bool(headers_before) and headers_before == headers_after,
+        "headers_changed": sum(1 for a, b in zip(headers_before, headers_after) if a != b)
+        + abs(len(headers_before) - len(headers_after)),
+        "common_prefix_chars": common,
+    }
+
+    # no_outcome_pipeline_budget_unchanged: no outcomes recorded => exactly the unprotected budget.
+    store = SQLiteStore(workdir / "invariants_budget.db")
+    for i in range(4):
+        store.write(SubconsciousChunk(
+            chunk_id=f"b{i}", layer="semantic", src="tool_result", pipeline_id="fresh", written_by="w",
+            content=f"payment retry fact {i}: " + "backoff jitter detail " * 4,
+        ))
+    handlers = make_handlers(store, config=load_config(cwd=workdir, env={}))
+    resp = _call(handlers, "ncp_get_context", {**args, "pipeline_id": "fresh"})
+    block = resp["budget_tokens"]
+    factors = block["reason_factors"]
+    expected = compute_adaptive_budget(
+        requested_tokens=block["requested"], floor_tokens=factors["floor_tokens"],
+        ceiling_tokens=factors["ceiling_tokens"], query_text="x" * factors["query_length_chars"],
+        drift_score=factors["drift_score"], pressure=factors["pressure"], slot_age=factors["slot_age"],
+        dollar_budget_fraction_used=factors["dollar_budget_fraction_used"], unproven=False,
+    ).adjusted_tokens
+    budget = {
+        "requested": block["requested"], "adjusted": block["adjusted"], "expected_adjusted": expected,
+        "budget_unproven_protected": block["budget_unproven_protected"],
+    }
+
+    tools = tools_for_config(load_config(cwd=_profile_root(workdir), env={}))
+    catalog_chars = _compact(tools)
+    agents_chars = len((Path(__file__).resolve().parents[2] / "AGENTS.md").read_text(encoding="utf-8"))
+    return {
+        "prefix_after_outcomes": prefix,
+        "no_outcome_budget": budget,
+        "standard_catalog_chars": catalog_chars,
+        "standard_catalog_max_chars": STANDARD_CATALOG_MAX_CHARS,
+        "agents_md_chars": agents_chars,
+        "agents_md_max_chars": AGENTS_MD_MAX_CHARS,
+        "checks": {
+            "prefix_stable_after_outcomes": prefix["headers_identical"],
+            "no_outcome_pipeline_budget_unchanged": (
+                budget["budget_unproven_protected"] is False and budget["adjusted"] == expected
+            ),
+            "standard_catalog_chars_le_limit": catalog_chars <= STANDARD_CATALOG_MAX_CHARS,
+            "agents_md_chars_le_limit": agents_chars <= AGENTS_MD_MAX_CHARS,
+        },
+    }
+
+
+def _profile_root(workdir: Path) -> Path:
+    root = workdir / "invariants_standard"
+    (root / ".ncp").mkdir(parents=True, exist_ok=True)
+    (root / ".ncp" / "config.toml").write_text('[tools]\nprofile = "standard"\n', encoding="utf-8")
+    return root
+
+
 # --- driver ----------------------------------------------------------------------------
 
 
@@ -345,6 +438,7 @@ def run_harness_overhead_benchmark(
             "f_budget_accuracy": _budget(root, budgets),
             "g_dispatch_chars": _skill_dispatch(root, workers, skill_chars),
         }
+        invariants = _release_invariants(root)
         unit = token_unit()
 
     chars = metrics["a_tool_catalog_chars"]["chars"]
@@ -359,11 +453,13 @@ def run_harness_overhead_benchmark(
         chars["minimal"] < chars["core"] < chars["standard"] < chars["full"]
     )
     checks["b_both_shapes_accepted"] = metrics["b_protocol_call_chars_per_turn"]["both_accepted"]
+    checks.update({f"release_{name}": ok for name, ok in invariants["checks"].items()})
     return {
         "benchmark": "harness_overhead",
         "unit": unit,
         "provider": "mock (no provider calls, no network)",
         "metrics": metrics,
+        "release_invariants": invariants,
         "summary": {"pass": all(checks.values()), "checks": checks},
     }
 
