@@ -96,11 +96,24 @@ def test_mmr_uses_embedding_similarity_when_available() -> None:
     assert [chunk.chunk_id for chunk in selected] == ["near_a", "far"]
 
 
-def test_assembler_default_lambda_keeps_duplicate_top_behavior(tmp_path: Path) -> None:
+def test_assembler_default_lambda_is_diverse(tmp_path: Path) -> None:
     store = SQLiteStore(tmp_path / "default.db")
     store.query = lambda *args, **kwargs: _pool()  # type: ignore[method-assign]
 
     result = Assembler(store=store).assemble(
+        conscious=_make_conscious(),
+        budget=BudgetContext(),
+        k=3,
+    )
+
+    assert [chunk.chunk_id for chunk in result.chunks] == ["dup_a", "distinct_rate", "distinct_schema"]
+
+
+def test_assembler_lambda_one_keeps_duplicate_top_behavior(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "legacy.db")
+    store.query = lambda *args, **kwargs: _pool()  # type: ignore[method-assign]
+
+    result = Assembler(store=store, config=_config(tmp_path, 1.0)).assemble(
         conscious=_make_conscious(),
         budget=BudgetContext(),
         k=3,

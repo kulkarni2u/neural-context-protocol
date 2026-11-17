@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 from ncp.assembler import Assembler
+from ncp.config import load_config
 from ncp.stores.sqlite import SQLiteStore
 from ncp.types import (
     BudgetContext,
@@ -34,6 +35,12 @@ def _conscious(**overrides: Any) -> ConsciousBlock:
 
 def _budget(pressure: str = "low") -> BudgetContext:
     return BudgetContext(pressure=pressure)  # type: ignore[arg-type]
+
+
+def _assembler(store: SQLiteStore) -> Assembler:
+    """Assembler with MMR off (lambda 1.0) so k is forwarded unwidened."""
+    config = load_config(cwd=store.path.parent, env={"NCP_DIVERSITY_LAMBDA": "1.0"})
+    return Assembler(store=store, config=config)
 
 
 def _store_spy(tmp_path: Path) -> tuple[SQLiteStore, list[int]]:
@@ -71,7 +78,7 @@ def _store_spy_with_whispers(tmp_path: Path) -> tuple[SQLiteStore, list[int], li
 def test_assemble_forwards_k_to_store_query(tmp_path: Path) -> None:
     """assembler.assemble(k=8) must call store.query with k=8."""
     store, captured = _store_spy(tmp_path)
-    assembler = Assembler(store=store)
+    assembler = _assembler(store)
 
     assembler.assemble(conscious=_conscious(), budget=_budget(), k=8)
 
@@ -84,8 +91,8 @@ def test_assemble_default_k_uses_pressure_logic(tmp_path: Path) -> None:
     store_n, cap_n = _store_spy(tmp_path / "normal")
     store_c, cap_c = _store_spy(tmp_path / "critical")
 
-    Assembler(store=store_n).assemble(conscious=_conscious(), budget=_budget("low"))
-    Assembler(store=store_c).assemble(conscious=_conscious(), budget=_budget("critical"))
+    _assembler(store_n).assemble(conscious=_conscious(), budget=_budget("low"))
+    _assembler(store_c).assemble(conscious=_conscious(), budget=_budget("critical"))
 
     assert cap_n[0] == 4, f"low pressure should use k=4, got {cap_n[0]}"
     assert cap_c[0] == 2, f"critical pressure should use k=2, got {cap_c[0]}"
@@ -96,8 +103,8 @@ def test_assemble_default_whisper_cap_uses_pressure_logic(tmp_path: Path) -> Non
     store_n, _, whisper_cap_n = _store_spy_with_whispers(tmp_path / "normal_whispers")
     store_c, _, whisper_cap_c = _store_spy_with_whispers(tmp_path / "critical_whispers")
 
-    Assembler(store=store_n).assemble(conscious=_conscious(), budget=_budget("low"))
-    Assembler(store=store_c).assemble(conscious=_conscious(), budget=_budget("critical"))
+    _assembler(store_n).assemble(conscious=_conscious(), budget=_budget("low"))
+    _assembler(store_c).assemble(conscious=_conscious(), budget=_budget("critical"))
 
     assert whisper_cap_n[0] == 3, f"low pressure should peek up to 3 whispers, got {whisper_cap_n[0]}"
     assert whisper_cap_c[0] == 1, (
@@ -108,7 +115,7 @@ def test_assemble_default_whisper_cap_uses_pressure_logic(tmp_path: Path) -> Non
 def test_assemble_k_overrides_pressure_default(tmp_path: Path) -> None:
     """Explicit k overrides the pressure-based default even under critical pressure."""
     store, captured = _store_spy(tmp_path)
-    assembler = Assembler(store=store)
+    assembler = _assembler(store)
 
     assembler.assemble(conscious=_conscious(), budget=_budget("critical"), k=6)
 
@@ -118,7 +125,7 @@ def test_assemble_k_overrides_pressure_default(tmp_path: Path) -> None:
 def test_assemble_explicit_k_keeps_default_whisper_cap(tmp_path: Path) -> None:
     """Explicit k widens chunk retrieval but should not widen whisper peek above 3."""
     store, _, whisper_caps = _store_spy_with_whispers(tmp_path)
-    assembler = Assembler(store=store)
+    assembler = _assembler(store)
 
     assembler.assemble(conscious=_conscious(), budget=_budget("critical"), k=6)
 
@@ -132,7 +139,7 @@ def test_assemble_explicit_k_keeps_default_whisper_cap(tmp_path: Path) -> None:
 def test_assemble_incremental_forwards_k(tmp_path: Path) -> None:
     """assembler.assemble_incremental(k=8) must call store.query with k=8."""
     store, captured = _store_spy(tmp_path)
-    assembler = Assembler(store=store)
+    assembler = _assembler(store)
 
     list(assembler.assemble_incremental(conscious=_conscious(), budget=_budget(), k=8))
 
@@ -170,7 +177,7 @@ def test_assemble_result_chunks_not_capped_at_four(tmp_path: Path) -> None:
             pipeline_id="pipe_test",
         ))
 
-    assembler = Assembler(store=store)
+    assembler = _assembler(store)
     result = assembler.assemble(
         conscious=_conscious(),
         budget=_budget(),
@@ -194,7 +201,8 @@ def test_api_get_context_forwards_k(tmp_path: Path) -> None:
 
     store, captured = _store_spy(tmp_path)
 
-    get_context(agent=_conscious(), store=store, k=8)
+    config = load_config(cwd=tmp_path, env={"NCP_DIVERSITY_LAMBDA": "1.0"})
+    get_context(agent=_conscious(), store=store, k=8, config=config)
 
     assert captured, "store.query was never called via api.get_context"
     assert captured[0] == 8, f"expected k=8 forwarded, got {captured[0]}"

@@ -274,8 +274,13 @@ class Assembler:
             fanin_dropped_malformed_count = len(reduced.dropped_malformed)
         deduped_chunks = self._dedupe_chunks([*recent_chunks, *subconscious])
         if self._diversity_lambda < 1.0:
+            # MMR ranks recent refs and retrieved chunks together, so apply the
+            # recent-slot budget first or recent refs can crowd out retrieval.
+            recent_kept = sorted(recent_chunks, key=lambda chunk: -float(chunk.relevance))[
+                : self._recent_budget(chunk_cap=chunk_cap, budget=budget)
+            ]
             combined_chunks = self._mmr_select_chunks(
-                deduped_chunks,
+                self._dedupe_chunks([*recent_kept, *subconscious]),
                 query_text=search_text,
                 diversity_lambda=self._diversity_lambda,
                 chunk_cap=chunk_cap,
@@ -931,7 +936,7 @@ class Assembler:
         store_k = k
         if diversity_lambda is not None and diversity_lambda < 1.0:
             store_k = max(store_k, k * 3)
-        if self._reduce_fanin_enabled or self._reduce_fanin_auto_min_writers > 0:
+        if self._reduce_fanin_enabled:
             store_k = max(store_k, k * self._reduce_fanin_overfetch)
         search_text = query_text or f"{conscious.task} {conscious.slot}"
         extra: dict = {}
@@ -1157,6 +1162,12 @@ class Assembler:
             deduped.append(chunk)
         return deduped
 
+    def _recent_budget(self, *, chunk_cap: int, budget: BudgetContext) -> int:
+        recent_budget = min(self._recent_slot_budget, chunk_cap)
+        if budget.pressure == "critical" and chunk_cap > 1:
+            recent_budget = min(recent_budget, 1)
+        return recent_budget
+
     def _split_recent_and_retrieved_chunks(
         self,
         *,
@@ -1165,9 +1176,7 @@ class Assembler:
         chunk_cap: int,
         budget: BudgetContext,
     ) -> list[SubconsciousChunk]:
-        recent_budget = min(self._recent_slot_budget, chunk_cap)
-        if budget.pressure == "critical" and chunk_cap > 1:
-            recent_budget = min(recent_budget, 1)
+        recent_budget = self._recent_budget(chunk_cap=chunk_cap, budget=budget)
         candidates: list[tuple[str, int, SubconsciousChunk]] = [
             ("recent", index, chunk) for index, chunk in enumerate(recent_chunks)
         ]
