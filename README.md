@@ -68,6 +68,32 @@ Bounded retrieval is the entry point, not the whole story. The mechanisms below 
 - **Fan-in reduction** — dedups near-duplicate claims across parallel workers before they reach a synthesis agent. **8% token reduction** against an unbounded raw dump. See [Fan-in reduction](#fan-in-reduction).
 - **Consolidation** — merges repeated or near-duplicate memory into fewer, stronger entries instead of leaving competing rows. See [Retrieval and self-improving memory](#retrieval-and-self-improving-memory).
 
+### Harness and subagent overhead (v1.9.6)
+
+The protocol calls around a turn cost characters too. v1.9.6 trims them, and each piece is opt-out or opt-in as noted:
+
+- **Capped handoff returns** — `ncp handoff` and `ncp run-turn` print a bounded summary plus the chunk id of the full output (`--return full` restores the old output).
+- **Smaller turn posts** — `ncp_post_turn` takes an optional `result_full` and defaults its whisper and chunk ids to those of the session's last `ncp_get_context` (in process memory, never for the shared default session).
+- **Per-connection tool profiles** — `?profile=minimal` (just `ncp_get_context` and `ncp_write_memory`), `X-NCP-Tool-Profile` or `ncp serve --profile`; a connection can only narrow the configured profile.
+- **Skills by reference** (opt-in, `[skill_cache].enabled`) — register a workflow once with `ncp skill cache`, then dispatch it by id (`--skill`, `ncp_skill`, `skills` on `ncp_get_context`). The worker's prompt gets a `[NCP:SKILL]` block of user-authored instructions; the orchestrator emits an id, not the text.
+- **Cross-turn delta** (opt-in) — `ncp_get_context` with `delta: true` and an explicit `session_id` sends `chunk:<id> seen:1` for chunks the session already holds unchanged. Not for the shared default session, reset by a `delta: false` call, and wrong for a worker that starts with a fresh context; distilled chunks are always re-sent.
+- **Lifecycle hooks** — one `ncp-lifecycle-hook.sh` covers SessionStart(compact|clear), SubagentStart, SubagentStop and Stop (`NCP_HOOKS_DISABLE=1` turns it off), and `ncp run-turn --host claude|codex|opencode|mock` runs one fresh-context turn.
+
+Chunk headers also drop the wall-clock `score:` by default (`[encoder].show_score` restores it), which keeps the cacheable prefix stable.
+
+A deterministic benchmark (`benchmarks/harness_overhead/`, in CI) measures these as structural character counts, with each "before" being the new code with the old behavior switched on:
+
+| Measure | Before | After |
+|---|---:|---:|
+| Handoff return, 20 KB provider response | 20,677 | 1,999 |
+| Model-emitted characters per `ncp_post_turn` | 1,909 | 257 |
+| Tool catalog, `standard` against `minimal` | 15,874 | 5,062 |
+| Chunk characters resent over 10 turns (delta) | 20,620 | 2,656 |
+| Prefix-stable fraction of the block across turns | 0.19 | 0.89 |
+| Orchestrator characters, one 6,000-character skill to 8 workers | 48,480 | 504 |
+
+These are `chars_div4` counts with a mock provider on small fixed workloads, not provider tokens or dollars, and the savings scale with the sizes chosen. See [the benchmark doc](./docs/NCP_BENCHMARK_HARNESS_OVERHEAD.md) and [the token-efficiency plan](./docs/NCP_TOKEN_EFFICIENCY_PLAN.md).
+
 ### Context quality
 
 - **Trust-weighted retrieval** — blends lexical relevance (BM25), recency, and trust into one score, with penalties for drift and heavily re-derived generations. See [Retrieval and self-improving memory](#retrieval-and-self-improving-memory).
@@ -639,6 +665,7 @@ python3 benchmarks/task_success/run.py --provider anthropic   # live task succes
 python3 benchmarks/efficacy/run.py --provider mock --seeds 2  # context adequacy at matched budget
 python3 benchmarks/compression/run.py             # ingestion-time compression
 python3 benchmarks/fanin_reduce/run.py            # many-workers-to-one-synthesizer fan-in reduction
+python3 benchmarks/harness_overhead/run.py        # handoff, turn-post, catalog, delta and skill-dispatch overhead
 python3 benchmarks/hotpotqa_style/run.py          # synthetic HotpotQA-shaped multi-hop QA
 ```
 
@@ -664,12 +691,13 @@ ncp_record_outcome   — attach outcome feedback to chunks, turns, or a decision
 ncp_lookup_memo      — check for reusable completed work by signature
 ncp_record_memo      — store reusable completed work by signature
 ncp_wait_whispers    — block until a whisper is queued for this agent (peeks, never drains)
+ncp_skill            — opt-in (`[skill_cache].enabled`): read a user-registered skill by id (get / recall / list)
 ncp_task             — opt-in task ledger: create / claim / heartbeat / release / complete / cancel / get / list
 ncp_overview         — ranked, token-bounded summary across active pipelines (read-only)
 ncp_ontology_*       — opt-in domain graph: capabilities / query / explain / assert / revoke / evidence
 ```
 
-The `[tools] profile` setting picks the advertised surface: `core` (5 per-turn lifecycle tools), `standard` (the default: core plus `ncp_record_outcome`, the decision tools and `ncp_wait_whispers`) or `full` (everything). `ncp_overview`, `ncp_remember`, `ncp_recall`, `ncp_improve`, `ncp_task` and the memo tools require `profile = "full"` (`ncp_task` also needs `[tasks].enabled = true`); the six `ncp_ontology_*` tools need `[ontology].enabled = true` and a non-`core` profile. See [the ontology guide](./docs/NCP_ONTOLOGY.md).
+The `[tools] profile` setting picks the advertised surface: `minimal` (`ncp_get_context` and `ncp_write_memory` only; also available per connection with `?profile=minimal`), `core` (5 per-turn lifecycle tools), `standard` (the default: core plus `ncp_record_outcome`, the decision tools and `ncp_wait_whispers`) or `full` (everything). `ncp_overview`, `ncp_remember`, `ncp_recall`, `ncp_improve`, `ncp_task` and the memo tools require `profile = "full"` (`ncp_task` also needs `[tasks].enabled = true`); the six `ncp_ontology_*` tools need `[ontology].enabled = true` and a non-`core` profile. See [the ontology guide](./docs/NCP_ONTOLOGY.md).
 
 The core agent-to-agent protocol is still: read context, publish memory, signal peers, and record outcomes. The memory facade (`ncp_remember` / `ncp_recall` / `ncp_improve`) is an ergonomic layer over the same trust-aware chunks and graph edges.
 
@@ -760,7 +788,9 @@ ncp ontology eval # score a scan against a golden manifest (precision / recall /
 ncp ontology seed # load/sync the opt-in ontology from one or more manifests (--dry-run, --prune)
 ncp calibrate   # recalibrate trust (add --feedback for the self-improvement pass)
 ncp refine      # evidence-backed procedural self-refinement: ingest/show/propose/apply/rollback
-ncp handoff     # cross-agent handoff coordination
+ncp handoff     # cross-agent handoff coordination (bounded summary return; --skill, --return full)
+ncp run-turn    # run one fresh-context turn on a host: claude, codex, opencode or mock
+ncp skill       # cache | list | show user-registered skills (opt-in, [skill_cache])
 ncp batch       # process a JSONL file of NCP operations
 ncp identity    # create / list / revoke Ed25519 agent identities
 ncp reputation  # per-identity reputation: score, confidence, observation count
@@ -807,8 +837,6 @@ resets the per-chunk retrieval/dissent counters it consumes, `ncp trust-drift`'s
 totals.
 
 -----
-- **Smaller harness overhead** — `ncp handoff` returns a bounded summary by default (`--return full` for everything); `ncp_post_turn` takes an optional `result_full` and defaults its ids from the last `ncp_get_context`; a connection can ask for a narrower tool set (`?profile=minimal`). See [the token-efficiency plan](./docs/NCP_TOKEN_EFFICIENCY_PLAN.md).
-- **Skill cache (opt-in)** — register a workflow or reference skill once (`ncp skill cache <file> --id team/deploy --pipeline <id>`), then pass it by id (`--skill`, `ncp_skill`, `skills` on `ncp_get_context`) instead of pasting it into every prompt. `[NCP:SKILL]` blocks are user-authored instructions. See [the design](./docs/NCP_SKILL_CACHING_DESIGN.md).
 
 ## Cross-agent handoffs
 
@@ -819,7 +847,7 @@ ncp handoff claude --cwd /path/to/project --pipeline-id pipe_demo --emit-to open
 ncp handoff opencode --cwd /path/to/project --pipeline-id pipe_demo --emit-to claude
 ```
 
-`ncp handoff` prints a bounded summary plus the chunk id of the full output; `--return full` prints it all, `--skill <id>` places a registered skill at the start of the prompt. `ncp run-turn --host claude|codex|opencode|mock` runs one fresh-context turn. The Claude plugin's `ncp-lifecycle-hook.sh` covers SessionStart(compact|clear), SubagentStart, SubagentStop and Stop (`NCP_HOOKS_DISABLE=1` turns it off).
+`ncp handoff` prints a bounded summary plus the chunk id of the full output; `--return full` prints it all, `--skill <id>` places a registered skill at the start of the prompt.  See [Harness and subagent overhead](#harness-and-subagent-overhead-v196).
 
 -----
 
@@ -846,16 +874,17 @@ ncp explain --cwd /path/to/project
 
 | Block            | Controls                                                                                  |
 |------------------|-------------------------------------------------------------------------------------------|
-| `[budget]`       | Context token budget and per-pressure chunk/whisper caps (default → high → critical)       |
+| `[budget]`       | Context token budget, per-pressure chunk/whisper caps (default → high → critical) and `estimate_margin` (0.9): the conservative counting margin |
 | `[pipeline]`     | Working-set size and GC (`max_working_chunks`, `gc_threshold`, default TTL); eviction is lowest trust/recency first and never removes `user_verified` chunks |
 | `[whispers]`     | Whisper TTL, max per drain, and `min_confidence` to deliver                                |
-| `[retrieval]`    | Signal weights, `generation_penalty_base`, `edge_expansion`, rerank, trust propagation, `reduce_fanin_enabled` |
+| `[retrieval]`    | Signal weights, `generation_penalty_base`, `edge_expansion`, rerank, trust propagation, `diversity_lambda` (0.7), `reduce_fanin_enabled` and `reduce_fanin_auto_min_writers` (3), `fit_swap_enabled` |
 | `[embedding]`    | Semantic vector retrieval — on by default (local, no API key); provider, model, graceful lexical-only fallback if `fastembed` is absent |
 | `[reputation]`   | Beta-reputation `gain`, `forget`, `confidence_k`                                           |
 | `[consolidation]`| Similarity threshold, trust floor, and optional LLM model for memory compaction            |
 | `[retention]`    | Hard cap on working chunks per pipeline (`user_verified` chunks are never evicted)         |
 | `[providers]`    | Per-model pricing used by `ncp cost` (configurable)                                        |
 | `[server]`       | `auth_token` for non-loopback binds                                                        |
+| `[tools]`        | `profile`: `minimal`, `core`, `standard` (default) or `full`; a connection can narrow it                 |
 | `[turns]`        | `result_full_max_chars` (8000): cap on the result stored by `ncp_post_turn`                |
 | `[encoder]`      | `show_score` (false): print `score:` in chunk headers (off keeps the cacheable prefix stable) |
 | `[skill_cache]`  | `enabled` (false) gates `ncp_skill`, `ncp skill` and `--skill`; `default_trust`, `default_expiry_days`, `window_chars` |
@@ -966,6 +995,7 @@ When Sarathi orchestrates, it dispatches the same roles. Every worker starts wit
 - [Benchmark: research pipeline](./docs/NCP_BENCHMARK_RESEARCH_PIPELINE.md)
 - [Benchmark: ingestion-time compression](./docs/NCP_BENCHMARK_COMPRESSION.md)
 - [Benchmark: fan-in reduction](./docs/NCP_BENCHMARK_FANIN_REDUCE.md)
+- [Benchmark: harness and subagent overhead](./docs/NCP_BENCHMARK_HARNESS_OVERHEAD.md)
 - [Benchmark: ontology](./docs/NCP_BENCHMARK_ONTOLOGY.md)
 - [MACE multi-agent eval](./benchmarks/mace/README.md)
 - [North-star capability roadmap](./docs/NCP_NORTH_STAR_CAPABILITY_ROADMAP.md)
