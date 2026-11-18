@@ -67,6 +67,7 @@ from ncp.stores.calibration import (
     FeedbackRow,
     ReputationUpdate,
     compute_feedback_updates,
+    registered_skill_chunk_ids,
     rollup_reputation,
     validate_chunk_alias,
 )
@@ -82,6 +83,9 @@ from ncp.types import (
     ChunkEdge,
     ConsciousBlock,
     ConsolidationReport,
+    ImprovementAttempt,
+    ImprovementProblem,
+    OutcomeStats,
     NCPResponse,
     DecisionRecord,
     OutcomeRecord,
@@ -1959,8 +1963,10 @@ class AsyncPgvectorStore(BaseStore):
                 await cur.execute(
                     self._sql(
                         "INSERT INTO {schema}.{prefix}outcomes"
-                        " (outcome_id, turn_id, chunk_ids, success, weight, note, created_at, consumed)"
-                        " VALUES (%s, %s, %s, %s, %s, %s, %s, 0)"
+                        " (outcome_id, turn_id, chunk_ids, success, weight, note, created_at, consumed,"
+                        " pipeline_id, task, slot, model, benchmark, split, eval_source,"
+                        " output_tokens, input_tokens, turns)"
+                        " VALUES (%s, %s, %s, %s, %s, %s, %s, 0, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
                         " ON CONFLICT (outcome_id) DO NOTHING"
                     ),
                     (
@@ -1971,6 +1977,16 @@ class AsyncPgvectorStore(BaseStore):
                         outcome.weight,
                         outcome.note,
                         outcome.created_at,
+                        outcome.pipeline_id,
+                        outcome.task,
+                        outcome.slot,
+                        outcome.model,
+                        outcome.benchmark,
+                        outcome.split,
+                        outcome.eval_source,
+                        outcome.output_tokens,
+                        outcome.input_tokens,
+                        outcome.turns,
                     ),
                 )
                 return cur.rowcount > 0
@@ -1984,6 +2000,152 @@ class AsyncPgvectorStore(BaseStore):
                 )
                 rows = await self._afetchall(cur)
         return PgvectorStore._row_to_outcome(rows[0]) if rows else None
+
+    # ── improvement records (v1.9.7) ──────────────────────────────────────
+    # outcome_stats and has_success_outcome are native async. The problem /
+    # attempt tables are sync-store only for now (see NotImplementedError).
+
+    _IMPROVEMENT_UNSUPPORTED = (
+        "improvement records are not implemented for the async pgvector store; "
+        "use the sqlite or sync pgvector store"
+    )
+
+    async def async_upsert_improvement_problem(self, problem: ImprovementProblem) -> ImprovementProblem:
+        raise NotImplementedError(self._IMPROVEMENT_UNSUPPORTED)
+
+    async def async_get_improvement_problem(self, problem_id: str) -> ImprovementProblem | None:
+        raise NotImplementedError(self._IMPROVEMENT_UNSUPPORTED)
+
+    async def async_list_improvement_problems(
+        self, *, pipeline_id: str | None = None, scope: str | None = None, limit: int = 100
+    ) -> list[ImprovementProblem]:
+        raise NotImplementedError(self._IMPROVEMENT_UNSUPPORTED)
+
+    async def async_merge_improvement_problems(
+        self, *, src_problem_id: str, dst_problem_id: str
+    ) -> None:
+        raise NotImplementedError(self._IMPROVEMENT_UNSUPPORTED)
+
+    async def async_record_improvement_attempt(self, attempt: ImprovementAttempt) -> ImprovementAttempt:
+        raise NotImplementedError(self._IMPROVEMENT_UNSUPPORTED)
+
+    async def async_update_improvement_attempt(
+        self, attempt_id: str, **fields: Any
+    ) -> ImprovementAttempt:
+        raise NotImplementedError(self._IMPROVEMENT_UNSUPPORTED)
+
+    async def async_list_improvement_attempts(
+        self,
+        *,
+        problem_id: str | None = None,
+        candidate_chunk_id: str | None = None,
+        limit: int = 200,
+    ) -> list[ImprovementAttempt]:
+        raise NotImplementedError(self._IMPROVEMENT_UNSUPPORTED)
+
+    async def async_outcome_stats(
+        self,
+        *,
+        chunk_ids: Sequence[str],
+        model: str | None = None,
+        exclude_chunk_ids: Sequence[str] = (),
+        split: str | None = None,
+    ) -> OutcomeStats:
+        ids = list(dict.fromkeys(str(c) for c in chunk_ids))
+        if not ids:
+            return OutcomeStats(
+                n=0, total_weight=0.0, success_weight=0.0, success_rate=None,
+                mean_output_tokens=None, mean_turns=None,
+            )
+        scope = (
+            "EXISTS (SELECT 1 FROM jsonb_array_elements_text(o.chunk_ids::jsonb) j(value)"
+            " WHERE j.value = ANY(%s))"
+        )
+        params: list[Any] = [ids]
+        if model is not None:
+            scope += " AND o.model = %s"
+            params.append(model)
+        if split is not None:
+            scope += " AND o.split = %s"
+            params.append(split)
+        excluded = list(dict.fromkeys(str(c) for c in exclude_chunk_ids))
+        if excluded:
+            scope += (
+                " AND NOT EXISTS (SELECT 1 FROM jsonb_array_elements_text(o.chunk_ids::jsonb) x(value)"
+                " WHERE x.value = ANY(%s))"
+            )
+            params.append(excluded)
+        async with self._aconnect() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    self._sql(
+                        "SELECT COUNT(*) AS n, COALESCE(SUM(o.weight), 0.0) AS tw,"
+                        " COALESCE(SUM(CASE WHEN o.success = 1 THEN o.weight ELSE 0 END), 0.0) AS sw,"
+                        " AVG(o.output_tokens) AS mot, AVG(o.turns) AS mt"
+                        f" FROM {{schema}}.{{prefix}}outcomes o WHERE {scope}"
+                    ),
+                    tuple(params),
+                )
+                agg = await self._afetchone(cur)
+                await cur.execute(
+                    self._sql(
+                        "SELECT DISTINCT o.task AS task, o.success AS success"
+                        f" FROM {{schema}}.{{prefix}}outcomes o WHERE o.task IS NOT NULL AND {scope}"
+                    ),
+                    tuple(params),
+                )
+                task_rows = await self._afetchall(cur)
+        assert agg is not None
+        total = float(agg["tw"])
+        success = float(agg["sw"])
+        return OutcomeStats(
+            n=int(agg["n"]),
+            total_weight=total,
+            success_weight=success,
+            success_rate=(success / total) if total > 0 else None,
+            mean_output_tokens=float(agg["mot"]) if agg["mot"] is not None else None,
+            mean_turns=float(agg["mt"]) if agg["mt"] is not None else None,
+            tasks_succeeded=sorted({str(r["task"]) for r in task_rows if r["success"]}),
+            tasks_failed=sorted({str(r["task"]) for r in task_rows if not r["success"]}),
+        )
+
+    async def async_has_success_outcome(
+        self, *, pipeline_id: str | None = None, task: str, slot: str | None = None
+    ) -> bool:
+        clauses = ["success = 1", "task = %s"]
+        params: list[Any] = [task]
+        if slot is not None:
+            clauses.append("slot = %s")
+            params.append(slot)
+        if pipeline_id is not None:
+            clauses.append("pipeline_id = %s")
+            params.append(pipeline_id)
+        async with self._aconnect() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    self._sql(
+                        "SELECT 1 FROM {schema}.{prefix}outcomes"
+                        f" WHERE {' AND '.join(clauses)} LIMIT 1"
+                    ),
+                    tuple(params),
+                )
+                row = await cur.fetchone()
+        return row is not None
+
+    async def async_has_any_outcome(self, *, pipeline_id: str | None = None) -> bool:
+        where = ""
+        params: tuple[Any, ...] = ()
+        if pipeline_id is not None:
+            where = " WHERE pipeline_id = %s"
+            params = (pipeline_id,)
+        async with self._aconnect() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    self._sql(f"SELECT 1 FROM {{schema}}.{{prefix}}outcomes{where} LIMIT 1"),
+                    params,
+                )
+                row = await cur.fetchone()
+        return row is not None
 
     # ── typed decisions (spec 4h) ─────────────────────────────────────────
 
@@ -2428,16 +2590,7 @@ class AsyncPgvectorStore(BaseStore):
             rows = await self._afetchall(cursor)
         results: list[OutcomeRecord] = []
         for row in rows:
-            results.append(OutcomeRecord(
-                outcome_id=str(row["outcome_id"]),
-                turn_id=row["turn_id"],
-                chunk_ids=json.loads(str(row["chunk_ids"])),
-                success=bool(row["success"]),
-                weight=float(row["weight"]),
-                note=row["note"],
-                created_at=float(row["created_at"]),
-                consumed=bool(row["consumed"]),
-            ))
+            results.append(PgvectorStore._row_to_outcome(row))
         return results
 
     async def _aload_outcome_applications(
@@ -3182,6 +3335,7 @@ class AsyncPgvectorStore(BaseStore):
         propagation_factor: float = 0.5,
         dissent_weight: float = 0.2,
         propagation_max_hops: int = 1,
+        outcome_step: float = 1.0,
     ) -> CalibrationReport:
         """Re-score base_trust on live chunks using async DB I/O. Full parity with calibrate()."""
         started = time.monotonic()
@@ -3247,7 +3401,9 @@ class AsyncPgvectorStore(BaseStore):
                     await cur.execute(
                         self._sql(
                             "SELECT chunk_id, base_trust, src, written_by, generation, created_at,"
-                            " retrieval_count, caused_by, dissent_count FROM {schema}.{prefix}chunks"
+                            " retrieval_count, caused_by, dissent_count,"
+                            " CASE WHEN src = 'skill_ref' THEN conditions END AS skill_conditions"
+                            " FROM {schema}.{prefix}chunks"
                             " WHERE chunk_id NOT IN"
                             " (SELECT chunk_id FROM {schema}.{prefix}tombstones)"
                             " AND pipeline_id = %s"
@@ -3258,7 +3414,9 @@ class AsyncPgvectorStore(BaseStore):
                     await cur.execute(
                         self._sql(
                             "SELECT chunk_id, base_trust, src, written_by, generation, created_at,"
-                            " retrieval_count, caused_by, dissent_count FROM {schema}.{prefix}chunks"
+                            " retrieval_count, caused_by, dissent_count,"
+                            " CASE WHEN src = 'skill_ref' THEN conditions END AS skill_conditions"
+                            " FROM {schema}.{prefix}chunks"
                             " WHERE chunk_id NOT IN"
                             " (SELECT chunk_id FROM {schema}.{prefix}tombstones)"
                         )
@@ -3271,8 +3429,14 @@ class AsyncPgvectorStore(BaseStore):
         chunk_author: dict[str, str] = {}
         consumed_feedback_ids: list[str] = []
         now = time.time()
-        for row in rows:
-            r = self._normalize_row(row, desc)
+        normalized_rows = [self._normalize_row(row, desc) for row in rows]
+        # R9: user-registered skills are never batch-decayed.
+        exempt_skill_ids = registered_skill_chunk_ids(
+            (str(r["chunk_id"]), r["skill_conditions"])
+            for r in normalized_rows
+            if r.get("skill_conditions")
+        )
+        for r in normalized_rows:
             cid = str(r["chunk_id"])
             bt = float(r.get("base_trust", 0.7))
             src = str(r.get("src") or "")
@@ -3286,7 +3450,9 @@ class AsyncPgvectorStore(BaseStore):
                 continue
 
             if not feedback_mode:
-                if age_seconds > cutoff_age and bt > 0.5 and generation == 0:
+                if cid in exempt_skill_ids:
+                    report.protected += 1
+                elif age_seconds > cutoff_age and bt > 0.5 and generation == 0:
                     new_trust = max(0.0, bt * decay_factor)
                     report.change_log.append({
                         "chunk_id": cid,
@@ -3355,7 +3521,11 @@ class AsyncPgvectorStore(BaseStore):
                         outcomes, {r.chunk_id for r in feedback_rows}, prior_pairs
                     )
                     if scoped:
-                        outcome_evidence = compute_outcome_evidence(scoped)
+                        outcome_evidence = compute_outcome_evidence(
+                            scoped,
+                            self_report_weight=self.config.calibration_self_report_weight if self.config is not None else 1.0,
+                            outcome_step=outcome_step,
+                        )
                     applied_now = [
                         (o.outcome_id, cid) for o in scoped for cid in o.chunk_ids
                     ]

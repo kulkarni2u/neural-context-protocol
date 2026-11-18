@@ -326,6 +326,25 @@ class TestPipelineAcl:
         with pytest.raises(AuthorizationError, match="pipeline_id is required"):
             ToolAuthorizer(store).check_call(_p(pipelines={"p1"}, caps={"verify"}), tool, {"query": "q"})
 
+    def test_record_outcome_has_no_pipeline_argument_and_is_scoped_by_chunks(self, store: SQLiteStore) -> None:
+        # The server derives the outcome pipeline (held context / shared chunk
+        # pipeline), so scope is enforced on the chunk ids alone.
+        store.write(SubconsciousChunk(chunk_id="c1", layer="semantic", content="x", src="tool_result",
+                                      pipeline_id="p1", written_by="someone_else"))
+        store.write(SubconsciousChunk(chunk_id="c2", layer="semantic", content="y", src="tool_result",
+                                      pipeline_id="p2", written_by="someone_else"))
+        auth = ToolAuthorizer(store)
+        limited = _p(pipelines={"p1"}, caps={"record_outcome"})
+        auth.check_call(limited, "ncp_record_outcome", {"success": True, "chunk_ids": ["c1"]})
+        # Cannot attribute to p2: its chunks are rejected, and a stray pipeline_id is not trusted.
+        with pytest.raises(AuthorizationError, match="outside"):
+            auth.check_call(limited, "ncp_record_outcome", {"success": True, "chunk_ids": ["c2"]})
+        with pytest.raises(AuthorizationError, match="outside"):
+            auth.check_call(limited, "ncp_record_outcome", {"success": True, "chunk_ids": ["c1", "c2"]})
+        assert "pipeline_id" not in next(
+            t for t in MCP_TOOLS if t["name"] == "ncp_record_outcome"
+        )["inputSchema"]["properties"]
+
     def test_unrestricted_principal_may_omit_pipeline(self, store: SQLiteStore) -> None:
         ToolAuthorizer(store).check_call(_p(), "ncp_recall", {"query": "q"})
 

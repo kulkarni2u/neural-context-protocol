@@ -40,6 +40,7 @@ FULL_NON_MEMO_TOOL_NAMES = [
     "ncp_recall",
     "ncp_improve",
     "ncp_fetch",
+    "ncp_improvement_log",
     "ncp_record_decision",
     "ncp_get_decision",
     "ncp_compile_decision_query",
@@ -280,6 +281,7 @@ class TestToolsList:
             "ncp_improve",
             "ncp_fetch",
             "ncp_skill",
+            "ncp_improvement_log",
             "ncp_record_decision",
             "ncp_get_decision",
             "ncp_compile_decision_query",
@@ -342,7 +344,7 @@ class TestToolsList:
         config = load_config(cwd=tmp_path)
         config.values["tools"]["profile"] = "full"
         size = len(json.dumps(tools_for_config(config)))
-        assert size < 19_600, f"full-profile tools/list grew to {size} chars"
+        assert size < 20_800, f"full-profile tools/list grew to {size} chars"
 
     def test_tool_profile_core_tools_list_advertises_only_context_lifecycle(self, tmp_path: Path) -> None:
         project = tmp_path / "repo"
@@ -2404,7 +2406,7 @@ class TestAdaptiveBudget:
 
         assert "budget_tokens" in result
         block = result["budget_tokens"]
-        assert set(block) == {"requested", "adjusted", "reason_factors"}
+        assert set(block) == {"requested", "adjusted", "reason_factors", "budget_unproven_protected"}
         assert block["requested"] == config.context_token_budget
         assert config.adaptive_budget_floor_tokens <= block["adjusted"] <= config.adaptive_budget_ceiling_tokens
         assert estimate_tokens(result["context"]) <= block["adjusted"]
@@ -2439,6 +2441,7 @@ class TestAdaptiveBudget:
             "requested": 200,
             "adjusted": 200,
             "reason_factors": {"explicit_override": True},
+            "budget_unproven_protected": False,
         }
         assert estimate_tokens(result["context"]) <= 200
 

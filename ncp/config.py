@@ -68,11 +68,21 @@ DEFAULT_CONFIG = {
         # adjusted value never exceeds context_token_budget. true restores
         # the 0.5x-1.5x scaling up to adaptive_budget_ceiling_tokens.
         "adaptive_allow_expand": False,
+        # R7: never shrink the adaptive budget for a task/slot that has no
+        # recorded success outcome yet (floor scale at 1.0x).
+        "protect_unproven_slots": True,
+        # Protection only applies while the slot is younger than this many turns
+        # and its pipeline already has outcomes but none successful for the slot.
+        "unproven_max_turns": 5,
     },
     "encoder": {
         # Print ``score:`` in each chunk header. Off by default: the score
         # includes wall-clock recency, so it makes the cacheable prefix drift.
         "show_score": False,
+        # Print each chunk's trust as first rendered in the fetch session, so
+        # calibration between turns does not change already-sent headers
+        # (ranking still uses live trust).
+        "pin_trust_per_session": True,
     },
     "chunking": {
         "default_type": "auto",
@@ -235,6 +245,18 @@ DEFAULT_CONFIG = {
         # functions in ncp.skill_cache work regardless.
         "enabled": False,
     },
+    "calibration": {
+        # Weight applied to outcomes whose eval_source is "self_report" during
+        # feedback calibration (1.0 = unchanged; lower to favor verifier/human).
+        "self_report_weight": 1.0,
+        # Run feedback calibration automatically after ncp_record_outcome,
+        # at most once per auto_min_interval_seconds per pipeline.
+        "auto_on_outcome": True,
+        "auto_min_interval_seconds": 60,
+        # Per-outcome trust step used by the automatic calibration (manual
+        # `ncp calibrate` keeps 1.0). Clamped to (0, 1].
+        "auto_outcome_step": 0.1,
+    },
     "tools": {
         "profile": "standard",
         "compact_default": True,
@@ -347,6 +369,19 @@ DEFAULT_CONFIG = {
         "min_failed_outcomes": 3,
         "max_bullets": 5,
         "promote_trust": 0.80,
+        # v1.9.7 prune gate: a prune candidate is applied only when its success
+        # rate >= gate_ratio x the anchor rate over >= min_trial_outcomes, and a
+        # prune needs >= min_anchor_outcomes on the current head.
+        "gate_ratio": 0.9,
+        "min_trial_outcomes": 5,
+        "min_anchor_outcomes": 5,
+        # Outcomes the gate scores: auto (holdout when enough, else all) | holdout | all.
+        "gate_split": "auto",
+    },
+    "improvement": {
+        # [NCP:IMPROVEMENT] blocks are never truncated; over this many chars the
+        # telemetry reports oversize=true.
+        "warn_chars": 8000,
     },
     "providers": {
         # ``cache_write`` (Anthropic-only): the premium for tokens written
@@ -510,6 +545,10 @@ class NCPConfig:
         return bool(self.values.get("encoder", {}).get("show_score", False))
 
     @property
+    def encoder_pin_trust_per_session(self) -> bool:
+        return bool(self.values.get("encoder", {}).get("pin_trust_per_session", True))
+
+    @property
     def estimate_margin(self) -> float:
         return min(1.0, max(0.1, float(self.values.get("budget", {}).get("estimate_margin", 1.0))))
 
@@ -649,6 +688,19 @@ class NCPConfig:
     @property
     def adaptive_budget_ceiling_tokens(self) -> int:
         return int(self.values.get("budget", {}).get("adaptive_budget_ceiling_tokens", 2000))
+
+    @property
+    def protect_unproven_slots(self) -> bool:
+        """R7: adaptive budget never shrinks slots without a success outcome."""
+        return bool(self.values.get("budget", {}).get("protect_unproven_slots", True))
+
+    @property
+    def unproven_max_turns(self) -> int:
+        """Slot age (turns) after which unproven-slot protection stops applying."""
+        try:
+            return max(0, int(self.values.get("budget", {}).get("unproven_max_turns", 5)))
+        except (TypeError, ValueError):
+            return 5
 
     @property
     def adaptive_allow_expand(self) -> bool:
@@ -843,6 +895,33 @@ class NCPConfig:
         return dict(raw) if isinstance(raw, dict) else {}
 
     @property
+    def calibration_self_report_weight(self) -> float:
+        """``[calibration].self_report_weight`` clamped to [0, 1]; invalid -> 1.0."""
+        raw = self.values.get("calibration", {}).get("self_report_weight", 1.0)
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            return 1.0
+        return min(1.0, max(0.0, float(raw)))
+
+    @property
+    def calibration_auto_on_outcome(self) -> bool:
+        return bool(self.values.get("calibration", {}).get("auto_on_outcome", True))
+
+    @property
+    def calibration_auto_outcome_step(self) -> float:
+        """``[calibration].auto_outcome_step`` clamped to (0, 1]; invalid -> 0.1."""
+        raw = self.values.get("calibration", {}).get("auto_outcome_step", 0.1)
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not raw > 0:
+            return 0.1
+        return min(1.0, float(raw))
+
+    @property
+    def calibration_auto_min_interval_seconds(self) -> float:
+        raw = self.values.get("calibration", {}).get("auto_min_interval_seconds", 60)
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)) or raw < 0:
+            return 60.0
+        return float(raw)
+
+    @property
     def skill_cache_default_trust(self) -> float:
         return float(self.values.get("skill_cache", {}).get("default_trust", 0.60))
 
@@ -928,6 +1007,29 @@ class NCPConfig:
     @property
     def refine_promote_trust(self) -> float:
         return float(self.values.get("refine", {}).get("promote_trust", 0.80))
+
+    @property
+    def refine_gate_ratio(self) -> float:
+        return float(self.values.get("refine", {}).get("gate_ratio", 0.9))
+
+    @property
+    def refine_min_trial_outcomes(self) -> int:
+        return max(1, int(self.values.get("refine", {}).get("min_trial_outcomes", 5)))
+
+    @property
+    def refine_min_anchor_outcomes(self) -> int:
+        return max(1, int(self.values.get("refine", {}).get("min_anchor_outcomes", 5)))
+
+    @property
+    def refine_gate_split(self) -> str:
+        value = str(self.values.get("refine", {}).get("gate_split", "auto")).strip().lower()
+        if value not in ("auto", "holdout", "all"):
+            raise ValueError(f"[refine].gate_split must be auto, holdout or all; got {value!r}")
+        return value
+
+    @property
+    def improvement_warn_chars(self) -> int:
+        return max(1, int(self.values.get("improvement", {}).get("warn_chars", 8000)))
 
 
 def load_config(

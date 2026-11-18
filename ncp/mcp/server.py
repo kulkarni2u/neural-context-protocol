@@ -70,6 +70,7 @@ from ncp.skill_cache import (
     SKILL_AUTHOR_PREFIX,
     ensure_cached,
     fetch_skill,
+    outline_skill,
     is_reserved_skill_identity,
     latest_registered_skill,
     list_skills,
@@ -469,11 +470,44 @@ MCP_TOOLS: list[dict[str, object]] = [
                 "action": {"type": "string", "enum": ["get", "recall", "list"]},
                 "skill_id": {"type": "string", "description": "get: <namespace>/<name>."},
                 "content_hash": {"type": "string", "description": "get: pin a version (default newest)."},
+                "detail": {"type": "string", "enum": ["full", "outline"], "description": "get: full (default) or outline (headings, first lines, code signatures)."},
                 "query": {"type": "string", "description": "recall."},
                 "k": {"type": "integer", "description": "recall: max 4."},
                 "pipeline_id": {"type": "string"},
                 "agent_id": {"type": "string"},
                 "session_id": {"type": "string"},
+            },
+            "required": ["action"],
+        },
+    },
+    {
+        "name": "ncp_improvement_log",
+        "description": "Improvement history: get, list_problems, record_attempt, resolve_attempt, merge.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["get", "list_problems", "record_attempt", "resolve_attempt", "merge"]},
+                "scope": {"type": "string"},
+                "pipeline_id": {"type": "string"},
+                "model": {"type": "string"},
+                "problem_id": {"type": "string"},
+                "problem_name": {"type": "string"},
+                "what": {"type": "string"},
+                "rationale": {"type": "string"},
+                "predicted": {"type": "array", "items": {"type": "string"}},
+                "files": {"type": "array", "items": {"type": "string"}},
+                "benchmark": {"type": "string"},
+                "candidate_chunk_id": {"type": "string"},
+                "attempt_id": {"type": "string"},
+                "status": {"type": "string", "enum": ["proposed", "applied", "rejected", "rolled_back"]},
+                "fixed": {"type": "array", "items": {"type": "string"}},
+                "missed": {"type": "array", "items": {"type": "string"}},
+                "passed": {"type": "number"},
+                "total": {"type": "number"},
+                "mean_output_tokens": {"type": "number"},
+                "note": {"type": "string"},
+                "src_problem_id": {"type": "string"},
+                "dst_problem_id": {"type": "string"},
             },
             "required": ["action"],
         },
@@ -561,19 +595,24 @@ MCP_TOOLS: list[dict[str, object]] = [
     {
         "name": "ncp_record_outcome",
         "description": (
-            "Record a task outcome for outcome-calibrated reputation. Give chunk_ids or "
-            "turn_id. success=true raises author reputation; false lowers it."
+            "Record a task outcome. Give chunk_ids or turn_id; success raises author "
+            "reputation, failure lowers it."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "success": {"type": "boolean", "description": "Whether the outcome was successful"},
-                "chunk_ids": {"type": "array", "items": {"type": "string"}, "description": "Contributing chunk ids. Exclusive with turn_id."},
+                "success": {"type": "boolean"},
+                "chunk_ids": {"type": "array", "items": {"type": "string"}, "description": "Credited chunk ids. Exclusive with turn_id."},
                 "turn_id": {"type": "string", "description": "Turn resolved to chunk_ids. Exclusive with chunk_ids."},
-                "decision_id": {"type": "string", "description": "Optional typed decision (dec_...) this resolves."},
+                "decision_id": {"type": "string", "description": "Decision (dec_...) resolved."},
                 "outcome_id": {"type": "string"},
-                "weight": {"type": "number", "description": "Evidence weight, 0 < weight <= 1 (default 1.0); others rejected."},
+                "weight": {"type": "number", "description": "0 < weight <= 1 (default 1)."},
                 "note": {"type": "string"},
+                "agent_id": {"type": "string", "description": "Pipeline/task/slot default from its last context."},
+                "ctx": {
+                    "type": "object",
+                    "description": "Optional: task, slot, model, benchmark, split, eval_source (self_report|verifier|human), output_tokens, input_tokens, turns",
+                },
             },
         },
     },
@@ -1090,15 +1129,25 @@ class FetchSession:
     # ncp_post_turn defaults to them when it omits the matching fields (never
     # for the shared default key). Value: (pending_whisper_ids, retrieved_chunk_ids).
     held_ids: dict[str, tuple[list[str], list[str]]] = field(default_factory=dict)
+    # (pipeline_id, task, slot) of this session's last ncp_get_context; unlike
+    # held_ids it survives ncp_post_turn, so ncp_record_outcome can default
+    # task/slot/pipeline_id to it. Never kept for the shared default key.
+    last_context: tuple[str | None, str, str] | None = None
     # Skill content hashes already returned by ncp_skill get in this session.
     skill_hashes: set[str] = field(default_factory=set)
     # Cross-turn delta: chunk_id -> content hash already delivered to this
     # session, in first-delivery order. Per-agent state: never kept for the
     # shared default key. Bounded (oldest dropped); expires with the entry.
     delivered: dict[str, str] = field(default_factory=dict)
+    # chunk_id -> trust first rendered in this session (LRU, _TRUST_PINS_MAX).
+    trust_pins: dict[str, float] = field(default_factory=dict)
 
 
 _RESULT_RAW_MAX_WINDOWS = 20
+
+_OUTCOME_CTX_KEYS = frozenset({
+    "task", "slot", "model", "benchmark", "split", "eval_source", "output_tokens", "input_tokens", "turns",
+})
 
 # Bound the in-memory fetch-session table so a client rotating session_ids
 # cannot grow it without limit. Entries older than the TTL are dropped; if the
@@ -1107,6 +1156,7 @@ _FETCH_SESSION_MAX = 1024
 _FETCH_SESSION_TTL_SECONDS = 3600.0
 _DELIVERED_MAX = 256
 _HELD_SLOTS_MAX = 8
+_TRUST_PINS_MAX = 512
 
 
 @dataclass
@@ -1214,6 +1264,10 @@ def make_handlers(
 
     sessions: dict[str, FetchSession] = {}
     sessions_lock = threading.Lock()
+    # Debounce state for auto-calibration after ncp_record_outcome: pipeline_id
+    # ("" = none) -> monotonic time of the last attempt.
+    auto_calibrate_last: dict[str, float] = {}
+    auto_calibrate_lock = threading.Lock()
     coordination = getattr(store, "coordination", None)
     default_whisper_ttl = config.whisper_ttl_default if config is not None else 1800
     require_signatures = config.require_signatures if config is not None else False
@@ -1231,6 +1285,8 @@ def make_handlers(
     adaptive_budget_floor_tokens = config.adaptive_budget_floor_tokens if config is not None else 300
     adaptive_budget_ceiling_tokens = config.adaptive_budget_ceiling_tokens if config is not None else 2000
     adaptive_allow_expand = config.adaptive_allow_expand if config is not None else False
+    protect_unproven_slots = config.protect_unproven_slots if config is not None else True
+    default_unproven_max_turns = config.unproven_max_turns if config is not None else 5
     default_context_token_budget = config.context_token_budget if config is not None else 840
     # CAP-T5: computed drift, opt-in (off by default -- legacy self-reported
     # drift_score is unchanged when disabled).
@@ -1423,12 +1479,16 @@ def make_handlers(
             floor_tokens = adaptive_budget_floor_tokens
             ceiling_tokens = adaptive_budget_ceiling_tokens
             allow_expand = adaptive_allow_expand
+            protect_unproven = protect_unproven_slots
+            unproven_max_turns = default_unproven_max_turns
         else:
             enabled = request_config.adaptive_budget_enabled
             requested_tokens = request_config.context_token_budget
             floor_tokens = request_config.adaptive_budget_floor_tokens
             ceiling_tokens = request_config.adaptive_budget_ceiling_tokens
             allow_expand = request_config.adaptive_allow_expand
+            protect_unproven = request_config.protect_unproven_slots
+            unproven_max_turns = request_config.unproven_max_turns
 
         if not enabled:
             return caller_max_tokens, None
@@ -1438,6 +1498,7 @@ def make_handlers(
                 "requested": caller_max_tokens,
                 "adjusted": caller_max_tokens,
                 "reason_factors": {"explicit_override": True},
+                "budget_unproven_protected": False,
             }
 
         if not allow_expand:
@@ -1446,6 +1507,18 @@ def make_handlers(
             floor_tokens = min(floor_tokens, requested_tokens)
             ceiling_tokens = min(ceiling_tokens, requested_tokens)
 
+        unproven = False
+        if protect_unproven and conscious.slot_age < unproven_max_turns:
+            # Only a pipeline that already records outcomes can have an unproven
+            # slot; a pipeline with none keeps the normal adaptive budget.
+            try:
+                unproven = store.has_any_outcome(pipeline_id=conscious.pipeline_id) and not (
+                    store.has_success_outcome(
+                        pipeline_id=conscious.pipeline_id, task=conscious.task, slot=conscious.slot
+                    )
+                )
+            except Exception:
+                unproven = False
         result: AdaptiveBudgetResult = compute_adaptive_budget(
             requested_tokens=requested_tokens,
             floor_tokens=floor_tokens,
@@ -1457,6 +1530,7 @@ def make_handlers(
             dollar_budget_fraction_used=(
                 None if budget_snapshot is None else budget_snapshot.fraction_used
             ),
+            unproven=unproven,
         )
         return result.adjusted_tokens, result.to_dict()
 
@@ -1550,6 +1624,8 @@ def make_handlers(
                 if existing is not None:
                     preserved_delivered = dict(existing.delivered)
         prior_held: dict[str, tuple[list[str], list[str]]] = {}
+        prior_pins: dict[str, float] = {}
+        pin_trust = config is not None and config.encoder_pin_trust_per_session
         if session_id != DEFAULT_FETCH_SESSION_ID:
             with sessions_lock:
                 prior_session = sessions.get(session_id)
@@ -1558,6 +1634,8 @@ def make_handlers(
                     and time.monotonic() - prior_session.last_access <= _FETCH_SESSION_TTL_SECONDS
                 ):
                     prior_held = dict(prior_session.held_ids)
+                    if pin_trust:
+                        prior_pins = dict(prior_session.trust_pins)
         if delta_applied:
             # Carry delivered state across the per-call session reset below,
             # unless the entry expired (TTL) or never existed (new session_id).
@@ -1634,6 +1712,8 @@ def make_handlers(
                 facade_provider=ontology_facade,
             )
         assembler = Assembler(store=store, config=request_config or config, ontology=enricher)
+        if pin_trust and session_id != DEFAULT_FETCH_SESSION_ID:
+            assembler.encoder.trust_pins = prior_pins
         stream = bool(args.get("stream", False))
         search_text = conscious.task + " " + conscious.slot
         try:
@@ -1758,12 +1838,21 @@ def make_handlers(
                 while len(slots) > _HELD_SLOTS_MAX:
                     del slots[next(iter(slots))]
                 held.held_ids = slots
+                held.last_context = (normalized_pipeline_id, conscious.task, conscious.slot)
                 # delta:false (or a reset session) starts from an empty set.
                 delivered = dict(prior_delivered) if delta_applied else dict(preserved_delivered or {})
                 delivered.update(fitted_result.delivered_hashes)
                 while len(delivered) > _DELIVERED_MAX:
                     del delivered[next(iter(delivered))]
                 held.delivered = delivered
+                if pin_trust:
+                    pins = prior_pins
+                    for chunk in fitted_result.chunks:
+                        # setdefault keeps the first-rendered value; re-insert to mark recent.
+                        pins[chunk.chunk_id] = pins.pop(chunk.chunk_id, chunk.base_trust)
+                    while len(pins) > _TRUST_PINS_MAX:
+                        del pins[next(iter(pins))]
+                    held.trust_pins = pins
                 held.last_access = time.monotonic()
         if not echo_ids:
             response.pop("pending_whisper_ids", None)
@@ -2596,8 +2685,12 @@ def make_handlers(
             info = latest
         if info is None:
             return not_found
+        detail = str(args.get("detail") or "full")
+        if detail not in ("full", "outline"):
+            raise ValueError("ncp_skill get 'detail' must be 'full' or 'outline'")
+        outline = detail == "outline"
         session_id = _session_id_from_args(args)
-        if session_id != DEFAULT_FETCH_SESSION_ID:
+        if session_id != DEFAULT_FETCH_SESSION_ID and not outline:
             with sessions_lock:
                 seen = sessions.setdefault(session_id, FetchSession())
                 seen.last_access = time.monotonic()
@@ -2608,11 +2701,154 @@ def make_handlers(
         )
         if text is None:
             return not_found
-        if session_id != DEFAULT_FETCH_SESSION_ID:
+        if session_id != DEFAULT_FETCH_SESSION_ID and not outline:
             with sessions_lock:
                 sessions.setdefault(session_id, FetchSession()).skill_hashes.add(info.content_hash)
         header = f"[NCP:SKILL] skill:{skill_id}@{info.content_hash[:12]} kind:{info.kind}"
+        if outline:
+            header += " detail:outline"
+            text = outline_skill(text)
         return {"result": f"{header}\n{text}"}
+
+    def _handle_improvement_log(args: dict[str, object]) -> object:
+        from ncp.improvement import build_improvement_view, render_improvement_block
+        from ncp.stores.improvement_common import make_problem_id
+        from ncp.types import ImprovementAttempt, ImprovementProblem
+
+        action = str(args.get("action", ""))
+
+        def _str(name: str) -> str | None:
+            value = args.get(name)
+            if value is None:
+                return None
+            if not isinstance(value, str):
+                raise ValueError(f"ncp_improvement_log '{name}' must be a string")
+            return value.strip() or None
+
+        def _str_list(name: str) -> list[str]:
+            value = args.get(name)
+            if value is None:
+                return []
+            if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+                raise ValueError(f"ncp_improvement_log '{name}' must be an array of strings")
+            return [v for v in value]
+
+        def _num(name: str) -> float | None:
+            value = args.get(name)
+            if value is None:
+                return None
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+                raise ValueError(f"ncp_improvement_log '{name}' must be a number >= 0")
+            return float(value)
+
+        pipeline_id = _str("pipeline_id")
+        warn_chars = config.improvement_warn_chars if config is not None else 8000
+        try:
+            if action == "get":
+                scope = _str("scope")
+                view = build_improvement_view(store, pipeline_id=pipeline_id, scope=scope)
+                block, telemetry = render_improvement_block(
+                    view, scope=scope, current_model=_str("model"), warn_chars=warn_chars
+                )
+                return {"block": block, "telemetry": telemetry}
+            if action == "list_problems":
+                problems = store.list_improvement_problems(pipeline_id=pipeline_id, scope=_str("scope"))
+                return {"problems": [p.model_dump() for p in problems]}
+            if action == "record_attempt":
+                problem_id = _str("problem_id")
+                problem_name = _str("problem_name")
+                if not problem_id and not problem_name:
+                    raise ValueError("ncp_improvement_log record_attempt must cite 'problem_id' or 'problem_name'")
+                what = _str("what")
+                if not what:
+                    raise ValueError("ncp_improvement_log record_attempt requires 'what'")
+                if len(what) > 500:
+                    raise ValueError("ncp_improvement_log 'what' must be <= 500 chars")
+                rationale = _str("rationale")
+                if rationale is not None and len(rationale) > 1000:
+                    raise ValueError("ncp_improvement_log 'rationale' must be <= 1000 chars")
+                if problem_id:
+                    problem = store.get_improvement_problem(problem_id)
+                    if problem is None:
+                        raise ValueError(f"unknown improvement problem {problem_id!r}")
+                else:
+                    scope = _str("scope")
+                    if not scope:
+                        raise ValueError("ncp_improvement_log record_attempt with 'problem_name' requires 'scope'")
+                    assert problem_name is not None
+                    if len(problem_name) > 300:
+                        raise ValueError("ncp_improvement_log 'problem_name' must be <= 300 chars")
+                    problem = store.upsert_improvement_problem(
+                        ImprovementProblem(
+                            problem_id=make_problem_id(pipeline_id=pipeline_id, scope=scope, name=problem_name),
+                            pipeline_id=pipeline_id,
+                            scope=scope,
+                            name=problem_name,
+                            opened_at=time.time(),
+                        )
+                    )
+                kind = _str("kind") or "manual"
+                if kind != "manual":
+                    raise ValueError("ncp_improvement_log record_attempt kind must be 'manual'")
+                candidate_chunk_id = _str("candidate_chunk_id")
+                if candidate_chunk_id and any(
+                    a.kind in ("repair", "prune")
+                    for a in store.list_improvement_attempts(candidate_chunk_id=candidate_chunk_id)
+                ):
+                    raise ValueError(
+                        "ncp_improvement_log 'candidate_chunk_id' already has a refine attempt; "
+                        "manual attempts cannot cite a repair/prune candidate"
+                    )
+                attempt = store.record_improvement_attempt(
+                    ImprovementAttempt(
+                        attempt_id=f"att_{int(time.time() * 1000)}_{uuid4().hex[:12]}",
+                        problem_id=problem.problem_id,
+                        kind="manual",
+                        what=what,
+                        rationale=rationale,
+                        files=_str_list("files"),
+                        candidate_chunk_id=candidate_chunk_id,
+                        predicted=_str_list("predicted"),
+                        model=_str("model"),
+                        benchmark=_str("benchmark"),
+                        created_at=time.time(),
+                    )
+                )
+                return {"attempt": attempt.model_dump()}
+            if action == "resolve_attempt":
+                attempt_id = _str("attempt_id")
+                if not attempt_id:
+                    raise ValueError("ncp_improvement_log resolve_attempt requires 'attempt_id'")
+                status = _str("status")
+                if status not in ("proposed", "applied", "rejected", "rolled_back"):
+                    raise ValueError(
+                        "ncp_improvement_log resolve_attempt 'status' must be one of "
+                        "proposed, applied, rejected, rolled_back"
+                    )
+                fields: dict[str, object] = {"status": status, "accepted": status == "applied"}
+                if status != "proposed":
+                    fields["resolved_at"] = time.time()
+                for name in ("fixed", "missed"):
+                    if args.get(name) is not None:
+                        fields[name] = _str_list(name)
+                for name in ("passed", "total", "mean_output_tokens"):
+                    value = _num(name)
+                    if value is not None:
+                        fields[name] = value
+                note = _str("note")
+                if note is not None:
+                    fields["note"] = note
+                return {"attempt": store.update_improvement_attempt(attempt_id, **fields).model_dump()}
+            if action == "merge":
+                src_id = _str("src_problem_id")
+                dst_id = _str("dst_problem_id")
+                if not src_id or not dst_id:
+                    raise ValueError("ncp_improvement_log merge requires 'src_problem_id' and 'dst_problem_id'")
+                store.merge_improvement_problems(src_problem_id=src_id, dst_problem_id=dst_id)
+                return {"merged": True, "src_problem_id": src_id, "dst_problem_id": dst_id}
+        except NotImplementedError as exc:
+            raise ValueError(str(exc)) from exc
+        raise ValueError(f"unknown ncp_improvement_log action {action!r}")
 
     def _typed_decision_args(args: dict[str, object]) -> bool:
         """True when the caller supplied any field from the typed contract."""
@@ -3011,6 +3247,91 @@ def make_handlers(
         if note is not None and not isinstance(note, str):
             raise ValueError("ncp_record_outcome 'note' must be a string or null")
 
+        raw_ctx = args.get("ctx")
+        if raw_ctx is None:
+            raw_ctx = {}
+        if not isinstance(raw_ctx, dict):
+            raise ValueError("ncp_record_outcome 'ctx' must be an object")
+        unknown_ctx = sorted(set(raw_ctx) - _OUTCOME_CTX_KEYS)
+        if unknown_ctx:
+            raise ValueError(
+                f"ncp_record_outcome 'ctx' has unknown keys {unknown_ctx}; allowed: {sorted(_OUTCOME_CTX_KEYS)}"
+            )
+
+        def _opt_str(name: str) -> str | None:
+            value = raw_ctx.get(name)
+            if value is None:
+                return None
+            if not isinstance(value, str):
+                raise ValueError(f"ncp_record_outcome ctx.{name} must be a string or null")
+            return value.strip() or None
+
+        def _opt_count(name: str) -> int | None:
+            value = raw_ctx.get(name)
+            if value is None:
+                return None
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"ncp_record_outcome ctx.{name} must be an integer >= 0")
+            return value
+
+        out_task = _opt_str("task")
+        out_slot = _opt_str("slot")
+        out_model = _opt_str("model")
+        out_benchmark = _opt_str("benchmark")
+        out_split = _opt_str("split")
+        if out_split is not None and len(out_split) > 32:
+            raise ValueError("ncp_record_outcome ctx.split must be at most 32 characters")
+        eval_source = raw_ctx.get("eval_source", "self_report")
+        if eval_source is None:
+            eval_source = "self_report"
+        if eval_source not in ("self_report", "verifier", "human"):
+            raise ValueError("ncp_record_outcome ctx.eval_source must be one of self_report, verifier, human")
+        output_tokens = _opt_count("output_tokens")
+        input_tokens = _opt_count("input_tokens")
+        turns = _opt_count("turns")
+
+        # The pipeline is never a client argument (a stale top-level pipeline_id is
+        # ignored, so an outcome cannot be attributed to a pipeline the caller did
+        # not work in). Server-held defaults: pipeline/task/slot come from this
+        # session's last ncp_get_context (never for the shared default session);
+        # ctx.task/ctx.slot override.
+        out_pipeline: str | None = None
+        out_session = _session_id_from_args({k: v for k, v in args.items() if k != "pipeline_id"})
+        if out_session != DEFAULT_FETCH_SESSION_ID:
+            with sessions_lock:
+                held_session = sessions.get(out_session)
+                if held_session is None or held_session.last_context is None:
+                    # Fall back to a sibling session: an admin's key embeds the
+                    # pipeline/agent of the call ("-" when omitted), and an
+                    # unauthenticated get_context keys "<pipeline>:<agent>".
+                    # Borrow only when exactly one candidate pipeline exists.
+                    agent = args.get("agent_id")
+                    caller = current_principal()
+                    if caller is not None and caller.is_admin:
+                        base = caller.fetch_session_key
+                        in_scope = [
+                            (key, sess) for key, sess in sessions.items()
+                            if key.startswith(f"{base}:") and (not agent or key.endswith(f":{agent}"))
+                        ]
+                    elif not args.get("session_id") and agent:
+                        in_scope = [(k, v) for k, v in sessions.items() if k.endswith(f":{out_session}")]
+                    else:
+                        in_scope = []
+                    matches = [sess for _, sess in in_scope if sess.last_context is not None]
+                    held_session = None
+                    if len({m.last_context[0] for m in matches if m.last_context}) == 1:
+                        held_session = max(matches, key=lambda sess: sess.last_access, default=None)
+                last = held_session.last_context if held_session is not None else None
+            if last is not None:
+                out_pipeline = last[0]
+                out_task = out_task if out_task is not None else last[1]
+                out_slot = out_slot if out_slot is not None else last[2]
+        if out_pipeline is None and chunk_ids:
+            # No held context: use the pipeline the credited chunks share, if one.
+            pipelines = {c.pipeline_id for c in store.get_chunks_by_ids(chunk_ids)}
+            if len(pipelines) == 1:
+                out_pipeline = next(iter(pipelines))
+
         outcome = OutcomeRecord(
             outcome_id=outcome_id or f"out_{int(time.time() * 1000)}_{uuid4().hex[:12]}",
             turn_id=turn_id,
@@ -3018,6 +3339,16 @@ def make_handlers(
             success=success,
             weight=weight,
             note=note,
+            pipeline_id=out_pipeline,
+            task=out_task,
+            slot=out_slot,
+            model=out_model,
+            benchmark=out_benchmark,
+            split=out_split,
+            eval_source=eval_source,
+            output_tokens=output_tokens,
+            input_tokens=input_tokens,
+            turns=turns,
         )
         recorded = store.record_outcome(outcome)
         response: dict[str, object] = {"recorded": recorded, "outcome_id": outcome.outcome_id}
@@ -3029,7 +3360,40 @@ def make_handlers(
             response["decision_linked"] = bool(
                 store.link_decision_outcome(decision_id, outcome.outcome_id)
             )
+        response["calibrated"] = bool(recorded) and _auto_calibrate(out_pipeline)
         return response
+
+    def _auto_calibrate(pipeline_id: str | None) -> bool:
+        """Debounced feedback calibration after a recorded outcome.
+
+        Feedback mode applies outcome/retrieval evidence only (it never runs the
+        batch gen-0 decay). Failures are logged, never raised to the client.
+        """
+        if config is not None and not config.calibration_auto_on_outcome:
+            return False
+        calibrate_fn = getattr(store, "calibrate", None)
+        if not callable(calibrate_fn):
+            return False
+        interval = config.calibration_auto_min_interval_seconds if config is not None else 60.0
+        key = pipeline_id or ""
+        now = time.monotonic()
+        with auto_calibrate_lock:
+            last_run = auto_calibrate_last.get(key)
+            if last_run is not None and now - last_run < interval:
+                return False
+            auto_calibrate_last[key] = now
+        try:
+            calibrate_fn(
+                feedback_mode=True,
+                pipeline_id=pipeline_id,
+                outcome_step=config.calibration_auto_outcome_step if config is not None else 0.1,
+            )
+        except NotImplementedError:
+            return False
+        except Exception as exc:
+            _err(f"ncp_record_outcome: auto-calibration failed: {type(exc).__name__}: {exc}")
+            return False
+        return True
 
     def _memo_counters() -> dict[str, int] | None:
         """Cheap hits/misses totals for hosts (S4.1 memoization telemetry)."""
@@ -3226,6 +3590,7 @@ def make_handlers(
         "ncp_post_turn": _handle_post_turn,
         "ncp_fetch": _handle_fetch,
         "ncp_skill": _handle_skill,
+        "ncp_improvement_log": _handle_improvement_log,
         "ncp_record_decision": _handle_record_decision,
         "ncp_get_decision": _handle_get_decision,
         "ncp_compile_decision_query": _handle_compile_decision_query,

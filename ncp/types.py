@@ -1075,6 +1075,68 @@ class OutcomeRecord(NCPModel):
     note: str | None = None
     created_at: float = Field(default_factory=time.time)
     consumed: bool = False
+    # v1.9.7 outcome context (all optional; old rows read back as None).
+    pipeline_id: str | None = None
+    task: str | None = None
+    slot: str | None = None
+    model: str | None = None
+    benchmark: str | None = None
+    split: str | None = Field(default=None, max_length=32)  # "train" | "holdout" | free tag
+    eval_source: Literal["self_report", "verifier", "human"] = "self_report"
+    output_tokens: int | None = Field(default=None, ge=0)
+    input_tokens: int | None = Field(default=None, ge=0)
+    turns: int | None = Field(default=None, ge=0)
+
+
+class ImprovementProblem(NCPModel):
+    """A root-cause hypothesis that improvement attempts are filed under."""
+
+    problem_id: str
+    pipeline_id: str | None = None
+    scope: str
+    name: str
+    opened_at: float
+    alias_of: str | None = None
+
+
+class ImprovementAttempt(NCPModel):
+    """One attempted change (repair/prune/manual) filed under a problem."""
+
+    attempt_id: str
+    problem_id: str
+    kind: Literal["repair", "prune", "manual"]
+    status: Literal["proposed", "applied", "rejected", "rolled_back"] = "proposed"
+    accepted: bool = False
+    what: str
+    rationale: str | None = None
+    files: list[str] = Field(default_factory=list)
+    candidate_chunk_id: str | None = None
+    predicted: list[str] = Field(default_factory=list)
+    fixed: list[str] = Field(default_factory=list)
+    missed: list[str] = Field(default_factory=list)
+    passed: float | None = None
+    total: float | None = None
+    mean_output_tokens: float | None = None
+    anchor_rate: float | None = None
+    anchor_output_tokens: float | None = None
+    model: str | None = None
+    benchmark: str | None = None
+    note: str | None = None
+    created_at: float
+    resolved_at: float | None = None
+
+
+class OutcomeStats(NCPModel):
+    """Aggregate of outcomes over a set of chunks (optionally one model)."""
+
+    n: int
+    total_weight: float
+    success_weight: float
+    success_rate: float | None
+    mean_output_tokens: float | None
+    mean_turns: float | None
+    tasks_succeeded: list[str] = Field(default_factory=list)
+    tasks_failed: list[str] = Field(default_factory=list)
 
 
 # ── Decision contract (spec §4h) ──────────────────────────────────────────────

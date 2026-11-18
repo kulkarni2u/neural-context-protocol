@@ -4,6 +4,135 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [Unreleased]
 
+## [1.9.7] - 2026-11-17
+
+### Release scope
+
+Self-improvement loop for procedures, skills and harness edits, from two
+papers: SIM, "Self-Improvement Memory Enables Continual Recursive
+Self-Improvement" (arXiv 2611.18856), whose improvement history (problems ->
+attempts, with rationale, predicted vs. observed results and evaluation
+context) is what makes continued improvement work; and EfficientSkill,
+"Learning Skills for Token-Efficient Multi-Turn Agents" (arXiv 2611.19823),
+which prunes only after a working anchor exists, under an accuracy gate. See
+`docs/NCP_SELF_IMPROVEMENT.md` and
+`docs/specs/2026-11-17-ncp-197-self-improvement-design.md`.
+
+### Upgrade notes (behavior changes)
+
+- Auto-calibration on outcome is on by default. After `ncp_record_outcome`,
+  feedback calibration runs (debounced, at most once per
+  `[calibration].auto_min_interval_seconds`, default 60, per pipeline) and
+  `ncp_record_outcome` returns `calibrated`. Each outcome moves trust by at most
+  weight x `[calibration].auto_outcome_step` (default 0.1); manual
+  `ncp calibrate` is unchanged. Set
+  `[calibration].auto_on_outcome = false` to restore operator-only calibration.
+  It never runs the batch generation-0 decay.
+- The adaptive budget no longer shrinks an unproven task/slot, but only when
+  the pipeline has recorded at least one outcome, the task/slot has no
+  successful outcome, and `slot_age` is below `[budget].unproven_max_turns`
+  (default 5). Pipelines that never record outcomes get exactly the 1.9.6
+  budget. Set `[budget].protect_unproven_slots = false` to disable. The
+  `budget` block gains `budget_unproven_protected`.
+- Chunk-header `trust:` is pinned per fetch session (the value at first render
+  in that session; ranking still uses live trust), so outcomes do not rewrite
+  the cached prefix. `[encoder].pin_trust_per_session = true`.
+- User-registered skills are no longer decayed by batch `ncp calibrate`.
+- `ncp refine apply` (and `apply_refinement`) refuses a stale candidate whose
+  predecessor is no longer the procedure head, even with `--force`. Propose
+  again from the current head.
+- `ncp_record_outcome` accepts `agent_id` and one `ctx` object (`task`, `slot`,
+  `model`, `benchmark`, `eval_source`, `output_tokens`, `input_tokens`,
+  `turns`). `pipeline_id` is no longer a client argument: it is derived from
+  the session, else from the chunks' common pipeline. Under `[principals]` it
+  checks `agent_id` against the principal.
+- `ncp_improvement_log` is in the `full` tool profile only (not `standard`).
+  It enforces pipeline ownership for `record_attempt`, `resolve_attempt` and
+  `merge`; a merge needs both problems in the same pipeline, and
+  `record_attempt` refuses a `candidate_chunk_id` already owned by a repair or
+  prune attempt.
+- `apply_refinement` also refuses a candidate whose attempt is not `proposed`
+  (already applied, rejected or rolled back) and a candidate with no
+  `source_refs`. At apply time the prune anchor is recomputed from the
+  predecessor's current outcomes, and outcomes that reference both the head and
+  the candidate are excluded from both sides (`outcome_stats` gains
+  `exclude_chunk_ids`).
+- `eval_source` is an honor-system field: any client allowed to call
+  `ncp_record_outcome` can claim `verifier` or `human`. `has_success_outcome`
+  (used by the unproven-slot budget protection) counts any success outcome
+  regardless of weight or `eval_source`.
+- `RefineError` now subclasses `ValueError`, so callers catching `ValueError`
+  also catch refine errors.
+- Prune candidates (`ncp refine prune`) are applied only through the gate:
+  success rate >= `[refine].gate_ratio` x anchor rate over at least
+  `[refine].min_trial_outcomes` outcomes, with lower mean output tokens.
+  `--force` bypasses the gate (never the stale-head check).
+
+### Kept from 1.9.6
+
+`benchmarks/harness_overhead` now gates `release_invariants` (ANDed into
+`summary.pass`): chunk header lines are identical across a
+`ncp_get_context` / 3 x `ncp_record_outcome` / `ncp_get_context` sequence; a
+pipeline with no outcomes gets the unprotected adaptive budget; the `standard`
+catalog is at most 16,000 compact-JSON chars; `AGENTS.md` is at most 9,000
+chars.
+
+### Added
+
+- Improvement records: problems (root-cause hypotheses) and the attempts filed
+  under them, in their own tables so they are never decayed or consolidated;
+  merging problems leaves aliases. SQLite and pgvector (migration 020);
+  `pgvector_async` follows. Redis has none.
+- `ncp_record_outcome` `ctx` object: `task`, `slot`, `model`, `benchmark`,
+  `eval_source` (`self_report`, `verifier`, `human`), `output_tokens`,
+  `input_tokens`, `turns`. Omitted `task`/`slot` default from the caller's last
+  `ncp_get_context`.
+- `[calibration].self_report_weight` scales outcomes whose `eval_source` is
+  `self_report` during feedback calibration.
+- `ncp refine propose` / `prune` take `--problem-id`, `--problem`,
+  `--rationale`, `--predict` and `--model`. New: `ncp refine prune KEY --file`,
+  `ncp refine reject`, `--gate-ratio` / `--min-trial-outcomes` /
+  `--force` on `apply`, and a rollback that marks the attempt `rolled_back`.
+- `ncp_improvement_log` MCP tool (full profile; `get`, `list_problems`, `record_attempt`,
+  `resolve_attempt`, `merge`), `ncp improvements show|merge`, and the
+  `[NCP:IMPROVEMENT]` block, never truncated (`[improvement].warn_chars`
+  reports oversize) and flagging attempts evaluated on another model.
+- `ncp_skill get` with `detail: "outline"`: headings, first line and python
+  signatures only.
+- `ncp.eval.paired_comparison`: mean difference, 95% t-interval, wins/losses
+  and an exact sign test, without scipy.
+- `benchmarks/refine_loop/` (CI gate; `docs/NCP_BENCHMARK_REFINE_LOOP.md`):
+  deterministic ten-check simulation of the repair -> prune loop.
+- `[refine].gate_ratio`, `min_trial_outcomes`, `min_anchor_outcomes`,
+  `[calibration].auto_on_outcome`, `auto_min_interval_seconds`,
+  `self_report_weight`, `[budget].protect_unproven_slots`,
+  `[improvement].warn_chars`.
+- `docs/NCP_SELF_IMPROVEMENT.md` user guide and an "Improvement records"
+  section in `AGENTS.md`.
+- Holdout gate: `ctx.split` tags an outcome (`train`/`holdout`, free string up
+  to 32 chars; migration 020). `[refine].gate_split` (`auto` default, `holdout`,
+  `all`; `ncp refine apply --gate-split`) makes the prune gate score
+  `split="holdout"` outcomes when both sides have enough, so the proposer can
+  learn from train outcomes while selection uses data it never saw.
+  `outcome_stats` gains `split`; the attempt note records `gate split: ...`.
+  Two new `refine_loop` checks.
+- `ncp refine compare KEY [--json]` (library: `compare_candidates`): read-only
+  ranking of the proposed repair/prune candidates, with stale ones last and the
+  exact `ncp refine apply` command for the best. No new MCP tool or output.
+
+### Changed
+
+- Refine repair candidates are recorded as improvement attempts with predicted,
+  fixed and missed task ids.
+- Version bumped to 1.9.7 in the package, plugin manifests and release checklist.
+
+### Fixed
+
+- `apply_refinement` adopted a candidate even when another version had become
+  the head since it was proposed (stale-head apply).
+- Batch calibrate decayed user-registered skills as if they were ordinary
+  generation-0 chunks.
+
 ## [1.9.6] - 2026-11-17
 
 ### Release scope

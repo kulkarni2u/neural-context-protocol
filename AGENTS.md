@@ -157,3 +157,8 @@ Once the task is validated (tests pass, review approved), call
 `ncp_record_outcome` with the chunk/turn IDs that informed it. This is what
 closes the loop — without it, a subagent's contribution never earns or
 loses trust, and `ncp calibrate --feedback` has nothing to work from.
+
+## Improvement records
+
+When a turn changes a procedure, skill or harness file, cite the problem it fixes via `ncp_improvement_log`
+(`record_attempt`); record results with `ncp_record_outcome` and a `ctx` object. Rules: `docs/NCP_SELF_IMPROVEMENT.md`.

@@ -58,6 +58,10 @@ IDENTITY_ARGS: dict[str, tuple[tuple[str, bool], ...]] = {
     "ncp_skill": (("agent_id", True),),
     "ncp_record_decision": (("agent_id", True),),
     "ncp_compile_decision_query": (("agent_id", True),),
+    # No pipeline_id argument: the server derives the outcome's pipeline from the
+    # caller's held context or the credited chunks, and _check_record_outcome
+    # requires those chunks to sit in the principal's allowed pipelines.
+    "ncp_record_outcome": (("agent_id", True),),
     "ncp_remember": (("written_by", True),),
 }
 
@@ -72,6 +76,7 @@ PIPELINE_SCOPED_TOOLS = frozenset({
     "ncp_task",
     "ncp_fetch",
     "ncp_skill",
+    "ncp_improvement_log",
     "ncp_record_decision",
     "ncp_compile_decision_query",
     "ncp_lookup_memo",
@@ -102,7 +107,7 @@ ONTOLOGY_GLOBAL_NAMESPACE = "global"
 # Tools with no acting-agent argument and no pipeline_id, scoped by lookups
 # instead (documented so the catalog check can tell "reviewed" from "missed").
 LOOKUP_SCOPED_TOOLS = frozenset({
-    "ncp_overview", "ncp_get_decision", "ncp_record_outcome",
+    "ncp_overview", "ncp_get_decision",
     # Static server metadata: no pipeline data, nothing to scope.
     "ncp_ontology_capabilities",
 })
@@ -380,7 +385,7 @@ class ToolAuthorizer:
         if tool in PIPELINE_SCOPED_TOOLS:
             self._check_pipeline_scope(principal, tool, args)
 
-        if tool in ("ncp_get_context", "ncp_fetch", "ncp_post_turn", "ncp_skill"):
+        if tool in ("ncp_get_context", "ncp_fetch", "ncp_post_turn", "ncp_skill", "ncp_record_outcome"):
             # The per-turn ncp_fetch budget (and the ids ncp_post_turn defaults
             # to from ncp_get_context) is keyed by principal, never by a
             # caller-chosen session_id. Admin acts for many agents, so its
@@ -414,6 +419,8 @@ class ToolAuthorizer:
             self._check_overview(principal, args)
         elif tool == "ncp_record_outcome":
             self._check_record_outcome(principal, args)
+        elif tool == "ncp_improvement_log":
+            self._check_improvement_log(principal, args)
         elif tool == "ncp_verify_memo":
             if not principal.has(CAP_VERIFY):
                 raise AuthorizationError(
@@ -585,6 +592,55 @@ class ToolAuthorizer:
             )
         for pipeline_id in raw:
             self._require_pipeline(principal, pipeline_id, where="ncp_overview")
+
+    def _check_improvement_log(self, principal: Principal, args: dict[str, object]) -> None:
+        """Problems/attempts are addressed by id: a pipeline-limited principal
+        may only touch records whose problem lives in one of its pipelines."""
+        if principal.pipelines is None:
+            return
+        action = str(args.get("action", ""))
+        where = "ncp_improvement_log"
+
+        def _check_problem(problem_id: object) -> None:
+            pid = _str_or_none(problem_id)
+            if pid is None:
+                return
+            try:
+                problem = self.store.get_improvement_problem(pid)
+            except NotImplementedError:
+                return
+            except Exception as exc:  # noqa: BLE001 - fail closed on lookup errors
+                raise AuthorizationError(f"{where}: cannot verify the pipeline of problem {pid!r}: {exc}") from exc
+            if problem is None:
+                return  # the handler reports unknown ids
+            if not principal.pipeline_allowed(problem.pipeline_id):
+                raise AuthorizationError(
+                    f"{where}: problem {pid!r} is in pipeline {problem.pipeline_id!r}, "
+                    f"outside principal {principal.name!r}'s pipelines"
+                )
+            if str(problem.pipeline_id) != _str_or_none(args.get("pipeline_id")):
+                raise AuthorizationError(
+                    f"{where}: problem {pid!r} is in pipeline {problem.pipeline_id!r}, "
+                    "not the pipeline_id named in this call"
+                )
+
+        if action == "record_attempt":
+            _check_problem(args.get("problem_id"))
+        elif action == "merge":
+            _check_problem(args.get("src_problem_id"))
+            _check_problem(args.get("dst_problem_id"))
+        elif action == "resolve_attempt":
+            attempt_id = _str_or_none(args.get("attempt_id"))
+            if attempt_id is None:
+                return
+            try:
+                attempt = self.store.get_improvement_attempt(attempt_id)
+            except NotImplementedError:
+                return
+            except Exception as exc:  # noqa: BLE001
+                raise AuthorizationError(f"{where}: cannot verify attempt {attempt_id!r}: {exc}") from exc
+            if attempt is not None:
+                _check_problem(attempt.problem_id)
 
     def _check_record_outcome(self, principal: Principal, args: dict[str, object]) -> None:
         if not principal.has(CAP_RECORD_OUTCOME):

@@ -501,3 +501,33 @@ def test_connect_passes_dsn_and_timeout_to_psycopg3(monkeypatch: pytest.MonkeyPa
     fake.connect.reset_mock()
     connect("postgresql://localhost/ncp", connect_timeout=3)
     fake.connect.assert_called_once_with("postgresql://localhost/ncp", connect_timeout=3)
+
+
+# ── 020_self_improvement (v1.9.7) ─────────────────────────────────────────────
+
+def test_migration_020_is_discovered_and_well_formed() -> None:
+    runner = MigrationRunner(MagicMock(), schema="ncp", prefix="ncp_")
+    files = {f.version: f for f in runner._discover()}
+    assert files[20].name == "020_self_improvement"
+    up, down = MigrationRunner.parse_sections(files[20].path.read_text())
+    for column in ("pipeline_id", "task", "slot", "model", "benchmark", "eval_source",
+                   "output_tokens", "input_tokens", "turns"):
+        assert f"ALTER TABLE {{schema}}.{{prefix}}outcomes ADD COLUMN IF NOT EXISTS {column}" in up
+        assert f"DROP COLUMN IF EXISTS {column}" in down
+    for table in ("improvement_problems", "improvement_attempts"):
+        assert f"CREATE TABLE IF NOT EXISTS {{schema}}.{{prefix}}{table}" in up
+        assert f"DROP TABLE IF EXISTS {{schema}}.{{prefix}}{table}" in down
+    for index in ("idx_outcomes_task_slot", "idx_improvement_attempts_problem",
+                  "idx_improvement_attempts_candidate"):
+        assert f"{{prefix}}{index}" in up
+    substituted = runner._sub(up) + runner._sub(down)
+    assert "{schema}" not in substituted and "{prefix}" not in substituted
+
+
+def test_migration_020_matches_inline_pgvector_template() -> None:
+    from ncp.stores.pgvector import PGVECTOR_SCHEMA_TEMPLATE
+
+    PGVECTOR_SCHEMA_TEMPLATE.format(schema="ncp", prefix="ncp_")
+    for fragment in ("improvement_problems", "improvement_attempts", "idx_outcomes_task_slot",
+                     "ADD COLUMN IF NOT EXISTS eval_source"):
+        assert fragment in PGVECTOR_SCHEMA_TEMPLATE

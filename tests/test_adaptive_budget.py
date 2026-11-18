@@ -97,9 +97,34 @@ def test_unknown_pressure_defaults_to_zero_norm() -> None:
 def test_to_dict_shape() -> None:
     result = _budget(query_text="hello world", drift_score=0.25, pressure="high", slot_age=2)
     payload = result.to_dict()
-    assert set(payload) == {"requested", "adjusted", "reason_factors"}
+    assert set(payload) == {"requested", "adjusted", "reason_factors", "budget_unproven_protected"}
     assert payload["requested"] == 840
     factors = payload["reason_factors"]
     assert factors["query_length_chars"] == len("hello world")
     assert factors["pressure"] == "high"
     assert factors["slot_age"] == 2
+
+
+def test_unproven_never_scales_below_requested() -> None:
+    easy = _budget(query_text="", drift_score=0.0, pressure="low", slot_age=0, unproven=True)
+    assert easy.reason_factors["scale"] == pytest.approx(1.0)
+    assert easy.adjusted_tokens == 840
+    assert easy.unproven_protected is True
+    assert easy.to_dict()["budget_unproven_protected"] is True
+
+
+def test_unproven_does_not_change_hard_turn_scale() -> None:
+    hard = {"query_text": "x" * 400, "drift_score": 1.0, "pressure": "critical", "slot_age": 50}
+    assert _budget(**hard, unproven=True).adjusted_tokens == _budget(**hard).adjusted_tokens
+    assert _budget(**hard, unproven=True).unproven_protected is False
+
+
+def test_unproven_still_subject_to_dollar_cut() -> None:
+    result = _budget(query_text="", unproven=True, dollar_budget_fraction_used=1.0)
+    assert result.adjusted_tokens == round(840 * 0.5)
+
+
+def test_unproven_default_false_is_unchanged() -> None:
+    result = _budget(query_text="")
+    assert result.adjusted_tokens == round(840 * 0.5)
+    assert result.unproven_protected is False

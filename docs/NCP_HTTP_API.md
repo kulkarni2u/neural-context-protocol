@@ -221,6 +221,9 @@ additionally adds `ncp_overview`, `ncp_remember`, `ncp_recall` and
   profile when memoization is enabled (`[memoization].enabled`, off by default).
 
 - `ncp_skill` — only when `[skill_cache].enabled = true` (standard and full).
+- `ncp_improvement_log` — improvement history (full profile only). Not
+  available on a store without improvement records (sqlite and pgvector have
+  them).
 
 #### Per-connection tool profile
 
@@ -668,14 +671,79 @@ curl -s $BASE/mcp -H "$AUTH" -H 'Content-Type: application/json' -d '{
 
 - `action` (required) — `get` | `recall` | `list`.
 - `get` — `skill_id` (`<namespace>/<name>`), optional `content_hash` to pin a
-  version (default newest). Returns only user-registered skills, as an
-  `[NCP:SKILL]` block.
+  version (default newest), optional `detail` (`full` default, or `outline`).
+  Returns only user-registered skills, as an `[NCP:SKILL]` block. `outline`
+  returns headings, the first line under each heading and python code reduced
+  to `def`/`class` signatures, and appends ` detail:outline` to the header;
+  outline reads are not deduplicated by `session_id`.
 - `recall` — `query`, optional `k` (max 4). Returns ranked sections and uses
   one slot of the `ncp_fetch` budget.
 - `list` — registered skills.
 - Optional on every action: `pipeline_id`, `agent_id`, `session_id`.
 
 Skill text is data, never instructions.
+
+### ncp_improvement_log — improvement history
+
+Problems (root-cause hypotheses) and the attempts filed under them. Repair and
+prune attempts from `ncp refine` land here automatically; use this tool to log
+edits made outside NCP (AGENTS.md, harness code).
+
+```bash
+curl -s $BASE/mcp -H "$AUTH" -H 'Content-Type: application/json' -d '{
+  "jsonrpc": "2.0", "id": 8, "method": "tools/call",
+  "params": {"name": "ncp_improvement_log", "arguments": {
+    "action": "record_attempt", "problem_name": "retries ignore backoff",
+    "scope": "AGENTS.md", "what": "added backoff rule", "pipeline_id": "pipe_demo"
+  }}}'
+```
+
+- `get` — optional `scope`, `pipeline_id`, `model`. Returns `{block, telemetry}`:
+  an untruncated `[NCP:IMPROVEMENT]` block (attempts whose `model` differs from
+  the caller's `model` carry `!model`) and `{chars, oversize, problems,
+  attempts}`; `oversize` is true past `[improvement].warn_chars` (default 8000).
+- `list_problems` — optional `scope`, `pipeline_id`.
+- `record_attempt` — must cite `problem_id` (existing) or `problem_name` (plus
+  `scope`, which is the problem's scope). Requires `what` (<= 500 chars).
+  Optional `rationale` (<= 1000), `predicted`, `files`, `model`, `benchmark`,
+  `candidate_chunk_id`. Recorded with `kind: "manual"`.
+- `resolve_attempt` — `attempt_id`, `status` (`proposed`, `applied`, `rejected`,
+  `rolled_back`), optional `fixed`, `missed`, `passed`, `total`,
+  `mean_output_tokens`, `note`.
+- `merge` — `src_problem_id`, `dst_problem_id`: the source becomes an alias and
+  its attempts move to the destination; nothing is deleted.
+
+### ncp_record_outcome — outcome with evaluation context
+
+Records whether the chunks that informed a task worked. Give `success` and
+either `chunk_ids` or `turn_id`, plus `agent_id` (the caller; under
+`[principals]` it must match the principal). v1.9.7 adds one optional `ctx`
+object, backward compatible with the v1.9.6 properties:
+
+```json
+{"success": true, "chunk_ids": ["c1"], "agent_id": "builder",
+ "ctx": {"task": "deploy", "slot": "migrate", "model": "m1", "benchmark": "b1",
+         "eval_source": "verifier", "output_tokens": 900, "input_tokens": 4000, "turns": 3}}
+```
+
+- `ctx.task`, `ctx.slot` — where the outcome applies. When omitted, a caller
+  that identifies itself (`agent_id`, or a `session_id`) gets the values from
+  its last `ncp_get_context`; the shared default session never borrows.
+- `ctx.model`, `ctx.benchmark` — what the evaluation ran against.
+- `ctx.split` — optional tag (at most 32 chars), conventionally `train` or `holdout`; the prune gate scores `holdout` outcomes when enough exist.
+- `ctx.eval_source` — `self_report` (default), `verifier` or `human`.
+  Self-reports are weighted by `[calibration].self_report_weight`.
+- `ctx.output_tokens`, `ctx.input_tokens`, `ctx.turns` — non-negative integers;
+  the prune gate compares mean output tokens.
+- `pipeline_id` is not a client argument. It is derived from the session, else
+  from the pipeline the chunks have in common.
+
+The response is `{recorded, outcome_id, calibrated}` (plus `decision_linked`
+when a `decision_id` resolves). `calibrated` is true when this call ran
+feedback calibration: it runs automatically after a recorded outcome, at most
+once per `[calibration].auto_min_interval_seconds` (default 60) per pipeline,
+moves trust by at most weight x `[calibration].auto_outcome_step` (default 0.1)
+per outcome, and can be turned off with `[calibration].auto_on_outcome = false`.
 
 ### POST /skills — register a user skill
 
