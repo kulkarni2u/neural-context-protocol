@@ -306,6 +306,7 @@ CREATE TABLE IF NOT EXISTS outcomes (
     slot TEXT,
     model TEXT,
     benchmark TEXT,
+    split TEXT,
     eval_source TEXT NOT NULL DEFAULT 'self_report',
     output_tokens INTEGER,
     input_tokens INTEGER,
@@ -655,6 +656,7 @@ class SQLiteStore(BaseStore):
                 "ALTER TABLE outcomes ADD COLUMN slot TEXT",
                 "ALTER TABLE outcomes ADD COLUMN model TEXT",
                 "ALTER TABLE outcomes ADD COLUMN benchmark TEXT",
+                "ALTER TABLE outcomes ADD COLUMN split TEXT",
                 "ALTER TABLE outcomes ADD COLUMN eval_source TEXT NOT NULL DEFAULT 'self_report'",
                 "ALTER TABLE outcomes ADD COLUMN output_tokens INTEGER",
                 "ALTER TABLE outcomes ADD COLUMN input_tokens INTEGER",
@@ -1344,8 +1346,8 @@ class SQLiteStore(BaseStore):
             cursor = connection.execute(
                 """
                 INSERT OR IGNORE INTO outcomes (outcome_id, turn_id, chunk_ids, success, weight, note, created_at, consumed,
-                    pipeline_id, task, slot, model, benchmark, eval_source, output_tokens, input_tokens, turns)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    pipeline_id, task, slot, model, benchmark, split, eval_source, output_tokens, input_tokens, turns)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     outcome.outcome_id,
@@ -1360,6 +1362,7 @@ class SQLiteStore(BaseStore):
                     outcome.slot,
                     outcome.model,
                     outcome.benchmark,
+                    outcome.split,
                     outcome.eval_source,
                     outcome.output_tokens,
                     outcome.input_tokens,
@@ -1401,6 +1404,7 @@ class SQLiteStore(BaseStore):
             slot=opt("slot"),
             model=opt("model"),
             benchmark=opt("benchmark"),
+            split=opt("split"),
             eval_source=opt("eval_source") or "self_report",
             output_tokens=opt("output_tokens"),
             input_tokens=opt("input_tokens"),
@@ -1651,6 +1655,7 @@ class SQLiteStore(BaseStore):
         chunk_ids: Sequence[str],
         model: str | None = None,
         exclude_chunk_ids: Sequence[str] = (),
+        split: str | None = None,
     ) -> OutcomeStats:
         ids = list(dict.fromkeys(str(c) for c in chunk_ids))
         if not ids:
@@ -1666,6 +1671,9 @@ class SQLiteStore(BaseStore):
         if model is not None:
             scope += " AND model = ?"
             params.append(model)
+        if split is not None:
+            scope += " AND split = ?"
+            params.append(split)
         excluded = list(dict.fromkeys(str(c) for c in exclude_chunk_ids))
         if excluded:
             scope += (

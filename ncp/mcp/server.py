@@ -602,16 +602,16 @@ MCP_TOOLS: list[dict[str, object]] = [
             "type": "object",
             "properties": {
                 "success": {"type": "boolean"},
-                "chunk_ids": {"type": "array", "items": {"type": "string"}, "description": "Contributing chunk ids. Exclusive with turn_id."},
+                "chunk_ids": {"type": "array", "items": {"type": "string"}, "description": "Credited chunk ids. Exclusive with turn_id."},
                 "turn_id": {"type": "string", "description": "Turn resolved to chunk_ids. Exclusive with chunk_ids."},
-                "decision_id": {"type": "string", "description": "Typed decision (dec_...) resolved."},
+                "decision_id": {"type": "string", "description": "Decision (dec_...) resolved."},
                 "outcome_id": {"type": "string"},
                 "weight": {"type": "number", "description": "0 < weight <= 1 (default 1)."},
                 "note": {"type": "string"},
                 "agent_id": {"type": "string", "description": "Pipeline/task/slot default from its last context."},
                 "ctx": {
                     "type": "object",
-                    "description": "Optional: task, slot, model, benchmark, eval_source (self_report|verifier|human), output_tokens, input_tokens, turns",
+                    "description": "Optional: task, slot, model, benchmark, split, eval_source (self_report|verifier|human), output_tokens, input_tokens, turns",
                 },
             },
         },
@@ -1146,7 +1146,7 @@ class FetchSession:
 _RESULT_RAW_MAX_WINDOWS = 20
 
 _OUTCOME_CTX_KEYS = frozenset({
-    "task", "slot", "model", "benchmark", "eval_source", "output_tokens", "input_tokens", "turns",
+    "task", "slot", "model", "benchmark", "split", "eval_source", "output_tokens", "input_tokens", "turns",
 })
 
 # Bound the in-memory fetch-session table so a client rotating session_ids
@@ -3278,6 +3278,9 @@ def make_handlers(
         out_slot = _opt_str("slot")
         out_model = _opt_str("model")
         out_benchmark = _opt_str("benchmark")
+        out_split = _opt_str("split")
+        if out_split is not None and len(out_split) > 32:
+            raise ValueError("ncp_record_outcome ctx.split must be at most 32 characters")
         eval_source = raw_ctx.get("eval_source", "self_report")
         if eval_source is None:
             eval_source = "self_report"
@@ -3341,6 +3344,7 @@ def make_handlers(
             slot=out_slot,
             model=out_model,
             benchmark=out_benchmark,
+            split=out_split,
             eval_source=eval_source,
             output_tokens=output_tokens,
             input_tokens=input_tokens,

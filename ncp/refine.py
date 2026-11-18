@@ -61,6 +61,8 @@ MAX_CONTENT_CHARS = 2000
 PROPOSAL_TRUST = 0.4  # below default synthesis trust (0.70): an un-adopted machine proposal
 REFINE_AUTHOR = "ncp:refine"
 ROLLBACK_AUTHOR = "ncp:refine:rollback"
+GATE_SPLITS = ("auto", "holdout", "all")
+HOLDOUT_SPLIT = "holdout"
 
 _SRC_DEFAULT_TRUST: dict[str, float] = {
     "user_verified": 0.95,
@@ -499,13 +501,54 @@ def _safe_stats(
     chunk_id: str,
     model: str | None,
     exclude_chunk_ids: Sequence[str] = (),
+    split: str | None = None,
 ) -> OutcomeStats | None:
     try:
         return store.outcome_stats(
-            chunk_ids=[chunk_id], model=model, exclude_chunk_ids=exclude_chunk_ids
+            chunk_ids=[chunk_id], model=model, exclude_chunk_ids=exclude_chunk_ids, split=split
         )
     except NotImplementedError:
         return None
+
+
+def _check_gate_split(gate_split: str) -> None:
+    if gate_split not in GATE_SPLITS:
+        raise RefineError(f"gate_split must be one of {', '.join(GATE_SPLITS)}; got {gate_split!r}")
+
+
+@dataclass(frozen=True)
+class _SplitChoice:
+    """Which outcome split a trial is scored on, plus the stats on that split."""
+
+    split_used: str  # "holdout" or "all"
+    holdout_ok: bool
+    stats: OutcomeStats | None
+    anchor: OutcomeStats | None
+    holdout_trial_weight: float
+    holdout_anchor_weight: float
+
+
+def _choose_split(
+    gate_split: str,
+    *,
+    trial_holdout: OutcomeStats | None,
+    anchor_holdout: OutcomeStats | None,
+    trial_all: OutcomeStats | None,
+    anchor_all: OutcomeStats | None,
+    min_trial_outcomes: int,
+    min_anchor_outcomes: int,
+) -> _SplitChoice:
+    """Pick holdout when both sides have enough holdout weight, else all outcomes.
+
+    ``gate_split="holdout"`` always reports holdout (even without evidence) so
+    callers can refuse; ``"all"`` never uses the split filter.
+    """
+    trial_w = trial_holdout.total_weight if trial_holdout else 0.0
+    anchor_w = anchor_holdout.total_weight if anchor_holdout else 0.0
+    ok = trial_w >= min_trial_outcomes and anchor_w >= min_anchor_outcomes
+    if gate_split == "all" or (gate_split == "auto" and not ok):
+        return _SplitChoice("all", ok, trial_all, anchor_all, trial_w, anchor_w)
+    return _SplitChoice(HOLDOUT_SPLIT, ok, trial_holdout, anchor_holdout, trial_w, anchor_w)
 
 
 def propose_prune(
@@ -591,14 +634,17 @@ def _observed_fields(attempt: ImprovementAttempt, stats: OutcomeStats | None) ->
     }
 
 
-def _check_prune_gate(
+def _prune_gate_details(
     attempt: ImprovementAttempt,
     stats: OutcomeStats | None,
     *,
     gate_ratio: float,
     min_trial_outcomes: int,
-) -> None:
+    split_used: str = "all",
+) -> dict[str, Any]:
+    """Evaluate the prune gate; ``details["reasons"]`` is present only when it fails."""
     details: dict[str, Any] = {
+        "split_used": split_used,
         "anchor_rate": attempt.anchor_rate,
         "candidate_rate": stats.success_rate if stats else None,
         "n": stats.n if stats else 0,
@@ -637,7 +683,31 @@ def _check_prune_gate(
             )
     if reasons:
         details["reasons"] = reasons
-        raise RefineGateError("prune gate failed: " + "; ".join(reasons), details)
+    return details
+
+
+def _check_prune_gate(
+    attempt: ImprovementAttempt,
+    stats: OutcomeStats | None,
+    *,
+    gate_ratio: float,
+    min_trial_outcomes: int,
+    split_used: str = "all",
+) -> None:
+    details = _prune_gate_details(
+        attempt,
+        stats,
+        gate_ratio=gate_ratio,
+        min_trial_outcomes=min_trial_outcomes,
+        split_used=split_used,
+    )
+    if details.get("reasons"):
+        raise RefineGateError("prune gate failed: " + "; ".join(details["reasons"]), details)
+
+
+def _with_split_note(existing: str | None, split_used: str) -> str:
+    tag = f"gate split: {split_used}"
+    return (f"{existing}; {tag}" if existing else tag)[:500]
 
 
 def apply_refinement(
@@ -649,18 +719,24 @@ def apply_refinement(
     force: bool = False,
     gate_ratio: float = 0.9,
     min_trial_outcomes: int = 5,
+    min_anchor_outcomes: int = 5,
+    gate_split: str = "auto",
 ) -> SubconsciousChunk:
     """Adopt a proposed candidate: promote it to head and lift its trust.
 
     Refuses a stale candidate (its predecessor is no longer the head), even
     with ``force``. Prune candidates must pass the accuracy/token gate unless
-    ``force`` is set.
+    ``force`` is set. ``gate_split`` picks the outcomes the gate scores:
+    ``auto`` uses ``split="holdout"`` outcomes when the candidate has
+    ``min_trial_outcomes`` and the head ``min_anchor_outcomes`` of them (else
+    all outcomes), ``holdout`` requires that, ``all`` ignores the split tag.
 
     Retires the candidate's predecessor via the existing CAP-C5
     ``store.supersede`` machinery (never deletes it) and promotes trust via
     the existing ``store.calibrate`` manual-override mode -- both reused as-is
     rather than duplicated here.
     """
+    _check_gate_split(gate_split)
     found = store.get_chunks_by_ids([chunk_id])
     if not found:
         raise ValueError(f"no chunk found for id '{chunk_id}'")
@@ -688,10 +764,55 @@ def apply_refinement(
         )
     model = attempt.model if attempt else None
     # Outcomes crediting both head and candidate belong to neither trial.
-    stats = _safe_stats(store, candidate.chunk_id, model, [candidate.supersedes])
-    if attempt is not None and attempt.kind == "prune":
+    def _side(chunk: str, other: str, split: str | None) -> OutcomeStats | None:
+        return _safe_stats(store, chunk, model, [other], split=split)
+
+    if gate_split == "all":
+        trial_holdout = anchor_holdout = None
+    else:
+        trial_holdout = _side(candidate.chunk_id, candidate.supersedes, HOLDOUT_SPLIT)
+        anchor_holdout = _side(candidate.supersedes, candidate.chunk_id, HOLDOUT_SPLIT)
+    choice = _choose_split(
+        gate_split,
+        trial_holdout=trial_holdout,
+        anchor_holdout=anchor_holdout,
+        trial_all=_side(candidate.chunk_id, candidate.supersedes, None),
+        anchor_all=_side(candidate.supersedes, candidate.chunk_id, None),
+        min_trial_outcomes=min_trial_outcomes,
+        min_anchor_outcomes=min_anchor_outcomes,
+    )
+    is_prune = attempt is not None and attempt.kind == "prune"
+    if is_prune and gate_split == "holdout" and not choice.holdout_ok and not force:
+        raise RefineGateError(
+            "prune gate failed: not enough holdout evidence "
+            f"(candidate {choice.holdout_trial_weight} < {min_trial_outcomes} or head "
+            f"{choice.holdout_anchor_weight} < {min_anchor_outcomes} outcomes tagged "
+            f"split={HOLDOUT_SPLIT!r}); tag outcomes with ctx.split or use --gate-split auto|all",
+            {
+                "split_used": HOLDOUT_SPLIT,
+                "holdout_trial_weight": choice.holdout_trial_weight,
+                "holdout_anchor_weight": choice.holdout_anchor_weight,
+                "required": {
+                    "min_trial_outcomes": min_trial_outcomes,
+                    "min_anchor_outcomes": min_anchor_outcomes,
+                },
+                "reasons": ["insufficient holdout evidence"],
+            },
+        )
+    split_used = choice.split_used
+    if gate_split == "holdout" and not choice.holdout_ok:
+        # Forced past missing holdout evidence (or a repair): observe on all outcomes.
+        split_used = "all"
+        choice = _SplitChoice(
+            "all", False, _side(candidate.chunk_id, candidate.supersedes, None),
+            _side(candidate.supersedes, candidate.chunk_id, None),
+            choice.holdout_trial_weight, choice.holdout_anchor_weight,
+        )
+    stats = choice.stats
+    if is_prune:
+        assert attempt is not None
         # Recompute the anchor now: outcomes since the proposal are evidence too.
-        anchor = _safe_stats(store, candidate.supersedes, model, [candidate.chunk_id])
+        anchor = choice.anchor
         if anchor is not None:
             attempt = attempt.model_copy(
                 update={
@@ -699,10 +820,14 @@ def apply_refinement(
                     "anchor_output_tokens": anchor.mean_output_tokens,
                 }
             )
-    if attempt is not None and attempt.kind == "prune" and not force:
-        _check_prune_gate(
-            attempt, stats, gate_ratio=gate_ratio, min_trial_outcomes=min_trial_outcomes
-        )
+        if not force:
+            _check_prune_gate(
+                attempt,
+                stats,
+                gate_ratio=gate_ratio,
+                min_trial_outcomes=min_trial_outcomes,
+                split_used=split_used,
+            )
 
     if not store.supersede(candidate.supersedes, candidate.chunk_id):
         raise ValueError(
@@ -724,6 +849,7 @@ def apply_refinement(
                     else {}
                 ),
                 **_observed_fields(attempt, stats),
+                note=_with_split_note(attempt.note, split_used),
             )
         except NotImplementedError:
             pass
@@ -732,6 +858,165 @@ def apply_refinement(
         write_to.write_text(candidate.content + "\n")
 
     return candidate.model_copy(update={"base_trust": promote_trust})
+
+
+@dataclass(frozen=True)
+class CandidateComparison:
+    """One proposed candidate scored against the head (read-only)."""
+
+    chunk_id: str
+    attempt_id: str
+    kind: str
+    status: str  # "proposed" or "stale" (no longer supersedes the head)
+    n: int
+    total_weight: float
+    success_rate: float | None
+    mean_output_tokens: float | None
+    split_used: str
+    would_pass_gate: bool | None  # prune: the apply gate; repair: None (ungated)
+    reasons: list[str]
+
+
+@dataclass(frozen=True)
+class CompareResult:
+    key: str
+    head_chunk_id: str
+    anchor_split: str
+    anchor_n: int
+    anchor_total_weight: float
+    anchor_success_rate: float | None
+    anchor_mean_output_tokens: float | None
+    candidates: list[CandidateComparison]
+
+    @property
+    def recommended(self) -> CandidateComparison | None:
+        return next((c for c in self.candidates if c.status != "stale"), None)
+
+
+def compare_candidates(
+    store: BaseStore,
+    *,
+    key: str,
+    pipeline_id: str | None = None,
+    model: str | None = None,
+    split: str = "auto",
+    gate_ratio: float | None = None,
+    min_trial_outcomes: int | None = None,
+    min_anchor_outcomes: int | None = None,
+) -> CompareResult:
+    """Rank every proposed repair/prune candidate of a procedure (never writes).
+
+    Each candidate is scored on outcomes that credit it and neither the head
+    nor any other candidate; the anchor is the head minus all candidates.
+    ``split`` follows ``apply_refinement``'s ``gate_split``. Rank order:
+    non-stale first, then gate-passing, success rate desc, mean output tokens
+    asc (unknown last), weight desc, chunk id.
+    """
+    _check_gate_split(split)
+    gate_ratio = 0.9 if gate_ratio is None else gate_ratio
+    min_trial = 5 if min_trial_outcomes is None else min_trial_outcomes
+    min_anchor = 5 if min_anchor_outcomes is None else min_anchor_outcomes
+    head = find_procedure_head(store, key=key, pipeline_id=pipeline_id)
+    if head is None:
+        raise ValueError(f"no procedure ingested for key '{key}'; run `ncp refine ingest` first")
+
+    found: list[tuple[SubconsciousChunk, ImprovementAttempt]] = []
+    for row in _procedure_rows(store, key=key, pipeline_id=pipeline_id):
+        if row["chunk_id"] == head.chunk_id or not row.get("supersedes"):
+            continue
+        attempt = _find_attempt(store, str(row["chunk_id"]))
+        if attempt is not None and attempt.status == "proposed":
+            found.append((_row_to_chunk(row), attempt))
+    candidate_ids = [chunk.chunk_id for chunk, _ in found]
+
+    def anchor_for(split_filter: str | None) -> OutcomeStats | None:
+        return _safe_stats(store, head.chunk_id, model, candidate_ids, split=split_filter)
+
+    anchor_all = anchor_for(None)
+    anchor_hold = None if split == "all" else anchor_for(HOLDOUT_SPLIT)
+
+    comparisons: list[CandidateComparison] = []
+    anchor_shown = anchor_all
+    anchor_split = "all"
+    for chunk, attempt in found:
+        excluded = [head.chunk_id, *[c for c in candidate_ids if c != chunk.chunk_id]]
+        trial_hold = (
+            None if split == "all"
+            else _safe_stats(store, chunk.chunk_id, model, excluded, split=HOLDOUT_SPLIT)
+        )
+        choice = _choose_split(
+            split,
+            trial_holdout=trial_hold,
+            anchor_holdout=anchor_hold,
+            trial_all=_safe_stats(store, chunk.chunk_id, model, excluded),
+            anchor_all=anchor_all,
+            min_trial_outcomes=min_trial,
+            min_anchor_outcomes=min_anchor,
+        )
+        stats = choice.stats
+        passes: bool | None = None
+        reasons: list[str] = []
+        if attempt.kind == "prune":
+            if split == "holdout" and not choice.holdout_ok:
+                reasons = ["insufficient holdout evidence"]
+            else:
+                anchor = choice.anchor
+                details = _prune_gate_details(
+                    attempt.model_copy(update={
+                        "anchor_rate": anchor.success_rate if anchor else None,
+                        "anchor_output_tokens": anchor.mean_output_tokens if anchor else None,
+                    }),
+                    stats,
+                    gate_ratio=gate_ratio,
+                    min_trial_outcomes=min_trial,
+                    split_used=choice.split_used,
+                )
+                reasons = list(details.get("reasons", []))
+            passes = not reasons
+        status = "proposed" if chunk.supersedes == head.chunk_id else "stale"
+        if status == "stale":
+            reasons = [*reasons, f"stale: supersedes {chunk.supersedes}, head is {head.chunk_id}"]
+        if choice.split_used == HOLDOUT_SPLIT:
+            anchor_shown, anchor_split = choice.anchor, HOLDOUT_SPLIT
+        comparisons.append(
+            CandidateComparison(
+                chunk_id=chunk.chunk_id,
+                attempt_id=attempt.attempt_id,
+                kind=attempt.kind,
+                status=status,
+                n=stats.n if stats else 0,
+                total_weight=stats.total_weight if stats else 0.0,
+                success_rate=stats.success_rate if stats else None,
+                mean_output_tokens=stats.mean_output_tokens if stats else None,
+                split_used=choice.split_used,
+                would_pass_gate=passes,
+                reasons=reasons,
+            )
+        )
+
+    def rank(c: CandidateComparison) -> tuple:
+        return (
+            c.status == "stale",
+            c.would_pass_gate is not True,
+            c.success_rate is None,
+            -(c.success_rate or 0.0),
+            c.mean_output_tokens is None,
+            c.mean_output_tokens or 0.0,
+            -c.total_weight,
+            c.chunk_id,
+        )
+
+    comparisons.sort(key=rank)
+    return CompareResult(
+        key=key,
+        head_chunk_id=head.chunk_id,
+        anchor_split=anchor_split,
+        anchor_n=anchor_shown.n if anchor_shown else 0,
+        anchor_total_weight=anchor_shown.total_weight if anchor_shown else 0.0,
+        anchor_success_rate=anchor_shown.success_rate if anchor_shown else None,
+        anchor_mean_output_tokens=anchor_shown.mean_output_tokens if anchor_shown else None,
+        candidates=comparisons,
+    )
 
 
 def reject_refinement(

@@ -730,6 +730,7 @@ object, backward compatible with the v1.9.6 properties:
   that identifies itself (`agent_id`, or a `session_id`) gets the values from
   its last `ncp_get_context`; the shared default session never borrows.
 - `ctx.model`, `ctx.benchmark` — what the evaluation ran against.
+- `ctx.split` — optional tag (at most 32 chars), conventionally `train` or `holdout`; the prune gate scores `holdout` outcomes when enough exist.
 - `ctx.eval_source` — `self_report` (default), `verifier` or `human`.
   Self-reports are weighted by `[calibration].self_report_weight`.
 - `ctx.output_tokens`, `ctx.input_tokens`, `ctx.turns` — non-negative integers;

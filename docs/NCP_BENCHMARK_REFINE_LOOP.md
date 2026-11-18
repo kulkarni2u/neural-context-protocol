@@ -9,7 +9,7 @@ outcomes are scripted so every guard fires exactly once. See
 python benchmarks/refine_loop/run.py
 ```
 
-The command prints a JSON artifact. `summary.checks` holds ten booleans and
+The command prints a JSON artifact. `summary.checks` holds twelve booleans and
 `summary.pass` is true only when all of them are. CI fails the build otherwise.
 
 ## What each check proves
@@ -25,6 +25,8 @@ The command prints a JSON artifact. `summary.checks` holds ten booleans and
 | `rollback_marks_rolled_back` | Rollback restores the earlier content and marks the attempt `rolled_back`. |
 | `block_lists_every_attempt` | The `[NCP:IMPROVEMENT]` block lists every attempt, including rejected and rolled-back ones. |
 | `prune_shorter_than_repair` | After the prune the head is shorter than after the repair. |
+| `holdout_gate_blocks_train_only_win` | A candidate that passes on pooled outcomes but fails on the `holdout` split is refused by the default (`auto`) gate with `split_used=holdout`. |
+| `compare_ranks_best_first` | `compare_candidates` ranks the better of two prune candidates first and a stale candidate last. |
 | `auto_calibration_changed_trust` | Recording outcomes through the MCP `ncp_record_outcome` handler changes a chunk's `base_trust` without an operator running `ncp calibrate`. |
 
 ## Reported only

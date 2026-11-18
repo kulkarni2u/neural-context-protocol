@@ -33,6 +33,7 @@ from ncp.refine import (
     RefineError,
     RefineGateError,
     apply_refinement,
+    compare_candidates,
     find_procedure_head,
     ingest_procedure,
     propose_prune,
@@ -65,10 +66,11 @@ _PAIRED_AFTER = [0.60, 0.60, 0.65, 0.50, 0.65, 0.60, 0.55, 0.75, 0.55, 0.70]
 
 def _outcome(
     store: SQLiteStore, oid: str, chunk_id: str, success: bool, *,
-    tokens: int | None = None, task: str | None = None, note: str | None = None,
+    tokens: int | None = None, task: str | None = None, note: str | None = None, split: str | None = None,
 ) -> None:
     store.record_outcome(OutcomeRecord(
-        outcome_id=oid, chunk_ids=[chunk_id], success=success, output_tokens=tokens, task=task, note=note, model=_MODEL,
+        outcome_id=oid, chunk_ids=[chunk_id], success=success, output_tokens=tokens, task=task, note=note,
+        model=_MODEL, split=split,
     ))
 
 
@@ -83,6 +85,75 @@ def _raises(exc_type: type[Exception], fn: Any, *args: Any, **kwargs: Any) -> Ex
 def _head_chars(store: SQLiteStore) -> int:
     head = find_procedure_head(store, key=_KEY)
     return len(head.content) if head is not None else -1
+
+
+def _holdout_and_compare_checks(config: Any, project: Path) -> dict[str, bool]:
+    """Holdout-gate and candidate-comparison checks, on their own store.
+
+    Separate stores keep the attempt history of the main loop (asserted by
+    ``block_lists_every_attempt``) untouched and the dedup guard out of the way.
+    """
+    store = SQLiteStore(project / ".ncp" / "store_holdout.db", config=config)
+    checks: dict[str, bool] = {}
+
+    # Holdout gate: the candidate wins on train outcomes only; the head is weak on train
+    # (so the pooled rate passes) but strong on holdout, where the candidate fails.
+    seed = ingest_procedure(store, key="holdout_proc", content=_SEED)
+    for i in range(5):
+        _outcome(store, f"ha{i}", seed.chunk_id, True, tokens=_ANCHOR_TOKENS, split="holdout")
+        _outcome(store, f"hb{i}", seed.chunk_id, False, tokens=_ANCHOR_TOKENS, split="train")
+    cand = propose_prune(store, key="holdout_proc", content=_PRUNE_GOOD, model=_MODEL)
+    holdout_ok = False
+    if cand.new_chunk is not None:
+        cid = cand.new_chunk.chunk_id
+        for i in range(5):
+            _outcome(store, f"hc{i}", cid, True, tokens=_PRUNED_TOKENS, split="train")
+            _outcome(store, f"hd{i}", cid, False, tokens=_PRUNED_TOKENS, split="holdout")
+        # Pooled over every outcome the candidate would pass; only the holdout split blocks it.
+        pooled = compare_candidates(store, key="holdout_proc", model=_MODEL, split="all")
+        gate_err = _raises(RefineGateError, apply_refinement, store, chunk_id=cid)
+        head = find_procedure_head(store, key="holdout_proc")
+        holdout_ok = (
+            pooled.candidates[0].would_pass_gate is True
+            and isinstance(gate_err, RefineGateError)
+            and gate_err.details.get("split_used") == "holdout"
+            and head is not None and head.chunk_id == seed.chunk_id
+        )
+    checks["holdout_gate_blocks_train_only_win"] = holdout_ok
+
+    # Compare: Z is proposed against the old head and goes stale; X (better) and Y (worse)
+    # are proposed against the new head.
+    store = SQLiteStore(project / ".ncp" / "store_compare.db", config=config)
+    cmp_seed = ingest_procedure(store, key="cmp_proc", content=_SEED)
+    for i in range(5):
+        _outcome(store, f"ca{i}", cmp_seed.chunk_id, True, tokens=_ANCHOR_TOKENS)
+    z = propose_prune(store, key="cmp_proc", content=_PRUNE_B, model=_MODEL)
+    w = propose_prune(store, key="cmp_proc", content=_PRUNE_GOOD, model=_MODEL)
+    ranked_ok = False
+    if z.new_chunk is not None and w.new_chunk is not None:
+        apply_refinement(store, chunk_id=w.new_chunk.chunk_id, force=True)
+        for i in range(5):
+            _outcome(store, f"cw{i}", w.new_chunk.chunk_id, True, tokens=_ANCHOR_TOKENS)
+        x = propose_prune(store, key="cmp_proc", content=_PRUNE_A, model=_MODEL)
+        y = propose_prune(store, key="cmp_proc", content=_PRUNE_BAD, model=_MODEL)
+        if x.new_chunk is not None and y.new_chunk is not None:
+            for i in range(5):
+                _outcome(store, f"cx{i}", x.new_chunk.chunk_id, True, tokens=_PRUNED_TOKENS)
+                _outcome(store, f"cz{i}", z.new_chunk.chunk_id, True, tokens=_PRUNED_TOKENS // 2)
+            for i in range(3):
+                _outcome(store, f"cy{i}", y.new_chunk.chunk_id, True, tokens=_PRUNED_TOKENS)
+            for i in range(2):
+                _outcome(store, f"cf{i}", y.new_chunk.chunk_id, False, tokens=_PRUNED_TOKENS)
+            result = compare_candidates(store, key="cmp_proc", model=_MODEL)
+            order = [c.chunk_id for c in result.candidates]
+            ranked_ok = (
+                order == [x.new_chunk.chunk_id, y.new_chunk.chunk_id, z.new_chunk.chunk_id]
+                and result.candidates[0].would_pass_gate is True
+                and result.candidates[1].would_pass_gate is False
+                and result.candidates[2].status == "stale"
+            )
+    checks["compare_ranks_best_first"] = ranked_ok
+    return checks
 
 
 def run_refine_loop_benchmark(*, workdir: str | Path) -> dict[str, object]:
@@ -226,6 +297,8 @@ def run_refine_loop_benchmark(*, workdir: str | Path) -> dict[str, object]:
     after = store.get_chunks_by_ids(["calib_fact"])[0].base_trust
     checks["auto_calibration_changed_trust"] = bool(result) and after != before
     metrics["calibrated_trust"] = {"before": round(before, 4), "after": round(after, 4)}
+
+    checks.update(_holdout_and_compare_checks(config, project))
 
     paired = paired_comparison(_PAIRED_BEFORE, _PAIRED_AFTER)
     return {

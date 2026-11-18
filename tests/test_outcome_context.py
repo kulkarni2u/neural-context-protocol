@@ -34,7 +34,7 @@ def test_schema_declares_ctx_object_only() -> None:
     tool = next(t for t in server_mod.MCP_TOOLS if t["name"] == "ncp_record_outcome")
     props = tool["inputSchema"]["properties"]
     assert props["ctx"]["type"] == "object"
-    for name in ("pipeline_id", "task", "slot", "model", "benchmark", "eval_source",
+    for name in ("pipeline_id", "task", "slot", "model", "benchmark", "split", "eval_source",
                  "output_tokens", "input_tokens", "turns"):
         assert name not in props
     for name in ("agent_id", "success", "chunk_ids", "turn_id", "decision_id", "outcome_id", "weight", "note"):
@@ -54,6 +54,18 @@ def test_ctx_fields_are_stored(env) -> None:
     # No held session: pipeline derives from the chunks' shared pipeline.
     assert (got.pipeline_id, got.task, got.slot, got.model, got.benchmark) == ("pipe", "t", "s", "m", "b")
     assert (got.eval_source, got.output_tokens, got.input_tokens, got.turns) == ("verifier", 5, 6, 2)
+
+
+def test_ctx_split_is_stored_and_validated(env) -> None:
+    store, h = env
+    res = h["ncp_record_outcome"]({"success": True, "chunk_ids": ["c1"], "ctx": {"split": " holdout "}})
+    got = store.get_outcome(res["outcome_id"])
+    assert got is not None and got.split == "holdout"
+    plain = store.get_outcome(h["ncp_record_outcome"]({"success": True, "chunk_ids": ["c1"]})["outcome_id"])
+    assert plain is not None and plain.split is None
+    for bad in (5, "x" * 33):
+        with pytest.raises(ValueError, match="split"):
+            h["ncp_record_outcome"]({"success": True, "chunk_ids": ["c1"], "ctx": {"split": bad}})
 
 
 def test_defaults_from_last_get_context_survive_post_turn(env) -> None:

@@ -138,6 +138,7 @@ confidence_k = 20
 # gate_ratio = 0.9
 # min_trial_outcomes = 5
 # min_anchor_outcomes = 5         # outcomes the head needs before a prune
+# gate_split = "auto"             # auto | holdout | all: outcomes the gate scores (ctx.split = "holdout")
 
 # [improvement]
 # warn_chars = 8000               # [NCP:IMPROVEMENT] is never truncated; over this it reports oversize

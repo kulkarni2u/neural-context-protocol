@@ -1964,9 +1964,9 @@ class AsyncPgvectorStore(BaseStore):
                     self._sql(
                         "INSERT INTO {schema}.{prefix}outcomes"
                         " (outcome_id, turn_id, chunk_ids, success, weight, note, created_at, consumed,"
-                        " pipeline_id, task, slot, model, benchmark, eval_source,"
+                        " pipeline_id, task, slot, model, benchmark, split, eval_source,"
                         " output_tokens, input_tokens, turns)"
-                        " VALUES (%s, %s, %s, %s, %s, %s, %s, 0, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+                        " VALUES (%s, %s, %s, %s, %s, %s, %s, 0, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
                         " ON CONFLICT (outcome_id) DO NOTHING"
                     ),
                     (
@@ -1982,6 +1982,7 @@ class AsyncPgvectorStore(BaseStore):
                         outcome.slot,
                         outcome.model,
                         outcome.benchmark,
+                        outcome.split,
                         outcome.eval_source,
                         outcome.output_tokens,
                         outcome.input_tokens,
@@ -2048,6 +2049,7 @@ class AsyncPgvectorStore(BaseStore):
         chunk_ids: Sequence[str],
         model: str | None = None,
         exclude_chunk_ids: Sequence[str] = (),
+        split: str | None = None,
     ) -> OutcomeStats:
         ids = list(dict.fromkeys(str(c) for c in chunk_ids))
         if not ids:
@@ -2063,6 +2065,9 @@ class AsyncPgvectorStore(BaseStore):
         if model is not None:
             scope += " AND o.model = %s"
             params.append(model)
+        if split is not None:
+            scope += " AND o.split = %s"
+            params.append(split)
         excluded = list(dict.fromkeys(str(c) for c in exclude_chunk_ids))
         if excluded:
             scope += (

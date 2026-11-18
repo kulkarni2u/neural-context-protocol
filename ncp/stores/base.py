@@ -386,10 +386,12 @@ class BaseStore(ABC):
         chunk_ids: Sequence[str],
         model: str | None = None,
         exclude_chunk_ids: Sequence[str] = (),
+        split: str | None = None,
     ) -> OutcomeStats:
         """Aggregate every outcome touching ``chunk_ids`` (optionally one ``model``).
 
-        Outcomes that also credit any of ``exclude_chunk_ids`` are not counted.
+        Outcomes that also credit any of ``exclude_chunk_ids`` are not counted;
+        ``split`` keeps only outcomes tagged with that split.
         """
         raise NotImplementedError("improvement records require the sqlite or pgvector store")
 
@@ -453,9 +455,14 @@ class BaseStore(ABC):
         chunk_ids: Sequence[str],
         model: str | None = None,
         exclude_chunk_ids: Sequence[str] = (),
+        split: str | None = None,
     ) -> OutcomeStats:
         fn = partial(
-            self.outcome_stats, chunk_ids=chunk_ids, model=model, exclude_chunk_ids=exclude_chunk_ids
+            self.outcome_stats,
+            chunk_ids=chunk_ids,
+            model=model,
+            exclude_chunk_ids=exclude_chunk_ids,
+            split=split,
         )
         return await anyio.to_thread.run_sync(fn)
 

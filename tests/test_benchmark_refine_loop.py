@@ -15,6 +15,8 @@ _CHECKS = {
     "block_lists_every_attempt",
     "prune_shorter_than_repair",
     "auto_calibration_changed_trust",
+    "holdout_gate_blocks_train_only_win",
+    "compare_ranks_best_first",
 }
 
 

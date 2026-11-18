@@ -34,6 +34,7 @@ Design and acceptance criteria:
    least `[refine].min_trial_outcomes` outcomes, and its mean output tokens are
    lower than the anchor's. Otherwise it raises `RefineGateError` (with the
    numbers) and you either collect more outcomes or `ncp refine reject`.
+   The gate scores the `holdout` split when it can (see below).
 6. **Rollback.** `ncp refine rollback KEY` writes the previous content as a new
    version and marks the attempt `rolled_back`. Nothing is deleted.
 
@@ -74,19 +75,48 @@ records need the sqlite or pgvector store.
 
 ## Outcome context
 
+## Holdout split and candidate comparison
+
+Selection on data the proposer never saw is what keeps a self-edit honest: most
+revisions fail, so a candidate should be judged on held-out outcomes and
+several candidates compared before one is adopted (see Meta's
+[Self-Improving Memory](https://facebookresearch.github.io/RAM/blogs/self_improving_memory/)
+write-up on selection on held-out data and most revisions failing).
+
+- **Tagging.** Record outcomes with `ctx.split`: `train` for the evidence the
+  proposer reads (failure notes behind `ncp refine propose`), `holdout` for
+  outcomes only the gate scores. NCP stores the tag; it does not assign it.
+- **Gate.** `[refine].gate_split` (or `ncp refine apply --gate-split`) picks
+  the outcomes the prune gate uses. `auto` (default) uses `holdout` outcomes
+  when the candidate has at least `min_trial_outcomes` and the head (candidate
+  excluded) at least `min_anchor_outcomes` of them, otherwise all outcomes.
+  `holdout` requires that evidence and raises `RefineGateError` without it
+  (`--force` still bypasses the gate, never the stale/status checks). `all`
+  ignores tags. `RefineGateError.details["split_used"]` and the attempt note
+  (`gate split: holdout`) record the choice. Repairs stay ungated; their
+  observed numbers use the same selection.
+- **Compare.** `ncp refine compare KEY [--pipeline-id P] [--model M]
+  [--gate-split S] [--json]` (library: `compare_candidates`) is read-only. It
+  ranks every proposed repair/prune candidate: current-head candidates first,
+  prune candidates that would pass the gate first, then success rate, mean
+  output tokens, weight. Each candidate's outcomes exclude the head's and the
+  other candidates'. It prints the exact `ncp refine apply CHUNK_ID` for the
+  best non-stale candidate.
+
 `ncp_record_outcome` takes `agent_id` and one optional `ctx` object so evidence
 can be judged later:
 
 ```json
 {"success": true, "chunk_ids": ["c1"], "agent_id": "builder",
  "ctx": {"task": "deploy", "slot": "migrate", "model": "m1", "benchmark": "b1",
-         "eval_source": "verifier", "output_tokens": 900, "input_tokens": 4000, "turns": 3}}
+         "split": "holdout", "eval_source": "verifier", "output_tokens": 900, "input_tokens": 4000, "turns": 3}}
 ```
 
 | `ctx` field | Meaning |
 |---|---|
 | `task`, `slot` | What the outcome applies to. Omitted values default from the caller's last `ncp_get_context`. |
 | `model`, `benchmark` | What the evaluation ran against. |
+| `split` | Optional tag, at most 32 chars: `train` or `holdout` by convention. |
 | `eval_source` | `self_report` (default), `verifier` or `human`. |
 | `output_tokens`, `input_tokens`, `turns` | Cost of the run; the prune gate compares mean output tokens. |
 
@@ -191,6 +221,7 @@ the prune gate only.
 | `[refine].gate_ratio` | 0.9 | Prune gate: minimum candidate/anchor success ratio. |
 | `[refine].min_trial_outcomes` | 5 | Prune gate: outcomes needed on the candidate. |
 | `[refine].min_anchor_outcomes` | 5 | Outcomes the head needs before a prune. |
+| `[refine].gate_split` | `auto` | Outcomes the gate scores: `auto`, `holdout` or `all`. |
 | `[improvement].warn_chars` | 8000 | Block size past which telemetry reports oversize. |
 | `[calibration].auto_on_outcome` | true | Calibrate after `ncp_record_outcome`. |
 | `[calibration].auto_min_interval_seconds` | 60 | Debounce per pipeline. |

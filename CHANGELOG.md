@@ -109,6 +109,16 @@ chars.
   `[improvement].warn_chars`.
 - `docs/NCP_SELF_IMPROVEMENT.md` user guide and an "Improvement records"
   section in `AGENTS.md`.
+- Holdout gate: `ctx.split` tags an outcome (`train`/`holdout`, free string up
+  to 32 chars; migration 020). `[refine].gate_split` (`auto` default, `holdout`,
+  `all`; `ncp refine apply --gate-split`) makes the prune gate score
+  `split="holdout"` outcomes when both sides have enough, so the proposer can
+  learn from train outcomes while selection uses data it never saw.
+  `outcome_stats` gains `split`; the attempt note records `gate split: ...`.
+  Two new `refine_loop` checks.
+- `ncp refine compare KEY [--json]` (library: `compare_candidates`): read-only
+  ranking of the proposed repair/prune candidates, with stale ones last and the
+  exact `ncp refine apply` command for the best. No new MCP tool or output.
 
 ### Changed
 

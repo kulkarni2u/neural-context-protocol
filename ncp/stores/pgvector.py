@@ -404,6 +404,7 @@ ALTER TABLE {schema}.{prefix}outcomes ADD COLUMN IF NOT EXISTS task TEXT;
 ALTER TABLE {schema}.{prefix}outcomes ADD COLUMN IF NOT EXISTS slot TEXT;
 ALTER TABLE {schema}.{prefix}outcomes ADD COLUMN IF NOT EXISTS model TEXT;
 ALTER TABLE {schema}.{prefix}outcomes ADD COLUMN IF NOT EXISTS benchmark TEXT;
+ALTER TABLE {schema}.{prefix}outcomes ADD COLUMN IF NOT EXISTS split TEXT;
 ALTER TABLE {schema}.{prefix}outcomes ADD COLUMN IF NOT EXISTS eval_source TEXT NOT NULL DEFAULT 'self_report';
 ALTER TABLE {schema}.{prefix}outcomes ADD COLUMN IF NOT EXISTS output_tokens INTEGER;
 ALTER TABLE {schema}.{prefix}outcomes ADD COLUMN IF NOT EXISTS input_tokens INTEGER;
@@ -1588,9 +1589,9 @@ class PgvectorStore(BaseStore):
                     self._sql(
                         "INSERT INTO {schema}.{prefix}outcomes"
                         " (outcome_id, turn_id, chunk_ids, success, weight, note, created_at, consumed,"
-                        " pipeline_id, task, slot, model, benchmark, eval_source,"
+                        " pipeline_id, task, slot, model, benchmark, split, eval_source,"
                         " output_tokens, input_tokens, turns)"
-                        " VALUES (%s, %s, %s, %s, %s, %s, %s, 0, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+                        " VALUES (%s, %s, %s, %s, %s, %s, %s, 0, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
                         " ON CONFLICT (outcome_id) DO NOTHING"
                     ),
                     (
@@ -1606,6 +1607,7 @@ class PgvectorStore(BaseStore):
                         outcome.slot,
                         outcome.model,
                         outcome.benchmark,
+                        outcome.split,
                         outcome.eval_source,
                         outcome.output_tokens,
                         outcome.input_tokens,
@@ -1628,6 +1630,7 @@ class PgvectorStore(BaseStore):
             pipeline_id=row.get("pipeline_id"), task=row.get("task"),
             slot=row.get("slot"), model=row.get("model"),
             benchmark=row.get("benchmark"),
+            split=row.get("split"),
             eval_source=row.get("eval_source") or "self_report",
             output_tokens=row.get("output_tokens"),
             input_tokens=row.get("input_tokens"), turns=row.get("turns"),
@@ -1918,6 +1921,7 @@ class PgvectorStore(BaseStore):
         chunk_ids: Sequence[str],
         model: str | None = None,
         exclude_chunk_ids: Sequence[str] = (),
+        split: str | None = None,
     ) -> OutcomeStats:
         ids = list(dict.fromkeys(str(c) for c in chunk_ids))
         if not ids:
@@ -1935,6 +1939,9 @@ class PgvectorStore(BaseStore):
         if model is not None:
             scope += " AND o.model = %s"
             params.append(model)
+        if split is not None:
+            scope += " AND o.split = %s"
+            params.append(split)
         excluded = list(dict.fromkeys(str(c) for c in exclude_chunk_ids))
         if excluded:
             scope += (

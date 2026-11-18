@@ -2694,6 +2694,7 @@ def refine_propose_command(
 @click.option("--force", is_flag=True, default=False, help="Bypass the prune gate (never bypasses the stale-head check).")
 @click.option("--gate-ratio", default=None, type=float, help="Prune gate: min candidate/anchor success ratio (default from config, 0.9).")
 @click.option("--min-trial-outcomes", default=None, type=int, help="Prune gate: min candidate outcomes (default from config, 5).")
+@click.option("--gate-split", default=None, type=click.Choice(["auto", "holdout", "all"]), help="Outcomes the gate scores (default from [refine].gate_split, auto).")
 def refine_apply_command(
     chunk_id: str,
     cwd: Path | None,
@@ -2702,6 +2703,7 @@ def refine_apply_command(
     force: bool,
     gate_ratio: float | None,
     min_trial_outcomes: int | None,
+    gate_split: str | None,
 ) -> None:
     """Adopt a proposed candidate chunk as the live version of its procedure."""
     from ncp.config import load_config
@@ -2724,6 +2726,8 @@ def refine_apply_command(
             min_trial_outcomes=(
                 min_trial_outcomes if min_trial_outcomes is not None else config.refine_min_trial_outcomes
             ),
+            min_anchor_outcomes=config.refine_min_anchor_outcomes,
+            gate_split=gate_split if gate_split is not None else config.refine_gate_split,
         )
     except RefineGateError as exc:
         click.echo(f"Gate failed: {exc}", err=True)
@@ -2736,6 +2740,84 @@ def refine_apply_command(
     console.print(f"[green]Adopted {adopted.chunk_id}[/green] (trust {adopted.base_trust:.2f}).")
     if write_to is not None:
         console.print(f"Wrote content to {write_to}")
+
+
+@refine_group.command("compare")
+@click.argument("key")
+@click.option("--cwd", default=None, type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("--pipeline-id", default=None, help="Pipeline scope for this procedure.")
+@click.option("--model", default=None, help="Only count outcomes recorded for this model.")
+@click.option("--gate-split", default=None, type=click.Choice(["auto", "holdout", "all"]), help="Outcomes to score (default from [refine].gate_split, auto).")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Machine-readable output.")
+def refine_compare_command(
+    key: str,
+    cwd: Path | None,
+    pipeline_id: str | None,
+    model: str | None,
+    gate_split: str | None,
+    as_json: bool,
+) -> None:
+    """Rank the proposed candidates for KEY (read-only) and recommend one to apply."""
+    from dataclasses import asdict
+
+    from ncp.config import load_config
+    from ncp.refine import compare_candidates
+
+    config = load_config(cwd=cwd or Path.cwd())
+    try:
+        store = create_store(config)
+    except NCPStoreUnavailableError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    try:
+        result = compare_candidates(
+            store,
+            key=key,
+            pipeline_id=pipeline_id,
+            model=model,
+            split=gate_split if gate_split is not None else config.refine_gate_split,
+            gate_ratio=config.refine_gate_ratio,
+            min_trial_outcomes=config.refine_min_trial_outcomes,
+            min_anchor_outcomes=config.refine_min_anchor_outcomes,
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    best = result.recommended
+    if as_json:
+        payload = asdict(result)
+        payload["recommended"] = best.chunk_id if best else None
+        payload["apply_command"] = f"ncp refine apply {best.chunk_id}" if best else None
+        click.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+
+    def fmt(value: float | None, spec: str) -> str:
+        return "-" if value is None else format(value, spec)
+
+    click.echo(
+        f"{key}: head {result.head_chunk_id} "
+        f"(n={result.anchor_n}, rate={fmt(result.anchor_success_rate, '.2f')}, "
+        f"out_tok={fmt(result.anchor_mean_output_tokens, '.0f')}, split={result.anchor_split})"
+    )
+    if not result.candidates:
+        click.echo("No proposed candidates.")
+        return
+    click.echo(f"{'chunk_id':<28} {'kind':<7} {'status':<9} {'weight':>6} {'rate':>5} {'out_tok':>7} {'split':<7} gate")
+    for c in result.candidates:
+        gate = "-" if c.would_pass_gate is None else ("pass" if c.would_pass_gate else "FAIL")
+        click.echo(
+            f"{c.chunk_id:<28} {c.kind:<7} {c.status:<9} {c.total_weight:>6.1f} "
+            f"{fmt(c.success_rate, '.2f'):>5} {fmt(c.mean_output_tokens, '.0f'):>7} {c.split_used:<7} {gate}"
+        )
+        for reason in c.reasons:
+            click.echo(f"    - {reason}")
+    if best is None:
+        click.echo("All candidates are stale; propose again.")
+    else:
+        click.echo(f"Recommended: {best.chunk_id}")
+        if best.would_pass_gate is False:
+            click.echo("  (it would not pass the gate yet: collect more outcomes or use --force)")
+        click.echo(f"  ncp refine apply {best.chunk_id}")
 
 
 @refine_group.command("prune")

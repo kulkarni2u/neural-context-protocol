@@ -1081,6 +1081,7 @@ class OutcomeRecord(NCPModel):
     slot: str | None = None
     model: str | None = None
     benchmark: str | None = None
+    split: str | None = Field(default=None, max_length=32)  # "train" | "holdout" | free tag
     eval_source: Literal["self_report", "verifier", "human"] = "self_report"
     output_tokens: int | None = Field(default=None, ge=0)
     input_tokens: int | None = Field(default=None, ge=0)

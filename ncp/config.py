@@ -375,6 +375,8 @@ DEFAULT_CONFIG = {
         "gate_ratio": 0.9,
         "min_trial_outcomes": 5,
         "min_anchor_outcomes": 5,
+        # Outcomes the gate scores: auto (holdout when enough, else all) | holdout | all.
+        "gate_split": "auto",
     },
     "improvement": {
         # [NCP:IMPROVEMENT] blocks are never truncated; over this many chars the
@@ -1017,6 +1019,13 @@ class NCPConfig:
     @property
     def refine_min_anchor_outcomes(self) -> int:
         return max(1, int(self.values.get("refine", {}).get("min_anchor_outcomes", 5)))
+
+    @property
+    def refine_gate_split(self) -> str:
+        value = str(self.values.get("refine", {}).get("gate_split", "auto")).strip().lower()
+        if value not in ("auto", "holdout", "all"):
+            raise ValueError(f"[refine].gate_split must be auto, holdout or all; got {value!r}")
+        return value
 
     @property
     def improvement_warn_chars(self) -> int:
