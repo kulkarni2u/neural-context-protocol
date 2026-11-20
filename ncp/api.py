@@ -221,11 +221,20 @@ def write_memory(
     *,
     store: BaseStore | None = None,
     config: NCPConfig | None = None,
+    allow_duplicate: bool = False,
 ) -> bool:
-    """Persist one chunk through the public API."""
+    """Persist one chunk through the public API.
+
+    Returns False when the store refuses the write, including when the chunk
+    is a near-duplicate of a recent one. ``allow_duplicate=True`` skips that
+    check, for records that must exist per event (such as a handoff's
+    completion) rather than per distinct claim.
+    """
 
     resolved_config = config or _CONFIG or configure(cwd=Path.cwd())
     resolved_store = store or create_store(resolved_config)
+    if allow_duplicate:
+        return resolved_store.write(chunk, allow_duplicate=True)
     return resolved_store.write(chunk)
 
 
