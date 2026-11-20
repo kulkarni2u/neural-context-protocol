@@ -797,7 +797,12 @@ def complete_handoff(
             source_refs=source_ids,
             raw_ref=next_id,
         )
-        if not api.write_memory(raw_chunk, store=run.store, config=run.config):
+        # A completion is a per-run record: a retry or a deterministic
+        # provider can repeat earlier output, and store dedup must not drop
+        # it (that fails the handoff and breaks this run's raw_ref chain).
+        if not api.write_memory(
+            raw_chunk, store=run.store, config=run.config, allow_duplicate=True
+        ):
             raise RuntimeError("Failed to persist NCP handoff completion memory.")
         next_id = raw_chunk.chunk_id
     chunk = SubconsciousChunk(
@@ -814,7 +819,9 @@ def complete_handoff(
         source_refs=source_ids,
         raw_ref=raw_chunk.chunk_id,
     )
-    persisted = api.write_memory(chunk, store=run.store, config=run.config)
+    persisted = api.write_memory(
+        chunk, store=run.store, config=run.config, allow_duplicate=True
+    )
     if not persisted:
         raise RuntimeError("Failed to persist NCP handoff completion memory.")
     acknowledge_handoffs(

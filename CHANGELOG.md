@@ -4,6 +4,23 @@ All notable changes to Neural Context Protocol will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`ncp handoff` failed when a provider's output resembled an earlier
+  run's.** `complete_handoff` stored the raw output parts and the completion
+  record through normal write-time dedup, which rejects near-duplicates of
+  recent chunks on the same pipeline. A retry, a deterministic provider, or
+  two similar short results (for example the same JSON verdict) made the
+  write return False, so the handoff raised "Failed to persist NCP handoff
+  completion memory." and the whisper stayed queued. Completion writes now
+  bypass dedup, so each run keeps its own record and full-output chain.
+
+### Added
+
+- `ncp.api.write_memory(..., allow_duplicate=True)` skips the store's
+  near-duplicate check, for records that must exist once per event rather
+  than once per distinct claim. The default is unchanged.
+
 ## [1.9.7] - 2026-11-17
 
 ### Release scope

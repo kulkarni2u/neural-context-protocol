@@ -1203,6 +1203,69 @@ def test_complete_handoff_persistence_failure_leaves_handoffs_queued(
     assert prepared.store.whisper_pending(prepared.handoffs[0].whisper_id) is True
 
 
+def _complete_one_handoff(
+    tmp_path: Path, store: SQLiteStore, *, payload: str, response: str
+) -> tuple[agent_handoff.PreparedHandoff, agent_handoff.HandoffCompletion]:
+    _seed_whisper(store, target="claude", payload=payload, pipeline_id="pipe_repeat")
+    prepared = agent_handoff.prepare_handoff(
+        cwd=tmp_path, agent_id="claude", runner="claude", pipeline_id="pipe_repeat"
+    )
+    completion = agent_handoff.complete_handoff(prepared, runner="claude", response=response)
+    return prepared, completion
+
+
+def _full_output(store: SQLiteStore, raw_chunk_id: str) -> list[str]:
+    parts: list[str] = []
+    next_id: str | None = raw_chunk_id
+    while next_id:
+        [chunk] = store.get_chunks_by_ids([next_id])
+        parts.append(chunk.content)
+        next_id = chunk.raw_ref
+    return parts
+
+
+@pytest.mark.parametrize(
+    ("first_response", "second_response"),
+    [
+        # Retries and deterministic providers repeat output byte for byte.
+        ('{"success":true,"outputs":{}}', '{"success":true,"outputs":{}}'),
+        # Similar results on one pipeline are near-duplicates to the store.
+        ("implemented the slice and tests pass", "implemented the slice and tests pass."),
+        # Multi-part output: every part repeats.
+        ("x" * 5000, "x" * 5000),
+    ],
+)
+def test_complete_handoff_persists_repeated_provider_output(
+    tmp_path: Path, first_response: str, second_response: str
+) -> None:
+    runner = CliRunner()
+    runner.invoke(main, ["init", "--cwd", str(tmp_path)])
+    store = SQLiteStore(tmp_path / ".ncp" / "store.db")
+
+    first_run, first = _complete_one_handoff(
+        tmp_path, store, payload="first handoff", response=first_response
+    )
+    second_run, second = _complete_one_handoff(
+        tmp_path, store, payload="second handoff", response=second_response
+    )
+
+    assert second.chunk_id != first.chunk_id
+    assert second.raw_chunk_id != first.raw_chunk_id
+    assert store.whisper_pending(first_run.handoffs[0].whisper_id) is False
+    assert store.whisper_pending(second_run.handoffs[0].whisper_id) is False
+    # Each completion keeps its own full-output chain, not the earlier run's.
+    first_parts = _full_output(store, first.raw_chunk_id)
+    second_parts = _full_output(store, second.raw_chunk_id)
+    assert len(second_parts) == len(first_parts)
+    assert {c.chunk_id for c in store.get_chunks_by_ids([first.raw_chunk_id, second.raw_chunk_id])} == {
+        first.raw_chunk_id,
+        second.raw_chunk_id,
+    }
+    assert "".join(
+        part.split("] ", 1)[1] if part.startswith("[part ") else part for part in second_parts
+    ) == second_response
+
+
 @pytest.mark.parametrize(
     ("credential_shape", "secret_value"),
     [
